@@ -1,0 +1,13 @@
+# HLS build artifacts
+fpga/scripts/hls_build/
+fpga/hls/vi_sweep/solution*/
+
+# Vivado project artifacts
+fpga/vivado/ultra96v2/vi_ultra96v2/
+fpga/vivado/ultra96v2/ip_repo/
+
+# OS
+.Xil/
+*.jou
+*.log
+*.str
