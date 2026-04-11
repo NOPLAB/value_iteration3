@@ -23,10 +23,10 @@ constexpr int HALO      = 6;   // max forward 0.3m / 0.05m resolution = 6 cells
 constexpr int TILE_W_H  = TILE_W + 2 * HALO;  // 44
 constexpr int TILE_H_H  = TILE_H + 2 * HALO;  // 44
 
-// Sentinel values
-constexpr value_t   MAX_VALUE       = 0xFFFF;
-constexpr penalty_t PENALTY_OBSTACLE = 0xFFFF;  // impassable cell
-constexpr penalty_t PENALTY_GOAL     = 0xFFFE;  // goal cell — value stays 0
+// Sentinel values (ap_uint is not literal type, so use const not constexpr)
+const value_t   MAX_VALUE        = 0xFFFF;
+const penalty_t PENALTY_OBSTACLE  = 0xFFFF;  // impassable cell
+const penalty_t PENALTY_GOAL      = 0xFFFE;  // goal cell — value stays 0
 
 // Transition table: packed as (dix, diy, dit) in one 32-bit word
 // Layout: bits [7:0]=dix, [15:8]=diy, [23:16]=dit, [31:24]=reserved
