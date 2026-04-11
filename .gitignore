@@ -4,6 +4,11 @@ fpga/hls/vi_sweep/hls_build/
 fpga/hls/vi_sweep/solution*/
 fpga/hls/vi_sweep/dfx_runtime.txt
 fpga/hls/vi_sweep/.Xil/
+dfx_runtime.txt
+
+# Bitstream artifacts (large binary files)
+fpga/pynq/*.bit
+fpga/pynq/*.hwh
 
 # Vivado project artifacts
 fpga/vivado/ultra96v2/vi_ultra96v2/
