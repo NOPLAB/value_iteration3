@@ -30,7 +30,7 @@ all: cli
 cli: $(CLI_BIN)
 
 $(CLI_BIN): $(CLI_OBJ) $(LIBVI)
-	$(CC) -o $@ $^ $(LDFLAGS) -lpthread
+	$(CC) -o $@ $^ $(LDFLAGS) -lpthread -lm
 
 # Mock-only CLI build (no Linux ops, for host smoke test)
 cli-mock: CFLAGS += -DVI_MOCK_ONLY
