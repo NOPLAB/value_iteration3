@@ -1,0 +1,7 @@
+pl_ps_irq0[0] = SPI <TO_BE_CONFIRMED>  # for vi_sweep_cu0
+pl_ps_irq0[1] = SPI <TO_BE_CONFIRMED>  # for vi_sweep_cu1
+
+# The actual SPI numbers must be verified after running Vivado by checking
+# the IP Integrator "Address Editor" or the interrupt report. Update this
+# file with the real numbers before writing the device tree (Task 12 of
+# the Phase 3 driver plan).

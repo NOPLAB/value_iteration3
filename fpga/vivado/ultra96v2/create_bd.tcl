@@ -53,6 +53,24 @@ connect_bd_net $rstn \
     [get_bd_pins vi_sweep_cu0/ap_rst_n] \
     [get_bd_pins vi_sweep_cu1/ap_rst_n]
 
+# --- Interrupt: CU0/CU1 ap_done -> pl_ps_irq0[1:0] ---
+set irq_concat [create_bd_cell -type ip -vlnv xilinx.com:ip:xlconcat:2.1 irq_concat]
+set_property -dict [list \
+    CONFIG.NUM_PORTS {2} \
+    CONFIG.IN0_WIDTH {1} \
+    CONFIG.IN1_WIDTH {1} \
+] $irq_concat
+
+connect_bd_net [get_bd_pins vi_sweep_cu0/interrupt] [get_bd_pins irq_concat/In0]
+connect_bd_net [get_bd_pins vi_sweep_cu1/interrupt] [get_bd_pins irq_concat/In1]
+connect_bd_net [get_bd_pins irq_concat/dout]        [get_bd_pins zynq_ps/pl_ps_irq0]
+
+# Enable pl_ps_irq0 on the PS block
+set_property -dict [list \
+    CONFIG.PSU__USE__IRQ0 {1} \
+    CONFIG.PSU__IRQ_P2F_IRQ0_SELECT {1} \
+] [get_bd_cells zynq_ps]
+
 # --- Control path: GP0 -> ctrl_smc -> CU0/CU1 control ---
 connect_bd_intf_net [get_bd_intf_pins zynq_ps/M_AXI_HPM0_FPD] [get_bd_intf_pins ctrl_smc/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins ctrl_smc/M00_AXI] [get_bd_intf_pins vi_sweep_cu0/s_axi_control]
