@@ -155,6 +155,14 @@ static uint32_t mock_read_reg(void *vctx, int cu, uint32_t off) {
 static void mock_write_reg(void *vctx, int cu, uint32_t off, uint32_t v) {
     mock_ctx_t *mc = (mock_ctx_t*)vctx;
     if (cu < 0 || cu >= VI_NUM_CU || off + 4 > MOCK_REG_BYTES) return;
+
+    /* ISR is W1C — read-modify-write based on the previous value. */
+    if (off == MOCK_ISR) {
+        uint32_t cur = rd32(mc->regs[cu], MOCK_ISR);
+        wr32(mc->regs[cu], MOCK_ISR, cur & ~v);
+        return;
+    }
+
     wr32(mc->regs[cu], off, v);
 
     /* ap_start: run one sweep synchronously. */
@@ -165,20 +173,16 @@ static void mock_write_reg(void *vctx, int cu, uint32_t off, uint32_t v) {
         ctrl &= ~0x1u;
         ctrl |= 0x6u;  /* done | idle */
         wr32(mc->regs[cu], MOCK_AP_CTRL, ctrl);
-        /* Set ISR bit 0. */
-        wr32(mc->regs[cu], MOCK_ISR, 0x1);
-    }
-
-    /* ISR W1C */
-    if (off == MOCK_ISR) {
-        uint32_t cur = rd32(mc->regs[cu], MOCK_ISR);
-        wr32(mc->regs[cu], MOCK_ISR, cur & ~v);
+        /* OR in ap_done bit on ISR. */
+        uint32_t isr = rd32(mc->regs[cu], MOCK_ISR);
+        wr32(mc->regs[cu], MOCK_ISR, isr | 0x1u);
     }
 }
 
 static int mock_wait_irq(void *vctx, int cu, int timeout_ms) {
     (void)timeout_ms;
     mock_ctx_t *mc = (mock_ctx_t*)vctx;
+    if (cu < 0 || cu >= VI_NUM_CU) return VI_ERR_IRQ;
     /* Sweep already ran synchronously during write_reg(AP_CTRL).
        Just verify ap_done is set. */
     uint32_t ctrl = rd32(mc->regs[cu], MOCK_AP_CTRL);
