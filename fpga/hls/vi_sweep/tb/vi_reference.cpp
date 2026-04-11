@@ -84,9 +84,12 @@ int run_vi(
                         if (nx < 0 || nx >= map_x || ny < 0 || ny >= map_y) continue;
 
                         uint16_t nv = value_table[to_index(nx, ny, nt, map_x)];
-                        uint16_t np = penalty_table[ny * map_x + nx];
+                        uint16_t np_raw = penalty_table[ny * map_x + nx];
 
-                        if (nv == MAX_VALUE || np == PENALTY_OBSTACLE) continue;
+                        if (nv == MAX_VALUE || np_raw == PENALTY_OBSTACLE) continue;
+
+                        // PENALTY_GOAL marks the goal cell — penalty to enter is 0
+                        uint16_t np = (np_raw == PENALTY_GOAL) ? 0 : np_raw;
 
                         // Saturating add
                         uint32_t sum = (uint32_t)nv + (uint32_t)np;

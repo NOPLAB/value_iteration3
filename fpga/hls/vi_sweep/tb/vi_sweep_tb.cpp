@@ -198,6 +198,33 @@ int main()
         }
     }
 
+    // Verify value propagation: count cells with finite (non-MAX) values
+    int finite_count = 0;
+    int total_free = 0;
+    for (int iy = 0; iy < MAP_Y; iy++) {
+        for (int ix = 0; ix < MAP_X; ix++) {
+            uint16_t p = penalty_hls[iy * MAP_X + ix];
+            if (p >= vi_ref::PENALTY_GOAL) continue;  // skip goals and obstacles
+            total_free++;
+            // Count if any theta for this cell has a finite value
+            bool has_finite = false;
+            for (int it = 0; it < vi_ref::N_THETA; it++) {
+                int idx = (iy * MAP_X + ix) * vi_ref::N_THETA + it;
+                if (value_hls[idx] < vi_ref::MAX_VALUE) {
+                    has_finite = true;
+                    break;
+                }
+            }
+            if (has_finite) finite_count++;
+        }
+    }
+    printf("Propagation: %d / %d free cells reached (finite value)\n",
+           finite_count, total_free);
+    if (finite_count < total_free / 2) {
+        printf("  FAIL: value propagation insufficient (less than 50%% of free cells)\n");
+        mismatch_count++;
+    }
+
     if (mismatch_count > 0) {
         printf("\nTESTBENCH FAILED (%d errors)\n", mismatch_count);
         return 1;

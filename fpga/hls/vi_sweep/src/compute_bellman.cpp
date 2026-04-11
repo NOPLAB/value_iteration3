@@ -55,14 +55,16 @@ void compute_bellman(
 
                     value_t nv = val_buf[ny][nx][nt];
 
-                    penalty_t np;
-                    if (a < 2)      np = pen_buf_0[ny][nx];
-                    else if (a < 4) np = pen_buf_1[ny][nx];
-                    else            np = pen_buf_2[ny][nx];
+                    penalty_t np_raw;
+                    if (a < 2)      np_raw = pen_buf_0[ny][nx];
+                    else if (a < 4) np_raw = pen_buf_1[ny][nx];
+                    else            np_raw = pen_buf_2[ny][nx];
 
-                    if (nv == MAX_VALUE || np >= PENALTY_OBSTACLE) {
+                    if (nv == MAX_VALUE || np_raw == PENALTY_OBSTACLE) {
                         costs[a] = MAX_VALUE;
                     } else {
+                        // PENALTY_GOAL marks the goal cell — penalty to enter is 0
+                        penalty_t np = (np_raw == PENALTY_GOAL) ? (penalty_t)0 : np_raw;
                         ap_uint<17> sum = (ap_uint<17>)nv + (ap_uint<17>)np;
                         costs[a] = (sum >= (ap_uint<17>)MAX_VALUE)
                                  ? (value_t)(MAX_VALUE - 1) : (value_t)sum;
