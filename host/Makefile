@@ -35,7 +35,7 @@ $(CLI_BIN): $(CLI_OBJ) $(LIBVI)
 # Mock-only CLI build (no Linux ops, for host smoke test)
 cli-mock: CFLAGS += -DVI_MOCK_ONLY
 cli-mock: $(LIBVI_MOCK)
-	$(CC) $(CFLAGS) -o vi_cli_mock $(CLI_SRC) $(LIBVI_MOCK)
+	$(CC) $(CFLAGS) -o vi_cli_mock $(CLI_SRC) $(LIBVI_MOCK) -lm
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
