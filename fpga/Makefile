@@ -31,19 +31,19 @@ stream tile:
 # ---------- Build targets ----------
 
 csim: | $(BUILD_DIR)
-	cd $(BUILD_DIR) && vitis-run --mode hls --tcl $(abspath $(TCL_DIR)run_csim_$(KERNEL).tcl)
+	cd "$(BUILD_DIR)" && vitis-run --mode hls --tcl "$(TCL_DIR)run_csim_$(KERNEL).tcl"
 
 hls: | $(BUILD_DIR)
-	cd $(BUILD_DIR) && vitis-run --mode hls --tcl $(abspath $(TCL_DIR)export_hls_ip_$(KERNEL).tcl)
-	cd $(VIVADO_DIR)ip_repo_$(KERNEL) && unzip -o export.zip
+	cd "$(BUILD_DIR)" && vitis-run --mode hls --tcl "$(TCL_DIR)export_hls_ip_$(KERNEL).tcl"
+	cd "$(VIVADO_DIR)ip_repo_$(KERNEL)" && unzip -o export.zip
 
 vivado: hls | $(BUILD_DIR)
-	vivado -mode batch -source $(TCL_DIR)build_vivado.tcl -tclargs $(KERNEL) $(abspath $(BUILD_DIR))
+	vivado -mode batch -source "$(TCL_DIR)build_vivado.tcl" -tclargs $(KERNEL) "$(BUILD_DIR)"
 
 bitstream: vivado
 
 $(BUILD_DIR):
-	$(call MKDIR,$(BUILD_DIR))
+	-$(call MKDIR,$(BUILD_DIR))
 
 # ---------- Clean ----------
 
