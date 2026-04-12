@@ -25,7 +25,9 @@ if [ ! -f "${EDF_DIR}/build/conf/local.conf" ]; then
 fi
 
 cd "${EDF_DIR}"
+set +u
 source edf-init-build-env build
+set -u
 
 echo "==> Building: MACHINE=${MACHINE} bitbake ${IMAGE}"
 MACHINE="${MACHINE}" bitbake "${IMAGE}"

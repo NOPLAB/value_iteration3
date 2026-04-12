@@ -33,7 +33,9 @@ fi
 
 # --- Step 2: Initialize build environment ---
 echo "==> Initializing build environment..."
+set +u
 source edf-init-build-env build
+set -u
 
 # --- Step 3: Configure local.conf ---
 LOCAL_CONF="${BUILD_DIR}/conf/local.conf"
@@ -56,10 +58,13 @@ CONFEOF
 fi
 
 # --- Step 4: Add meta-vi-sweep layer ---
+# Cannot use bitbake-layers on Windows FS (Unix socket not supported),
+# so edit bblayers.conf directly.
+BBLAYERS_CONF="${BUILD_DIR}/conf/bblayers.conf"
 LAYER_DIR="/work/petalinux/meta-vi-sweep"
-if [ -d "${LAYER_DIR}" ]; then
-    bitbake-layers add-layer "${LAYER_DIR}" 2>/dev/null || true
-    echo "  Added meta-vi-sweep layer"
+if [ -d "${LAYER_DIR}" ] && ! grep -q 'meta-vi-sweep' "${BBLAYERS_CONF}" 2>/dev/null; then
+    sed -i "\|BBLAYERS|a\\  ${LAYER_DIR} \\\\" "${BBLAYERS_CONF}"
+    echo "  Added meta-vi-sweep layer to bblayers.conf"
 fi
 
 # --- Step 5: Generate machine config from XSA (if provided) ---

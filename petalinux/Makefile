@@ -35,9 +35,13 @@ docker-build:
 
 # ---------- Run helpers ----------
 
+DOCKER_FLAGS ?= -it
+# Named volume for bitbake build dir (Unix sockets don't work on Windows FS)
+BUILDVOL := vi-edf-build
 define DOCKER_RUN
-	docker run --rm -it \
+	docker run --rm $(DOCKER_FLAGS) \
 		-v "$(REPO_ROOT):/work" \
+		-v "$(BUILDVOL):/work/edf/build" \
 		-w /work \
 		$(IMAGE_NAME)
 endef

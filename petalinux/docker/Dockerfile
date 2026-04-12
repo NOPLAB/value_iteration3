@@ -13,7 +13,7 @@ ENV TZ=Asia/Tokyo
 # Yocto Project host dependencies (Yocto 5.x / Scarthgap)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential ca-certificates chrpath cpio curl debianutils diffstat \
-    file gawk gcc git iputils-ping less libacl1 liblz4-tool locales lz4 make \
+    file gawk gcc git gnupg iputils-ping less libacl1 liblz4-tool locales lz4 make \
     python3 python3-git python3-jinja2 python3-pexpect python3-pip \
     python3-subunit socat sudo texinfo unzip wget xz-utils zstd \
     && rm -rf /var/lib/apt/lists/*
@@ -34,7 +34,7 @@ RUN curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
     > /usr/local/bin/repo && chmod +x /usr/local/bin/repo
 
 # Workspace mount point
-RUN mkdir -p /work && chown ${PUSER}:${PUSER} /work
+RUN mkdir -p /work/edf/build && chown -R ${PUSER}:${PUSER} /work
 WORKDIR /work
 
 USER ${PUSER}
