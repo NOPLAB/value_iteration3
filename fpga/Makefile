@@ -1,6 +1,7 @@
 FPGA_DIR    := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-SCRIPTS_DIR := $(FPGA_DIR)scripts/
+TCL_DIR     := $(FPGA_DIR)tcl/
 VIVADO_DIR  := $(FPGA_DIR)vivado/ultra96v2/
+BUILD_DIR   := $(FPGA_DIR)build/
 
 # ---------- Kernel selector ----------
 # Usage: make -C fpga csim stream
@@ -21,29 +22,31 @@ stream tile:
 # ---------- Build targets ----------
 
 csim:
-	cd $(SCRIPTS_DIR) && vitis-run --mode hls --tcl run_csim_$(KERNEL).tcl
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && vitis-run --mode hls --tcl $(abspath $(TCL_DIR)run_csim_$(KERNEL).tcl)
 
 hls:
-	cd $(SCRIPTS_DIR) && vitis-run --mode hls --tcl export_hls_ip_$(KERNEL).tcl
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && vitis-run --mode hls --tcl $(abspath $(TCL_DIR)export_hls_ip_$(KERNEL).tcl)
 	cd $(VIVADO_DIR)ip_repo_$(KERNEL) && unzip -o export.zip
 
 vivado: hls
-	vivado -mode batch -source $(SCRIPTS_DIR)build_vivado.tcl -tclargs $(KERNEL)
+	mkdir -p $(BUILD_DIR)
+	vivado -mode batch -source $(TCL_DIR)build_vivado.tcl -tclargs $(KERNEL) $(abspath $(BUILD_DIR))
 
 bitstream: vivado
 
 # ---------- Clean ----------
 
 clean_hls:
-	if exist "$(subst /,\,$(SCRIPTS_DIR)hls_build_$(KERNEL))" rmdir /s /q "$(subst /,\,$(SCRIPTS_DIR)hls_build_$(KERNEL))"
+	rm -rf $(BUILD_DIR)hls_build_$(KERNEL)
 
 clean_vivado:
-	if exist "$(subst /,\,$(VIVADO_DIR)vi_$(KERNEL))" rmdir /s /q "$(subst /,\,$(VIVADO_DIR)vi_$(KERNEL))"
+	rm -rf $(BUILD_DIR)vi_$(KERNEL)
 
 ifdef KERNEL
 clean: clean_hls clean_vivado
 else
 clean:
-	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) clean_hls clean_vivado stream
-	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) clean_hls clean_vivado tile
+	rm -rf $(BUILD_DIR)
 endif

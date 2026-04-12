@@ -8,7 +8,7 @@ set vivado_dir   [file normalize "$tcl_dir/../vivado/ultra96v2"]
 set ip_repo_dir  [file normalize "$vivado_dir/ip_repo_stream"]
 set part         "xczu3eg-sbva484-1-i"
 
-create_project $project_name "$vivado_dir/$project_name" -part $part -force
+create_project $project_name "$::build_dir/$project_name" -part $part -force
 
 set_property board_part Avnet-tria:Ultra96v2:part0:1.3 [current_project]
 
@@ -24,7 +24,7 @@ generate_target all [get_files vi_bd.bd]
 
 # Create HDL wrapper
 make_wrapper -files [get_files vi_bd.bd] -top
-add_files -norecurse [glob "$vivado_dir/$project_name/$project_name.gen/sources_1/bd/vi_bd/hdl/vi_bd_wrapper.v"]
+add_files -norecurse [glob "$::build_dir/$project_name/$project_name.gen/sources_1/bd/vi_bd/hdl/vi_bd_wrapper.v"]
 update_compile_order -fileset sources_1
 
-puts "INFO: Project created at $vivado_dir/$project_name"
+puts "INFO: Project created at $::build_dir/$project_name"
