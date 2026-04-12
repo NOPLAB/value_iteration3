@@ -14,12 +14,12 @@ fpga/pynq/*.hwh
 fpga/vivado/ultra96v2/vi_ultra96v2/
 fpga/vivado/ultra96v2/ip_repo/
 
-# Phase 3 C build artifacts
+# C build artifacts
 *.o
 driver/uio/*.a
 driver/uio/*.so
 
-# Phase 3 compiled binaries
+# compiled binaries
 host/vi_cli
 host/vi_cli_mock
 host/test/test_map_pgm
