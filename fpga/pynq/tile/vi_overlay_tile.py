@@ -4,7 +4,7 @@ Usage:
     Copy vi_bd_wrapper.bit, vi_bd_wrapper.hwh, and this file to Ultra96-V2.
 
 After HLS synthesis, verify register offsets in:
-  hls_build_tile/solution1/impl/misc/drivers/vi_sweep_v1_0/src/xvi_sweep_hw.h
+  vivado/ultra96v2/ip_repo_tile/drivers/vi_sweep_v1_0/src/xvi_sweep_hw.h
 
 NOTE: The offsets below are *estimated* from the streaming kernel layout and
 HLS parameter ordering. You MUST verify them against the generated header

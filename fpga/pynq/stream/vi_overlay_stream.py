@@ -7,7 +7,7 @@ Usage:
     Copy vi_bd_wrapper.bit, vi_bd_wrapper.hwh, and this file to Ultra96-V2.
 
 After HLS synthesis, verify register offsets in:
-  ip_repo_stream/drivers/vi_sweep_stream_v1_0/src/xvi_sweep_stream_hw.h
+  vivado/ultra96v2/ip_repo_stream/drivers/vi_sweep_stream_v1_0/src/xvi_sweep_stream_hw.h
 """
 
 import numpy as np

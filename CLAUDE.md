@@ -19,22 +19,22 @@ Top-level `Makefile` delegates to `driver/uio/` and `host/`. Run from the repo r
 
 ### FPGA build (`fpga/Makefile`)
 
-Tools must be on `PATH` — invoke bare `vitis-run` / `vivado` (Vitis 2025.2). Do **not** prefix with `source settings.sh`. Tile and streaming kernels have fully separate build paths.
+Tools must be on `PATH` — invoke bare `vitis-run` / `vivado` (Vitis 2025.2). Do **not** prefix with `source settings.sh`. Tile and streaming kernels have fully separate build paths. All TCL scripts live in `fpga/tcl/`; build artifacts go to `fpga/build/`.
 
-- `make -C fpga csim tile` — HLS C-simulation of tile-based kernel (`fpga/hls/vi_sweep_tile/`).
-- `make -C fpga csim stream` — HLS C-simulation of streaming kernel (`fpga/hls/vi_sweep_stream/`).
-- `make -C fpga hls tile` — HLS synth + IP export (tile) into `fpga/scripts/hls_build_tile/`, IP to `ip_repo_tile/`.
-- `make -C fpga hls stream` — HLS synth + IP export (streaming) into `fpga/scripts/hls_build_stream/`, IP to `ip_repo_stream/`.
-- `make -C fpga bitstream tile` — HLS + Vivado synthesis + bitstream for tile kernel, project `fpga/vivado/ultra96v2/vi_tile/`.
-- `make -C fpga bitstream stream` — HLS + Vivado synthesis + bitstream for streaming kernel, project `fpga/vivado/ultra96v2/vi_stream/`.
+- `make -C fpga csim tile` — HLS C-simulation of tile-based kernel (`fpga/hls/tile/`).
+- `make -C fpga csim stream` — HLS C-simulation of streaming kernel (`fpga/hls/stream/`).
+- `make -C fpga hls tile` — HLS synth + IP export (tile) into `fpga/build/hls_build_tile/`, IP to `ip_repo_tile/`.
+- `make -C fpga hls stream` — HLS synth + IP export (streaming) into `fpga/build/hls_build_stream/`, IP to `ip_repo_stream/`.
+- `make -C fpga bitstream tile` — HLS + Vivado synthesis + bitstream for tile kernel, project `fpga/build/vi_tile/`.
+- `make -C fpga bitstream stream` — HLS + Vivado synthesis + bitstream for streaming kernel, project `fpga/build/vi_stream/`.
 - `make -C fpga clean` — clean both tile and stream build artifacts. Append `tile` or `stream` to clean one.
 - After regenerating HLS IP, sync the register header into the driver: `make -C driver/uio sync-hw-header` (copies `xvi_sweep_hw.h` into `driver/uio/generated/`; review the diff).
 
 ## Architecture
 
-Four vertically integrated layers share the same 16-bit data contract defined in `fpga/hls/vi_sweep_tile/src/vi_types.h` (tile-based) and `fpga/hls/vi_sweep_stream/src/vi_stream_types.h` (streaming). Keep them in sync.
+Four vertically integrated layers share the same 16-bit data contract defined in `fpga/hls/tile/src/vi_types.h` (tile-based) and `fpga/hls/stream/src/vi_stream_types.h` (streaming). Keep them in sync.
 
-### 1. HLS kernel (`fpga/hls/vi_sweep_tile/` and `fpga/hls/vi_sweep_stream/`)
+### 1. HLS kernel (`fpga/hls/tile/` and `fpga/hls/stream/`)
 Dataflow kernel `vi_sweep_top` = `load_tiles` → `compute_bellman` → `store_tiles`, processing 32×32 tiles with a 6-cell halo (TILE_W_H = 44). Two CUs are instantiated in the Vivado BD for red/black tile sweeping. Datatypes: `value_t`/`penalty_t` are `ap_uint<16>`; offsets `ap_int<8>`. Sentinels: `PENALTY_OBSTACLE = 0xFFFF` (impassable); `PENALTY_GOAL = 0xFFFE` — **when read as a neighbor's penalty it must be treated as 0** so the goal cell's value stays pinned at 0 (this convention is load-bearing; see the testbench and `host/src/penalty.c`). Transition table is a packed `(dix, diy, dit)` word per `(action, theta)` — 6×60 = 360 entries, precomputed on ARM and DMA'd into the kernel.
 
 ### 2. Device layer (`driver/uio/`)
