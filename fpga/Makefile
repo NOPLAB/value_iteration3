@@ -20,33 +20,34 @@ stream tile:
 .PHONY: stream tile csim hls vivado bitstream clean_hls clean_vivado clean
 
 # ---------- Build targets ----------
+# Use order-only prerequisite to create build dir once.
 
-csim:
-	mkdir -p $(BUILD_DIR)
+csim: | $(BUILD_DIR)
 	cd $(BUILD_DIR) && vitis-run --mode hls --tcl $(abspath $(TCL_DIR)run_csim_$(KERNEL).tcl)
 
-hls:
-	mkdir -p $(BUILD_DIR)
+hls: | $(BUILD_DIR)
 	cd $(BUILD_DIR) && vitis-run --mode hls --tcl $(abspath $(TCL_DIR)export_hls_ip_$(KERNEL).tcl)
 	cd $(VIVADO_DIR)ip_repo_$(KERNEL) && unzip -o export.zip
 
-vivado: hls
-	mkdir -p $(BUILD_DIR)
+vivado: hls | $(BUILD_DIR)
 	vivado -mode batch -source $(TCL_DIR)build_vivado.tcl -tclargs $(KERNEL) $(abspath $(BUILD_DIR))
 
 bitstream: vivado
 
+$(BUILD_DIR):
+	-mkdir "$(subst /,\,$(BUILD_DIR))"
+
 # ---------- Clean ----------
 
 clean_hls:
-	rm -rf $(BUILD_DIR)hls_build_$(KERNEL)
+	if exist "$(subst /,\,$(BUILD_DIR)hls_build_$(KERNEL))" rmdir /s /q "$(subst /,\,$(BUILD_DIR)hls_build_$(KERNEL))"
 
 clean_vivado:
-	rm -rf $(BUILD_DIR)vi_$(KERNEL)
+	if exist "$(subst /,\,$(BUILD_DIR)vi_$(KERNEL))" rmdir /s /q "$(subst /,\,$(BUILD_DIR)vi_$(KERNEL))"
 
 ifdef KERNEL
 clean: clean_hls clean_vivado
 else
 clean:
-	rm -rf $(BUILD_DIR)
+	if exist "$(subst /,\,$(BUILD_DIR))" rmdir /s /q "$(subst /,\,$(BUILD_DIR))"
 endif
