@@ -18,21 +18,20 @@ set xpr_file     "$project_dir/$project_name/$project_name.xpr"
 
 if {![file exists $xpr_file]} {
     puts "INFO: Project not found, creating..."
-    source "$project_dir/create_project_${variant}.tcl"
+    source "$script_dir/create_project_${variant}.tcl"
 } else {
     open_project $xpr_file
 }
 
-# Synthesis
-reset_run synth_1
-launch_runs synth_1 -jobs 4
+# Synthesis (incremental — skips unchanged OOC blocks)
+launch_runs synth_1 -jobs 6
 wait_on_run synth_1
 if {[get_property STATUS [get_runs synth_1]] != "synth_design Complete!"} {
     error "Synthesis failed"
 }
 
 # Implementation + bitstream
-launch_runs impl_1 -to_step write_bitstream -jobs 4
+launch_runs impl_1 -to_step write_bitstream -jobs 6
 wait_on_run impl_1
 if {[get_property STATUS [get_runs impl_1]] != "write_bitstream Complete!"} {
     error "Implementation/bitstream failed"

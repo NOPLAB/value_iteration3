@@ -4,7 +4,7 @@
 # ===========================================================================
 
 set script_dir [file normalize [file dirname [info script]]]
-set hls_dir    [file normalize "$script_dir/../hls/vi_sweep_stream"]
+set hls_dir    [file normalize "$script_dir/../hls/stream"]
 set ip_dst     [file normalize "$script_dir/../vivado/ultra96v2/ip_repo_stream"]
 set part       "xczu3eg-sbva484-1-i"
 
