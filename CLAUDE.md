@@ -21,11 +21,11 @@ Top-level `Makefile` delegates to `driver/uio/` and `host/`. Run from the repo r
 
 Tools must be on `PATH` — invoke bare `vitis_hls` / `vivado` (Vitis 2025.2). Do **not** prefix with `source settings.sh`.
 
-- `make -C fpga/scripts csim` — HLS C-simulation of tile-based kernel (`fpga/hls/vi_sweep_tile/`).
-- `make -C fpga/scripts csim_stream` — HLS C-simulation of streaming kernel (`fpga/hls/vi_sweep_stream/`).
-- `make -C fpga/scripts hls` — HLS synth + IP export (tile-based) into `fpga/scripts/hls_build_tile/`.
-- `make -C fpga/scripts hls_stream` — HLS synth + IP export (streaming) into `fpga/scripts/hls_build_stream/`.
-- `make -C fpga/scripts vivado` (or `bitstream`) — runs HLS then `build_vivado.tcl` to produce the Ultra96-V2 bitstream under `fpga/vivado/ultra96v2/vi_ultra96v2/`.
+- `make -C fpga csim` — HLS C-simulation of tile-based kernel (`fpga/hls/vi_sweep_tile/`).
+- `make -C fpga csim_stream` — HLS C-simulation of streaming kernel (`fpga/hls/vi_sweep_stream/`).
+- `make -C fpga hls` — HLS synth + IP export (tile-based) into `fpga/scripts/hls_build_tile/`.
+- `make -C fpga hls_stream` — HLS synth + IP export (streaming) into `fpga/scripts/hls_build_stream/`.
+- `make -C fpga vivado` (or `bitstream`) — runs HLS then `build_vivado.tcl` to produce the Ultra96-V2 bitstream under `fpga/vivado/ultra96v2/vi_ultra96v2/`.
 - After regenerating HLS IP, sync the register header into the driver: `make -C driver/uio sync-hw-header` (copies `xvi_sweep_hw.h` into `driver/uio/generated/`; review the diff).
 
 ## Architecture

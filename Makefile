@@ -20,13 +20,13 @@ test-hw:
 # ---------- FPGA (HLS + Vivado) ----------
 
 csim:
-	$(MAKE) -C fpga/scripts csim
+	$(MAKE) -C fpga csim
 
 hls:
-	$(MAKE) -C fpga/scripts hls
+	$(MAKE) -C fpga hls
 
 vivado: hls
-	$(MAKE) -C fpga/scripts vivado
+	$(MAKE) -C fpga vivado
 
 bitstream: vivado
 
@@ -56,7 +56,7 @@ clean-plnx:
 	$(MAKE) -C petalinux clean
 
 clean-fpga:
-	$(MAKE) -C fpga/scripts clean
+	$(MAKE) -C fpga clean
 
 clean:
 	$(MAKE) -C driver/uio clean
