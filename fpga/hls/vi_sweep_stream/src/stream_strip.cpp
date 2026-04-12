@@ -28,10 +28,8 @@ void stream_strip(
 
     value_t local_max = 0;
 
-    // --- Initialize window: load WINDOW_ROWS rows around the first data row ---
+    // --- Initialize window: load WINDOW_ROWS rows ---
     INIT_WIN: for (int wr = 0; wr < WINDOW_ROWS; wr++) {
-        // For forward (cu_id=0): first data row is iy=0, window covers [-HALO..+HALO]
-        // For reverse (cu_id=1): first data row is iy=map_y-1, window covers [map_y-1-HALO..map_y-1+HALO]
         int gy;
         if (cu_id == 0)
             gy = -HALO_MAX + wr;
@@ -60,19 +58,17 @@ void stream_strip(
                   iy, strip_x0, strip_w, map_x);
 
         // Evict oldest row, load next future row
-        if (iy_raw + HALO_MAX + 1 < map_y + HALO_MAX) {
-            int next_gy;
-            if (cu_id == 0)
-                next_gy = iy_raw + HALO_MAX + 1;
-            else
-                next_gy = (map_y - 1) - (iy_raw + HALO_MAX + 1);
+        int evict_slot = iy_raw % WINDOW_ROWS;
+        int next_gy;
+        if (cu_id == 0)
+            next_gy = iy_raw + HALO_MAX + 1;
+        else
+            next_gy = (map_y - 1) - (iy_raw + HALO_MAX + 1);
 
-            int evict_slot = iy_raw % WINDOW_ROWS;
-            load_row(val_buf[evict_slot],
-                     pen_buf_0[evict_slot], pen_buf_1[evict_slot], pen_buf_2[evict_slot],
-                     value_table, penalty_table,
-                     next_gy, strip_x0, strip_w, map_x, map_y);
-        }
+        load_row(val_buf[evict_slot],
+                 pen_buf_0[evict_slot], pen_buf_1[evict_slot], pen_buf_2[evict_slot],
+                 value_table, penalty_table,
+                 next_gy, strip_x0, strip_w, map_x, map_y);
     }
 
     strip_max_delta = local_max;

@@ -24,8 +24,28 @@ void compute_row(
 
     value_t local_max = 0;
 
+    // Pre-compute neighbor Y slot indices for all (action, theta) pairs.
+    // This hoists the expensive % WINDOW_ROWS out of the pipelined LOOP_T.
+    // ny_lut is constant across all ix in this row (only depends on win_center).
+    int ny_lut[N_ACTIONS][N_THETA];
+    #pragma HLS ARRAY_PARTITION variable=ny_lut complete dim=0
+
+    int y_sign = (cu_id == 0) ? 1 : -1;
+    PRECOMP_NY: for (int a = 0; a < N_ACTIONS; a++) {
+        for (int it = 0; it < N_THETA; it++) {
+            #pragma HLS PIPELINE II=1
+            int diy = y_sign * (int)delta_table[a][it][1];
+            int ny = win_center + diy;
+            // Manual modulo for small range: ny is in [-HALO_MAX, WINDOW_ROWS+HALO_MAX-1]
+            if (ny < 0) ny += WINDOW_ROWS;
+            else if (ny >= WINDOW_ROWS) ny -= WINDOW_ROWS;
+            ny_lut[a][it] = ny;
+        }
+    }
+
     LOOP_X: for (int ix_raw = 0; ix_raw < STRIP_W_MAX; ix_raw++) {
         #pragma HLS LOOP_TRIPCOUNT min=1 max=256
+        #pragma HLS LOOP_FLATTEN off
         if (ix_raw >= strip_w) break;
 
         int ix = (cu_id == 0) ? ix_raw : (strip_w - 1 - ix_raw);
@@ -40,44 +60,45 @@ void compute_row(
 
             value_t old_val = val_buf[win_center][bx][it];
 
-            // Reverse scan inverts Y slot ordering: slot++ = gy-- for cu_id=1
-            int y_sign = (cu_id == 0) ? 1 : -1;
-
             // --- 6 actions, BRAM-port-scheduled ---
+            // ny from pre-computed LUT (no modulo in pipeline)
+            // Actions 0,1: theta bank[it], pen_buf_0
+            // Actions 2,4: theta bank[it_l], pen_buf_1, pen_buf_2
+            // Actions 3,5: theta bank[it_r], pen_buf_1, pen_buf_2
+
             // Action 0: forward
-            int ny0 = (win_center + y_sign * (int)delta_table[0][it][1] + WINDOW_ROWS) % WINDOW_ROWS;
             int nx0 = bx + (int)delta_table[0][it][0];
-            int it_fw = it;
-            value_t c0 = cost_of(val_buf[ny0][nx0][it_fw], pen_buf_0[ny0][nx0]);
+            value_t c0 = cost_of(val_buf[ny_lut[0][it]][nx0][it],
+                                 pen_buf_0[ny_lut[0][it]][nx0]);
 
             // Action 1: backward
-            int ny1 = (win_center + y_sign * (int)delta_table[1][it][1] + WINDOW_ROWS) % WINDOW_ROWS;
             int nx1 = bx + (int)delta_table[1][it][0];
-            value_t c1 = cost_of(val_buf[ny1][nx1][it_fw], pen_buf_0[ny1][nx1]);
+            value_t c1 = cost_of(val_buf[ny_lut[1][it]][nx1][it],
+                                 pen_buf_0[ny_lut[1][it]][nx1]);
 
             // Action 2: left
-            int ny2 = (win_center + y_sign * (int)delta_table[2][it][1] + WINDOW_ROWS) % WINDOW_ROWS;
             int nx2 = bx + (int)delta_table[2][it][0];
             int it_l = it + (int)delta_table[2][it][2];
             it_l = (it_l < 0) ? it_l + N_THETA : (it_l >= N_THETA) ? it_l - N_THETA : it_l;
-            value_t c2 = cost_of(val_buf[ny2][nx2][it_l], pen_buf_1[ny2][nx2]);
+            value_t c2 = cost_of(val_buf[ny_lut[2][it]][nx2][it_l],
+                                 pen_buf_1[ny_lut[2][it]][nx2]);
 
             // Action 3: right
-            int ny3 = (win_center + y_sign * (int)delta_table[3][it][1] + WINDOW_ROWS) % WINDOW_ROWS;
             int nx3 = bx + (int)delta_table[3][it][0];
             int it_r = it + (int)delta_table[3][it][2];
             it_r = (it_r < 0) ? it_r + N_THETA : (it_r >= N_THETA) ? it_r - N_THETA : it_r;
-            value_t c3 = cost_of(val_buf[ny3][nx3][it_r], pen_buf_1[ny3][nx3]);
+            value_t c3 = cost_of(val_buf[ny_lut[3][it]][nx3][it_r],
+                                 pen_buf_1[ny_lut[3][it]][nx3]);
 
             // Action 4: forward-left
-            int ny4 = (win_center + y_sign * (int)delta_table[4][it][1] + WINDOW_ROWS) % WINDOW_ROWS;
             int nx4 = bx + (int)delta_table[4][it][0];
-            value_t c4 = cost_of(val_buf[ny4][nx4][it_l], pen_buf_2[ny4][nx4]);
+            value_t c4 = cost_of(val_buf[ny_lut[4][it]][nx4][it_l],
+                                 pen_buf_2[ny_lut[4][it]][nx4]);
 
             // Action 5: forward-right
-            int ny5 = (win_center + y_sign * (int)delta_table[5][it][1] + WINDOW_ROWS) % WINDOW_ROWS;
             int nx5 = bx + (int)delta_table[5][it][0];
-            value_t c5 = cost_of(val_buf[ny5][nx5][it_r], pen_buf_2[ny5][nx5]);
+            value_t c5 = cost_of(val_buf[ny_lut[5][it]][nx5][it_r],
+                                 pen_buf_2[ny_lut[5][it]][nx5]);
 
             // Min-reduction tree
             value_t min01 = (c0 < c1) ? c0 : c1;
