@@ -1,32 +1,25 @@
-"""Value Iteration FPGA overlay for PYNQ on Ultra96-V2.
+"""Value Iteration FPGA overlay — streaming kernel for PYNQ on Ultra96-V2.
 
 Usage:
     Copy vi_bd_wrapper.bit, vi_bd_wrapper.hwh, and this file to Ultra96-V2.
 
-    from vi_overlay import VIOverlay
-    vi = VIOverlay("vi_bd_wrapper.bit")
-    sweeps = vi.run(value_table, penalty_table, trans_table, map_x, map_y)
+After HLS synthesis, verify register offsets in:
+  hls_build_stream/solution1/impl/misc/drivers/vi_sweep_stream_v1_0/src/xvi_sweep_stream_hw.h
 """
 
-import struct
 import numpy as np
 from pynq import Overlay, allocate
 
-# AXI-Lite register offsets — verified against HLS synthesis report
-# (hls_build/hls/syn/report/csynth.rpt, Vitis HLS 2025.2)
+# AXI-Lite register offsets (verify after HLS synthesis — see docstring above)
 AP_CTRL          = 0x00
 ADDR_VALUE_TABLE = 0x10  # 64-bit address (upper at 0x14)
 ADDR_PENALTY     = 0x1C  # 64-bit address (upper at 0x20)
 ADDR_TRANS       = 0x28  # 64-bit address (upper at 0x2C)
 ADDR_MAP_X       = 0x34
 ADDR_MAP_Y       = 0x3C
-ADDR_NUM_TILES_X = 0x44
-ADDR_NUM_TILES_Y = 0x4C
-ADDR_CU_ID       = 0x54
-ADDR_MAX_DELTA   = 0x5C
+ADDR_CU_ID       = 0x44  # 0=forward, 1=reverse
+ADDR_MAX_DELTA   = 0x4C
 
-TILE_W = 32
-TILE_H = 32
 N_THETA = 60
 
 
@@ -38,8 +31,8 @@ def _write_addr64(ip, offset, addr):
 class VIOverlay:
     def __init__(self, bitstream_path: str):
         self.ol = Overlay(bitstream_path)
-        self.cu0 = self.ol.vi_sweep_cu0
-        self.cu1 = self.ol.vi_sweep_cu1
+        self.cu0 = self.ol.vi_sweep_stream_cu0
+        self.cu1 = self.ol.vi_sweep_stream_cu1
 
     def run(
         self,
@@ -53,6 +46,8 @@ class VIOverlay:
     ) -> int:
         """Run Value Iteration on FPGA until convergence.
 
+        Both CUs run simultaneously each sweep: CU0=forward, CU1=reverse.
+
         Args:
             value_np: shape (map_y, map_x, N_THETA), uint16. Modified in-place.
             penalty_np: shape (map_y, map_x), uint16.
@@ -64,10 +59,6 @@ class VIOverlay:
         Returns:
             Number of sweeps executed.
         """
-        num_tiles_x = (map_x + TILE_W - 1) // TILE_W
-        num_tiles_y = (map_y + TILE_H - 1) // TILE_H
-
-        # Allocate contiguous DMA buffers
         val_buf = allocate(shape=value_np.shape, dtype=np.uint16)
         pen_buf = allocate(shape=penalty_np.shape, dtype=np.uint16)
         trans_buf = allocate(shape=trans_np.shape, dtype=np.uint32)
@@ -85,18 +76,16 @@ class VIOverlay:
             _write_addr64(cu, ADDR_TRANS, trans_buf.device_address)
             cu.write(ADDR_MAP_X, map_x)
             cu.write(ADDR_MAP_Y, map_y)
-            cu.write(ADDR_NUM_TILES_X, num_tiles_x)
-            cu.write(ADDR_NUM_TILES_Y, num_tiles_y)
+
+        # CU0=forward, CU1=reverse (fixed for all sweeps)
+        self.cu0.write(ADDR_CU_ID, 0)
+        self.cu1.write(ADDR_CU_ID, 1)
 
         sweep = 0
         for sweep in range(max_sweeps):
-            # Start both CUs (checkerboard)
-            self.cu0.write(ADDR_CU_ID, 0)
-            self.cu1.write(ADDR_CU_ID, 1)
             self.cu0.write(AP_CTRL, 0x01)
             self.cu1.write(AP_CTRL, 0x01)
 
-            # Wait for both to finish
             while not (self.cu0.read(AP_CTRL) & 0x02):
                 pass
             while not (self.cu1.read(AP_CTRL) & 0x02):
