@@ -3,6 +3,8 @@
        edf-docker edf-shell edf-setup edf-build \
        clean clean-fpga clean-edf
 
+KERNEL ?=
+
 # ---------- Software (driver + host) ----------
 
 driver:
@@ -18,20 +20,24 @@ test-hw:
 	$(MAKE) -C host test-hw
 
 # ---------- FPGA (HLS + Vivado) ----------
+# Pass KERNEL= to select tile or stream, e.g.:
+#   make csim KERNEL=stream
+#   make bitstream KERNEL=tile
 
 csim:
-	$(MAKE) -C fpga csim
+	$(MAKE) -C fpga csim $(KERNEL)
 
 hls:
-	$(MAKE) -C fpga hls
+	$(MAKE) -C fpga hls $(KERNEL)
 
-vivado: hls
-	$(MAKE) -C fpga vivado
+vivado:
+	$(MAKE) -C fpga vivado $(KERNEL)
 
-bitstream: vivado
+bitstream:
+	$(MAKE) -C fpga bitstream $(KERNEL)
 
-sync-hw-header: hls
-	$(MAKE) -C driver/uio sync-hw-header
+sync-hw-header:
+	$(MAKE) -C driver/uio sync-hw-header KERNEL=$(KERNEL)
 
 # ---------- EDF / Linux (Docker) ----------
 

@@ -36,12 +36,22 @@ $(LIB_SHARED): $(OBJ_COMMON) $(OBJ_LINUX)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Copy HLS-generated register header into generated/
-HLS_HW_HEADER := ../../fpga/hls/vi_sweep/hls_build/hls/impl/ip/drivers/vi_sweep_v1_0/src/xvi_sweep_hw.h
+# Usage: make sync-hw-header KERNEL=tile   (or KERNEL=stream)
+KERNEL ?= tile
+IP_REPO := ../../fpga/vivado/ultra96v2/ip_repo_$(KERNEL)
+
+ifeq ($(KERNEL),stream)
+  HLS_HW_HEADER := $(IP_REPO)/drivers/vi_sweep_stream_v1_0/src/xvi_sweep_stream_hw.h
+  GEN_HEADER    := generated/xvi_sweep_stream_hw.h
+else
+  HLS_HW_HEADER := $(IP_REPO)/drivers/vi_sweep_v1_0/src/xvi_sweep_hw.h
+  GEN_HEADER    := generated/xvi_sweep_hw.h
+endif
 
 sync-hw-header:
 	@test -f $(HLS_HW_HEADER) || { echo "HLS header not found: $(HLS_HW_HEADER)"; exit 1; }
-	install -D $(HLS_HW_HEADER) generated/xvi_sweep_hw.h
-	@echo "Synced xvi_sweep_hw.h. Review diff with: git diff generated/xvi_sweep_hw.h"
+	install -D $(HLS_HW_HEADER) $(GEN_HEADER)
+	@echo "Synced $(GEN_HEADER). Review diff with: git diff $(GEN_HEADER)"
 
 clean:
 	rm -f *.o *.a *.so

@@ -28,7 +28,7 @@ Tools must be on `PATH` — invoke bare `vitis-run` / `vivado` (Vitis 2025.2). D
 - `make -C fpga bitstream tile` — HLS + Vivado synthesis + bitstream for tile kernel, project `fpga/build/vi_tile/`.
 - `make -C fpga bitstream stream` — HLS + Vivado synthesis + bitstream for streaming kernel, project `fpga/build/vi_stream/`.
 - `make -C fpga clean` — clean both tile and stream build artifacts. Append `tile` or `stream` to clean one.
-- After regenerating HLS IP, sync the register header into the driver: `make -C driver/uio sync-hw-header` (copies `xvi_sweep_hw.h` into `driver/uio/generated/`; review the diff).
+- After regenerating HLS IP, sync the register header into the driver: `make -C driver/uio sync-hw-header KERNEL=tile` or `KERNEL=stream` (copies `xvi_sweep_hw.h` / `xvi_sweep_stream_hw.h` into `driver/uio/generated/`; review the diff).
 
 ## Architecture
 
