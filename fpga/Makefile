@@ -3,6 +3,15 @@ TCL_DIR     := $(FPGA_DIR)tcl/
 VIVADO_DIR  := $(FPGA_DIR)vivado/ultra96v2/
 BUILD_DIR   := $(FPGA_DIR)build/
 
+# ---------- OS detection ----------
+ifeq ($(OS),Windows_NT)
+  MKDIR = if not exist "$(subst /,\,$1)" mkdir "$(subst /,\,$1)"
+  RMDIR = if exist "$(subst /,\,$1)" rmdir /s /q "$(subst /,\,$1)"
+else
+  MKDIR = mkdir -p $1
+  RMDIR = rm -rf $1
+endif
+
 # ---------- Kernel selector ----------
 # Usage: make -C fpga csim stream
 #        make -C fpga bitstream tile
@@ -20,7 +29,6 @@ stream tile:
 .PHONY: stream tile csim hls vivado bitstream clean_hls clean_vivado clean
 
 # ---------- Build targets ----------
-# Use order-only prerequisite to create build dir once.
 
 csim: | $(BUILD_DIR)
 	cd $(BUILD_DIR) && vitis-run --mode hls --tcl $(abspath $(TCL_DIR)run_csim_$(KERNEL).tcl)
@@ -35,19 +43,19 @@ vivado: hls | $(BUILD_DIR)
 bitstream: vivado
 
 $(BUILD_DIR):
-	-mkdir "$(subst /,\,$(BUILD_DIR))"
+	$(call MKDIR,$(BUILD_DIR))
 
 # ---------- Clean ----------
 
 clean_hls:
-	if exist "$(subst /,\,$(BUILD_DIR)hls_build_$(KERNEL))" rmdir /s /q "$(subst /,\,$(BUILD_DIR)hls_build_$(KERNEL))"
+	$(call RMDIR,$(BUILD_DIR)hls_build_$(KERNEL))
 
 clean_vivado:
-	if exist "$(subst /,\,$(BUILD_DIR)vi_$(KERNEL))" rmdir /s /q "$(subst /,\,$(BUILD_DIR)vi_$(KERNEL))"
+	$(call RMDIR,$(BUILD_DIR)vi_$(KERNEL))
 
 ifdef KERNEL
 clean: clean_hls clean_vivado
 else
 clean:
-	if exist "$(subst /,\,$(BUILD_DIR))" rmdir /s /q "$(subst /,\,$(BUILD_DIR))"
+	$(call RMDIR,$(BUILD_DIR))
 endif
