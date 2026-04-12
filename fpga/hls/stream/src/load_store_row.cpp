@@ -5,7 +5,7 @@ void load_row(
     penalty_t pen_row_0[BUF_W],
     penalty_t pen_row_1[BUF_W],
     penalty_t pen_row_2[BUF_W],
-    const value_t   *value_table,
+    const value_t   *value_table_rd,
     const penalty_t *penalty_table,
     int gy,
     int strip_x0,
@@ -56,7 +56,7 @@ void load_row(
     LOAD_VAL_X: for (int i = 0; i < x_count; i++) {
         LOAD_VAL_T: for (int it = 0; it < N_THETA; it++) {
             #pragma HLS PIPELINE II=1
-            val_row[lx_offset + i][it] = value_table[val_base + i * N_THETA + it];
+            val_row[lx_offset + i][it] = value_table_rd[val_base + i * N_THETA + it];
         }
     }
 }

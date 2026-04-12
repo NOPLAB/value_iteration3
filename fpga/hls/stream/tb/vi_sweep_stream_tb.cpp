@@ -102,11 +102,13 @@ static int run_test(const char *name, int map_x, int map_y,
         value_t d0, d1;
         vi_sweep_stream(
             (value_t *)val_hls,
+            (const value_t *)val_hls,
             (const penalty_t *)pen_hls,
             (const ap_uint<32> *)trans_packed,
             map_x, map_y, 0, &d0);
         vi_sweep_stream(
             (value_t *)val_hls,
+            (const value_t *)val_hls,
             (const penalty_t *)pen_hls,
             (const ap_uint<32> *)trans_packed,
             map_x, map_y, 1, &d1);

@@ -5,7 +5,8 @@
 // Stream one X-strip through the sliding window.
 // cu_id: 0=forward (Y ascending), 1=reverse (Y descending).
 void stream_strip(
-    value_t   *value_table,
+    value_t       *value_table,
+    const value_t *value_table_rd,
     const penalty_t *penalty_table,
     offset_t  delta_table[N_ACTIONS][N_THETA][3],
     int map_x, int map_y,

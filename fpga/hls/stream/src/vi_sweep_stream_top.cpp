@@ -19,6 +19,7 @@ static void load_transitions(
 
 extern "C" void vi_sweep_stream(
     value_t       *value_table,
+    const value_t *value_table_rd,
     const penalty_t *penalty_table,
     const ap_uint<32> *trans_table,
     int map_x,
@@ -27,10 +28,18 @@ extern "C" void vi_sweep_stream(
     value_t *max_delta)
 {
     // --- AXI interface pragmas ---
-    #pragma HLS INTERFACE m_axi port=value_table   bundle=gmem0 depth=672000000
-    #pragma HLS INTERFACE m_axi port=penalty_table  bundle=gmem1 depth=11200000
+    // value_table (gmem0): write-only path for store_row
+    #pragma HLS INTERFACE m_axi port=value_table    bundle=gmem0 depth=672000000 \
+        max_write_burst_length=256
+    // value_table_rd (gmem2): read-only path for load_row — separate port
+    // enables true read/write overlap via DATAFLOW
+    #pragma HLS INTERFACE m_axi port=value_table_rd bundle=gmem2 depth=672000000 \
+        max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=penalty_table  bundle=gmem1 depth=11200000 \
+        max_read_burst_length=256
     #pragma HLS INTERFACE m_axi port=trans_table    bundle=gmem1 depth=360
     #pragma HLS INTERFACE s_axilite port=value_table
+    #pragma HLS INTERFACE s_axilite port=value_table_rd
     #pragma HLS INTERFACE s_axilite port=penalty_table
     #pragma HLS INTERFACE s_axilite port=trans_table
     #pragma HLS INTERFACE s_axilite port=map_x
@@ -64,7 +73,8 @@ extern "C" void vi_sweep_stream(
                        ? (map_x - strip_x0) : STRIP_W_MAX;
 
         value_t strip_delta;
-        stream_strip(value_table, penalty_table, delta_table,
+        stream_strip(value_table, value_table_rd, penalty_table,
+                     delta_table,
                      map_x, map_y, strip_x0, strip_w,
                      cu_id, strip_delta);
 

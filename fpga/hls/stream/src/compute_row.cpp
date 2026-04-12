@@ -17,7 +17,8 @@ void compute_row(
     int win_center,
     int strip_w,
     int cu_id,
-    value_t &row_max_delta)
+    value_t &row_max_delta,
+    value_t   store_buf[BUF_W][N_THETA])
 {
     #pragma HLS INLINE off
     #pragma HLS ARRAY_PARTITION variable=delta_table complete dim=0
@@ -57,15 +58,15 @@ void compute_row(
     }
 
     LOOP_X: for (int ix_raw = 0; ix_raw < STRIP_W_MAX; ix_raw++) {
-        #pragma HLS LOOP_TRIPCOUNT min=1 max=145
         #pragma HLS LOOP_FLATTEN off
-        if (ix_raw >= strip_w) break;
 
-        int ix = (cu_id == 0) ? ix_raw : (strip_w - 1 - ix_raw);
+        bool x_active = (ix_raw < strip_w);
+        int ix = x_active ? ((cu_id == 0) ? ix_raw : (strip_w - 1 - ix_raw))
+                          : 0;
         int bx = ix + HALO_MAX;
 
         penalty_t cell_pen = pen_buf_0[win_center][bx];
-        bool skip = (cell_pen >= PENALTY_GOAL);
+        bool skip = (!x_active) || (cell_pen >= PENALTY_GOAL);
 
         LOOP_T: for (int it = 0; it < N_THETA; it++) {
             #pragma HLS PIPELINE II=1
@@ -118,9 +119,10 @@ void compute_row(
             value_t min03 = (min01 < min23) ? min01 : min23;
             value_t min_cost = (min03 < min45) ? min03 : min45;
 
-            // Gauss-Seidel in-place update
+            // Gauss-Seidel in-place update (no-op when x_active==false)
             value_t new_val = skip ? old_val : min_cost;
             val_buf[win_center][bx][it] = new_val;
+            store_buf[bx][it] = new_val;
 
             value_t d = (new_val > old_val) ? (value_t)(new_val - old_val)
                                             : (value_t)(old_val - new_val);
