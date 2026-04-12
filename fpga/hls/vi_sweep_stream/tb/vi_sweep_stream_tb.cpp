@@ -95,18 +95,22 @@ static int run_test(const char *name, int map_x, int map_y,
                                      map_x, map_y, 0, 200);
     printf("  CPU reference: %d sweeps\n", ref_sweeps);
 
-    // HLS kernel — alternate forward/reverse
+    // HLS kernel — both CUs per sweep (CU0=left half, CU1=right half)
     value_t hls_max_delta;
     int hls_sweeps = 0;
     for (int s = 0; s < 200; s++) {
-        int cid = s % 2;  // alternate forward/reverse
+        value_t d0, d1;
         vi_sweep_stream(
             (value_t *)val_hls,
             (const penalty_t *)pen_hls,
             (const ap_uint<32> *)trans_packed,
-            map_x, map_y,
-            cid,
-            &hls_max_delta);
+            map_x, map_y, 0, &d0);
+        vi_sweep_stream(
+            (value_t *)val_hls,
+            (const penalty_t *)pen_hls,
+            (const ap_uint<32> *)trans_packed,
+            map_x, map_y, 1, &d1);
+        hls_max_delta = (d0 > d1) ? d0 : d1;
         hls_sweeps++;
         if ((uint16_t)hls_max_delta == 0) break;
     }

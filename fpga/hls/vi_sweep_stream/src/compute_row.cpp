@@ -26,7 +26,6 @@ void compute_row(
 
     // Pre-compute neighbor Y slot indices for all (action, theta) pairs.
     // This hoists the expensive % WINDOW_ROWS out of the pipelined LOOP_T.
-    // ny_lut is constant across all ix in this row (only depends on win_center).
     int ny_lut[N_ACTIONS][N_THETA];
     #pragma HLS ARRAY_PARTITION variable=ny_lut complete dim=0
 
@@ -36,15 +35,29 @@ void compute_row(
             #pragma HLS PIPELINE II=1
             int diy = y_sign * (int)delta_table[a][it][1];
             int ny = win_center + diy;
-            // Manual modulo for small range: ny is in [-HALO_MAX, WINDOW_ROWS+HALO_MAX-1]
             if (ny < 0) ny += WINDOW_ROWS;
             else if (ny >= WINDOW_ROWS) ny -= WINDOW_ROWS;
             ny_lut[a][it] = ny;
         }
     }
 
+    // Pre-compute theta neighbor indices (it_l, it_r) for all theta.
+    // Hoists conditional wrapping out of the pipelined LOOP_T.
+    int it_l_lut[N_THETA];
+    int it_r_lut[N_THETA];
+    #pragma HLS ARRAY_PARTITION variable=it_l_lut complete dim=0
+    #pragma HLS ARRAY_PARTITION variable=it_r_lut complete dim=0
+
+    PRECOMP_THETA: for (int it = 0; it < N_THETA; it++) {
+        #pragma HLS PIPELINE II=1
+        int tl = it + (int)delta_table[2][it][2];
+        it_l_lut[it] = (tl < 0) ? tl + N_THETA : (tl >= N_THETA) ? tl - N_THETA : tl;
+        int tr = it + (int)delta_table[3][it][2];
+        it_r_lut[it] = (tr < 0) ? tr + N_THETA : (tr >= N_THETA) ? tr - N_THETA : tr;
+    }
+
     LOOP_X: for (int ix_raw = 0; ix_raw < STRIP_W_MAX; ix_raw++) {
-        #pragma HLS LOOP_TRIPCOUNT min=1 max=256
+        #pragma HLS LOOP_TRIPCOUNT min=1 max=145
         #pragma HLS LOOP_FLATTEN off
         if (ix_raw >= strip_w) break;
 
@@ -60,8 +73,10 @@ void compute_row(
 
             value_t old_val = val_buf[win_center][bx][it];
 
+            int it_l = it_l_lut[it];
+            int it_r = it_r_lut[it];
+
             // --- 6 actions, BRAM-port-scheduled ---
-            // ny from pre-computed LUT (no modulo in pipeline)
             // Actions 0,1: theta bank[it], pen_buf_0
             // Actions 2,4: theta bank[it_l], pen_buf_1, pen_buf_2
             // Actions 3,5: theta bank[it_r], pen_buf_1, pen_buf_2
@@ -78,15 +93,11 @@ void compute_row(
 
             // Action 2: left
             int nx2 = bx + (int)delta_table[2][it][0];
-            int it_l = it + (int)delta_table[2][it][2];
-            it_l = (it_l < 0) ? it_l + N_THETA : (it_l >= N_THETA) ? it_l - N_THETA : it_l;
             value_t c2 = cost_of(val_buf[ny_lut[2][it]][nx2][it_l],
                                  pen_buf_1[ny_lut[2][it]][nx2]);
 
             // Action 3: right
             int nx3 = bx + (int)delta_table[3][it][0];
-            int it_r = it + (int)delta_table[3][it][2];
-            it_r = (it_r < 0) ? it_r + N_THETA : (it_r >= N_THETA) ? it_r - N_THETA : it_r;
             value_t c3 = cost_of(val_buf[ny_lut[3][it]][nx3][it_r],
                                  pen_buf_1[ny_lut[3][it]][nx3]);
 

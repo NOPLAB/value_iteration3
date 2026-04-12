@@ -44,16 +44,21 @@ extern "C" void vi_sweep_stream(
     #pragma HLS ARRAY_PARTITION variable=delta_table complete dim=0
     load_transitions(trans_table, delta_table);
 
-    // 2. Compute strip layout
+    // 2. Compute strip layout — each CU handles half the strips
     int num_strips = (map_x + STRIP_W_MAX - 1) / STRIP_W_MAX;
+    int half_strips = (num_strips + 1) / 2;  // CU0 gets ceil, CU1 gets floor
 
     value_t global_max_delta = 0;
 
-    // 3. Iterate X-strips
-    STRIP_LOOP: for (int sx_raw = 0; sx_raw < num_strips; sx_raw++) {
-        #pragma HLS LOOP_TRIPCOUNT min=1 max=56
-        // Forward CU: left-to-right strips; Reverse CU: right-to-left
-        int sx = (cu_id == 0) ? sx_raw : (num_strips - 1 - sx_raw);
+    // 3. Iterate X-strips (CU0: left half L→R, CU1: right half R→L)
+    STRIP_LOOP: for (int si = 0; si < half_strips; si++) {
+        #pragma HLS LOOP_TRIPCOUNT min=1 max=35
+        int sx;
+        if (cu_id == 0)
+            sx = si;                       // 0, 1, …, half-1
+        else
+            sx = num_strips - 1 - si;      // N-1, N-2, …, half
+        if (sx < 0 || sx >= num_strips) break;
         int strip_x0 = sx * STRIP_W_MAX;
         int strip_w  = ((strip_x0 + STRIP_W_MAX) > map_x)
                        ? (map_x - strip_x0) : STRIP_W_MAX;

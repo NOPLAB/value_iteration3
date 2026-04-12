@@ -1,5 +1,6 @@
 # ===========================================================================
 # create_bd.tcl — Block Design: Zynq PS + 2x vi_sweep_stream HLS IP
+# STRIP_W_MAX=145 → 63 BRAM36 per CU → 2 CUs fit in ZU3EG (138/216).
 # ===========================================================================
 
 create_bd_design "vi_bd"

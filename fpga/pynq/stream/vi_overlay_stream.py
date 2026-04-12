@@ -1,10 +1,13 @@
 """Value Iteration FPGA overlay — streaming kernel for PYNQ on Ultra96-V2.
 
+2-CU design: CU0=forward sweep, CU1=reverse sweep, running in parallel.
+STRIP_W_MAX=145 fits 2 CUs in ZU3EG BRAM budget.
+
 Usage:
     Copy vi_bd_wrapper.bit, vi_bd_wrapper.hwh, and this file to Ultra96-V2.
 
 After HLS synthesis, verify register offsets in:
-  hls_build_stream/solution1/impl/misc/drivers/vi_sweep_stream_v1_0/src/xvi_sweep_stream_hw.h
+  ip_repo_stream/drivers/vi_sweep_stream_v1_0/src/xvi_sweep_stream_hw.h
 """
 
 import numpy as np
@@ -31,8 +34,8 @@ def _write_addr64(ip, offset, addr):
 class VIOverlay:
     def __init__(self, bitstream_path: str):
         self.ol = Overlay(bitstream_path)
-        self.cu0 = self.ol.vi_sweep_cu0
-        self.cu1 = self.ol.vi_sweep_cu1
+        self.cu0 = self.ol.vi_sweep_stream_cu0
+        self.cu1 = self.ol.vi_sweep_stream_cu1
 
     def run(
         self,

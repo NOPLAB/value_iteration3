@@ -12,7 +12,7 @@ constexpr int N_ACTIONS   = 6;
 constexpr int N_THETA     = 60;
 constexpr int HALO_MAX    = 6;     // max |dix|, |diy| at 0.05m
 constexpr int WINDOW_ROWS = 2 * HALO_MAX + 1;  // 13
-constexpr int STRIP_W_MAX = 256;   // BRAM-limited per CU
+constexpr int STRIP_W_MAX = 145;   // max for 2 CUs: 13*(145+12)=2041 ≤ 2048 BRAM36
 constexpr int BUF_W       = STRIP_W_MAX + 2 * HALO_MAX;  // 268
 
 constexpr int TRANS_TABLE_SIZE = N_ACTIONS * N_THETA;  // 360

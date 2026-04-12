@@ -28,4 +28,4 @@ csynth_design
 export_design -format ip_catalog -output $ip_dst
 
 close_project
-puts "INFO: HLS IP exported to $ip_dst"
+puts "INFO: HLS IP (vi_sweep) exported to $ip_dst"
