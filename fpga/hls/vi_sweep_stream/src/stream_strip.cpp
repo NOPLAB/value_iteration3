@@ -47,7 +47,7 @@ void stream_strip(
     ROW_LOOP: for (int iy_raw = 0; iy_raw < map_y; iy_raw++) {
         #pragma HLS LOOP_TRIPCOUNT min=20 max=800
         int iy = (cu_id == 0) ? iy_raw : (map_y - 1 - iy_raw);
-        int win_center = iy_raw % WINDOW_ROWS;
+        int win_center = (iy_raw + HALO_MAX) % WINDOW_ROWS;
 
         // Compute Bellman update for current row
         value_t row_delta;
@@ -67,7 +67,7 @@ void stream_strip(
             else
                 next_gy = (map_y - 1) - (iy_raw + HALO_MAX + 1);
 
-            int evict_slot = (iy_raw + HALO_MAX + 1) % WINDOW_ROWS;
+            int evict_slot = iy_raw % WINDOW_ROWS;
             load_row(val_buf[evict_slot],
                      pen_buf_0[evict_slot], pen_buf_1[evict_slot], pen_buf_2[evict_slot],
                      value_table, penalty_table,
