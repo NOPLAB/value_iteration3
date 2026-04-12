@@ -20,10 +20,6 @@ petalinux/output/
 petalinux/project/
 petalinux/docker/*.run
 
-# Bitstream artifacts (large binary files)
-fpga/pynq/*.bit
-fpga/pynq/*.hwh
-
 # Vivado project artifacts
 fpga/vivado/ultra96v2/vi_ultra96v2/
 fpga/vivado/ultra96v2/ip_repo/
