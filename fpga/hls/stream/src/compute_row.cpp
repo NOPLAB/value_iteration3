@@ -17,16 +17,13 @@ void compute_row(
     int win_center,
     int strip_w,
     int cu_id,
-    value_t &row_max_delta,
-    value_t   store_buf[BUF_W][N_THETA])
+    value_t &row_max_delta)
 {
     #pragma HLS INLINE off
     #pragma HLS ARRAY_PARTITION variable=delta_table complete dim=0
 
     value_t local_max = 0;
 
-    // Pre-compute neighbor Y slot indices for all (action, theta) pairs.
-    // This hoists the expensive % WINDOW_ROWS out of the pipelined LOOP_T.
     int ny_lut[N_ACTIONS][N_THETA];
     #pragma HLS ARRAY_PARTITION variable=ny_lut complete dim=0
 
@@ -40,21 +37,6 @@ void compute_row(
             else if (ny >= WINDOW_ROWS) ny -= WINDOW_ROWS;
             ny_lut[a][it] = ny;
         }
-    }
-
-    // Pre-compute theta neighbor indices (it_l, it_r) for all theta.
-    // Hoists conditional wrapping out of the pipelined LOOP_T.
-    int it_l_lut[N_THETA];
-    int it_r_lut[N_THETA];
-    #pragma HLS ARRAY_PARTITION variable=it_l_lut complete dim=0
-    #pragma HLS ARRAY_PARTITION variable=it_r_lut complete dim=0
-
-    PRECOMP_THETA: for (int it = 0; it < N_THETA; it++) {
-        #pragma HLS PIPELINE II=1
-        int tl = it + (int)delta_table[2][it][2];
-        it_l_lut[it] = (tl < 0) ? tl + N_THETA : (tl >= N_THETA) ? tl - N_THETA : tl;
-        int tr = it + (int)delta_table[3][it][2];
-        it_r_lut[it] = (tr < 0) ? tr + N_THETA : (tr >= N_THETA) ? tr - N_THETA : tr;
     }
 
     LOOP_X: for (int ix_raw = 0; ix_raw < STRIP_W_MAX; ix_raw++) {
@@ -74,40 +56,37 @@ void compute_row(
 
             value_t old_val = val_buf[win_center][bx][it];
 
-            int it_l = it_l_lut[it];
-            int it_r = it_r_lut[it];
+            int it_l = it + 3;
+            if (it_l >= N_THETA) it_l -= N_THETA;
+            int it_r = it - 3;
+            if (it_r < 0) it_r += N_THETA;
 
-            // --- 6 actions, BRAM-port-scheduled ---
-            // Actions 0,1: theta bank[it], pen_buf_0
-            // Actions 2,4: theta bank[it_l], pen_buf_1, pen_buf_2
-            // Actions 3,5: theta bank[it_r], pen_buf_1, pen_buf_2
-
-            // Action 0: forward
+            // Action 0: forward  (bank[it])
             int nx0 = bx + (int)delta_table[0][it][0];
             value_t c0 = cost_of(val_buf[ny_lut[0][it]][nx0][it],
                                  pen_buf_0[ny_lut[0][it]][nx0]);
 
-            // Action 1: backward
+            // Action 1: backward (bank[it])
             int nx1 = bx + (int)delta_table[1][it][0];
             value_t c1 = cost_of(val_buf[ny_lut[1][it]][nx1][it],
                                  pen_buf_0[ny_lut[1][it]][nx1]);
 
-            // Action 2: left
+            // Action 2: left     (bank[it_l])
             int nx2 = bx + (int)delta_table[2][it][0];
             value_t c2 = cost_of(val_buf[ny_lut[2][it]][nx2][it_l],
                                  pen_buf_1[ny_lut[2][it]][nx2]);
 
-            // Action 3: right
+            // Action 3: right    (bank[it_r])
             int nx3 = bx + (int)delta_table[3][it][0];
             value_t c3 = cost_of(val_buf[ny_lut[3][it]][nx3][it_r],
                                  pen_buf_1[ny_lut[3][it]][nx3]);
 
-            // Action 4: forward-left
+            // Action 4: fwd-left (bank[it_l])
             int nx4 = bx + (int)delta_table[4][it][0];
             value_t c4 = cost_of(val_buf[ny_lut[4][it]][nx4][it_l],
                                  pen_buf_2[ny_lut[4][it]][nx4]);
 
-            // Action 5: forward-right
+            // Action 5: fwd-right(bank[it_r])
             int nx5 = bx + (int)delta_table[5][it][0];
             value_t c5 = cost_of(val_buf[ny_lut[5][it]][nx5][it_r],
                                  pen_buf_2[ny_lut[5][it]][nx5]);
@@ -119,10 +98,8 @@ void compute_row(
             value_t min03 = (min01 < min23) ? min01 : min23;
             value_t min_cost = (min03 < min45) ? min03 : min45;
 
-            // Gauss-Seidel in-place update (no-op when x_active==false)
             value_t new_val = skip ? old_val : min_cost;
             val_buf[win_center][bx][it] = new_val;
-            store_buf[bx][it] = new_val;
 
             value_t d = (new_val > old_val) ? (value_t)(new_val - old_val)
                                             : (value_t)(old_val - new_val);

@@ -24,11 +24,30 @@ if {![file exists $xpr_file]} {
     open_project $xpr_file
 }
 
+# Upgrade any locked IPs (e.g., after HLS IP regeneration)
+set locked [get_ips -filter {IS_LOCKED == 1} -quiet]
+if {[llength $locked] > 0} {
+    puts "INFO: Upgrading locked IPs: $locked"
+    upgrade_ip $locked
+}
+
+# Reset stale runs so they can be re-launched
+if {[get_property NEEDS_REFRESH [get_runs synth_1]]} {
+    puts "INFO: Resetting synth_1 (stale)"
+    reset_run synth_1
+}
+
 # Synthesis (incremental — skips unchanged OOC blocks)
 launch_runs synth_1 -jobs 6
 wait_on_run synth_1
 if {[get_property STATUS [get_runs synth_1]] != "synth_design Complete!"} {
     error "Synthesis failed"
+}
+
+# Reset impl run if stale
+if {[get_property NEEDS_REFRESH [get_runs impl_1]]} {
+    puts "INFO: Resetting impl_1 (stale)"
+    reset_run impl_1
 }
 
 # Implementation + bitstream

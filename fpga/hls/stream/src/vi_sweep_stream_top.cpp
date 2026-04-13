@@ -28,15 +28,14 @@ extern "C" void vi_sweep_stream(
     value_t *max_delta)
 {
     // --- AXI interface pragmas ---
-    // value_table (gmem0): write-only path for store_row
+    // gmem0: write-only (store_row), gmem2: read-only (load_row values)
+    // max_widen_bitwidth=128 packs 8×16-bit values per AXI beat
     #pragma HLS INTERFACE m_axi port=value_table    bundle=gmem0 depth=672000000 \
-        max_write_burst_length=256
-    // value_table_rd (gmem2): read-only path for load_row — separate port
-    // enables true read/write overlap via DATAFLOW
+        max_write_burst_length=256 max_widen_bitwidth=128
     #pragma HLS INTERFACE m_axi port=value_table_rd bundle=gmem2 depth=672000000 \
-        max_read_burst_length=256
+        max_read_burst_length=256 max_widen_bitwidth=128
     #pragma HLS INTERFACE m_axi port=penalty_table  bundle=gmem1 depth=11200000 \
-        max_read_burst_length=256
+        max_read_burst_length=256 max_widen_bitwidth=128
     #pragma HLS INTERFACE m_axi port=trans_table    bundle=gmem1 depth=360
     #pragma HLS INTERFACE s_axilite port=value_table
     #pragma HLS INTERFACE s_axilite port=value_table_rd

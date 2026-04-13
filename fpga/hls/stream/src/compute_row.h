@@ -6,8 +6,6 @@
 // val_buf is the full sliding window [WINDOW_ROWS][BUF_W][N_THETA].
 // win_center is the circular buffer index of the current row.
 // cu_id controls X scan direction: 0=forward (ix++), 1=reverse (ix--).
-// store_buf receives a copy of the updated row for DDR writeback,
-// decoupling the store path from val_buf to enable DATAFLOW overlap.
 void compute_row(
     value_t   val_buf[WINDOW_ROWS][BUF_W][N_THETA],
     penalty_t pen_buf_0[WINDOW_ROWS][BUF_W],
@@ -17,5 +15,4 @@ void compute_row(
     int win_center,
     int strip_w,
     int cu_id,
-    value_t &row_max_delta,
-    value_t   store_buf[BUF_W][N_THETA]);
+    value_t &row_max_delta);
