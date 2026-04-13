@@ -41,6 +41,11 @@ extern const vi_device_ops_t vi_linux_ops;
 #endif
 extern const vi_device_ops_t vi_mock_ops;
 
+/* MATLAB HDL Coder kernel ops (register map TBD after SoC Builder IP generation) */
+#ifndef VI_MOCK_ONLY
+extern const vi_device_ops_t vi_matlab_ops;
+#endif
+
 /* Mock context constructor (returns opaque ctx to pass to vi_open). */
 void* vi_mock_ctx_new(void);
 void  vi_mock_ctx_free(void *ctx);
