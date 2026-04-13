@@ -35,7 +35,7 @@ csim: | $(BUILD_DIR)
 
 hls: | $(BUILD_DIR)
 	cd "$(BUILD_DIR)" && vitis-run --mode hls --tcl "$(TCL_DIR)export_hls_ip_$(KERNEL).tcl"
-	cd "$(VIVADO_DIR)ip_repo_$(KERNEL)" && unzip -o export.zip
+	unzip -o "$(VIVADO_DIR)ip_repo_$(KERNEL).zip" -d "$(VIVADO_DIR)ip_repo_$(KERNEL)"
 
 vivado: hls | $(BUILD_DIR)
 	vivado -mode batch -source "$(TCL_DIR)build_vivado.tcl" -tclargs $(KERNEL) "$(BUILD_DIR)"
