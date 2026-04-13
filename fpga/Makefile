@@ -28,14 +28,42 @@ stream tile:
 
 .PHONY: stream tile csim hls vivado bitstream clean_hls clean_vivado clean
 
+# ---------- HLS source dependencies ----------
+
+HLS_STREAM_SRC := $(wildcard $(FPGA_DIR)hls/stream/src/*.cpp) \
+                  $(wildcard $(FPGA_DIR)hls/stream/src/*.h)
+HLS_STREAM_TB  := $(wildcard $(FPGA_DIR)hls/stream/tb/*.cpp)
+
+HLS_TILE_SRC   := $(wildcard $(FPGA_DIR)hls/tile/src/*.cpp) \
+                  $(wildcard $(FPGA_DIR)hls/tile/src/*.h)
+HLS_TILE_TB    := $(wildcard $(FPGA_DIR)hls/tile/tb/*.cpp)
+
+HLS_CSIM_STAMP  := $(BUILD_DIR).csim_$(KERNEL)_done
+HLS_SYNTH_STAMP := $(BUILD_DIR).hls_$(KERNEL)_done
+
 # ---------- Build targets ----------
 
-csim: | $(BUILD_DIR)
-	cd "$(BUILD_DIR)" && vitis-run --mode hls --tcl "$(TCL_DIR)run_csim_$(KERNEL).tcl"
+csim: $(HLS_CSIM_STAMP)
 
-hls: | $(BUILD_DIR)
-	cd "$(BUILD_DIR)" && vitis-run --mode hls --tcl "$(TCL_DIR)export_hls_ip_$(KERNEL).tcl"
-	unzip -o "$(VIVADO_DIR)ip_repo_$(KERNEL).zip" -d "$(VIVADO_DIR)ip_repo_$(KERNEL)"
+$(BUILD_DIR).csim_stream_done: $(HLS_STREAM_SRC) $(HLS_STREAM_TB) | $(BUILD_DIR)
+	cd "$(BUILD_DIR)" && vitis-run --mode hls --tcl "$(TCL_DIR)run_csim_stream.tcl"
+	@touch $@
+
+$(BUILD_DIR).csim_tile_done: $(HLS_TILE_SRC) $(HLS_TILE_TB) | $(BUILD_DIR)
+	cd "$(BUILD_DIR)" && vitis-run --mode hls --tcl "$(TCL_DIR)run_csim_tile.tcl"
+	@touch $@
+
+hls: $(HLS_SYNTH_STAMP)
+
+$(BUILD_DIR).hls_stream_done: $(HLS_STREAM_SRC) | $(BUILD_DIR)
+	cd "$(BUILD_DIR)" && vitis-run --mode hls --tcl "$(TCL_DIR)export_hls_ip_stream.tcl"
+	unzip -o "$(VIVADO_DIR)ip_repo_stream.zip" -d "$(VIVADO_DIR)ip_repo_stream"
+	@touch $@
+
+$(BUILD_DIR).hls_tile_done: $(HLS_TILE_SRC) | $(BUILD_DIR)
+	cd "$(BUILD_DIR)" && vitis-run --mode hls --tcl "$(TCL_DIR)export_hls_ip_tile.tcl"
+	unzip -o "$(VIVADO_DIR)ip_repo_tile.zip" -d "$(VIVADO_DIR)ip_repo_tile"
+	@touch $@
 
 vivado: hls | $(BUILD_DIR)
 	vivado -mode batch -source "$(TCL_DIR)build_vivado.tcl" -tclargs $(KERNEL) "$(BUILD_DIR)"
@@ -49,6 +77,12 @@ $(BUILD_DIR):
 
 clean_hls:
 	$(call RMDIR,$(BUILD_DIR)hls_build_$(KERNEL))
+ifeq ($(OS),Windows_NT)
+	-del "$(subst /,\,$(BUILD_DIR)).csim_$(KERNEL)_done" 2>NUL
+	-del "$(subst /,\,$(BUILD_DIR)).hls_$(KERNEL)_done" 2>NUL
+else
+	-rm -f "$(BUILD_DIR).csim_$(KERNEL)_done" "$(BUILD_DIR).hls_$(KERNEL)_done"
+endif
 
 clean_vivado:
 	$(call RMDIR,$(BUILD_DIR)vi_$(KERNEL))
