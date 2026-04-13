@@ -30,16 +30,16 @@ Tools must be on `PATH` — invoke bare `vitis-run` / `vivado` (Vitis 2025.2). D
 - `make -C fpga clean` — clean both tile and stream build artifacts. Append `tile` or `stream` to clean one.
 - After regenerating HLS IP, sync the register header into the driver: `make -C driver/uio sync-hw-header KERNEL=tile` or `KERNEL=stream` (copies `xvi_sweep_hw.h` / `xvi_sweep_stream_hw.h` into `driver/uio/generated/`; review the diff).
 
-### MATLAB kernel (`fpga/matlab/`)
+### MATLAB kernel (`matlab/`)
 
 Requires MATLAB R2024b+ with HDL Coder, HDL Verifier, Fixed-Point Designer, SoC Blockset.
 
-- `make -C fpga matlab-sim` — run MATLAB algorithm tests (`tb_full_sweep`).
-- `make -C fpga matlab-hdl` — generate/update Simulink model.
-- `make -C fpga matlab-cosim` — HDL Verifier cosimulation via Xsim.
-- `make -C fpga matlab-bitstream` — SoC Builder bitstream generation.
+- `make matlab-sim` — run MATLAB algorithm tests (`tb_full_sweep`).
+- `make matlab-hdl` — generate/update Simulink model.
+- `make matlab-cosim` — HDL Verifier cosimulation via Xsim.
+- `make matlab-bitstream` — SoC Builder bitstream generation.
 
-The MATLAB kernel is a third variant alongside tile and stream HLS kernels. Algorithm functions in `fpga/matlab/src/` mirror the streaming HLS kernel (`fpga/hls/stream/src/`). Constants in `vi_params.m` must stay synchronized with `vi_stream_types.h`.
+The MATLAB kernel is a third variant alongside tile and stream HLS kernels. Algorithm functions in `matlab/src/` mirror the streaming HLS kernel (`fpga/hls/stream/src/`). Constants in `vi_params.m` must stay synchronized with `vi_stream_types.h`.
 
 ### EDF / Petalinux (`petalinux/`)
 

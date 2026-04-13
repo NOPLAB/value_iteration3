@@ -39,7 +39,7 @@ cd soc; build_bitstream
 ## Directory Structure
 
 ```
-fpga/matlab/
+matlab/
 ├── src/           MATLAB functions (HDL Coder targets)
 ├── testbench/     Tests and test data generators
 ├── fixedpoint/    Fixed-Point Advisor configuration
@@ -78,7 +78,7 @@ fpga/matlab/
 
 ## Makefile Targets
 
-From `fpga/`:
+From project root:
 
 ```bash
 make matlab-sim        # Run tb_full_sweep

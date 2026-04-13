@@ -93,19 +93,3 @@ else
 clean:
 	$(call RMDIR,$(BUILD_DIR))
 endif
-
-# ---------- MATLAB kernel targets ----------
-
-.PHONY: matlab-sim matlab-hdl matlab-cosim matlab-bitstream
-
-matlab-sim:
-	cd "$(FPGA_DIR)matlab" && matlab -batch "addpath('src','testbench'); tb_full_sweep"
-
-matlab-hdl:
-	cd "$(FPGA_DIR)matlab" && matlab -batch "addpath('src','model'); cd model; create_model"
-
-matlab-cosim:
-	cd "$(FPGA_DIR)matlab" && matlab -batch "addpath('src','testbench'); cd cosim; cosim_tb"
-
-matlab-bitstream:
-	cd "$(FPGA_DIR)matlab" && matlab -batch "addpath('src','testbench','model'); cd soc; build_bitstream"

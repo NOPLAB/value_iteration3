@@ -53,6 +53,22 @@ edf-setup:
 edf-build:
 	$(MAKE) -C petalinux edf-build MACHINE=$(MACHINE)
 
+# ---------- MATLAB (HDL Coder) ----------
+
+.PHONY: matlab-sim matlab-hdl matlab-cosim matlab-bitstream
+
+matlab-sim:
+	cd matlab && matlab -batch "addpath('src','testbench'); tb_full_sweep"
+
+matlab-hdl:
+	cd matlab && matlab -batch "addpath('src','model'); cd model; create_model"
+
+matlab-cosim:
+	cd matlab && matlab -batch "addpath('src','testbench'); cd cosim; cosim_tb"
+
+matlab-bitstream:
+	cd matlab && matlab -batch "addpath('src','testbench','model'); cd soc; build_bitstream"
+
 # ---------- Clean ----------
 
 clean-edf:

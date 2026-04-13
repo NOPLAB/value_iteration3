@@ -1,6 +1,6 @@
 /* vi_reference_mex.c — MEX gateway for vi_reference_run().
- * Build: mex vi_reference_mex.c ../../host/src/vi_reference_c.c
- *        -I../../host/src -I../../driver/uio
+ * Build: mex vi_reference_mex.c ../host/src/vi_reference_c.c
+ *        -I../host/src -I../driver/uio
  */
 #include "mex.h"
 #include "vi_reference_c.h"

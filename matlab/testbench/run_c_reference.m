@@ -22,8 +22,8 @@ function [value_out, sweeps] = run_c_reference(value, penalty, trans, ...
     % Build MEX if not on path
     mex_file = fullfile(fileparts(mfilename('fullpath')), 'vi_reference_mex');
     if ~exist([mex_file '.' mexext], 'file')
-        src_dir = fullfile(fileparts(mfilename('fullpath')), '..', '..', 'host', 'src');
-        drv_dir = fullfile(fileparts(mfilename('fullpath')), '..', '..', 'driver', 'uio');
+        src_dir = fullfile(fileparts(mfilename('fullpath')), '..', 'host', 'src');
+        drv_dir = fullfile(fileparts(mfilename('fullpath')), '..', 'driver', 'uio');
         mex_src = fullfile(fileparts(mfilename('fullpath')), 'vi_reference_mex.c');
         ref_src = fullfile(src_dir, 'vi_reference_c.c');
         mex(mex_src, ref_src, ['-I' src_dir], ['-I' drv_dir], ...

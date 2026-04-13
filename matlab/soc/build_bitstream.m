@@ -8,7 +8,7 @@ function build_bitstream()
     cfg = soc_config();
     model_name = 'vi_sweep_stream_matlab';
     model_dir = fullfile(fileparts(mfilename('fullpath')), '..', 'model');
-    build_dir = fullfile(fileparts(mfilename('fullpath')), '..', '..', 'build', 'matlab');
+    build_dir = fullfile(fileparts(mfilename('fullpath')), '..', 'build');
 
     fprintf('=== SoC Builder Bitstream Generation ===\n');
     fprintf('Board: %s\n', cfg.board);
