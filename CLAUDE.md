@@ -30,12 +30,27 @@ Tools must be on `PATH` — invoke bare `vitis-run` / `vivado` (Vitis 2025.2). D
 - `make -C fpga clean` — clean both tile and stream build artifacts. Append `tile` or `stream` to clean one.
 - After regenerating HLS IP, sync the register header into the driver: `make -C driver/uio sync-hw-header KERNEL=tile` or `KERNEL=stream` (copies `xvi_sweep_hw.h` / `xvi_sweep_stream_hw.h` into `driver/uio/generated/`; review the diff).
 
+### EDF / Petalinux (`petalinux/`)
+
+Docker-based Yocto/EDF build for the Ultra96-V2 Linux image. Driven from the repo root:
+
+- `make edf-docker` — build the Docker container for the EDF environment.
+- `make edf-shell` — open an interactive shell in the container.
+- `make edf-setup XSA=<path>` — initialize the EDF project from an XSA hardware description.
+- `make edf-build MACHINE=<machine>` — run the full Yocto/EDF build.
+- `make clean-edf` — clean EDF build artifacts.
+
 ## Architecture
 
 Four vertically integrated layers share the same 16-bit data contract defined in `fpga/hls/tile/src/vi_types.h` (tile-based) and `fpga/hls/stream/src/vi_stream_types.h` (streaming). Keep them in sync.
 
 ### 1. HLS kernel (`fpga/hls/tile/` and `fpga/hls/stream/`)
-Dataflow kernel `vi_sweep_top` = `load_tiles` → `compute_bellman` → `store_tiles`, processing 32×32 tiles with a 6-cell halo (TILE_W_H = 44). Two CUs are instantiated in the Vivado BD for red/black tile sweeping. Datatypes: `value_t`/`penalty_t` are `ap_uint<16>`; offsets `ap_int<8>`. Sentinels: `PENALTY_OBSTACLE = 0xFFFF` (impassable); `PENALTY_GOAL = 0xFFFE` — **when read as a neighbor's penalty it must be treated as 0** so the goal cell's value stays pinned at 0 (this convention is load-bearing; see the testbench and `host/src/penalty.c`). Transition table is a packed `(dix, diy, dit)` word per `(action, theta)` — 6×60 = 360 entries, precomputed on ARM and DMA'd into the kernel.
+Two kernel architectures share the same data contract but differ in how they sweep the grid:
+
+- **Tile kernel** (`fpga/hls/tile/`): Dataflow pipeline `vi_sweep_top` = `load_tiles` → `compute_bellman` → `store_tiles`, processing 32×32 tiles with a 6-cell halo (TILE_W_H = 44). Two CUs are instantiated in the Vivado BD for red/black tile sweeping.
+- **Streaming kernel** (`fpga/hls/stream/`): Strip-based row streaming via `vi_sweep_stream`. Processes horizontal strips using 13-row line buffers (`WINDOW_ROWS = 2*HALO_MAX+1`). Pipeline: `load_store_row` feeds rows → `stream_strip` manages the line buffer → `compute_row` does per-cell Bellman updates. Two CUs split the map vertically.
+
+Datatypes: `value_t`/`penalty_t` are `ap_uint<16>`; offsets `ap_int<8>`. Sentinels: `PENALTY_OBSTACLE = 0xFFFF` (impassable); `PENALTY_GOAL = 0xFFFE` — **when read as a neighbor's penalty it must be treated as 0** so the goal cell's value stays pinned at 0 (this convention is load-bearing; see the testbench and `host/src/penalty.c`). Transition table is a packed `(dix, diy, dit)` word per `(action, theta)` — 6×60 = 360 entries, precomputed on ARM and DMA'd into the kernel.
 
 ### 2. Device layer (`driver/uio/`)
 `vi_device.h` defines a `vi_device_ops_t` vtable (init/shutdown/read_reg/write_reg/wait_irq/map_buf) with two implementations:
