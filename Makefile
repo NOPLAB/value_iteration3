@@ -64,10 +64,10 @@ matlab-hdl:
 	cd matlab && matlab -batch "addpath('src','model'); cd model; create_model"
 
 matlab-cosim:
-	cd matlab && matlab -batch "addpath('src','testbench'); cd cosim; cosim_tb"
+	cd matlab && matlab -batch "addpath('src','test'); cd cosim; cosim_tb"
 
 matlab-bitstream:
-	cd matlab && matlab -batch "addpath('src','testbench','model'); cd soc; build_bitstream"
+	cd matlab && matlab -batch "addpath('src','model'); cd soc; build_bitstream"
 
 # ---------- Clean ----------
 

@@ -25,18 +25,18 @@ function cosim_tb()
         fprintf('\n--- Test: %s (%dx%d, %s) ---\n', t.name, t.mx, t.my, t.type);
 
         % Generate inputs
-        [value, penalty, ~, ~] = gen_test_map(t.mx, t.my, t.type);
+        [value, penalty, ~, ~, goal_mask] = gen_test_map(t.mx, t.my, t.type);
         trans = gen_transitions('trivial');
 
         % Run MATLAB golden model
         ml_value = value;
         for sweep = 1:t.sweeps
             [ml_value, d0] = vi_sweep_stream_algo(ml_value, ml_value, ...
-                                                   penalty, trans, ...
-                                                   t.mx, t.my, 0);
+                                                   penalty, goal_mask, ...
+                                                   trans, t.mx, t.my, 0);
             [ml_value, d1] = vi_sweep_stream_algo(ml_value, ml_value, ...
-                                                   penalty, trans, ...
-                                                   t.mx, t.my, 1);
+                                                   penalty, goal_mask, ...
+                                                   trans, t.mx, t.my, 1);
             if max(d0, d1) == 0, break; end
         end
 
@@ -48,7 +48,7 @@ function cosim_tb()
         %
         % For now, save golden data for manual cosim verification.
         save(fullfile(cfg.output_dir, [t.name '_golden.mat']), ...
-             'value', 'penalty', 'trans', 'ml_value', 't');
+             'value', 'penalty', 'goal_mask', 'trans', 'ml_value', 't');
         fprintf('  Golden data saved to %s_golden.mat\n', t.name);
     end
 
