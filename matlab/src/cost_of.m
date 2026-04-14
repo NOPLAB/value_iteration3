@@ -6,6 +6,7 @@ function c = cost_of(nv, np_raw)
     MAX_VALUE        = 65535;
     PENALTY_OBSTACLE = 65535;
     PENALTY_GOAL     = 65534;
+    STEP_COST        = 1;
 
     if nv == MAX_VALUE || np_raw == PENALTY_OBSTACLE
         c = MAX_VALUE;
@@ -18,7 +19,7 @@ function c = cost_of(nv, np_raw)
         np = np_raw;
     end
 
-    s = nv + np;
+    s = nv + np + STEP_COST;
     if s >= MAX_VALUE
         c = MAX_VALUE - 1;
     else

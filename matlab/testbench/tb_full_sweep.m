@@ -1,66 +1,45 @@
 function tb_full_sweep()
-%TB_FULL_SWEEP Full kernel test comparing MATLAB algo vs C reference.
+%TB_FULL_SWEEP Compare the FPGA MATLAB model against the paper reference.
     addpath(fullfile(fileparts(mfilename('fullpath')), '..', 'src'));
     p = vi_params();
     MV = double(p.MAX_VALUE);
 
     test_cases = {
-        struct('name','empty_8x8',    'mx',8,  'my',8,  'type','empty')
-        struct('name','empty_32x32',  'mx',32, 'my',32, 'type','empty')
-        struct('name','obstacle_16x16','mx',16,'my',16, 'type','obstacle')
-        struct('name','sentinel_8x8', 'mx',8,  'my',8,  'type','sentinel')
+        struct('name', 'empty_6x6',      'mx', 6, 'my', 6, 'type', 'empty')
+        struct('name', 'obstacle_8x8',   'mx', 8, 'my', 8, 'type', 'obstacle')
     };
 
-    trans = gen_transitions('trivial');
+    trans = gen_transitions('paper_mc');
 
     for tc = 1:numel(test_cases)
         t = test_cases{tc};
         fprintf('  Test: %s ... ', t.name);
 
-        [value, penalty, ~, ~] = gen_test_map(t.mx, t.my, t.type);
+        [value, penalty, ~, ~, goal_mask] = gen_test_map(t.mx, t.my, t.type);
+        [ref_out, ref_action, ~, ~] = vi_full_reference(value, penalty, ...
+            goal_mask, trans, t.mx, t.my, 0, 15);
 
-        % Run C reference
-        [ref_out, ~] = run_c_reference(value, penalty, trans, ...
-                                        t.mx, t.my, 0, 200);
-
-        % Run MATLAB kernel (same number of sweeps as reference for comparison)
-        % We run a fixed number of sweeps to compare intermediate state
         ml_value = value;
-        for sweep = 1:50
+        for sweep = 1:15
             [ml_value, delta0] = vi_sweep_stream_algo(ml_value, ml_value, ...
-                                                       penalty, trans, ...
-                                                       t.mx, t.my, 0);
+                penalty, goal_mask, trans, t.mx, t.my, 0);
             [ml_value, delta1] = vi_sweep_stream_algo(ml_value, ml_value, ...
-                                                       penalty, trans, ...
-                                                       t.mx, t.my, 1);
+                penalty, goal_mask, trans, t.mx, t.my, 1);
             if max(delta0, delta1) == 0
                 break;
             end
         end
 
-        % Compare converged values: both should converge to same result.
-        % After full convergence, reachable cells must have identical
-        % optimal cost values between MATLAB and C reference.
-        ml_reachable = (ml_value < MV);
-        ref_reachable = (ref_out < MV);
-        assert(isequal(ml_reachable, ref_reachable), ...
-            [t.name ': reachability mismatch']);
+        ml_action = compute_action_table_reference(ml_value, penalty, ...
+            goal_mask, trans, t.mx, t.my);
 
-        % Verify actual converged values match (not just reachability)
-        reachable_mask = ref_reachable;
-        ml_vals = ml_value(reachable_mask);
-        ref_vals = ref_out(reachable_mask);
-        assert(isequal(ml_vals, ref_vals), ...
-            [t.name ': value mismatch on reachable cells']);
-
-        % Goal cells must be 0 in both
-        goal_mask = (penalty == double(p.PENALTY_GOAL));
-        for it = 1:p.N_THETA
-            ml_slice = ml_value(:,:,it);
-            ref_slice = ref_out(:,:,it);
-            assert(all(ml_slice(goal_mask) == 0), [t.name ': MATLAB goal not 0']);
-            assert(all(ref_slice(goal_mask) == 0), [t.name ': Ref goal not 0']);
-        end
+        free_mask = ~goal_mask & repmat(penalty ~= double(p.PENALTY_OBSTACLE), [1, 1, p.N_THETA]);
+        ml_vals = ml_value(free_mask);
+        ref_vals = ref_out(free_mask);
+        assert(isequal(ml_vals < MV, ref_vals < MV), [t.name ': reachability mismatch']);
+        assert(isequal(ml_vals, ref_vals), [t.name ': value mismatch']);
+        assert(isequal(ml_action(free_mask), ref_action(free_mask)), [t.name ': action mismatch']);
+        assert(all(ml_value(goal_mask) == 0), [t.name ': goal values changed']);
 
         fprintf('PASSED\n');
     end

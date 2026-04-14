@@ -24,7 +24,9 @@ tb_cost_of
 tb_compute_row
 tb_load_store_row
 tb_stream_strip
-tb_full_sweep          % Requires MEX compiler for C reference comparison
+tb_full_sweep
+tb_goal_area
+tb_paper_vs_fpga       % Reports paper-vs-FPGA mismatch percentages
 
 % 3. Fixed-point analysis (requires Fixed-Point Designer)
 cd fixedpoint; fp_config
@@ -53,20 +55,20 @@ matlab/
 ### Phase A: Floating-Point Verification
 
 1. Edit algorithm in `src/*.m` (all signals are `double`)
-2. Run `tb_full_sweep` to compare against C reference
+2. Run `tb_full_sweep` and `tb_paper_vs_fpga` to compare against the paper reference
 3. Iterate until all tests pass
 
 ### Phase B: Fixed-Point Conversion
 
 1. Run `fixedpoint/fp_config.m` to analyze dynamic range
-2. Open Simulink model → Fixed-Point Tool → apply proposed types
+2. Open Simulink model -> Fixed-Point Tool -> apply proposed types
 3. Re-run `tb_full_sweep` to verify zero-error conversion
 4. Target bit widths: value=16, penalty=16, offset=8 (matching HLS)
 
 ### Phase C: HDL Generation and Cosimulation
 
 1. Open `model/vi_sweep_stream_matlab.slx` in Simulink
-2. HDL Workflow Advisor → Generate HDL
+2. HDL Workflow Advisor -> Generate HDL
 3. Run `cosim/cosim_tb.m` with Xsim backend
 4. Verify cycle-accurate match against golden MATLAB output
 

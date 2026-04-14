@@ -1,5 +1,6 @@
-function [val_row, pen_row] = load_row_algo(value_table, penalty_table, ...
-                                             gy, strip_x0, strip_w, map_x, map_y)
+function [val_row, pen_row, goal_row] = load_row_algo(value_table, penalty_table, ...
+                                                       goal_mask, gy, strip_x0, ...
+                                                       strip_w, map_x, map_y)
 %LOAD_ROW_ALGO Load one row with halo from value/penalty tables.
 %   Matches fpga/hls/stream/src/load_store_row.cpp:load_row().
 %   gy: 0-indexed global Y coordinate.
@@ -9,6 +10,7 @@ function [val_row, pen_row] = load_row_algo(value_table, penalty_table, ...
 %   Returns:
 %     val_row — [BUF_W, N_THETA] double
 %     pen_row — [BUF_W, 1] double
+%     goal_row — [BUF_W, N_THETA] logical
 
     p = vi_params();
     MV = double(p.MAX_VALUE);
@@ -19,6 +21,7 @@ function [val_row, pen_row] = load_row_algo(value_table, penalty_table, ...
     % Phase A: Fill with sentinels
     val_row = MV * ones(p.BUF_W, p.N_THETA);
     pen_row = OB * ones(p.BUF_W, 1);
+    goal_row = false(p.BUF_W, p.N_THETA);
 
     % OOB check
     if gy < 0 || gy >= map_y
@@ -50,6 +53,7 @@ function [val_row, pen_row] = load_row_algo(value_table, penalty_table, ...
         lx1 = lx_offset + i + 1;
         for it = 1:p.N_THETA
             val_row(lx1, it) = value_table(gy1, gx1, it);
+            goal_row(lx1, it) = goal_mask(gy1, gx1, it);
         end
     end
 end
