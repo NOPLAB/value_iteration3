@@ -34,10 +34,10 @@ Tools must be on `PATH` — invoke bare `vitis-run` / `vivado` (Vitis 2025.2). D
 
 Requires MATLAB R2024b+ with HDL Coder, HDL Verifier, Fixed-Point Designer, SoC Blockset.
 
-- `make matlab-sim` — run MATLAB algorithm tests (`tb_full_sweep`).
-- `make matlab-hdl` — generate/update Simulink model.
+- `make matlab-sim` — run the MATLAB `matlab.unittest` suite (`run_matlab_tests.m`).
+- `make matlab-hdl` — export packaged HDL IP for the repo Vivado flow (`export_repo_ip`).
 - `make matlab-cosim` — HDL Verifier cosimulation via Xsim.
-- `make matlab-bitstream` — SoC Builder bitstream generation.
+- `make matlab-bitstream` — Vivado bitstream from the exported MATLAB HDL IP.
 
 The MATLAB kernel is a third variant alongside tile and stream HLS kernels. Algorithm functions in `matlab/src/` mirror the streaming HLS kernel (`fpga/hls/stream/src/`). Constants in `vi_params.m` must stay synchronized with `vi_stream_types.h`.
 
