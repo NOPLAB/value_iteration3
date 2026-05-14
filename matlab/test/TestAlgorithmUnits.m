@@ -165,5 +165,40 @@ classdef TestAlgorithmUnits < TestBase
             testCase.verifyEqual(value_out(goal_y, boundary_x, goal_theta), 1);
             testCase.verifyGreaterThan(strip_delta, 0);
         end
+
+        function testPaperMcDitIsRelative(testCase)
+            % paper_mc dit must be a signed relative offset, matching the
+            % consumer in compute_row_algo / vi_full_reference (nt = it + dit).
+            % Regression guard for the absolute-vs-relative interpretation bug.
+            clear gen_transitions;
+            p = vi_params();
+            trans = gen_transitions('paper_mc');
+            model = unpack_transitions(trans);
+
+            fw_action = find(p.ACTION_FW > 0 & p.ACTION_ROT == 0, 1);
+            bw_action = find(p.ACTION_FW < 0 & p.ACTION_ROT == 0, 1);
+            for it = 1:p.N_THETA
+                n_fw = model.n_outcomes(fw_action, it);
+                fw_dits = squeeze(model.dit(fw_action, it, 1:n_fw));
+                testCase.verifyTrue(all(fw_dits == 0), ...
+                    sprintf('forward action dit must be 0 at it=%d', it));
+
+                n_bw = model.n_outcomes(bw_action, it);
+                bw_dits = squeeze(model.dit(bw_action, it, 1:n_bw));
+                testCase.verifyTrue(all(bw_dits == 0), ...
+                    sprintf('backward action dit must be 0 at it=%d', it));
+            end
+
+            for a = 1:p.N_ACTIONS
+                expected = round(p.ACTION_ROT(a) / (360 / p.N_THETA));
+                for it = 1:p.N_THETA
+                    n = model.n_outcomes(a, it);
+                    dits = squeeze(model.dit(a, it, 1:n));
+                    testCase.verifyTrue(all(abs(dits - expected) <= 1), ...
+                        sprintf('action %d at it=%d: dit %s not within ±1 of expected %d', ...
+                            a, it, mat2str(dits(:)'), expected));
+                end
+            end
+        end
     end
 end

@@ -124,7 +124,10 @@ function model = build_monte_carlo_model(p, xy_resolution)
             diy = floor(abs(dy) / xy_resolution);
             diy(dy < 0) = -diy(dy < 0) - 1;
 
-            dit = floor(dt / t_resolution);
+            dit_abs = floor(dt / t_resolution);
+            dit = dit_abs - (it - 1);
+            dit(dit > p.N_THETA / 2) = dit(dit > p.N_THETA / 2) - p.N_THETA;
+            dit(dit < -p.N_THETA / 2) = dit(dit < -p.N_THETA / 2) + p.N_THETA;
             rows = [dix(:), diy(:), dit(:)];
             [uniq_rows, ~, ic] = unique(rows, 'rows', 'stable');
             counts = accumarray(ic, 1);
