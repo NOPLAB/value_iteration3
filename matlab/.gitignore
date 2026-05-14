@@ -30,6 +30,17 @@ b/
 opcount_build/
 model/hdlsrc/
 soc/opcount_build/
+bench/codegen_build/
+artifacts/benchmarks/codegen_build/
+artifacts/benchmarks/results/
+artifacts/build/
+artifacts/cosim/
+artifacts/derived/
+artifacts/opcount_build/
+artifacts/slprj/
+artifacts/soc/
+artifacts/simulink_cache/
+platforms/fpga/model/hdlsrc/
 
 # Cache files
 *.slxc

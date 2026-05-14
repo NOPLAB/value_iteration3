@@ -1,13 +1,29 @@
 function model = coerce_transition_model(transitions)
 %COERCE_TRANSITION_MODEL Accept struct, packed table, or deterministic deltas.
-
-    p = vi_params();
-    persistent last_packed last_model
+%#codegen
 
     if isstruct(transitions)
         model = transitions;
         return;
     end
+
+    if coder.target('MATLAB')
+        model = coerce_transition_model_matlab(transitions);
+    else
+        % Codegen path: entry wrappers always pre-unpack to a struct, so any
+        % non-struct input here is a contract violation. Returning unchanged
+        % keeps the generated code well-typed; the algorithm will then fail
+        % loudly when it tries to index struct fields on a non-struct.
+        model = transitions;
+    end
+end
+
+function model = coerce_transition_model_matlab(transitions)
+% MATLAB-only path with persistent cache and polymorphic dispatch. Excluded
+% from MATLAB Coder via the coder.target gate in the caller.
+
+    p = vi_params();
+    persistent last_packed last_model
 
     if isvector(transitions)
         if ~isempty(last_packed) && isequal(last_packed, transitions)

@@ -1,15 +1,13 @@
 function results = run_matlab_tests()
 %RUN_MATLAB_TESTS Run the MATLAB unit test suite for this project.
 
-    root_dir = fileparts(mfilename('fullpath'));
+    layout = vi_matlab_layout();
     original_path = path();
     cleanup = onCleanup(@() path(original_path)); %#ok<NASGU>
 
-    addpath(fullfile(root_dir, 'src'));
-    addpath(fullfile(root_dir, 'src', 'bitboard'));
-    addpath(fullfile(root_dir, 'test'));
+    setup_matlab_paths('src', 'tests');
 
-    results = runtests(fullfile(root_dir, 'test'), 'IncludeSubfolders', true);
+    results = runtests(layout.workflows_validation_tests, 'IncludeSubfolders', true);
     if any([results.Failed])
         error('run_matlab_tests:Failed', '%d MATLAB tests failed.', ...
             nnz([results.Failed]));
