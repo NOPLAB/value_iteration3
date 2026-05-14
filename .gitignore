@@ -27,6 +27,7 @@ slprj/
 *.slxc
 tmp_*.slx
 myproj/
+matlab/bench/results/
 
 # compiled binaries
 host/vi_cli

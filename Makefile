@@ -55,7 +55,7 @@ edf-build:
 
 # ---------- MATLAB (HDL Coder) ----------
 
-.PHONY: matlab-sim matlab-hdl matlab-cosim matlab-bitstream
+.PHONY: matlab-sim matlab-hdl matlab-cosim matlab-bitstream matlab-bench
 
 matlab-sim:
 	cd matlab && matlab -batch "run_matlab_tests"
@@ -68,6 +68,9 @@ matlab-cosim:
 
 matlab-bitstream: matlab-hdl
 	vivado -mode batch -source "fpga/tcl/build_vivado.tcl" -tclargs matlab "fpga/build"
+
+matlab-bench:
+	cd matlab && matlab -batch "addpath('src','test','bench'); benchmark_vi"
 
 # ---------- Clean ----------
 
