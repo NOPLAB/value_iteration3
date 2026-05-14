@@ -6,6 +6,7 @@ function results = run_matlab_tests()
     cleanup = onCleanup(@() path(original_path)); %#ok<NASGU>
 
     addpath(fullfile(root_dir, 'src'));
+    addpath(fullfile(root_dir, 'src', 'bitboard'));
     addpath(fullfile(root_dir, 'test'));
 
     results = runtests(fullfile(root_dir, 'test'), 'IncludeSubfolders', true);
