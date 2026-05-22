@@ -24,31 +24,37 @@ mod tests {
     use crate::params::{MAX_VALUE, PENALTY_OBSTACLE, PENALTY_GOAL};
 
     /// PENALTY_GOAL is substituted to 0: cost_of(5, PENALTY_GOAL) == 5 + 0 + 1 == 6
+    /// Goal-pinning invariant: the goal cell's value stays pinned at 0.
     #[test]
     fn penalty_goal_substituted_to_zero() {
         assert_eq!(cost_of(5, PENALTY_GOAL), 6);
     }
 
-    /// PENALTY_OBSTACLE returns MAX_VALUE
     #[test]
     fn penalty_obstacle_returns_max_value() {
         assert_eq!(cost_of(5, PENALTY_OBSTACLE), MAX_VALUE);
     }
 
-    /// MAX_VALUE neighbor returns MAX_VALUE
     #[test]
     fn max_value_neighbor_returns_max_value() {
         assert_eq!(cost_of(MAX_VALUE, 0), MAX_VALUE);
     }
 
-    /// Overflow clamp returns MAX_VALUE - 1
     #[test]
     fn overflow_clamp_returns_max_value_minus_one() {
         // MAX_VALUE - 2 + 10 + 1 = MAX_VALUE + 9 => clamp to MAX_VALUE - 1
         assert_eq!(cost_of(MAX_VALUE - 2, 10), MAX_VALUE - 1);
     }
 
-    /// Normal sum: cost_of(10, 5) == 16
+    #[test]
+    fn exact_clamp_boundary() {
+        // nv + np + STEP_COST == MAX_VALUE exactly → clamp fires (>=), returns MAX_VALUE - 1
+        // MAX_VALUE - 2 + 1 + 1 = MAX_VALUE => clamp
+        assert_eq!(cost_of(MAX_VALUE - 2, 1), MAX_VALUE - 1);
+        // one below boundary: MAX_VALUE - 2 + 0 + 1 = MAX_VALUE - 1 < MAX_VALUE → no clamp
+        assert_eq!(cost_of(MAX_VALUE - 2, 0), MAX_VALUE - 1);
+    }
+
     #[test]
     fn normal_sum() {
         assert_eq!(cost_of(10, 5), 16);

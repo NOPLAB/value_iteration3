@@ -1,7 +1,5 @@
+//! Core value-iteration primitives: types, algorithm constants, and the `cost_of` function.
+
 pub mod params;
 pub mod types;
 pub mod cost;
-
-pub use params::*;
-pub use types::*;
-pub use cost::*;

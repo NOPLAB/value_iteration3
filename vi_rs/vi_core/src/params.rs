@@ -1,10 +1,12 @@
-use crate::types::Value;
+//! Constants mirroring `vi_matlab/src/common/vi_params.m` and `fpga/hls/stream/src/vi_stream_types.h`.
+
+use crate::types::{Value, Penalty};
 
 pub const N_ACTIONS: usize = 6;
 pub const N_THETA: usize = 60;
 pub const MAX_VALUE: Value = 0xFFFF;
-pub const PENALTY_OBSTACLE: u16 = 0xFFFF;
-pub const PENALTY_GOAL: u16 = 0xFFFE;
+pub const PENALTY_OBSTACLE: Penalty = 0xFFFF;
+pub const PENALTY_GOAL: Penalty = 0xFFFE;
 pub const STEP_COST: u32 = 1;
 pub const PROB_BASE: u32 = 262_144;
 pub const MAX_OUTCOMES: usize = 10;
