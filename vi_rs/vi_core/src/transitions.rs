@@ -1,8 +1,15 @@
+//! Pack/unpack the value-iteration transition table. Mirrors
+//! `vi_matlab/workflows/validation/tests/gen_transitions.m::pack_model` and
+//! `vi_matlab/src/common/unpack_transitions.m`.
+
 use crate::params::{MAX_OUTCOMES, N_ACTIONS, N_THETA, TRANS_TABLE_SIZE, TRANS_WORD_STRIDE};
 use crate::types::Offset;
 
 pub struct PackedTransitions(pub Vec<u32>);
 
+// NOTE: #[derive(Default)] is not used here because Rust does not implement Default for
+// arrays longer than 32 elements on stable toolchains older than 1.87. The manual impl below
+// is equivalent and kept for portability.
 pub struct TransitionModel {
     pub n_outcomes: [[u8; N_THETA]; N_ACTIONS],
     pub dix: [[[Offset; MAX_OUTCOMES]; N_THETA]; N_ACTIONS],
@@ -37,6 +44,7 @@ fn unpack_delta(word: u32) -> (Offset, Offset, Offset) {
 }
 
 impl PackedTransitions {
+    /// Unpack a flat DMA buffer into a `TransitionModel`. Mirrors `unpack_transitions.m`.
     pub fn unpack(&self) -> TransitionModel {
         let mut m = TransitionModel::default();
         for a in 0..N_ACTIONS {
@@ -58,6 +66,7 @@ impl PackedTransitions {
 }
 
 impl TransitionModel {
+    /// Pack outcomes into a flat DMA buffer. Mirrors `gen_transitions.m::pack_model`.
     pub fn pack(&self) -> PackedTransitions {
         let mut v = vec![0u32; TRANS_TABLE_SIZE];
         for a in 0..N_ACTIONS {
@@ -74,6 +83,7 @@ impl TransitionModel {
         PackedTransitions(v)
     }
 
+    /// Return the maximum absolute displacement `(dx, dy, dtheta)` across all actions and outcomes.
     pub fn max_displacement(&self) -> (u8, u8, u8) {
         let mut mx: u8 = 0;
         let mut my: u8 = 0;
@@ -154,6 +164,43 @@ mod tests {
         assert_eq!(u.dix[0][0][0], -3);
         assert_eq!(u.diy[0][0][0], -127);
         assert_eq!(u.dit[0][0][0], -1);
+    }
+
+    #[test]
+    fn roundtrip_with_max_outcomes() {
+        let mut m = TransitionModel::default();
+        // Fill (a=0, it=0) with all MAX_OUTCOMES slots using distinct values.
+        m.n_outcomes[0][0] = MAX_OUTCOMES as u8;
+        for k in 0..MAX_OUTCOMES {
+            m.dix[0][0][k] = (k as i8) - 5;
+            m.diy[0][0][k] = (k as i8) * 2 - 9;
+            m.dit[0][0][k] = (k as i8) - 4;
+            m.prob[0][0][k] = PROB_BASE - k as u32 * 1000;
+        }
+        // Give every other (a, it) exactly 1 outcome so the table is non-trivial.
+        for a in 0..N_ACTIONS {
+            for it in 0..N_THETA {
+                if a == 0 && it == 0 {
+                    continue;
+                }
+                m.n_outcomes[a][it] = 1;
+                m.dix[a][it][0] = 0;
+                m.diy[a][it][0] = 0;
+                m.dit[a][it][0] = 0;
+                m.prob[a][it][0] = PROB_BASE;
+            }
+        }
+
+        let packed = m.pack();
+        let u = packed.unpack();
+
+        assert_eq!(u.n_outcomes[0][0], MAX_OUTCOMES as u8);
+        for k in 0..MAX_OUTCOMES {
+            assert_eq!(u.dix[0][0][k], (k as i8) - 5, "dix mismatch at k={k}");
+            assert_eq!(u.diy[0][0][k], (k as i8) * 2 - 9, "diy mismatch at k={k}");
+            assert_eq!(u.dit[0][0][k], (k as i8) - 4, "dit mismatch at k={k}");
+            assert_eq!(u.prob[0][0][k], PROB_BASE - k as u32 * 1000, "prob mismatch at k={k}");
+        }
     }
 
     #[test]
