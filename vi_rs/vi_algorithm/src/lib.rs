@@ -2,6 +2,7 @@
 //!
 //! See `docs/superpowers/specs/2026-05-22-vi-rs-algorithm-port-design.md` §4.
 
+pub mod bitboard;
 pub mod context;
 pub mod kernel;
 

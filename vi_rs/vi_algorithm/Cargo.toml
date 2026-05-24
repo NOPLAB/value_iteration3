@@ -7,3 +7,6 @@ rust-version.workspace = true
 [dependencies]
 vi_core = { path = "../vi_core" }
 ndarray = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
