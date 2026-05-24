@@ -7,6 +7,8 @@
 //! - Bits with `ix >= map_x` are silently skipped (should not occur in a
 //!   correctly maintained bitboard, but we guard anyway).
 
+use std::iter::FusedIterator;
+
 use super::{Bitboard2D, Bitboard3D};
 
 // ---------------------------------------------------------------------------
@@ -60,31 +62,35 @@ impl<'a> Iterator for Bitboard2DIter<'a> {
     type Item = (u32, u32);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Skip empty words
-        while self.word == 0 {
-            if self.iy >= self.bb.map_y() {
-                return None;
+        loop {
+            // Skip empty words
+            while self.word == 0 {
+                if self.iy >= self.bb.map_y() {
+                    return None;
+                }
+                self.advance();
+                if self.iy >= self.bb.map_y() {
+                    return None;
+                }
             }
-            self.advance();
-            if self.iy >= self.bb.map_y() {
-                return None;
+
+            // Extract the lowest set bit
+            let bit = self.word.trailing_zeros();
+            let ix = self.wi * 64 + bit;
+            // Clear that bit (Brian Kernighan)
+            self.word &= self.word - 1;
+
+            // Guard: skip out-of-range bits (shouldn't happen with correct row_mask).
+            // Instead of recursing, continue the loop to retry within this word.
+            if ix < self.bb.map_x() {
+                return Some((ix, self.iy));
             }
+            // ix out of range — strip bit and retry in the same word
         }
-
-        // Extract the lowest set bit
-        let bit = self.word.trailing_zeros();
-        let ix = self.wi * 64 + bit;
-        // Clear that bit (Brian Kernighan)
-        self.word &= self.word - 1;
-
-        // Guard: skip out-of-range bits (shouldn't happen with correct row_mask)
-        if ix >= self.bb.map_x() {
-            return self.next();
-        }
-
-        Some((ix, self.iy))
     }
 }
+
+impl FusedIterator for Bitboard2DIter<'_> {}
 
 // ---------------------------------------------------------------------------
 // Bitboard3DIter
@@ -140,27 +146,31 @@ impl<'a> Iterator for Bitboard3DIter<'a> {
     type Item = (u32, u32, u32);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.word == 0 {
-            if self.it >= self.bb.n_theta() {
-                return None;
+        loop {
+            while self.word == 0 {
+                if self.it >= self.bb.n_theta() {
+                    return None;
+                }
+                self.advance();
+                if self.it >= self.bb.n_theta() {
+                    return None;
+                }
             }
-            self.advance();
-            if self.it >= self.bb.n_theta() {
-                return None;
+
+            let bit = self.word.trailing_zeros();
+            let ix = self.wi * 64 + bit;
+            self.word &= self.word - 1;
+
+            // Guard: skip out-of-range bits. Continue loop instead of recursing.
+            if ix < self.bb.map_x() {
+                return Some((ix, self.iy, self.it));
             }
+            // ix out of range — strip bit and retry in the same word
         }
-
-        let bit = self.word.trailing_zeros();
-        let ix = self.wi * 64 + bit;
-        self.word &= self.word - 1;
-
-        if ix >= self.bb.map_x() {
-            return self.next();
-        }
-
-        Some((ix, self.iy, self.it))
     }
 }
+
+impl FusedIterator for Bitboard3DIter<'_> {}
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -10,9 +10,9 @@
 //! - 2D word flat index: `iy * words_per_row + wi`.
 //! - 3D word flat index: `it * map_y * words_per_row + iy * words_per_row + wi`.
 
-pub mod conv;
-pub mod enumerate;
-pub mod ops;
+pub(crate) mod conv;
+pub(crate) mod enumerate;
+pub(crate) mod ops;
 
 pub use enumerate::{Bitboard2DIter, Bitboard3DIter};
 
@@ -104,13 +104,15 @@ impl Bitboard2D {
 
     /// Bitwise AND (in-place): `self &= other`.
     pub fn and_inplace(&mut self, other: &Self) {
-        debug_assert_eq!(self.data.len(), other.data.len());
+        debug_assert_eq!(self.map_x, other.map_x);
+        debug_assert_eq!(self.map_y, other.map_y);
         ops::and_slice(&mut self.data, &other.data);
     }
 
     /// Bitwise OR (in-place): `self |= other`.
     pub fn or_inplace(&mut self, other: &Self) {
-        debug_assert_eq!(self.data.len(), other.data.len());
+        debug_assert_eq!(self.map_x, other.map_x);
+        debug_assert_eq!(self.map_y, other.map_y);
         ops::or_slice(&mut self.data, &other.data);
     }
 
@@ -208,13 +210,17 @@ impl Bitboard3D {
 
     /// Bitwise AND (in-place): `self &= other`.
     pub fn and_inplace(&mut self, other: &Self) {
-        debug_assert_eq!(self.data.len(), other.data.len());
+        debug_assert_eq!(self.map_x, other.map_x);
+        debug_assert_eq!(self.map_y, other.map_y);
+        debug_assert_eq!(self.n_theta, other.n_theta);
         ops::and_slice(&mut self.data, &other.data);
     }
 
     /// Bitwise OR (in-place): `self |= other`.
     pub fn or_inplace(&mut self, other: &Self) {
-        debug_assert_eq!(self.data.len(), other.data.len());
+        debug_assert_eq!(self.map_x, other.map_x);
+        debug_assert_eq!(self.map_y, other.map_y);
+        debug_assert_eq!(self.n_theta, other.n_theta);
         ops::or_slice(&mut self.data, &other.data);
     }
 
@@ -362,6 +368,7 @@ mod tests {
 #[cfg(test)]
 mod prop_tests {
     use super::*;
+    use ndarray::Array3;
     use proptest::prelude::*;
 
     // -----------------------------------------------------------------------
@@ -499,6 +506,57 @@ mod prop_tests {
             let logical = bb.to_logical();
             let bb2 = Bitboard2D::from_logical(logical.view());
             prop_assert_eq!(bb, bb2);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // v. prop_logical_roundtrip_3d  (Minor #8)
+    // -----------------------------------------------------------------------
+    proptest! {
+        #[test]
+        fn prop_logical_roundtrip_3d(
+            map_x in 1u32..=10,
+            map_y in 1u32..=10,
+            n_theta in 1u32..=10,
+        ) {
+            // Deterministic pattern: set cell if (ix + iy + it) % 3 == 0
+            let mask = Array3::from_shape_fn(
+                (map_y as usize, map_x as usize, n_theta as usize),
+                |(iy, ix, it)| (ix + iy + it) % 3 == 0,
+            );
+            let bb = Bitboard3D::from_logical(mask.view());
+            let back = bb.to_logical();
+            prop_assert_eq!(mask, back);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // w. prop_dilate2d_crosses_word_boundary  (Minor #9)
+    // -----------------------------------------------------------------------
+    proptest! {
+        #[test]
+        fn prop_dilate2d_crosses_word_boundary(
+            map_x in 60u32..=70,
+            map_y in 1u32..=5,
+            dx in 0u32..=4,
+            dy in 0u32..=2,
+        ) {
+            let mut bb = Bitboard2D::new(map_x, map_y);
+            // Set bits straddling the word boundary (ix=62, 63, 64) where applicable
+            for iy in 0..map_y {
+                for &ix in &[62u32, 63, 64] {
+                    if ix < map_x {
+                        bb.set(ix, iy);
+                    }
+                }
+            }
+            let d = bb.dilate(dx, dy);
+            // Invariant: popcount monotone (dilation can only add bits)
+            prop_assert!(d.popcount() >= bb.popcount());
+            // Invariant: every set bit in `bb` is still set in `d`
+            for (ix, iy) in bb.enumerate() {
+                prop_assert!(d.test(ix, iy), "bit ({ix},{iy}) was set but missing after dilate");
+            }
         }
     }
 }

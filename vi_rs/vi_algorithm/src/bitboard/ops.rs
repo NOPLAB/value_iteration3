@@ -34,21 +34,24 @@ pub(crate) fn or_slice(a: &mut [u64], b: &[u64]) {
 
 /// Horizontal big-integer shift of one row by `sx` bit positions.
 ///
+/// Writes the shifted, masked result into `out`.
 /// - Positive `sx`: shifts bits toward higher x indices (left in memory-word
 ///   sense, i.e. higher bit positions).
 /// - Negative `sx`: shifts toward lower x indices.
 /// - Constraint: `-64 < sx < 64`.
+/// - `out.len() == row.len() == row_mask.len()` (debug-asserted).
 ///
 /// Mirrors `bb_shift_row.m`.
-pub(crate) fn shift_row(row: &[u64], sx: i32, rmask: &[u64]) -> Vec<u64> {
+pub(crate) fn shift_row(out: &mut [u64], row: &[u64], sx: i32, rmask: &[u64]) {
     let nw = row.len();
-    let mut out = vec![0u64; nw];
+    debug_assert_eq!(out.len(), nw);
+    debug_assert_eq!(rmask.len(), nw);
 
     if sx == 0 {
         for i in 0..nw {
             out[i] = row[i] & rmask[i];
         }
-        return out;
+        return;
     }
 
     if sx > 0 {
@@ -80,79 +83,134 @@ pub(crate) fn shift_row(row: &[u64], sx: i32, rmask: &[u64]) -> Vec<u64> {
     for i in 0..nw {
         out[i] &= rmask[i];
     }
-    out
 }
 
 // ---------------------------------------------------------------------------
-// dilate2d
+// dilate2d_into  (hot inner helper)
+// ---------------------------------------------------------------------------
+
+/// L-infinity box dilation written into an existing slice `dst`.
+///
+/// `dst`, `src`, and `row_mask` all have length `map_y * wpr`.
+/// `scratch_pos` and `scratch_neg` are caller-provided row-sized scratch
+/// buffers (length `wpr`) reused across calls to avoid per-call allocation.
+///
+/// Algorithm (mirrors `bb_dilate2d.m`):
+/// 1. Y-pass: copy `src` into `dst`, then OR shifted rows from `src`.
+/// 2. X-pass (if `dx > 0`): for each row, save the Y-dilated row into
+///    `scratch_pos`, then for each `sx_abs` OR ±shifted versions into `dst`.
+/// 3. Final mask applied inside the X-pass (and in the dx==0 fast-path).
+///
+/// Panics if `dx >= 64`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dilate2d_into(
+    dst: &mut [u64],
+    src: &[u64],
+    map_y: usize,
+    wpr: usize,
+    dx: u32,
+    dy: u32,
+    scratch_pos: &mut Vec<u64>,
+    scratch_neg: &mut Vec<u64>,
+    rmask: &[u64],
+) {
+    assert!(dx < 64, "bb_dilate2d: dx >= 64 ({dx}) not supported");
+
+    // --- Y-pass: dst ← y_dilated ---
+    // Copy src into dst, then OR in shifted rows (reading always from src).
+    dst.copy_from_slice(src);
+
+    for sy in 1..=(dy as usize) {
+        for r in 0..map_y {
+            let r_start = r * wpr;
+            if r + sy < map_y {
+                let dst_start = (r + sy) * wpr;
+                for w in 0..wpr {
+                    dst[dst_start + w] |= src[r_start + w];
+                }
+            }
+            if r >= sy {
+                let dst_start = (r - sy) * wpr;
+                for w in 0..wpr {
+                    dst[dst_start + w] |= src[r_start + w];
+                }
+            }
+        }
+    }
+
+    // --- Early return if dx == 0 ---
+    if dx == 0 {
+        // Just mask the Y-dilated result
+        for iy in 0..map_y {
+            for w in 0..wpr {
+                dst[iy * wpr + w] &= rmask[w];
+            }
+        }
+        return;
+    }
+
+    // --- X-pass ---
+    // For each row: save its Y-dilated value into scratch_pos, then for each
+    // sx_abs OR ±shifted versions into dst.
+    // scratch_neg is reused for each individual shifted row.
+    scratch_pos.resize(wpr, 0u64);
+    scratch_neg.resize(wpr, 0u64);
+
+    for iy in 0..map_y {
+        let row_start = iy * wpr;
+        // Copy the Y-dilated row into scratch_pos (so reads are stable while
+        // we accumulate the OR into dst[row_start..]).
+        scratch_pos.copy_from_slice(&dst[row_start..row_start + wpr]);
+
+        for sx_abs in 1..=(dx as i32) {
+            shift_row(scratch_neg, scratch_pos, sx_abs, rmask);
+            for w in 0..wpr {
+                dst[row_start + w] |= scratch_neg[w];
+            }
+            shift_row(scratch_neg, scratch_pos, -sx_abs, rmask);
+            for w in 0..wpr {
+                dst[row_start + w] |= scratch_neg[w];
+            }
+        }
+
+        // Final mask (shift_row already masks, but the original Y-dilated
+        // row stored in scratch_pos may have unmasked bits from the Y-pass).
+        for w in 0..wpr {
+            dst[row_start + w] &= rmask[w];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dilate2d  (public entry point)
 // ---------------------------------------------------------------------------
 
 /// L-infinity box dilation of a 2-D bitboard by `(dx, dy)`.
 ///
-/// Mirrors `bb_dilate2d.m`:
-/// 1. Y-pass: for each `sy in 1..=dy`, OR rows with their ±sy shifted
-///    versions (reading from the **original** `bb`, not the accumulator).
-/// 2. X-pass: for each `sx in 1..=dx`, OR each row of the output with its
-///    ±sx horizontally-shifted version (shifting the Y-dilated row).
-/// 3. Final mask with row_mask.
-///
 /// Panics if `dx >= 64`.
 pub(crate) fn dilate2d(bb: &Bitboard2D, dx: u32, dy: u32) -> Bitboard2D {
-    assert!(dx < 64, "bb_dilate2d: dx >= 64 ({dx}) not supported");
-
     let map_x = bb.map_x();
     let map_y = bb.map_y() as usize;
     let wpr = bb.words_per_row() as usize;
     let rmask = row_mask(map_x);
     let src = bb.data();
 
-    // --- Y-pass ---
-    // y_dilated starts as a copy of bb; accumulate by reading from src.
-    let mut y_dilated = src.to_vec();
+    // Allocate output + two scratch row-buffers (the only heap allocs here).
+    let mut out_data = vec![0u64; map_y * wpr];
+    let mut scratch_pos = Vec::with_capacity(wpr);
+    let mut scratch_neg = Vec::with_capacity(wpr);
 
-    for sy in 1..=(dy as usize) {
-        // For row r: y_dilated[r + sy] |= src[r]  (if r + sy < map_y)
-        //            y_dilated[r - sy] |= src[r]  (if r >= sy)
-        for r in 0..map_y {
-            let r_start = r * wpr;
-            if r + sy < map_y {
-                let dst_start = (r + sy) * wpr;
-                for w in 0..wpr {
-                    y_dilated[dst_start + w] |= src[r_start + w];
-                }
-            }
-            if r >= sy {
-                let dst_start = (r - sy) * wpr;
-                for w in 0..wpr {
-                    y_dilated[dst_start + w] |= src[r_start + w];
-                }
-            }
-        }
-    }
-
-    // out starts as y_dilated (dx == 0 → returns y_dilated directly)
-    let mut out_data = y_dilated.clone();
-
-    // --- X-pass ---
-    if dx > 0 {
-        for sx_abs in 1..=(dx as i32) {
-            for iy in 0..map_y {
-                let row_slice = &y_dilated[iy * wpr..(iy + 1) * wpr];
-                let row_pos = shift_row(row_slice, sx_abs, &rmask);
-                let row_neg = shift_row(row_slice, -sx_abs, &rmask);
-                for w in 0..wpr {
-                    out_data[iy * wpr + w] |= row_pos[w] | row_neg[w];
-                }
-            }
-        }
-    }
-
-    // Final mask (handles overflow from the X-pass)
-    for iy in 0..map_y {
-        for w in 0..wpr {
-            out_data[iy * wpr + w] &= rmask[w];
-        }
-    }
+    dilate2d_into(
+        &mut out_data,
+        src,
+        map_y,
+        wpr,
+        dx,
+        dy,
+        &mut scratch_pos,
+        &mut scratch_neg,
+        &rmask,
+    );
 
     Bitboard2D {
         data: out_data,
@@ -169,47 +227,64 @@ pub(crate) fn dilate2d(bb: &Bitboard2D, dx: u32, dy: u32) -> Bitboard2D {
 /// 3-D box dilation: XY by `(dx, dy)`, periodic-theta by `dt`.
 ///
 /// Mirrors `bb_dilate3d.m`:
-/// 1. Apply `dilate2d` to every theta layer → `temp`.
+/// 1. Apply XY dilation to every theta layer → `temp`.
 /// 2. For each `st in 1..=dt`, OR `temp[it]` with
 ///    `temp[(it + st) % n_theta]` and `temp[(it - st + n_theta) % n_theta]`.
-///    Source is always `temp` (post-XY, pre-theta-dilation copy).
+///    Source is always `temp` (post-XY, pre-theta-dilation buffer).
+///
+/// # WHY two buffers in the theta-pass
+/// Each output theta layer reads up to 2*dt source layers via the wrap.
+/// Modifying output layer `it` in-place would corrupt the contributions still
+/// owed to subsequent layers (it+1 .. it+dt). Using `temp` as the read-only
+/// source and `out` as the write target decouples reads from writes.
 ///
 /// Panics if `dx >= 64`.
 pub(crate) fn dilate3d(bb: &Bitboard3D, dx: u32, dy: u32, dt: u32) -> Bitboard3D {
     let map_x = bb.map_x();
-    let map_y = bb.map_y();
+    let map_y = bb.map_y() as usize;
     let n_theta = bb.n_theta() as usize;
+    let wpr = bb.words_per_row() as usize;
     let layer_stride = bb.layer_stride();
+    let rmask = row_mask(map_x);
 
-    // Step 1: XY dilate each layer into `temp`
+    // Allocate: output buffer + temp (post-XY) + 2 scratch row-buffers.
+    // All shared across all theta layers — no per-layer allocation.
+    let mut out = vec![0u64; bb.data().len()];
     let mut temp = vec![0u64; bb.data().len()];
+    let mut scratch_pos: Vec<u64> = Vec::with_capacity(wpr);
+    let mut scratch_neg: Vec<u64> = Vec::with_capacity(wpr);
+
+    // Step 1: XY dilate each layer into `temp`, reusing scratch buffers.
     for it in 0..n_theta {
-        // Build a temporary Bitboard2D for this layer
-        let src_start = it * layer_stride;
-        let src_layer = &bb.data()[src_start..src_start + layer_stride];
-        let bb2 = Bitboard2D {
-            data: src_layer.to_vec(),
-            map_x,
+        let layer_start = it * layer_stride;
+        let src_layer = &bb.data()[layer_start..layer_start + layer_stride];
+        dilate2d_into(
+            &mut temp[layer_start..layer_start + layer_stride],
+            src_layer,
             map_y,
-            words_per_row: bb.words_per_row(),
-        };
-        let dilated = dilate2d(&bb2, dx, dy);
-        temp[src_start..src_start + layer_stride].copy_from_slice(dilated.data());
+            wpr,
+            dx,
+            dy,
+            &mut scratch_pos,
+            &mut scratch_neg,
+            &rmask,
+        );
     }
 
     if dt == 0 {
         return Bitboard3D {
             data: temp,
             map_x,
-            map_y,
+            map_y: bb.map_y(),
             n_theta: bb.n_theta(),
             words_per_row: bb.words_per_row(),
         };
     }
 
-    // Step 2: theta dilation — source is `temp` (unchanged during this pass)
-    let temp_snap = temp.clone();
-    let mut out = temp; // accumulate into this
+    // Step 2: theta dilation.
+    // `out` starts as a copy of `temp` (each layer already contains its own
+    // XY-dilated bits); the theta-pass only ORs in neighbours.
+    out.copy_from_slice(&temp);
 
     for st in 1..=(dt as usize) {
         for it in 0..n_theta {
@@ -222,7 +297,7 @@ pub(crate) fn dilate3d(bb: &Bitboard3D, dx: u32, dy: u32, dt: u32) -> Bitboard3D
 
             for w in 0..layer_stride {
                 out[dst_start + w] |=
-                    temp_snap[src_plus_start + w] | temp_snap[src_minus_start + w];
+                    temp[src_plus_start + w] | temp[src_minus_start + w];
             }
         }
     }
@@ -230,7 +305,7 @@ pub(crate) fn dilate3d(bb: &Bitboard3D, dx: u32, dy: u32, dt: u32) -> Bitboard3D
     Bitboard3D {
         data: out,
         map_x,
-        map_y,
+        map_y: bb.map_y(),
         n_theta: bb.n_theta(),
         words_per_row: bb.words_per_row(),
     }
@@ -437,7 +512,8 @@ mod tests {
         // Single word, row = [1] (bit 0 set), shift by 3 → bit 3 set
         let row = vec![1u64];
         let rmask = vec![u64::MAX];
-        let out = shift_row(&row, 3, &rmask);
+        let mut out = vec![0u64; 1];
+        shift_row(&mut out, &row, 3, &rmask);
         assert_eq!(out[0], 1u64 << 3);
     }
 
@@ -446,7 +522,8 @@ mod tests {
         // Single word, row = [8] (bit 3 set), shift by -3 → bit 0 set
         let row = vec![8u64];
         let rmask = vec![u64::MAX];
-        let out = shift_row(&row, -3, &rmask);
+        let mut out = vec![0u64; 1];
+        shift_row(&mut out, &row, -3, &rmask);
         assert_eq!(out[0], 1u64);
     }
 
@@ -456,7 +533,8 @@ mod tests {
         // After shift: word 0 = u64::MAX << 1, word 1 = MAX >> 63 = 1.
         let row = vec![u64::MAX, 0u64];
         let rmask = vec![u64::MAX, u64::MAX];
-        let out = shift_row(&row, 1, &rmask);
+        let mut out = vec![0u64; 2];
+        shift_row(&mut out, &row, 1, &rmask);
         assert_eq!(out[0], u64::MAX << 1);
         assert_eq!(out[1], 1u64);
     }
@@ -468,7 +546,8 @@ mod tests {
         // Out[1] = 1 >> 1 = 0
         let row = vec![0u64, 1u64];
         let rmask = vec![u64::MAX, u64::MAX];
-        let out = shift_row(&row, -1, &rmask);
+        let mut out = vec![0u64; 2];
+        shift_row(&mut out, &row, -1, &rmask);
         assert_eq!(out[0], 1u64 << 63);
         assert_eq!(out[1], 0u64);
     }
