@@ -2,6 +2,7 @@
 //!
 //! Mirrors `vi_matlab/src/cpu/reference/vi_full_reference.m`.
 //! Bit-exact with the C reference in `host/src/vi_reference_c.c`.
+//! See `docs/superpowers/specs/2026-05-22-vi-rs-algorithm-port-design.md` §4.2, §4.8.
 
 use vi_core::{MAX_VALUE, N_THETA, PENALTY_OBSTACLE, Value};
 use crate::context::{Budget, SolveExtra, SolveStats, Solver, VIContext};
@@ -9,6 +10,11 @@ use crate::kernel::bellman_backup;
 
 pub mod action_table;
 
+/// Brute-force value-iteration reference solver. Bit-exact with MATLAB `vi_full_reference.m`.
+///
+/// `threshold`: convergence residual cap. The solver terminates early
+/// (sets `converged = true`) when the per-sweep maximum `|new - old|` falls at
+/// or below this value. Use `threshold: 0` for strict MATLAB-matching convergence.
 pub struct Reference {
     pub threshold: Value,
 }
@@ -50,15 +56,19 @@ impl Solver for Reference {
 
         let map_x = ctx.dims.map_x;
         let map_y = ctx.dims.map_y;
+        let map_x_us = map_x as usize;
+        let map_y_us = map_y as usize;
 
         let mut sweeps = 0u32;
         let mut final_delta: Value = MAX_VALUE;
         let mut converged = false;
 
+        // Iteration order iy → ix → it is load-bearing: this Gauss-Seidel in-place sweep
+        // matches MATLAB's loop order. Do not reorder or substitute ndarray::Zip::indexed.
         for sweep in 1..=max_sweeps {
             let mut max_delta: Value = 0;
-            for iy in 0..map_y as usize {
-                for ix in 0..map_x as usize {
+            for iy in 0..map_y_us {
+                for ix in 0..map_x_us {
                     if ctx.penalty[[iy, ix]] == PENALTY_OBSTACLE {
                         continue;
                     }
@@ -88,9 +98,13 @@ impl Solver for Reference {
             }
         }
 
-        // Pin goal cells to 0 (MATLAB does value_table(goal_mask) = 0 at end)
-        for iy in 0..map_y as usize {
-            for ix in 0..map_x as usize {
+        // Pin goal cells to 0 again after the sweep loop. This matches
+        // `value_table(goal_mask) = 0` at the end of vi_full_reference.m.
+        // Two reasons this is not dead code:
+        //   1. When max_sweeps == 0 the sweep loop never runs, so this is the only pin.
+        //   2. Exact MATLAB parity: MATLAB pins after the loop regardless of convergence.
+        for iy in 0..map_y_us {
+            for ix in 0..map_x_us {
                 for it in 0..N_THETA {
                     if ctx.goal_mask[[iy, ix, it]] {
                         ctx.value[[iy, ix, it]] = 0;
@@ -193,6 +207,11 @@ pub(crate) mod tests {
             "corner cell should be reachable, got {}",
             ctx.value[[0, 0, 0]]
         );
+        // On the 3x3 with deterministic unit-cost actions and goal at (1,1,0):
+        // the goal-adjacent cell (1,0,0) should be exactly 1 step from goal (cost_of(0,0)=1).
+        assert_eq!(ctx.value[[1, 0, 0]], 1, "left-of-goal cell should be exactly 1 step away");
+        // Corner (0,0,0) is reachable in 2 steps via right-then-down → expected cost 2.
+        assert_eq!(ctx.value[[0, 0, 0]], 2, "corner should be exactly 2 steps from goal");
     }
 
     #[test]
@@ -238,14 +257,31 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn non_zero_threshold_terminates_early() {
-        // With threshold == MAX_VALUE, convergence is guaranteed in 1 sweep
-        // (max_delta <= MAX_VALUE is always true).
-        let mut ctx = empty_3x3_ctx();
-        let solver = Reference { threshold: MAX_VALUE };
-        let stats = solver.run(&mut ctx, Budget::Sweeps(100));
+    fn threshold_above_zero_terminates_earlier_than_strict() {
+        // Run identical contexts with threshold=0 (strict) and threshold=5 (relaxed).
+        // The relaxed run must terminate in <= sweeps as the strict run (typically fewer).
+        let mut ctx_strict = empty_3x3_ctx();
+        let mut ctx_relaxed = empty_3x3_ctx();
+        let strict = Reference { threshold: 0 };
+        let relaxed = Reference { threshold: 5 };
+        let s_strict = strict.run(&mut ctx_strict, Budget::Sweeps(50));
+        let s_relaxed = relaxed.run(&mut ctx_relaxed, Budget::Sweeps(50));
+        // Both should converge in well under 50 sweeps on the trivial 3x3.
+        assert!(s_strict.converged);
+        assert!(s_relaxed.converged);
+        assert!(s_relaxed.iters_or_sweeps <= s_strict.iters_or_sweeps,
+            "relaxed (threshold=5) took {} sweeps; strict (threshold=0) took {}",
+            s_relaxed.iters_or_sweeps, s_strict.iters_or_sweeps);
+    }
 
-        assert!(stats.converged, "should converge immediately");
-        assert_eq!(stats.iters_or_sweeps, 1, "should terminate after sweep 1");
+    #[test]
+    fn zero_sweeps_pins_goal() {
+        // The post-loop goal pin is the only thing that runs when max_sweeps == 0.
+        let mut ctx = empty_3x3_ctx();
+        let solver = Reference { threshold: 0 };
+        let stats = solver.run(&mut ctx, Budget::Sweeps(0));
+        assert_eq!(ctx.value[[1, 1, 0]], 0, "goal must be pinned even with 0 sweeps");
+        assert_eq!(stats.iters_or_sweeps, 0);
+        assert!(!stats.converged);
     }
 }

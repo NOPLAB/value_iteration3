@@ -1,6 +1,7 @@
 //! Compute argmin-action table from a (converged) value table.
 //!
 //! Mirrors `vi_matlab/src/cpu/reference/compute_action_table_reference.m`.
+//! See `docs/superpowers/specs/2026-05-22-vi-rs-algorithm-port-design.md` §4.2, §4.5.
 
 use ndarray::{Array2, Array3};
 use vi_core::{
@@ -16,12 +17,14 @@ pub fn compute_action_table_reference(
     map_x: u32,
     map_y: u32,
 ) -> Array3<ActionIdx> {
+    let map_x_us = map_x as usize;
+    let map_y_us = map_y as usize;
     let mut action_table = Array3::<ActionIdx>::zeros(
-        (map_y as usize, map_x as usize, N_THETA),
+        (map_y_us, map_x_us, N_THETA),
     );
 
-    for iy in 0..map_y as usize {
-        for ix in 0..map_x as usize {
+    for iy in 0..map_y_us {
+        for ix in 0..map_x_us {
             for it in 0..N_THETA {
                 if goal_mask[[iy, ix, it]] || penalty[[iy, ix]] == PENALTY_OBSTACLE {
                     action_table[[iy, ix, it]] = 0;
@@ -47,6 +50,9 @@ pub fn compute_action_table_reference(
     action_table
 }
 
+// NOTE: intentional near-duplicate of bellman_backup's per-action inner loop.
+// Deduplication deferred (YAGNI) — if bellman semantics change, update both.
+// See kernel/bellman.rs for the corresponding logic.
 #[allow(clippy::too_many_arguments)]
 fn action_cost(
     value: &Array3<Value>,
