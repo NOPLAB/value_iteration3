@@ -2,6 +2,7 @@
 //!
 //! Mirrors `vi_matlab/src/cpu/frontier/vi_frontier_2d.m`.
 //! Bit-exact with Reference: converged value table matches byte-for-byte.
+//! See spec §4.2, §4.8.
 
 use vi_core::{N_THETA};
 
@@ -11,6 +12,9 @@ use crate::kernel::bellman_backup;
 
 use super::{build_passable_bb_2d, build_value_seed_2d, max_iters, pin_goals};
 
+/// Frontier-VI solver using a 2D spatial bitboard.
+/// When a spatial cell enters the frontier, all N_THETA layers are re-evaluated;
+/// dilation is cheaper but per-cell work is N_THETA× larger than [`Frontier3D`].
 pub struct Frontier2D;
 
 impl Solver for Frontier2D {
@@ -50,24 +54,27 @@ impl Solver for Frontier2D {
             let mut new_frontier = Bitboard2D::new(map_x, map_y);
 
             for (ix, iy) in candidates.enumerate() {
+                let ix_us = ix as usize;
+                let iy_us = iy as usize;
                 let mut changed = false;
                 for it in 0..N_THETA {
-                    if ctx.goal_mask[[iy as usize, ix as usize, it]] {
+                    let it_u32 = it as u32;
+                    if ctx.goal_mask[[iy_us, ix_us, it]] {
                         continue;
                     }
-                    let old = ctx.value[[iy as usize, ix as usize, it]];
+                    let old = ctx.value[[iy_us, ix_us, it]];
                     let new_val = bellman_backup(
                         &ctx.value,
                         &ctx.penalty,
                         &ctx.transitions,
                         ix,
                         iy,
-                        it as u32,
+                        it_u32,
                         map_x,
                         map_y,
                     );
                     if new_val < old {
-                        ctx.value[[iy as usize, ix as usize, it]] = new_val;
+                        ctx.value[[iy_us, ix_us, it]] = new_val;
                         updates += 1;
                         changed = true;
                     }
@@ -189,6 +196,7 @@ mod tests {
         let mut ctx = empty_5x5_ctx();
         let stats = Frontier2D.run(&mut ctx, Budget::Iterations(1));
         assert!(!stats.converged);
+        assert_eq!(stats.iters_or_sweeps, 1, "budget of 1 must produce exactly 1 iteration");
     }
 
     #[test]

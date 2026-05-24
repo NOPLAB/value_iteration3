@@ -2,6 +2,7 @@
 //!
 //! Mirrors `vi_matlab/src/cpu/frontier/vi_frontier_stack.m`.
 //! Bit-exact with Reference: converged value table matches byte-for-byte.
+//! See spec §4.2, §4.8.
 
 use vi_core::{MAX_VALUE, N_THETA};
 
@@ -11,6 +12,9 @@ use crate::kernel::bellman_backup;
 
 use super::{build_passable_bb_2d, max_iters, pin_goals};
 
+/// Frontier-VI solver using N_THETA stacked 2D bitboards.
+/// Per-layer 2D dilation followed by theta-direction OR-merging for the expand step;
+/// memory layout is friendlier than [`Frontier3D`] when sparsity differs across theta.
 pub struct FrontierStack;
 
 impl Solver for FrontierStack {
@@ -34,14 +38,20 @@ impl Solver for FrontierStack {
         // Single shared 2D passable bitboard.
         let passable_bb = build_passable_bb_2d(&ctx.penalty);
 
-        // Per-layer goal bitboards and initial frontiers.
-        let goal_layers: Vec<Bitboard2D> = (0..N_THETA)
-            .map(|it| {
-                Bitboard2D::from_logical(
-                    ctx.goal_mask.slice(ndarray::s![.., .., it]),
-                )
-            })
-            .collect();
+        // Precompute per-layer goal complements once (reused every iteration).
+        // goal_layers is scoped here so it's dropped after goal_complements is built
+        // (~87 MB freed on a 14000×800 map), leaving only goal_complements alive.
+        // WHY: complement() allocates; caching avoids N_THETA allocs per iter.
+        let goal_complements: Vec<Bitboard2D> = {
+            let goal_layers: Vec<Bitboard2D> = (0..N_THETA)
+                .map(|it| {
+                    Bitboard2D::from_logical(
+                        ctx.goal_mask.slice(ndarray::s![.., .., it]),
+                    )
+                })
+                .collect();
+            goal_layers.iter().map(|g| g.complement()).collect()
+        };
 
         let mut frontier: Vec<Bitboard2D> = (0..N_THETA)
             .map(|it| {
@@ -61,13 +71,8 @@ impl Solver for FrontierStack {
         let mut updates: u64 = 0;
         let mut iters: u32 = 0;
 
-        // Precompute per-layer goal complements once (reused every iteration).
-        // WHY: complement() allocates; caching avoids N_THETA allocs per iter.
-        let goal_complements: Vec<Bitboard2D> =
-            goal_layers.iter().map(|g| g.complement()).collect();
-
         // Stack popcount: total set bits across all theta layers.
-        let stack_popcount = |layers: &Vec<Bitboard2D>| -> u64 {
+        let stack_popcount = |layers: &[Bitboard2D]| -> u64 {
             layers.iter().map(|bb| bb.popcount()).sum()
         };
 
@@ -102,7 +107,9 @@ impl Solver for FrontierStack {
 
             for it in 0..N_THETA {
                 for (ix, iy) in candidates[it].enumerate() {
-                    let old = ctx.value[[iy as usize, ix as usize, it]];
+                    let ix_us = ix as usize;
+                    let iy_us = iy as usize;
+                    let old = ctx.value[[iy_us, ix_us, it]];
                     let new_val = bellman_backup(
                         &ctx.value,
                         &ctx.penalty,
@@ -114,7 +121,7 @@ impl Solver for FrontierStack {
                         map_y,
                     );
                     if new_val < old {
-                        ctx.value[[iy as usize, ix as usize, it]] = new_val;
+                        ctx.value[[iy_us, ix_us, it]] = new_val;
                         updates += 1;
                         new_frontier[it].set(ix, iy);
                     }
@@ -233,6 +240,7 @@ mod tests {
         let mut ctx = empty_5x5_ctx();
         let stats = FrontierStack.run(&mut ctx, Budget::Iterations(1));
         assert!(!stats.converged);
+        assert_eq!(stats.iters_or_sweeps, 1, "budget of 1 must produce exactly 1 iteration");
     }
 
     #[test]

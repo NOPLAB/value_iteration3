@@ -2,6 +2,7 @@
 //!
 //! Mirrors `vi_matlab/src/cpu/frontier/vi_frontier_3d.m`.
 //! Bit-exact with Reference: converged value table matches byte-for-byte.
+//! See spec §4.2, §4.8.
 
 use vi_core::N_THETA;
 
@@ -11,6 +12,8 @@ use crate::kernel::bellman_backup;
 
 use super::{build_passable_bb_3d, build_passable_bb_2d, build_value_seed_3d, max_iters, pin_goals};
 
+/// Frontier-VI solver using a single 3D bitboard (x, y, theta).
+/// Higher per-iter cost than [`Frontier2D`] but tracks theta independently per cell.
 pub struct Frontier3D;
 
 impl Solver for Frontier3D {
@@ -57,7 +60,9 @@ impl Solver for Frontier3D {
             let mut new_frontier = Bitboard3D::new(map_x, map_y, N_THETA as u32);
 
             for (ix, iy, it) in candidates.enumerate() {
-                let old = ctx.value[[iy as usize, ix as usize, it as usize]];
+                let ix_us = ix as usize;
+                let iy_us = iy as usize;
+                let old = ctx.value[[iy_us, ix_us, it as usize]];
                 let new_val = bellman_backup(
                     &ctx.value,
                     &ctx.penalty,
@@ -69,7 +74,7 @@ impl Solver for Frontier3D {
                     map_y,
                 );
                 if new_val < old {
-                    ctx.value[[iy as usize, ix as usize, it as usize]] = new_val;
+                    ctx.value[[iy_us, ix_us, it as usize]] = new_val;
                     updates += 1;
                     new_frontier.set(ix, iy, it);
                 }
@@ -187,6 +192,7 @@ mod tests {
         let mut ctx = empty_5x5_ctx();
         let stats = Frontier3D.run(&mut ctx, Budget::Iterations(1));
         assert!(!stats.converged);
+        assert_eq!(stats.iters_or_sweeps, 1, "budget of 1 must produce exactly 1 iteration");
     }
 
     #[test]

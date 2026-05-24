@@ -36,10 +36,12 @@ pub(crate) fn build_passable_bb_3d(passable_2d: &Bitboard2D, n_theta: u32) -> Bi
     let map_x = passable_2d.map_x();
     let map_y = passable_2d.map_y();
     let mut bb = Bitboard3D::new(map_x, map_y, n_theta);
-    for (ix, iy) in passable_2d.enumerate() {
-        for it in 0..n_theta {
-            bb.set(ix, iy, it);
-        }
+    let stride = bb.layer_stride();
+    let src = passable_2d.data();
+    debug_assert_eq!(src.len(), stride, "Bitboard2D and one layer of Bitboard3D should have same word count");
+    let dst = bb.data_mut();
+    for it in 0..n_theta as usize {
+        dst[it * stride..(it + 1) * stride].copy_from_slice(src);
     }
     bb
 }
