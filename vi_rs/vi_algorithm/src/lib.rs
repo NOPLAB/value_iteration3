@@ -4,8 +4,10 @@
 
 pub mod bitboard;
 pub mod context;
+pub mod frontier;
 pub mod kernel;
 pub mod reference;
 
 pub use context::{Budget, MapDims, SolveExtra, SolveStats, Solver, VIContext};
+pub use frontier::{Frontier2D, Frontier3D, FrontierStack};
 pub use reference::Reference;
