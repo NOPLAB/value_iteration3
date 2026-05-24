@@ -28,6 +28,8 @@ use super::{
 ///   (when every (action,theta) has exactly one outcome, as in the deterministic
 ///   4-dir test fixture, the result is bit-exact).
 pub struct Frontier3DTopK {
+    /// Number of highest-probability outcomes per (action, theta) to retain.
+    /// `k >= MAX_OUTCOMES` is a no-op (no pruning). Clamped to `[1, MAX_OUTCOMES]`.
     pub k: u32,
 }
 
@@ -90,7 +92,12 @@ impl Solver for Frontier3DTopK {
                     map_y,
                 );
 
-                // MATLAB fallback: if v_new == MV, try the full model.
+                // WHY: defensive fallback mirroring MATLAB vi_frontier_3d_topk.m. The pruned
+                // model's outcomes are a strict subset of the full model's, so if the pruned
+                // backup returns MAX_VALUE (all actions invalid in pruned), the full backup
+                // will also return MAX_VALUE (same OOB outcomes are present). In practice
+                // this path is dead code — kept for MATLAB parity and as a guard against
+                // future pruning-semantics changes.
                 if new_val == vi_core::MAX_VALUE {
                     new_val = bellman_backup(
                         &ctx.value,
@@ -115,11 +122,7 @@ impl Solver for Frontier3DTopK {
         }
 
         // Defensive goal re-pin (mirrors MATLAB's end-of-function pin).
-        for ((iy, ix, it), &is_goal) in ctx.goal_mask.indexed_iter() {
-            if is_goal {
-                ctx.value[[iy, ix, it]] = 0;
-            }
-        }
+        pin_goals(&mut ctx.value, &ctx.goal_mask);
 
         let converged = frontier.popcount() == 0;
 

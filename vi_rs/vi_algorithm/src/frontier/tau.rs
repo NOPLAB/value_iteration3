@@ -26,6 +26,9 @@ use super::{
 /// * `tau > 0` → approximate: some updates are suppressed, so the final
 ///   value table may differ from the exact solution.
 pub struct Frontier3DTau {
+    /// Residual threshold for re-enqueuing. Only updates with
+    /// `old_val - new_val > tau` mark the new frontier. `tau == 0` is
+    /// equivalent to (and delegates to) [`Frontier3D`].
     pub tau: Value,
 }
 
@@ -100,11 +103,7 @@ impl Solver for Frontier3DTau {
 
         // MATLAB re-pins goals at the very end (defensive against tau suppressing a
         // goal update — harmless when tau=0 but the MATLAB code always does it).
-        for ((iy, ix, it), &is_goal) in ctx.goal_mask.indexed_iter() {
-            if is_goal {
-                ctx.value[[iy, ix, it]] = 0;
-            }
-        }
+        pin_goals(&mut ctx.value, &ctx.goal_mask);
 
         let converged = frontier.popcount() == 0;
 
@@ -179,11 +178,10 @@ mod tests {
             .sum::<f64>()
             / count as f64;
 
-        assert!(
-            mean_abs_diff < 10.0,
-            "layer-0 mean abs diff vs Reference = {:.2} (tau=5)",
-            mean_abs_diff
-        );
+        // WHY: tau=5 suppresses small updates; some cells settle at values 5-9 below
+        // the strict-convergence floor. Bound of 10.0 catches gross regressions while
+        // allowing the expected tau-induced drift.
+        assert!(mean_abs_diff < 10.0, "mean abs diff vs reference = {}", mean_abs_diff);
     }
 
     #[test]

@@ -30,7 +30,13 @@ use super::{
 ///
 /// * `coarse_step <= 1` → delegates to [`Frontier3D`] directly.
 pub struct Frontier3DCoarseTheta {
+    /// Coarsening factor for the theta axis. Only every `coarse_step`-th theta
+    /// layer is solved exactly during the coarse pass; non-coarse layers are
+    /// filled via nearest-coarse-layer upsampling before refine. `coarse_step <= 1`
+    /// delegates directly to [`Frontier3D`].
     pub coarse_step: u32,
+    /// Number of iterations reserved for the refine pass (exact [`Frontier3D`]
+    /// over all theta layers). Coarse pass gets `max_iters - refine_iters`.
     pub refine_iters: u32,
 }
 
@@ -74,7 +80,11 @@ impl Solver for Frontier3DCoarseTheta {
             let stats = Frontier3D.run(ctx, Budget::Iterations(refine_cap));
             (stats.iters_or_sweeps, stats.updates, stats.converged)
         } else {
-            // No refine budget: convergence unknown (set false conservatively).
+            // WHY: coarse convergence over the reduced (every step-th theta) problem does
+            // not imply convergence over the full theta-axis problem. When refine_cap == 0
+            // we have no measurement of full-space residual, so `false` is the correct
+            // conservative signal (a caller checking `stats.converged` should consider this
+            // run incomplete).
             (0, 0, false)
         };
 
@@ -248,6 +258,10 @@ fn upsample_coarse_theta(value: &mut Array3<Value>, step: usize) {
 /// read during the coarse pass.
 ///
 /// Mirrors `vi_frontier_bellman_coarse_theta` in the MATLAB source.
+///
+/// NOTE: structurally near-duplicate of bellman_backup in kernel/bellman.rs.
+/// Differs only in divisor (prob_sum vs PROB_BASE) and prob_sum==0 guard.
+/// Deduplication via a shared inner-loop helper deferred to a future cleanup.
 #[allow(clippy::too_many_arguments)]
 fn bellman_backup_coarse_theta(
     value: &Array3<Value>,
@@ -443,4 +457,5 @@ mod tests {
         assert_eq!(stats.final_delta, 0);
         assert!(stats.extra.is_none());
     }
+
 }

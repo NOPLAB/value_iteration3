@@ -20,6 +20,12 @@ use vi_core::{Penalty, TransitionModel, Value};
 /// outcomes have been pruned away.
 ///
 /// Returns `MAX_VALUE` when no action produces a finite-cost result.
+///
+/// # Note
+///
+/// NOTE: structurally near-duplicate of bellman_backup in kernel/bellman.rs.
+/// Differs only in divisor (prob_sum vs PROB_BASE) and prob_sum==0 guard.
+/// Deduplication via a shared inner-loop helper deferred to a future cleanup.
 #[allow(clippy::too_many_arguments)]
 pub fn bellman_backup_norm(
     value: &Array3<Value>,
@@ -40,6 +46,8 @@ pub fn bellman_backup_norm(
             continue;
         }
 
+        // max accum: MAX_VALUE * PROB_BASE * MAX_OUTCOMES = 65535 * 262144 * 10 ≈ 2^37, << u64::MAX
+        // max prob_sum: PROB_BASE * MAX_OUTCOMES = 2^18 * 10 ≈ 2^22, << u64::MAX
         let mut accum: u64 = 0;
         let mut prob_sum: u64 = 0;
         let mut valid = true;
