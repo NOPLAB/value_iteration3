@@ -5,5 +5,7 @@
 pub mod bitboard;
 pub mod context;
 pub mod kernel;
+pub mod reference;
 
 pub use context::{Budget, MapDims, SolveExtra, SolveStats, Solver, VIContext};
+pub use reference::Reference;
