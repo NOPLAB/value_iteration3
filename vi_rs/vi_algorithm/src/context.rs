@@ -1,7 +1,7 @@
 use ndarray::{Array2, Array3};
 use vi_core::{ActionIdx, Penalty, TransitionModel, Value};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct MapDims {
     pub map_x: u32,
     pub map_y: u32,
@@ -16,11 +16,13 @@ pub struct VIContext {
 }
 
 impl VIContext {
-    /// Clone with a fresh independent `value` table (other fields shared logically by clone).
-    /// Used by benchmarks to run multiple solvers from the same initial state.
+    /// Deep-clones the full context, producing a completely independent
+    /// working state. Used by benchmarks to run multiple solvers from the
+    /// same initial state without aliasing `value`, `penalty`, `goal_mask`,
+    /// or `transitions`.
     pub fn clone_value(&self) -> Self {
         VIContext {
-            dims: self.dims.clone(),
+            dims: self.dims,
             value: self.value.clone(),
             penalty: self.penalty.clone(),
             goal_mask: self.goal_mask.clone(),
@@ -64,8 +66,22 @@ pub struct PyramidLevelStat {
     pub final_delta: Value,
 }
 
+/// Common interface for value-iteration solver variants.
+///
+/// All solvers operate on a shared [`VIContext`], updating `value` in place
+/// while treating `penalty`, `goal_mask`, `transitions`, and `dims` as
+/// read-only inputs.
+///
+/// Implementations should run until convergence (residual <= solver's
+/// configured threshold) OR until the [`Budget`] is exhausted, whichever
+/// comes first. The returned [`SolveStats`] records which condition fired
+/// via `converged`.
 pub trait Solver: Send + Sync {
+    /// Short static identifier used to label benchmark rows
+    /// (e.g. `"reference"`, `"frontier_3d"`, `"pyramid_sweep"`).
     fn name(&self) -> &'static str;
+
+    /// Runs the solver to convergence or until `budget` is exhausted.
     fn run(&self, ctx: &mut VIContext, budget: Budget) -> SolveStats;
 }
 
@@ -91,8 +107,21 @@ mod tests {
     fn clone_value_independence() {
         let ctx = make_test_ctx(3, 3);
         let mut cloned = ctx.clone_value();
+
         cloned.value[[0, 0, 0]] = 42;
-        assert_eq!(ctx.value[[0, 0, 0]], 0, "original must not be affected by mutation of clone");
+        assert_eq!(ctx.value[[0, 0, 0]], 0, "original must not be affected by mutation of clone value");
         assert_eq!(cloned.value[[0, 0, 0]], 42);
+
+        cloned.penalty[[0, 0]] = 99;
+        assert_eq!(ctx.penalty[[0, 0]], 0, "original must not be affected by mutation of clone penalty");
+        assert_eq!(cloned.penalty[[0, 0]], 99);
+
+        cloned.goal_mask[[0, 0, 0]] = true;
+        assert!(!ctx.goal_mask[[0, 0, 0]], "original must not be affected by mutation of clone goal_mask");
+        assert!(cloned.goal_mask[[0, 0, 0]]);
+
+        cloned.transitions.n_outcomes[0][0] = 7;
+        assert_eq!(ctx.transitions.n_outcomes[0][0], 0, "original must not be affected by mutation of clone transitions");
+        assert_eq!(cloned.transitions.n_outcomes[0][0], 7);
     }
 }
