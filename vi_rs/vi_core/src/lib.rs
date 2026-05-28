@@ -11,4 +11,6 @@ pub use cost::cost_of;
 pub use transitions::{PackedTransitions, TransitionModel};
 pub use goal::{GoalSpec, make_goal_mask};
 pub use params::{MAX_VALUE, N_THETA, N_ACTIONS, PROB_BASE,
-                 PENALTY_OBSTACLE, PENALTY_GOAL, STEP_COST};
+                 PENALTY_OBSTACLE, PENALTY_GOAL, STEP_COST,
+                 RESOLUTION_XY_BIT, RESOLUTION_T_BIT,
+                 ACTION_FW, ACTION_ROT};

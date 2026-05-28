@@ -1,1 +1,7 @@
-// Implementation pending — see docs/superpowers/specs/2026-05-22-vi-rs-algorithm-port-design.md
+//! Test and benchmark fixtures: map generation and transition tables.
+
+pub mod maps;
+pub mod transitions;
+
+pub use maps::{GeneratedMap, MapType, generate_map};
+pub use transitions::{TransitionMode, generate_transitions};
