@@ -4,3 +4,26 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+vi_core      = { path = "../vi_core" }
+vi_algorithm = { path = "../vi_algorithm" }
+vi_fixtures  = { path = "../vi_fixtures" }
+criterion    = { workspace = true }
+clap         = { workspace = true }
+ndarray      = { workspace = true }
+
+[[bench]]
+name = "reference"
+harness = false
+
+[[bench]]
+name = "frontier"
+harness = false
+
+[[bench]]
+name = "block_pyramid"
+harness = false
+
+[[bench]]
+name = "bitboard"
+harness = false

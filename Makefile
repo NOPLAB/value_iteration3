@@ -86,6 +86,21 @@ matlab-codegen-build:
 matlab-codegen-clean:
 	rm -rf vi_matlab/artifacts/benchmarks/codegen_build
 
+# ---------- Rust (vi_rs workspace) ----------
+
+.PHONY: rs-test rs-bench rs-bench-summary
+
+rs-test:
+	cd vi_rs && cargo test --workspace
+
+rs-bench:
+	cd vi_rs && cargo bench -p vi_bench
+
+rs-bench-summary:
+	cd vi_rs && cargo run --release -p vi_bench --bin bench_summary -- \
+	    --sizes 8,16,32,64 --types empty,obstacle,sentinel,random \
+	    --markdown --out target/bench_results/summary_$(shell date +%Y%m%d_%H%M%S).csv
+
 # ---------- Clean ----------
 
 clean-edf:
