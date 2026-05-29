@@ -642,6 +642,7 @@ dependencies = [
  "crossbeam-channel",
  "ndarray",
  "proptest",
+ "rayon",
  "thiserror",
  "vi_algorithm",
  "vi_core",

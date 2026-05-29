@@ -8,16 +8,16 @@ KERNEL ?=
 # ---------- Software (driver + host) ----------
 
 driver:
-	$(MAKE) -C driver/uio all
+	$(MAKE) -C vi_fpga/driver/uio all
 
 host: driver
-	$(MAKE) -C host all
+	$(MAKE) -C vi_fpga/host all
 
 test-host:
-	$(MAKE) -C host test-host
+	$(MAKE) -C vi_fpga/host test-host
 
 test-hw:
-	$(MAKE) -C host test-hw
+	$(MAKE) -C vi_fpga/host test-hw
 
 # ---------- FPGA (HLS + Vivado) ----------
 # Pass KERNEL= to select tile or stream, e.g.:
@@ -25,33 +25,33 @@ test-hw:
 #   make bitstream KERNEL=tile
 
 csim:
-	$(MAKE) -C fpga csim $(KERNEL)
+	$(MAKE) -C vi_fpga csim $(KERNEL)
 
 hls:
-	$(MAKE) -C fpga hls $(KERNEL)
+	$(MAKE) -C vi_fpga hls $(KERNEL)
 
 vivado:
-	$(MAKE) -C fpga vivado $(KERNEL)
+	$(MAKE) -C vi_fpga vivado $(KERNEL)
 
 bitstream:
-	$(MAKE) -C fpga bitstream $(KERNEL)
+	$(MAKE) -C vi_fpga bitstream $(KERNEL)
 
 sync-hw-header:
-	$(MAKE) -C driver/uio sync-hw-header KERNEL=$(KERNEL)
+	$(MAKE) -C vi_fpga/driver/uio sync-hw-header KERNEL=$(KERNEL)
 
 # ---------- EDF / Linux (Docker) ----------
 
 edf-docker:
-	$(MAKE) -C petalinux docker-build
+	$(MAKE) -C vi_fpga/petalinux docker-build
 
 edf-shell:
-	$(MAKE) -C petalinux docker-shell
+	$(MAKE) -C vi_fpga/petalinux docker-shell
 
 edf-setup:
-	$(MAKE) -C petalinux edf-setup XSA=$(XSA)
+	$(MAKE) -C vi_fpga/petalinux edf-setup XSA=$(XSA)
 
 edf-build:
-	$(MAKE) -C petalinux edf-build MACHINE=$(MACHINE)
+	$(MAKE) -C vi_fpga/petalinux edf-build MACHINE=$(MACHINE)
 
 # ---------- MATLAB (HDL Coder) ----------
 
@@ -68,7 +68,7 @@ matlab-cosim:
 	cd vi_matlab && matlab -batch "setup_matlab_paths('validation','tests'); cosim_tb"
 
 matlab-bitstream: matlab-hdl
-	vivado -mode batch -source "fpga/tcl/build_vivado.tcl" -tclargs matlab "fpga/build"
+	vivado -mode batch -source "vi_fpga/tcl/build_vivado.tcl" -tclargs matlab "vi_fpga/build"
 
 matlab-bench:
 	cd vi_matlab && matlab -batch "setup_matlab_paths('src','tests','bench'); benchmark_vi"
@@ -109,14 +109,14 @@ rs-bench-parallel:
 # ---------- Clean ----------
 
 clean-edf:
-	$(MAKE) -C petalinux clean
+	$(MAKE) -C vi_fpga/petalinux clean
 
 clean-fpga:
-	$(MAKE) -C fpga clean
+	$(MAKE) -C vi_fpga clean
 
 clean:
-	$(MAKE) -C driver/uio clean
-	$(MAKE) -C host clean
+	$(MAKE) -C vi_fpga/driver/uio clean
+	$(MAKE) -C vi_fpga/host clean
 
 # ----- vi_ros2 (ROS2 Humble + ros2_rust) ------------------------------
 
