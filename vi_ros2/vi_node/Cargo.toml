@@ -37,6 +37,10 @@ nav_msgs      = "0.4"
 geometry_msgs = "0.4"
 vi_interfaces = "0.1"
 
+# tokio is used directly by the action-server callback (spawn_blocking, time::interval).
+# rclrs uses tokio internally but does not re-export it.
+tokio = { version = "1", features = ["rt", "time"] }
+
 # Optional: rayon thread-pool for parallel VI sweeps.
 rayon = { version = "1.10", optional = true }
 

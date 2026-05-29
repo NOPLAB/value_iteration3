@@ -454,22 +454,15 @@ fn wait_for_map(
     let (tx, rx) = sync_channel::<nav_msgs::msg::OccupancyGrid>(1);
     let tx_c = tx.clone();
 
-    // Transient_local QoS: matches the map_server default.
-    let qos = QoSProfile::topics_default()
-        .reliable()
-        .transient_local()
-        .keep_last(1);
-
     // TODO(Task 11): verify exact subscription creation signature.
     // The upstream `node.create_subscription` takes:
     //   (options: impl Into<SubscriptionOptions>, callback: impl Callback)
-    // where a bare `&str` satisfies `Into<SubscriptionOptions>` with default QoS,
-    // and `("topic", qos)` may or may not work depending on which
-    // `IntoPrimitiveOptions` impls are active. If it doesn't compile, use:
-    //   SubscriptionOptions::new("map").transient_local().reliable().keep_last(1)
-    // (upstream SubscriptionOptions has no builder-style methods directly, but
-    // IntoPrimitiveOptions / IntoPrimitiveQosOptions may provide them via `.transient_local()`
-    // on the &str — upstream subscription.rs line 916 shows `"my_topic".transient_local()`).
+    // where a bare `&str` satisfies `Into<SubscriptionOptions>` with default QoS.
+    // IntoPrimitiveOptions on `&str` adds `.transient_local()`, `.reliable()`,
+    // `.keep_last(n)` builder methods — upstream subscription.rs line 916 shows
+    // `"my_topic".transient_local()`.
+    // If that doesn't compile, construct QoSProfile explicitly and pass via
+    // SubscriptionOptions: `SubscriptionOptions { topic: "map", qos: <profile> }`.
     let _sub = node.create_subscription::<nav_msgs::msg::OccupancyGrid, _>(
         "map".transient_local().reliable().keep_last(1),
         move |msg: nav_msgs::msg::OccupancyGrid| {
