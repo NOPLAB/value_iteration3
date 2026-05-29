@@ -117,3 +117,32 @@ clean-fpga:
 clean:
 	$(MAKE) -C driver/uio clean
 	$(MAKE) -C host clean
+
+# ----- vi_ros2 (ROS2 Humble + ros2_rust) ------------------------------
+
+VI_ROS2_DOCKER_IMG ?= vi_ros2_dev:humble
+
+ros2-docker:
+	docker build -t $(VI_ROS2_DOCKER_IMG) vi_ros2/docker
+
+ros2-shell:
+	docker run --rm -it \
+	  -v $(PWD):/workspace \
+	  -w /workspace \
+	  $(VI_ROS2_DOCKER_IMG)
+
+ros2-build:
+	docker run --rm \
+	  -v $(PWD):/workspace \
+	  -w /workspace \
+	  $(VI_ROS2_DOCKER_IMG) \
+	  bash scripts/ros2_build.sh
+
+ros2-test:
+	docker run --rm \
+	  -v $(PWD):/workspace \
+	  -w /workspace \
+	  $(VI_ROS2_DOCKER_IMG) \
+	  bash scripts/ros2_test.sh
+
+.PHONY: ros2-docker ros2-shell ros2-build ros2-test
