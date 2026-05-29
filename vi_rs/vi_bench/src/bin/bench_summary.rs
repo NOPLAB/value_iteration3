@@ -193,7 +193,12 @@ fn build_solver_registry(max_sweeps: u32, max_iters: u32) -> Vec<SolverEntry> {
                 min_size: 4,
                 coarse_sweeps: 8,
                 refine_sweeps: pyramid_refine_sweeps,
-                descend_tau: 1,
+                // descend_tau MUST be 0 for the exact-oracle gate: a nonzero tau
+                // prunes cells whose per-sweep delta <= tau from the descent, so the
+                // finest level's active mask would miss reachable cells (they'd keep
+                // the pessimistic MAX seed) and mismatch Reference. With tau=0 every
+                // changed cell descends, guaranteeing full finest-level coverage.
+                descend_tau: 0,
             }),
             budget: sweeps,
         },

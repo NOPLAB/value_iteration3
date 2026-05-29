@@ -39,7 +39,10 @@ fn bench_block_pyramid(c: &mut Criterion) {
         min_size: 4,
         coarse_sweeps: 8,
         refine_sweeps: 50,
-        descend_tau: 1,
+        // descend_tau=0 to time the *exact* configuration (matches bench_summary
+        // and the parity tests); a nonzero tau would benchmark a faster but
+        // non-bit-exact variant.
+        descend_tau: 0,
     });
 }
 

@@ -971,6 +971,7 @@ dependencies = [
  "proptest",
  "rayon",
  "vi_core",
+ "vi_fixtures",
 ]
 
 [[package]]

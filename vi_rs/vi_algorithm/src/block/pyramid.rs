@@ -112,8 +112,21 @@ impl Solver for PyramidSweep {
 
         // Descend from coarsest (n_levels-1) to finest (0).
         for li in (0..n_levels).rev() {
-            // Prolongate value from coarser level if this is not the coarsest.
-            if li < n_levels - 1 {
+            // Prolongate value from the coarser level for *intermediate* levels only.
+            //
+            // WHY skip the finest level (li == 0): the probabilistic Bellman backup
+            // averages multi-outcome neighbor costs and floors the result
+            // (`accum / PROB_BASE`), so its fixed point is NOT unique — value
+            // iteration from an under-estimate converges to a fixed point up to 1
+            // below the one reached from above. Reference (and every other exact
+            // solver) starts from the original pessimistic seed and converges from
+            // above to the true V*. Prolongation hands the finest level an
+            // *optimistic* (under-estimate) seed, which would land it on the lower
+            // fixed point and break bit-exactness by ±1. Leaving `values[0]` at the
+            // original seed makes the finest level converge from above, exactly like
+            // Reference. The coarse descent still does its job: it builds the active
+            // mask (which cells to sweep), which is all the finest level needs.
+            if li > 0 && li < n_levels - 1 {
                 let coarser = li + 1;
                 let fine_val = prolongate_level(
                     &values[coarser],
@@ -581,7 +594,6 @@ mod tests {
     use crate::context::{Budget, SolveExtra};
     use crate::frontier::test_helpers::{empty_5x5_ctx, empty_3x3_ctx};
     use crate::reference::Reference;
-    use vi_core::MAX_VALUE;
 
     #[test]
     fn parity_pyramid_empty_5x5() {
@@ -602,24 +614,13 @@ mod tests {
             descend_tau: 0,
         }.run(&mut ctx_pyr, Budget::Sweeps(100));
 
-        // Compare reachable cells (cells that Reference solved < MAX_VALUE).
-        // PyramidSweep may leave unreachable cells at a different but still MAX_VALUE-or-above value,
-        // so we compare only where Reference produced a real answer.
-        let mean_abs_diff: f64 = {
-            let count = 5 * 5 * N_THETA;
-            ctx_ref.value.indexed_iter()
-                .map(|((iy, ix, it), &rv)| {
-                    let pv = ctx_pyr.value[[iy, ix, it]];
-                    if rv == MAX_VALUE && pv == MAX_VALUE { 0.0 }
-                    else { (rv as i32 - pv as i32).abs() as f64 }
-                })
-                .sum::<f64>() / count as f64
-        };
-
-        assert!(
-            mean_abs_diff < 5.0,
-            "PyramidSweep mean_abs_diff vs Reference = {} (expected < 5.0)",
-            mean_abs_diff
+        // Spec §7.2: exact variants must match Reference on every cell. With
+        // descend_tau=0 the finest level sweeps every reachable cell from the
+        // original (pessimistic) seed, converging from above exactly like
+        // Reference. Unreachable cells stay MAX_VALUE in both.
+        assert_eq!(
+            ctx_pyr.value, ctx_ref.value,
+            "PyramidSweep must be bit-exact with Reference on empty 5x5"
         );
     }
 
