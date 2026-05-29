@@ -45,9 +45,10 @@ tokio = { version = "1", features = ["rt", "time"] }
 rayon = { version = "1.10", optional = true }
 
 [features]
-default  = ["parallel"]
-online   = []
-parallel = ["vi_algorithm/parallel", "dep:rayon"]
+default     = ["parallel"]
+online      = []
+parallel    = ["vi_algorithm/parallel", "dep:rayon"]
+integration = []
 
 [dev-dependencies]
 proptest = "1"

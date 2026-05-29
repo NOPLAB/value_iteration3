@@ -16,5 +16,6 @@
 
   <export>
     <build_type>ament_cargo</build_type>
+    <install>launch</install>
   </export>
 </package>
