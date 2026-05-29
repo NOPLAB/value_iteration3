@@ -6,8 +6,11 @@
 //! and constructing these views. Keeping this module ROS-free means
 //! `cargo test -p vi_node --lib` runs without ROS installed.
 
-use ndarray::Array2;
-use vi_core::{Penalty, PENALTY_OBSTACLE};
+use ndarray::{Array2, ArrayView3};
+use vi_core::{
+    ActionIdx, GoalSpec, Penalty, Value,
+    MAX_VALUE, N_ACTIONS, PENALTY_OBSTACLE,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct OccupancyGridView<'a> {
@@ -93,6 +96,82 @@ pub fn occupancy_to_penalty(
     p
 }
 
+/// `PoseStamped` → `GoalSpec`. `yaw_rad` is wrapped into `[0, 360)` deg.
+/// `goal_x` / `goal_y` come from the pose directly (not cell-indexed —
+/// `make_goal_mask` does the cell math).
+pub fn pose_to_goal_spec(
+    pose: &PoseView,
+    grid: &OccupancyGridView,
+    goal_radius_m: f64,
+    goal_margin_theta_deg: f64,
+) -> GoalSpec {
+    let mut deg = pose.yaw_rad.to_degrees();
+    deg = ((deg % 360.0) + 360.0) % 360.0;
+    GoalSpec {
+        xy_resolution: grid.resolution,
+        map_origin_x: grid.origin_x,
+        map_origin_y: grid.origin_y,
+        goal_x: pose.x,
+        goal_y: pose.y,
+        goal_theta_deg: deg,
+        goal_radius_m,
+        goal_margin_theta_deg,
+    }
+}
+
+/// Value slice → OccupancyGrid `data[]` (length `width*height`).
+///
+/// - `MAX_VALUE` (unreachable) → `-1` (unknown).
+/// - 0 → 0 (free).
+/// - Otherwise linearly mapped 0..=`threshold_value` → 0..=100, clamped.
+///
+/// `threshold_value` should be the value at which "cost is too high to draw
+/// a meaningful gradient" — value_iteration uses `cost_drawing_threshold`
+/// in u64-PROB_BASE space; here it is already in `Value` (u16) space.
+pub fn value_slice_to_occupancy(
+    value: ArrayView3<Value>,
+    theta_idx: usize,
+    threshold_value: Value,
+) -> Vec<i8> {
+    let h = value.shape()[0];
+    let w = value.shape()[1];
+    let mut out = vec![0i8; w * h];
+    let denom = threshold_value as u32;
+    for iy in 0..h {
+        for ix in 0..w {
+            let v = value[[iy, ix, theta_idx]];
+            out[iy * w + ix] = if v == MAX_VALUE {
+                -1
+            } else if denom == 0 {
+                if v == 0 { 0 } else { 100 }
+            } else {
+                let scaled = (v as u32 * 100) / denom;
+                if scaled >= 100 { 100 } else { scaled as i8 }
+            };
+        }
+    }
+    out
+}
+
+/// Optimal-action slice (theta_idx) → OccupancyGrid `data[]`.
+/// Action ids `0..N_ACTIONS` map to evenly spaced 0..100 buckets.
+pub fn action_table_to_occupancy(
+    actions: ArrayView3<ActionIdx>,
+    theta_idx: usize,
+) -> Vec<i8> {
+    let h = actions.shape()[0];
+    let w = actions.shape()[1];
+    let mut out = vec![0i8; w * h];
+    let step = 100 / N_ACTIONS as i32;
+    for iy in 0..h {
+        for ix in 0..w {
+            let a = actions[[iy, ix, theta_idx]] as i32;
+            out[iy * w + ix] = (a * step).min(100) as i8;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +240,56 @@ mod tests {
         // Distance-2 cells stay 0.
         assert_eq!(p[[0, 0]], 0);
         assert_eq!(p[[4, 4]], 0);
+    }
+
+    use ndarray::Array3;
+    use vi_core::params::N_THETA;
+
+    #[test]
+    fn yaw_wraps_into_zero_to_360() {
+        let g = OccupancyGridView { width:1,height:1,resolution:0.05,origin_x:0.0,origin_y:0.0, data: &[0i8] };
+        let p = PoseView { x:0.0, y:0.0, yaw_rad: -std::f64::consts::FRAC_PI_2 };
+        let spec = pose_to_goal_spec(&p, &g, 0.1, 15.0);
+        assert!((spec.goal_theta_deg - 270.0).abs() < 1e-9, "got {}", spec.goal_theta_deg);
+    }
+
+    #[test]
+    fn yaw_positive_quarter() {
+        let g = OccupancyGridView { width:1,height:1,resolution:0.05,origin_x:0.0,origin_y:0.0, data: &[0i8] };
+        let p = PoseView { x:0.0, y:0.0, yaw_rad: std::f64::consts::FRAC_PI_2 };
+        let spec = pose_to_goal_spec(&p, &g, 0.1, 15.0);
+        assert!((spec.goal_theta_deg - 90.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn value_max_renders_as_minus_one() {
+        let mut v = Array3::<Value>::zeros((1, 1, N_THETA));
+        v[[0, 0, 0]] = MAX_VALUE;
+        let d = value_slice_to_occupancy(v.view(), 0, 1000);
+        assert_eq!(d[0], -1);
+    }
+
+    #[test]
+    fn value_zero_renders_zero() {
+        let v = Array3::<Value>::zeros((2, 3, N_THETA));
+        let d = value_slice_to_occupancy(v.view(), 0, 1000);
+        assert!(d.iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn value_above_threshold_clamps_to_100() {
+        let mut v = Array3::<Value>::zeros((1, 1, N_THETA));
+        v[[0, 0, 0]] = 5000;
+        let d = value_slice_to_occupancy(v.view(), 0, 1000);
+        assert_eq!(d[0], 100);
+    }
+
+    #[test]
+    fn action_table_maps_to_evenly_spaced_buckets() {
+        let mut a = Array3::<ActionIdx>::zeros((1, N_ACTIONS, N_THETA));
+        for i in 0..N_ACTIONS { a[[0, i, 0]] = i as ActionIdx; }
+        let d = action_table_to_occupancy(a.view(), 0);
+        assert_eq!(d[0], 0);
+        assert_eq!(d[5], (5 * (100 / N_ACTIONS as i32)) as i8);
     }
 }
