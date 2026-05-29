@@ -28,18 +28,22 @@ vi_core      = { path = "../../vi_rs/vi_core" }
 vi_algorithm = { path = "../../vi_rs/vi_algorithm" }
 vi_fixtures  = { path = "../../vi_rs/vi_fixtures" }
 
-# ROS deps — wired in Task 11 once the Docker image exposes rclrs via colcon.
-# Until then we keep main.rs ROS-free so `cargo check` works on the host.
-# rclrs         = { version = "0.4" }
-# std_msgs      = { version = "0.4" }
-# nav_msgs      = { version = "0.4" }
-# geometry_msgs = { version = "0.4" }
-# vi_interfaces = { version = "0.1" }
+# ROS deps — these versions are best-guess for rclrs Humble in the Docker image.
+# The exact versions provided by `colcon` in the Docker container (Task 11) may
+# differ; update after `make ros2-build` reports the actual resolved versions.
+rclrs         = "0.4"
+std_msgs      = "0.4"
+nav_msgs      = "0.4"
+geometry_msgs = "0.4"
+vi_interfaces = "0.1"
+
+# Optional: rayon thread-pool for parallel VI sweeps.
+rayon = { version = "1.10", optional = true }
 
 [features]
 default  = ["parallel"]
 online   = []
-parallel = ["vi_algorithm/parallel"]
+parallel = ["vi_algorithm/parallel", "dep:rayon"]
 
 [dev-dependencies]
 proptest = "1"
