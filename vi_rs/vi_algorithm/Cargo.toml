@@ -7,6 +7,11 @@ rust-version.workspace = true
 [dependencies]
 vi_core = { path = "../vi_core" }
 ndarray = { workspace = true }
+rayon   = { workspace = true, optional = true }
+
+[features]
+default = []
+parallel = ["dep:rayon"]
 
 [dev-dependencies]
 proptest = { workspace = true }

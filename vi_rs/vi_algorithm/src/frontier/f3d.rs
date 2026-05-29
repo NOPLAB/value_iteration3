@@ -1,8 +1,9 @@
 //! Frontier-VI with a 3D (x, y, theta) bitboard.
 //!
 //! Mirrors `vi_matlab/src/cpu/frontier/vi_frontier_3d.m`.
-//! Bit-exact with Reference: converged value table matches byte-for-byte.
-//! See spec §4.2, §4.8.
+//! Bit-exact with Reference: converged value table matches byte-for-byte
+//! (serial path only; see [`Frontier3D::run_parallel`] for the Jacobi variant).
+//! See spec §4.2, §4.7, §4.8.
 
 use vi_core::N_THETA;
 
@@ -23,6 +24,55 @@ impl Solver for Frontier3D {
 
     fn run(&self, ctx: &mut VIContext, budget: Budget) -> SolveStats {
         let max_iter = max_iters(budget);
+
+        #[cfg(not(feature = "parallel"))]
+        let (iters, updates, converged) = self.run_serial_inner(ctx, max_iter);
+
+        #[cfg(feature = "parallel")]
+        let (iters, updates, converged) = self.run_parallel(ctx, max_iter);
+
+        SolveStats {
+            iters_or_sweeps: iters,
+            updates,
+            // WHY: Frontier solvers do not compute a residual per iteration;
+            // convergence is signalled by "frontier empty". final_delta=0 per spec §4.8.
+            final_delta: 0,
+            converged,
+            extra: None,
+        }
+    }
+}
+
+impl Frontier3D {
+    /// Public serial entry-point. Mirrors [`Solver::run`] but is guaranteed to
+    /// run the Gauss-Seidel serial frontier iteration regardless of whether
+    /// the crate was compiled with `--features parallel`. Used by
+    /// `bench_summary --parallel` to compare serial vs parallel timings in the
+    /// same process.
+    pub fn run_serial(&self, ctx: &mut VIContext, budget: Budget) -> SolveStats {
+        let max_iter = max_iters(budget);
+        let (iters, updates, converged) = self.run_serial_inner(ctx, max_iter);
+        SolveStats {
+            iters_or_sweeps: iters,
+            updates,
+            final_delta: 0,
+            converged,
+            extra: None,
+        }
+    }
+
+    /// Serial Gauss-Seidel frontier iteration. Bit-exact with MATLAB
+    /// `vi_frontier_3d.m`: per iteration, the candidate set is enumerated and
+    /// each Bellman backup is written in-place into `ctx.value`, so backups
+    /// later in the same iteration may read newly-updated neighbours.
+    ///
+    /// Returns `(iters_run, updates, converged)`. Internal helper — the public
+    /// [`Self::run_serial`] wraps this with the `SolveStats` packaging.
+    pub(crate) fn run_serial_inner(
+        &self,
+        ctx: &mut VIContext,
+        max_iter: u32,
+    ) -> (u32, u64, bool) {
         let map_x = ctx.dims.map_x;
         let map_y = ctx.dims.map_y;
 
@@ -84,16 +134,101 @@ impl Solver for Frontier3D {
         }
 
         let converged = frontier.popcount() == 0;
+        (iters, updates, converged)
+    }
 
-        SolveStats {
-            iters_or_sweeps: iters,
-            updates,
-            // WHY: Frontier solvers do not compute a residual per iteration;
-            // convergence is signalled by "frontier empty". final_delta=0 per spec §4.8.
-            final_delta: 0,
-            converged,
-            extra: None,
+    /// Jacobi-style frontier iteration parallelised with rayon. Spec §4.7:
+    /// the per-cell Bellman backups in one iteration all read from the
+    /// pre-iteration snapshot (`ctx.value` is treated as immutable during the
+    /// parallel pass), then writes and the new frontier are reduced
+    /// sequentially. The fixed point is identical to the serial path; only
+    /// `iters_or_sweeps` and `updates` may differ. Bit-exact MATLAB parity is
+    /// preserved by the serial path only.
+    ///
+    /// Returns `(iters_run, updates, converged)`.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn run_parallel(
+        &self,
+        ctx: &mut VIContext,
+        max_iter: u32,
+    ) -> (u32, u64, bool) {
+        use rayon::prelude::*;
+
+        let map_x = ctx.dims.map_x;
+        let map_y = ctx.dims.map_y;
+
+        let (mx, my, mt) = ctx.transitions.max_displacement();
+        let mx = mx as u32;
+        let my = my as u32;
+        let mt = mt as u32;
+
+        // Pin goal cells to 0 BEFORE building the frontier seed so that
+        // goal cells (value drops to 0 < MAX_VALUE) are included, and so the
+        // Jacobi snapshot already contains 0 at goal cells on the first
+        // iteration (matching the serial path's pre-loop pin).
+        pin_goals(&mut ctx.value, &ctx.goal_mask);
+
+        let passable_2d = build_passable_bb_2d(&ctx.penalty);
+        let passable_bb = build_passable_bb_3d(&passable_2d, N_THETA as u32);
+
+        let goal_bb = Bitboard3D::from_logical(ctx.goal_mask.view());
+        let not_goal_bb = goal_bb.complement();
+
+        let mut frontier = build_value_seed_3d(&ctx.value);
+
+        let mut updates: u64 = 0;
+        let mut iters: u32 = 0;
+
+        while frontier.popcount() > 0 && iters < max_iter {
+            iters += 1;
+
+            // Expand frontier → candidate set.
+            let mut candidates = frontier.dilate(mx, my, mt);
+            candidates.and_inplace(&passable_bb);
+            candidates.and_inplace(&not_goal_bb);
+
+            // Collect candidate cells; the Bellman backups below all read
+            // from `ctx.value` as an immutable snapshot (Jacobi within an
+            // iteration), so we can fan them out across rayon workers and
+            // apply writes sequentially after the parallel pass.
+            let mut cells: Vec<(u32, u32, u32)> = Vec::with_capacity(candidates.popcount() as usize);
+            cells.extend(candidates.enumerate());
+
+            let prev = &ctx.value;
+            let penalty = &ctx.penalty;
+            let transitions = &ctx.transitions;
+
+            // Per-cell result: (ix, iy, it, new_val), kept only when the new
+            // value strictly improves the existing one.
+            let results: Vec<(u32, u32, u32, vi_core::Value)> = cells
+                .par_iter()
+                .filter_map(|&(ix, iy, it)| {
+                    let old = prev[[iy as usize, ix as usize, it as usize]];
+                    let new_val = bellman_backup(
+                        prev, penalty, transitions,
+                        ix, iy, it, map_x, map_y,
+                    );
+                    if new_val < old {
+                        Some((ix, iy, it, new_val))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Sequential apply: write back to ctx.value, build new frontier,
+            // and fold the updates count.
+            let mut new_frontier = Bitboard3D::new(map_x, map_y, N_THETA as u32);
+            for &(ix, iy, it, new_val) in &results {
+                ctx.value[[iy as usize, ix as usize, it as usize]] = new_val;
+                new_frontier.set(ix, iy, it);
+            }
+            updates += results.len() as u64;
+            frontier = new_frontier;
         }
+
+        let converged = frontier.popcount() == 0;
+        (iters, updates, converged)
     }
 }
 
@@ -208,5 +343,92 @@ mod tests {
         let stats = Frontier3D.run(&mut ctx, Budget::Iterations(100));
         assert_eq!(stats.final_delta, 0, "Frontier3D always returns final_delta=0");
         assert!(stats.extra.is_none());
+    }
+}
+
+#[cfg(all(test, feature = "parallel"))]
+mod parallel_tests {
+    use super::*;
+    use crate::context::Budget;
+    use crate::reference::Reference;
+    use super::super::test_helpers::{
+        empty_3x3_ctx, empty_5x5_ctx, obstacle_3x3_ctx, sentinel_3x3_ctx,
+    };
+
+    /// Parallel (Jacobi) and serial (Gauss-Seidel) Frontier3D iterations
+    /// converge to the same fixed point as Reference, even though they may
+    /// take a different number of iterations to get there. Spec §4.7.
+    #[test]
+    fn parallel_frontier3d_parity_empty_5x5() {
+        let mut ctx_ref = empty_5x5_ctx();
+        let mut ctx_par = ctx_ref.clone_value();
+
+        let ref_stats = Reference { threshold: 0 }.run(&mut ctx_ref, Budget::Sweeps(100));
+        assert!(ref_stats.converged, "Reference must converge for parity test to be valid");
+
+        let stats = Frontier3D.run(&mut ctx_par, Budget::Iterations(300));
+        assert!(stats.converged, "parallel Frontier3D must converge");
+
+        assert_eq!(
+            ctx_ref.value, ctx_par.value,
+            "parallel Frontier3D must converge to the same value table as Reference (5x5)"
+        );
+    }
+
+    #[test]
+    fn parallel_frontier3d_parity_obstacle_3x3() {
+        let mut ctx_ref = obstacle_3x3_ctx();
+        let mut ctx_par = ctx_ref.clone_value();
+
+        let ref_stats = Reference { threshold: 0 }.run(&mut ctx_ref, Budget::Sweeps(50));
+        assert!(ref_stats.converged, "Reference must converge");
+
+        let stats = Frontier3D.run(&mut ctx_par, Budget::Iterations(200));
+        assert!(stats.converged, "parallel Frontier3D must converge");
+
+        assert_eq!(
+            ctx_ref.value, ctx_par.value,
+            "parallel Frontier3D must match Reference on obstacle_3x3"
+        );
+    }
+
+    #[test]
+    fn parallel_frontier3d_parity_sentinel_3x3() {
+        let mut ctx_ref = sentinel_3x3_ctx();
+        let mut ctx_par = ctx_ref.clone_value();
+
+        let ref_stats = Reference { threshold: 0 }.run(&mut ctx_ref, Budget::Sweeps(50));
+        assert!(ref_stats.converged, "Reference must converge");
+
+        let stats = Frontier3D.run(&mut ctx_par, Budget::Iterations(200));
+        assert!(stats.converged, "parallel Frontier3D must converge");
+
+        assert_eq!(
+            ctx_ref.value, ctx_par.value,
+            "parallel Frontier3D must match Reference on sentinel_3x3"
+        );
+    }
+
+    /// Serial and parallel Frontier3D from identical contexts must produce
+    /// identical converged value tables (the fixed-point cross-check).
+    #[test]
+    fn parallel_matches_serial_frontier3d_empty_5x5() {
+        let mut ctx_serial = empty_5x5_ctx();
+        let mut ctx_par = ctx_serial.clone_value();
+
+        Frontier3D.run_serial_inner(&mut ctx_serial, 300);
+        Frontier3D.run_parallel(&mut ctx_par, 300);
+
+        assert_eq!(
+            ctx_serial.value, ctx_par.value,
+            "serial and parallel Frontier3D must converge to the same value table"
+        );
+    }
+
+    #[test]
+    fn parallel_frontier3d_pins_goal_3x3() {
+        let mut ctx = empty_3x3_ctx();
+        Frontier3D.run(&mut ctx, Budget::Iterations(100));
+        assert_eq!(ctx.value[[1, 1, 0]], 0, "goal cell must be pinned to 0 in parallel path");
     }
 }

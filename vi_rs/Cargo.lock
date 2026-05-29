@@ -969,6 +969,7 @@ version = "0.1.0"
 dependencies = [
  "ndarray",
  "proptest",
+ "rayon",
  "vi_core",
 ]
 

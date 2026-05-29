@@ -12,6 +12,10 @@ criterion    = { workspace = true }
 clap         = { workspace = true }
 ndarray      = { workspace = true }
 
+[features]
+default = []
+parallel = ["vi_algorithm/parallel"]
+
 [[bench]]
 name = "reference"
 harness = false
