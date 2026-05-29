@@ -7,3 +7,4 @@
 //! It will be added once the StreamMimic solver lands.
 
 pub mod fixtures;
+pub mod pgm;
