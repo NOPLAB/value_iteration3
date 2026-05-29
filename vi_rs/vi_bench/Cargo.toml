@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "bitboard"
 harness = false
+
+[[bench]]
+name = "stream_mimic"
+harness = false

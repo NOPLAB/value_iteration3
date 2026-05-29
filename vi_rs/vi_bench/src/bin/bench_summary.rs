@@ -29,7 +29,7 @@ use ndarray::{Array3, Zip};
 use vi_algorithm::context::{Budget, Solver, VIContext};
 use vi_algorithm::{
     BlockRefine, Frontier2D, Frontier3D, Frontier3DCoarseTheta, Frontier3DTau, Frontier3DTopK,
-    FrontierStack, PyramidSweep, Reference,
+    FrontierStack, PyramidSweep, Reference, StreamMimic,
 };
 use vi_bench::fixtures::build_context;
 use vi_core::params::MAX_OUTCOMES;
@@ -52,6 +52,12 @@ const EXACT_SOLVERS: &[&str] = &[
     "frontier_stack",
     "block_refine",
     "pyramid_sweep",
+    // StreamMimic is documented as "not required to be bit-exact" (spec §4.8),
+    // but in practice the (CU, strip, Y, X) scan order is just another
+    // Gauss-Seidel ordering — at the fixed point with threshold=0 it must
+    // equal Reference. If a real bench ever flags a mismatch, that's the
+    // signal to investigate.
+    "stream_mimic",
 ];
 
 /// Solvers that currently have an explicit parallel path. When the binary is
@@ -191,6 +197,7 @@ fn build_solver_registry(max_sweeps: u32, max_iters: u32) -> Vec<SolverEntry> {
             }),
             budget: sweeps,
         },
+        SolverEntry { boxed: Box::new(StreamMimic { threshold: 0 }), budget: sweeps },
     ]
 }
 

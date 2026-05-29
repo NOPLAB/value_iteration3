@@ -8,8 +8,10 @@ pub mod context;
 pub mod frontier;
 pub mod kernel;
 pub mod reference;
+pub mod stream;
 
 pub use block::{BlockRefine, PyramidSweep};
 pub use context::{Budget, MapDims, SolveExtra, SolveStats, Solver, VIContext};
 pub use frontier::{Frontier2D, Frontier3D, Frontier3DCoarseTheta, Frontier3DTau, Frontier3DTopK, FrontierStack};
 pub use reference::Reference;
+pub use stream::StreamMimic;
