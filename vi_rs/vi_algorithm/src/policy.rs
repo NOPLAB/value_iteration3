@@ -19,6 +19,9 @@ pub fn optimal_action_at(ctx: &VIContext, ix: i32, iy: i32, it: usize) -> Action
     if ix < 0 || iy < 0 || ix >= map_x as i32 || iy >= map_y as i32 {
         return 0;
     }
+    if it >= vi_core::N_THETA {
+        return 0;
+    }
     let ix_u = ix as u32;
     let iy_u = iy as u32;
     if ctx.penalty[[iy as usize, ix as usize]] == PENALTY_OBSTACLE {
@@ -42,6 +45,8 @@ pub fn optimal_action_at(ctx: &VIContext, ix: i32, iy: i32, it: usize) -> Action
     best_act
 }
 
+// NOTE: near-duplicate of action_table::action_cost and bellman_backup's
+// inner loop; deduplication deferred (YAGNI). Update all three in lockstep.
 #[allow(clippy::too_many_arguments)]
 fn action_cost_single(
     value: &Array3<Value>,
@@ -110,6 +115,7 @@ mod tests {
         assert_eq!(optimal_action_at(&ctx, -1, 0, 0), 0);
         assert_eq!(optimal_action_at(&ctx, 0, -1, 0), 0);
         assert_eq!(optimal_action_at(&ctx, 100, 0, 0), 0);
+        assert_eq!(optimal_action_at(&ctx, 0, 0, N_THETA), 0);
     }
 
     #[test]
@@ -123,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn agrees_with_reference_action_table_on_random_cell() {
+    fn agrees_with_reference_action_table() {
         use crate::reference::Reference;
         use crate::context::{Budget, Solver, SolveExtra};
         let mut ctx = small_ctx();
@@ -138,9 +144,34 @@ mod tests {
             Some(SolveExtra::ActionTable(t)) => t,
             _ => panic!("expected ActionTable"),
         };
-        let (iy, ix, it) = (1usize, 1usize, 0usize);
-        let expected = at[[iy, ix, it]];
-        let actual = optimal_action_at(&ctx, ix as i32, iy as i32, it);
-        assert_eq!(actual, expected, "policy::optimal_action_at must match the reference action table");
+        for iy in 0..ctx.dims.map_y as usize {
+            for ix in 0..ctx.dims.map_x as usize {
+                for it in 0..N_THETA {
+                    let expected = at[[iy, ix, it]];
+                    let actual = optimal_action_at(&ctx, ix as i32, iy as i32, it);
+                    assert_eq!(actual, expected,
+                        "divergence at iy={iy}, ix={ix}, it={it}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fully_blocked_cell_returns_zero() {
+        // Free cell at (1, 1) surrounded by obstacles on every chessboard
+        // neighbour. Every action's neighbour transition is OOB-or-obstacle,
+        // so optimal_action_at should fall back to action 0.
+        let mut ctx = small_ctx();
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 { continue; }
+                let nx = (1 + dx) as usize;
+                let ny = (1 + dy) as usize;
+                if nx < 8 && ny < 8 {
+                    ctx.penalty[[ny, nx]] = vi_core::PENALTY_OBSTACLE;
+                }
+            }
+        }
+        assert_eq!(optimal_action_at(&ctx, 1, 1, 0), 0);
     }
 }
