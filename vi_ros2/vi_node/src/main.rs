@@ -727,44 +727,185 @@ fn spawn_action_server(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// spawn_value_function_publisher — Task 10 stub
+// spawn_value_function_publisher — 1 Hz OccupancyGrid publisher (Task 10)
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Publish `value_function` and `policy` OccupancyGrids at 1 Hz.
 ///
-/// **Task 10 fills this in.** The stub returns Ok(()) without creating any
-/// publishers so Task 9 compiles (with ROS deps uncommented in Docker).
+/// `value_function` publishes a theta=0 slice of the current value array as
+/// a signed-byte OccupancyGrid (0–100 scaled to `threshold`, -1 = unreachable).
 ///
-/// TODO(Task 10): implement using `node.create_publisher` and
-/// `node.create_timer_repeating`; request ValueSlice via `WorkerRequest::ValueSlice`.
-#[allow(unused_variables)]
+/// `policy` publishes a placeholder grid of all -1 (unknown) until the worker
+/// exposes the latest ActionTable. See spec §8 open items — wiring it to
+/// `WorkerRequest::ActionTableSlice` is left as a follow-up.
+///
+/// # API notes (TODO(Task 11))
+/// - `node.create_publisher::<T>(topic, qos)` — signature matches upstream
+///   node.rs but may vary; adjust if `CreatePublisher` trait or options struct
+///   is required.
+/// - `node.create_wall_timer(duration, callback)` — returns a guard handle.
+///   The handle is discarded here (dropped at function exit). If the timer
+///   requires the guard to be live, return it from this function and bind it
+///   with a leading `_` in main(). See TODO(Task 11) comment inside.
+/// - `node.get_clock().now().to_msg()` — unverified. Fallback: build
+///   `builtin_interfaces::msg::Time` directly from `std::time::SystemTime`.
+/// - `pub.publish(&msg)` — rclrs may require by-value; flip to `pub.publish(msg)`
+///   if `&msg` fails to compile.
 fn spawn_value_function_publisher(
     node: &Node,
     handle: &Arc<Mutex<Option<SweepHandle>>>,
     grid_meta: &GridMeta,
     threshold: u16,
 ) -> Result<()> {
-    todo!("Task 10: implement value_function + policy publishers (1 Hz OccupancyGrid on transient_local topics)")
+    use nav_msgs::msg::OccupancyGrid;
+    use std_msgs::msg::Header;
+
+    let qos = QoSProfile::default().reliable().transient_local().keep_last(1);
+    let pub_value = node.create_publisher::<OccupancyGrid>("value_function", qos.clone())?;
+    let pub_policy = node.create_publisher::<OccupancyGrid>("policy", qos)?;
+
+    let handle_c = Arc::clone(handle);
+    let grid_meta = grid_meta.clone();
+    let node_clock = node.get_clock();
+
+    // TODO(Task 11): verify that the returned timer guard does not need to be
+    // kept alive for the timer to fire. If the timer silently stops when the
+    // guard is dropped, return it from this function and bind it in main() with
+    // `let _vf_timer = spawn_value_function_publisher(...)`.
+    node.create_wall_timer(std::time::Duration::from_secs(1), move || {
+        let h_guard = handle_c.lock().unwrap();
+        let Some(h) = h_guard.as_ref() else { return; };
+
+        // Request theta=0 slice from the worker (online mode uses current yaw;
+        // offline always uses yaw=0 as a representative slice for visualisation).
+        let theta_idx = 0usize;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        if h.request_tx
+            .send(WorkerRequest::ValueSlice { theta_idx, resp: tx })
+            .is_err()
+        {
+            return;
+        }
+        let slice = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        // Worker returns Array2<Value> [h, w]; insert a dummy theta axis so
+        // value_slice_to_occupancy sees ArrayView3 [h, w, 1] and theta_idx=0.
+        let data = vi_node::bridge::value_slice_to_occupancy(
+            slice.view().insert_axis(ndarray::Axis(2)),
+            0,
+            threshold,
+        );
+
+        let msg = OccupancyGrid {
+            header: Header {
+                stamp: node_clock.now().to_msg(),
+                frame_id: "map".into(),
+            },
+            info: grid_meta.to_map_meta_data(),
+            data,
+        };
+        // TODO(Task 11): if rclrs requires publish by value, change to
+        // `pub_value.publish(msg)`.
+        let _ = pub_value.publish(&msg);
+
+        // Policy publisher placeholder — all cells -1 (unknown) until the
+        // worker exposes the latest ActionTable. See spec §8 open items.
+        let _ = pub_policy.publish(&OccupancyGrid {
+            header: Header {
+                stamp: node_clock.now().to_msg(),
+                frame_id: "map".into(),
+            },
+            info: grid_meta.to_map_meta_data(),
+            data: vec![-1i8; (grid_meta.width * grid_meta.height) as usize],
+        });
+    })?;
+
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// spawn_cmd_vel_timer — Task 10 stub
+// spawn_cmd_vel_timer — 10 Hz cmd_vel publisher (Task 10, online mode only)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Publish `cmd_vel` at 10 Hz in online mode.
+/// Publish `cmd_vel` Twist at 10 Hz when `params.online == true`.
 ///
-/// **Task 10 fills this in.** The stub returns Ok(()) without doing anything
-/// (only called when `params.online == true`).
+/// Each tick requests the optimal action for the current robot cell via
+/// `WorkerRequest::OptimalAction` and converts it to forward/angular velocity.
+/// Velocities are computed as motion-per-period / period so they represent
+/// instantaneous body-frame rates (m/s and rad/s).
 ///
-/// TODO(Task 10): implement using `node.create_timer_repeating` at 100ms;
-/// request `WorkerRequest::OptimalAction` for the current robot cell
-/// (from a tf lookup — tf2_rs deferred; for now hardcode (0, 0, 0)).
-#[allow(unused_variables)]
+/// # tf2 deferral
+/// TODO(tf2_rs): the robot pose `(ix, iy, it)` is currently hardcoded to
+/// `(0, 0, 0)`. When tf2_rs is integrated, replace with a `map → base_link`
+/// transform lookup and convert the translation/yaw to grid cell indices via
+/// a helper analogous to `pose_to_goal_spec` (inline or extracted to bridge.rs
+/// once it grows — see spec §4.5).
+///
+/// Until tf2_rs is available this function is only useful for smoke-testing
+/// the topic flow (confirming cmd_vel appears and responds to value changes).
+///
+/// # API notes (TODO(Task 11))
+/// - See notes in `spawn_value_function_publisher` regarding timer guard
+///   lifetime, `create_publisher` signature, and `publish` by-ref vs by-value.
 fn spawn_cmd_vel_timer(
     node: &Node,
     handle: &Arc<Mutex<Option<SweepHandle>>>,
-    grid_meta: &GridMeta,
+    _grid_meta: &GridMeta,
     action_list: &[(String, f64, f64)],
 ) -> Result<()> {
-    todo!("Task 10: implement cmd_vel 10 Hz timer (online mode; tf2 lookup deferred)")
+    use geometry_msgs::msg::Twist;
+
+    let pub_cmd = node.create_publisher::<Twist>("cmd_vel", QoSProfile::default().keep_last(2))?;
+
+    // Collect (forward_m, rotation_deg) pairs indexed by action id.
+    let actions: Vec<(f64, f64)> = action_list
+        .iter()
+        .map(|(_, fw, rot)| (*fw, *rot))
+        .collect();
+
+    let handle_c = Arc::clone(handle);
+    let period = std::time::Duration::from_millis(100);
+
+    // TODO(Task 11): see timer guard lifetime note in spawn_value_function_publisher.
+    node.create_wall_timer(period, move || {
+        let h_guard = handle_c.lock().unwrap();
+        let Some(h) = h_guard.as_ref() else {
+            // No active sweep — publish zero velocity.
+            let _ = pub_cmd.publish(&Twist::default());
+            return;
+        };
+
+        // TODO(tf2_rs): replace (0, 0, 0) with map → base_link lookup when
+        // tf2_rs is available. Until then cmd_vel always queries the same cell,
+        // which is only useful for smoke-testing the topic flow.
+        let (ix, iy, it) = (0i32, 0i32, 0usize);
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        if h.request_tx
+            .send(WorkerRequest::OptimalAction { ix, iy, it, resp: tx })
+            .is_err()
+        {
+            let _ = pub_cmd.publish(&Twist::default());
+            return;
+        }
+        let aid = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(a) => a as usize,
+            Err(_) => {
+                let _ = pub_cmd.publish(&Twist::default());
+                return;
+            }
+        };
+
+        let (fw, rot_deg) = actions.get(aid).copied().unwrap_or((0.0, 0.0));
+        let mut tw = Twist::default();
+        // Convert per-period motion to instantaneous body-frame rates.
+        tw.linear.x = fw / period.as_secs_f64();
+        tw.angular.z = rot_deg.to_radians() / period.as_secs_f64();
+        let _ = pub_cmd.publish(&tw);
+    })?;
+
+    Ok(())
 }
