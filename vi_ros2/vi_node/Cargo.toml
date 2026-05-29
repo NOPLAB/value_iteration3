@@ -1,0 +1,45 @@
+[package]
+name = "vi_node"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+publish = false
+
+# Must NOT be part of vi_rs's workspace — explicit empty workspace section
+# isolates this crate so path deps to ../../vi_rs/* do not pull vi_node into
+# their workspace.
+[workspace]
+
+[[bin]]
+name = "vi_node"
+path = "src/main.rs"
+
+[lib]
+name = "vi_node"
+path = "src/lib.rs"
+
+[dependencies]
+ndarray            = "0.16"
+crossbeam-channel  = "0.5"
+anyhow             = "1"
+thiserror          = "1"
+
+vi_core      = { path = "../../vi_rs/vi_core" }
+vi_algorithm = { path = "../../vi_rs/vi_algorithm" }
+vi_fixtures  = { path = "../../vi_rs/vi_fixtures" }
+
+# ROS deps — wired in Task 11 once the Docker image exposes rclrs via colcon.
+# Until then we keep main.rs ROS-free so `cargo check` works on the host.
+# rclrs         = { version = "0.4" }
+# std_msgs      = { version = "0.4" }
+# nav_msgs      = { version = "0.4" }
+# geometry_msgs = { version = "0.4" }
+# vi_interfaces = { version = "0.1" }
+
+[features]
+default  = ["parallel"]
+online   = []
+parallel = ["vi_algorithm/parallel"]
+
+[dev-dependencies]
+proptest = "1"
