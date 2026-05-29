@@ -1,0 +1,6 @@
+# colcon workspace artifacts (created by the build scripts, never tracked)
+vi_ros2_ws/
+**/install/
+**/build/
+**/log/
+**/target/
