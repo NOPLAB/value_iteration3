@@ -15,31 +15,28 @@ Phase plan and design specs live in `docs/superpowers/specs/` and `docs/superpow
 
 ## Repository layout (important)
 
-The C/HLS/driver/Petalinux code lives **under `vi_fpga/`**, not at the repo root. The root `Makefile` is currently **stale for the software/FPGA/EDF targets**: its `driver`/`host`/`test-host`/`csim`/`hls`/`bitstream`/`edf-*`/`clean*` targets reference root-level `driver/`, `host/`, `fpga/`, `petalinux/` directories that no longer exist. Only the root-level `matlab-*` and `rs-*` targets are current. Until the root wrapper is repaired, drive the hardware vertical with `make -C vi_fpga/...` as shown below.
+The C/HLS/driver/Petalinux code lives **under `vi_fpga/`**, not at the repo root. The root `Makefile` is a thin wrapper that delegates the software/FPGA/EDF targets into `vi_fpga/...` (and `matlab-*` / `rs-*` / `ros2-*` into their own trees), so the commands below are run from the repo root. Note: recursive `$(MAKE)` invocation fails under Windows GnuWin32 (`e=87`); run these on Linux/WSL (which is also where the Ultra96-targeted builds belong), or invoke the sub-Makefile directly (`make -C vi_fpga/host test-host`).
 
 ## Build & Test
 
 ### Software (driver + host CLI), under `vi_fpga/`
 
-- `make -C vi_fpga/driver/uio all` — build `libvi_sweep.a` / `.so` (UIO + u-dma-buf Linux ops + mock).
-- `make -C vi_fpga/host all` — build `host/vi_cli` linked against the Linux libvi_sweep (depends on the driver lib).
-- `make -C vi_fpga/host test-host` — build the mock-only lib and run all host unit tests (`vi_fpga/host/test/test_*.c`). No FPGA needed.
-- `make -C vi_fpga/host test-hw` — HW integration via SSH. Requires `VI_TARGET_HOST=<ultra96-hostname>`; runs `vi_fpga/host/test/hw/run_smoke.sh` then `run_big.sh`, which scp the CLI + generated maps to the target and execute `vi_cli --verify` there.
+- `make driver` — build `libvi_sweep.a` / `.so` (UIO + u-dma-buf Linux ops + mock) via `vi_fpga/driver/uio/`.
+- `make host` — build `vi_fpga/host/vi_cli` linked against the Linux libvi_sweep (depends on `driver`).
+- `make test-host` — build the mock-only lib and run all host unit tests (`vi_fpga/host/test/test_*.c`). No FPGA needed.
+- `make test-hw` — HW integration via SSH. Requires `VI_TARGET_HOST=<ultra96-hostname>`; runs `vi_fpga/host/test/hw/run_smoke.sh` then `run_big.sh`, which scp the CLI + generated maps to the target and execute `vi_cli --verify` there.
 - Run a single host test: `make -C vi_fpga/host test/test_penalty.run` (pattern: `test/<name>.run`).
 - Host-only CLI with the mock backend (no UIO needed, useful for local debugging): `make -C vi_fpga/host cli-mock` → `vi_fpga/host/vi_cli_mock`.
 
 ### FPGA build (`vi_fpga/Makefile`)
 
-Tools must be on `PATH` — invoke bare `vitis-run` / `vivado` (Vitis 2025.2). Do **not** prefix with `source settings.sh`. Tile and streaming kernels have fully separate build paths. All TCL scripts live in `vi_fpga/tcl/`; build artifacts go to `vi_fpga/build/`. Select the kernel by appending `tile` or `stream` as a goal.
+Tools must be on `PATH` — invoke bare `vitis-run` / `vivado` (Vitis 2025.2). Do **not** prefix with `source settings.sh`. Tile and streaming kernels have fully separate build paths. All TCL scripts live in `vi_fpga/tcl/`; build artifacts go to `vi_fpga/build/`. From the root wrapper, select the kernel with `KERNEL=tile` / `KERNEL=stream`; invoking `vi_fpga/Makefile` directly instead selects it via a `tile`/`stream` goal (`make -C vi_fpga csim stream`).
 
-- `make -C vi_fpga csim tile` — HLS C-simulation of tile-based kernel (`vi_fpga/hls/tile/`).
-- `make -C vi_fpga csim stream` — HLS C-simulation of streaming kernel (`vi_fpga/hls/stream/`).
-- `make -C vi_fpga hls tile` — HLS synth + IP export (tile) into `vi_fpga/build/hls_build_tile/`, IP to `ip_repo_tile/`.
-- `make -C vi_fpga hls stream` — HLS synth + IP export (streaming).
-- `make -C vi_fpga bitstream tile` — HLS + Vivado synthesis + bitstream for tile kernel, project `vi_fpga/build/vi_tile/`.
-- `make -C vi_fpga bitstream stream` — HLS + Vivado synthesis + bitstream for streaming kernel, project `vi_fpga/build/vi_stream/`.
-- `make -C vi_fpga clean` — clean both tile and stream build artifacts. Append `tile` or `stream` to clean one.
-- After regenerating HLS IP, sync the register header into the driver: `make -C vi_fpga/driver/uio sync-hw-header KERNEL=tile` or `KERNEL=stream` (copies `xvi_sweep_hw.h` / `xvi_sweep_stream_hw.h` into `vi_fpga/driver/uio/generated/`; review the diff).
+- `make csim KERNEL=stream` — HLS C-simulation of streaming kernel (`vi_fpga/hls/stream/`); `KERNEL=tile` for the tile kernel (`vi_fpga/hls/tile/`).
+- `make hls KERNEL=tile` — HLS synth + IP export (tile) into `vi_fpga/build/hls_build_tile/`, IP to `ip_repo_tile/`; `KERNEL=stream` for streaming.
+- `make bitstream KERNEL=tile` — HLS + Vivado synthesis + bitstream for tile kernel, project `vi_fpga/build/vi_tile/`; `KERNEL=stream` → `vi_fpga/build/vi_stream/`.
+- `make clean-fpga` — clean both tile and stream build artifacts (`make -C vi_fpga clean`; append `tile`/`stream` to clean one).
+- After regenerating HLS IP, sync the register header into the driver: `make sync-hw-header KERNEL=tile` or `KERNEL=stream` (copies `xvi_sweep_hw.h` / `xvi_sweep_stream_hw.h` into `vi_fpga/driver/uio/generated/`; review the diff).
 
 ### Rust workspace (`vi_rs/`)
 
@@ -67,7 +64,13 @@ The MATLAB kernel is a variant alongside tile and stream HLS kernels. Algorithm 
 
 ### ROS2 node (`vi_ros2/`) — in progress
 
-ROS2 Humble Rust node, built via `colcon` + `cargo-ament-build` (no Makefile target yet). Two packages:
+ROS2 Humble Rust node, built via `colcon` + `cargo-ament-build` inside a Docker image. Driven from the repo root:
+
+- `make ros2-docker` — build the dev image (`vi_ros2/docker/Dockerfile`), tag `vi_ros2_dev:humble` (override `VI_ROS2_DOCKER_IMG`).
+- `make ros2-shell` — interactive shell in the image with the repo mounted at `/workspace`.
+- `make ros2-build` / `make ros2-test` — run `scripts/ros2_build.sh` / `scripts/ros2_test.sh` in the container.
+
+Two packages:
 
 - `vi_interfaces/` — ament_cmake package defining `action/Vi.action` only; `rosidl_generator_rs` emits Rust types for rclrs.
 - `vi_node/` — the rclrs node. **`vi_node` is deliberately outside the `vi_rs` Cargo workspace** (its `Cargo.toml` has an explicit empty `[workspace]`) so its `path = "../../vi_rs/*"` deps don't pull it into that workspace. ROS deps (`rclrs`, `nav_msgs`, etc.) are currently **commented out** — `main.rs` is kept ROS-free so `cargo check` works on the host until the Docker image exposes rclrs via colcon.
@@ -77,13 +80,13 @@ The external ROS interface is **interface-equivalent** to the ROS1 `value_iterat
 
 ### EDF / Petalinux (`vi_fpga/petalinux/`)
 
-Docker-based Yocto/EDF build for the Ultra96-V2 Linux image:
+Docker-based Yocto/EDF build for the Ultra96-V2 Linux image (delegates to `vi_fpga/petalinux/`):
 
-- `make -C vi_fpga/petalinux docker-build` — build the Docker container for the EDF environment.
-- `make -C vi_fpga/petalinux docker-shell` — open an interactive shell in the container.
-- `make -C vi_fpga/petalinux edf-setup XSA=<path>` — initialize the EDF project from an XSA hardware description.
-- `make -C vi_fpga/petalinux edf-build MACHINE=<machine>` — run the full Yocto/EDF build.
-- `make -C vi_fpga/petalinux clean` — clean EDF build artifacts.
+- `make edf-docker` — build the Docker container for the EDF environment.
+- `make edf-shell` — open an interactive shell in the container.
+- `make edf-setup XSA=<path>` — initialize the EDF project from an XSA hardware description.
+- `make edf-build MACHINE=<machine>` — run the full Yocto/EDF build.
+- `make clean-edf` — clean EDF build artifacts.
 
 ## Architecture
 
