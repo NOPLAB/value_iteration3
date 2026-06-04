@@ -2,7 +2,7 @@
 
 CC      ?= gcc
 CFLAGS  := -std=c11 -Wall -Wextra -Werror -O2 \
-           -Isrc -I../driver/uio -I../fpga/hls/vi_sweep/src
+           -Isrc -I../driver/uio
 LDFLAGS :=
 
 # --- vi_cli ---

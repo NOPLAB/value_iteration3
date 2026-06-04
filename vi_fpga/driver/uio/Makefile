@@ -38,7 +38,7 @@ $(LIB_SHARED): $(OBJ_COMMON) $(OBJ_LINUX)
 # Copy HLS-generated register header into generated/
 # Usage: make sync-hw-header KERNEL=tile   (or KERNEL=stream)
 KERNEL ?= tile
-IP_REPO := ../../fpga/vivado/ultra96v2/ip_repo_$(KERNEL)
+IP_REPO := ../../vivado/ultra96v2/ip_repo_$(KERNEL)
 
 ifeq ($(KERNEL),stream)
   HLS_HW_HEADER := $(IP_REPO)/drivers/vi_sweep_stream_v1_0/src/xvi_sweep_stream_hw.h
