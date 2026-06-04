@@ -1060,15 +1060,18 @@ ROS2_UNREACH = 65535
 ROS1_UNREACH = 1e6
 
 # 8 dihedral spatial transforms on the (H, W) plane (theta axis preserved).
+# Order matters: on a tie in the unreachable-mask score the first wins (strict <),
+# so simple/natural transforms precede rotations (transpose must beat rot270 on a
+# row-symmetric mask).
 _TRANSFORMS = {
-    'identity':   lambda a: a,
-    'rot90':      lambda a: np.rot90(a, 1, axes=(0, 1)),
-    'rot180':     lambda a: np.rot90(a, 2, axes=(0, 1)),
-    'rot270':     lambda a: np.rot90(a, 3, axes=(0, 1)),
-    'fliplr':     lambda a: a[:, ::-1, :],
-    'flipud':     lambda a: a[::-1, :, :],
-    'transpose':  lambda a: np.transpose(a, (1, 0, 2)),
+    'identity':      lambda a: a,
+    'fliplr':        lambda a: a[:, ::-1, :],
+    'flipud':        lambda a: a[::-1, :, :],
+    'transpose':     lambda a: np.transpose(a, (1, 0, 2)),
     'antitranspose': lambda a: np.transpose(a, (1, 0, 2))[::-1, ::-1, :],
+    'rot90':         lambda a: np.rot90(a, 1, axes=(0, 1)),
+    'rot180':        lambda a: np.rot90(a, 2, axes=(0, 1)),
+    'rot270':        lambda a: np.rot90(a, 3, axes=(0, 1)),
 }
 
 def align(ros1, ros2, ros1_unreach, ros2_unreach):
