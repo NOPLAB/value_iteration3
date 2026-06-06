@@ -31,7 +31,7 @@ vi_fixtures  = { path = "../../vi_rs/vi_fixtures" }
 # ROS deps — these versions are best-guess for rclrs Humble in the Docker image.
 # The exact versions provided by `colcon` in the Docker container (Task 11) may
 # differ; update after `make ros2-build` reports the actual resolved versions.
-rclrs         = "0.4"
+rclrs         = "0.7"
 std_msgs      = "0.4"
 nav_msgs      = "0.4"
 geometry_msgs = "0.4"
