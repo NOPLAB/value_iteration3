@@ -35,8 +35,20 @@ ln -sfn "$REPO_ROOT/vi_ros2/vi_node"       "$WS/src/vi_node"
 #     linking vi_node. A single merged prefix ($WS/install/lib) puts them on the
 #     search path (this is also how the Dockerfile builds rclrs).
 cd "$REPO_ROOT"
+# Build vi_node (Rust) in cargo's *release* profile for a fair speed comparison
+# against the ROS1 C++ baseline (built -O2). `-DCMAKE_BUILD_TYPE=Release` only
+# affects CMake packages (vi_interfaces); colcon-ros-cargo 0.2.0 builds the Rust
+# crate via `cargo ament-build -- ... --target-dir $WS/build/vi_node --quiet
+# <cargo-args>` and (unlike base colcon-cargo) does NOT inject a profile, so
+# cargo would otherwise default to the `dev` (debug) profile. A debug-profile
+# bit-exact Reference VI solver on 384x384x60 is ~10-50x slower and would not
+# converge in the benchmark window. `--cargo-args --release` appends `--release`
+# to that cargo invocation, so release artifacts land in $WS/build/vi_node/release/.
+# It is placed BEFORE --cmake-args so the trailing "$@" still forwards to
+# cmake-args.
 colcon build --merge-install --packages-select vi_interfaces vi_node \
        --base-paths "$WS/src" \
        --build-base "$WS/build" \
        --install-base "$WS/install" \
+       --cargo-args --release \
        --cmake-args -DCMAKE_BUILD_TYPE=Release "$@"
