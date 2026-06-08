@@ -20,4 +20,4 @@ pub mod state;
 pub use state::State;
 pub mod value_iterator;
 
-pub use value_iterator::ValueIterator;
+pub use value_iterator::{GridLayers, ValueIterator};

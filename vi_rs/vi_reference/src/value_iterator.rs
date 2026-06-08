@@ -441,6 +441,113 @@ impl ValueIterator {
             self.thread_status.insert(id, st);
         }
     }
+
+    /// 本家 `valueFunctionWriter`。各 θ 層に `total_cost/prob_base`。
+    pub fn value_function_writer(&self) -> GridLayers {
+        let (nx, ny, nt) = (self.cell_num_x, self.cell_num_y, self.cell_num_t);
+        let mut layers = vec![vec![0f64; (nx * ny) as usize]; nt as usize];
+        for t in 0..nt {
+            let mut i = t;
+            while (i as usize) < self.states.len() {
+                let s = &self.states[i as usize];
+                layers[t as usize][(s.iy * nx + s.ix) as usize] =
+                    s.total_cost as f64 / PROB_BASE as f64;
+                i += nt;
+            }
+        }
+        GridLayers { cell_num_x: nx, cell_num_y: ny, cell_num_t: nt, layers }
+    }
+
+    /// 本家 `policyWriter`。各 θ 層に optimal_action の id (None は -1)。
+    pub fn policy_writer(&self) -> GridLayers {
+        let (nx, ny, nt) = (self.cell_num_x, self.cell_num_y, self.cell_num_t);
+        let mut layers = vec![vec![0f64; (nx * ny) as usize]; nt as usize];
+        for t in 0..nt {
+            let mut i = t;
+            while (i as usize) < self.states.len() {
+                let s = &self.states[i as usize];
+                let v = match s.optimal_action {
+                    None => -1.0,
+                    Some(ai) => self.actions[ai].id as f64,
+                };
+                layers[t as usize][(s.iy * nx + s.ix) as usize] = v;
+                i += nt;
+            }
+        }
+        GridLayers { cell_num_x: nx, cell_num_y: ny, cell_num_t: nt, layers }
+    }
+
+    /// 本家 `makeValueFunctionMap`。i8 への push ラップ (250→-6, 255→-1) を再現。
+    pub fn make_value_function_map(
+        &self,
+        threshold: i32,
+        _x: f64,
+        _y: f64,
+        yaw_rad: f64,
+    ) -> OccupancyGrid {
+        let (nx, ny) = (self.cell_num_x, self.cell_num_y);
+        let it = ((((yaw_rad / PI * 180.0) as i32 + 360 * 100) % 360) as f64 / self.t_resolution)
+            .floor() as i32;
+        let mut data: Vec<i8> = Vec::with_capacity((nx * ny) as usize);
+        for y in 0..ny {
+            for x in 0..nx {
+                let index = self.to_index(x, y, it) as usize;
+                let cost = self.states[index].total_cost as f64 / PROB_BASE as f64;
+                let val: i32 = if cost < threshold as f64 {
+                    (cost / threshold as f64 * 250.0) as i32
+                } else if self.states[index].free {
+                    250
+                } else {
+                    255
+                };
+                data.push(val as u8 as i8); // ★i8 ラップ
+            }
+        }
+        OccupancyGrid {
+            width: nx,
+            height: ny,
+            resolution: self.xy_resolution,
+            origin_x: self.map_origin_x,
+            origin_y: self.map_origin_y,
+            origin_quat: self.map_origin_quat.clone(),
+            data,
+        }
+    }
+
+    /// 本家 `posToAction`。
+    pub fn pos_to_action(&mut self, x: f64, y: f64, t_rad: f64) -> Option<usize> {
+        let ix = ((x - self.map_origin_x) / self.xy_resolution).floor() as i32;
+        let iy = ((y - self.map_origin_y) / self.xy_resolution).floor() as i32;
+        let t = (180.0 * t_rad / PI) as i32;
+        let it = (((t + 360 * 100) % 360) as f64 / self.t_resolution).floor() as i32;
+        let index = self.to_index(ix, iy, it) as usize;
+        if self.states[index].final_state {
+            self.status = "goal".to_string();
+            None
+        } else if self.states[index].optimal_action.is_some() {
+            self.states[index].optimal_action
+        } else {
+            None
+        }
+    }
+
+    pub fn set_cancel(&mut self) {
+        self.status = "canceled".to_string();
+    }
+    pub fn end_of_trial(&self) -> bool {
+        self.status == "canceled" || self.status == "goal"
+    }
+    pub fn arrived(&self) -> bool {
+        self.status == "goal"
+    }
+    pub fn set_calculated(&mut self) {
+        if self.status != "canceled" {
+            self.status = "calculated".to_string();
+        }
+    }
+    pub fn is_calculated(&self) -> bool {
+        self.status == "calculated"
+    }
 }
 
 // ── コア free 関数 (単スレッド経路とマルチスレッド経路で共有) ──
@@ -601,6 +708,15 @@ pub(crate) fn value_iteration_raw(
     states[idx].total_cost = min_cost;
     states[idx].optimal_action = min_action;
     delta.unsigned_abs()
+}
+
+/// 本家 `valueFunctionWriter` / `policyWriter` 相当のプレーンデータ。
+/// `layers[t]` は長さ `cell_num_x*cell_num_y`、索引 `iy*cell_num_x + ix`。
+pub struct GridLayers {
+    pub cell_num_x: i32,
+    pub cell_num_y: i32,
+    pub cell_num_t: i32,
+    pub layers: Vec<Vec<f64>>,
 }
 
 #[cfg(test)]
@@ -1009,5 +1125,43 @@ mod tests {
         assert_eq!(sweeps.len(), 3);
         assert!(finish);
         assert!(sweeps.iter().all(|&s| s == 5));
+    }
+
+    #[test]
+    fn make_value_function_map_wraps_to_i8() {
+        let mut vi = ValueIterator::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
+        let map = free_grid(2, 2);
+        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.2, 10);
+        vi.set_goal(0.0, 0.0, 0);
+        // 全セル total_cost=MAX_COST → cost>>=大 → threshold 超 & free → 250 → i8 -6。
+        let og = vi.make_value_function_map(60, 0.0, 0.0, 0.0);
+        assert_eq!(og.width, 2);
+        assert_eq!(og.height, 2);
+        assert!(og.data.iter().all(|&v| v == (250u8 as i8)));
+        assert_eq!(250u8 as i8, -6);
+    }
+
+    #[test]
+    fn status_transitions() {
+        let mut vi = ValueIterator::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
+        assert_eq!(vi.status, "init");
+        vi.set_calculated();
+        assert!(vi.is_calculated());
+        vi.set_cancel();
+        assert!(vi.end_of_trial());
+        vi.set_calculated(); // canceled からは変えない
+        assert_eq!(vi.status, "canceled");
+    }
+
+    #[test]
+    fn policy_writer_marks_unset_as_minus_one() {
+        let mut vi = ValueIterator::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
+        let map = free_grid(2, 2);
+        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.2, 10);
+        vi.set_goal(0.0, 0.0, 0);
+        let pol = vi.policy_writer();
+        assert_eq!(pol.layers.len(), 60);
+        // 未計算なので全 -1。
+        assert!(pol.layers[0].iter().all(|&v| v == -1.0));
     }
 }
