@@ -1,0 +1,18 @@
+# keep in sync with vi_compare/params.yaml :: planning
+vi_node:
+  ros__parameters:
+    solver: "reference"
+    theta_cell_num: 60
+    safety_radius: 0.2
+    safety_radius_penalty: 30
+    goal_margin_radius: 0.3
+    goal_margin_theta: 15.0
+    online: false
+    delta_threshold: 0
+    thread_num: 1
+    map_wait_sec: 60
+    allow_action_mismatch: false
+    bench_dump_path: "/results"
+    action_names: ["forward","back","right","rightfw","left","leftfw"]
+    action_forward_m: [0.3, -0.2, 0.0, 0.2, 0.0, 0.2]
+    action_rotation_deg: [0.0, 0.0, -20.0, -20.0, 20.0, 20.0]

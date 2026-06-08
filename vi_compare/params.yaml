@@ -1,0 +1,16 @@
+# 比較ベンチ共通パラメータ (正典)。planning は ros1/bench.launch と ros2/vi_node_params.yaml にミラー。
+goal:
+  x: -0.425   # m  (house.pgm 自由空間重心セル pixel(col,row)=(191,192))
+  y: -0.425   # m
+  yaw_deg: 0.0
+client:
+  delta_threshold: 0
+  max_sweeps: 3000
+  timeout_sec: 1200
+planning:
+  theta_cell_num: 60
+  safety_radius: 0.2
+  safety_radius_penalty: 30
+  goal_margin_radius: 0.3
+  goal_margin_theta: 15
+  thread_num: 1

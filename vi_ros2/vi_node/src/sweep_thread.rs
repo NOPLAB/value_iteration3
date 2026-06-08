@@ -2,17 +2,45 @@
 //! read requests from publisher / cmd_vel timers.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use ndarray::{s, Array2};
+use ndarray::{s, Array2, Array3};
 use vi_algorithm::{Budget, SolveStats, Solver, VIContext};
-use vi_core::{ActionIdx, Value};
+use vi_core::{ActionIdx, Value, MAX_VALUE, N_THETA, PENALTY_OBSTACLE};
 
 pub struct FeedbackTick {
     pub sweep_count: u32,
     pub final_delta: u16,
+}
+
+pub struct DumpData {
+    pub value: Array3<Value>,
+    pub policy: Array3<i16>,
+}
+
+/// Build the full optimal-policy table; -1 where obstacle / goal / unreachable
+/// (mirrors the legacy node's `optimal_action_ == NULL ? -1`).
+pub fn compute_policy(ctx: &VIContext) -> Array3<i16> {
+    let h = ctx.dims.map_y as usize;
+    let w = ctx.dims.map_x as usize;
+    let mut pol = Array3::<i16>::from_elem((h, w, N_THETA), -1);
+    for iy in 0..h {
+        for ix in 0..w {
+            if ctx.penalty[[iy, ix]] == PENALTY_OBSTACLE {
+                continue;
+            }
+            for it in 0..N_THETA {
+                if ctx.goal_mask[[iy, ix, it]] || ctx.value[[iy, ix, it]] == MAX_VALUE {
+                    continue;
+                }
+                pol[[iy, ix, it]] =
+                    vi_algorithm::optimal_action_at(ctx, ix as i32, iy as i32, it) as i16;
+            }
+        }
+    }
+    pol
 }
 
 pub enum WorkerRequest {
@@ -31,6 +59,7 @@ pub fn spawn_sweep(
     mut ctx: VIContext,
     solver: Box<dyn Solver>,
     cancel: Arc<AtomicBool>,
+    dump_slot: Option<Arc<Mutex<Option<DumpData>>>>,
 ) -> SweepHandle {
     let (feedback_tx, feedback_rx) = unbounded::<FeedbackTick>();
     let (request_tx, request_rx) = unbounded::<WorkerRequest>();
@@ -70,6 +99,10 @@ pub fn spawn_sweep(
             last_stats = stats;
             if done { break; }
         }
+        if let Some(slot) = dump_slot {
+            let policy = compute_policy(&ctx);
+            *slot.lock().unwrap() = Some(DumpData { value: ctx.value.clone(), policy });
+        }
         last_stats
     });
 
@@ -99,7 +132,7 @@ mod tests {
     fn converges_and_joins() {
         let ctx = ctx_with_goal();
         let cancel = Arc::new(AtomicBool::new(false));
-        let h = spawn_sweep(ctx, Box::new(Reference { threshold: 0 }), cancel);
+        let h = spawn_sweep(ctx, Box::new(Reference { threshold: 0 }), cancel, None);
         let stats = h.join.join().expect("worker panicked");
         assert!(stats.converged, "small empty map must converge with Reference");
     }
@@ -120,7 +153,7 @@ mod tests {
             transitions: trans.unpack(),
         };
         let cancel = Arc::new(AtomicBool::new(false));
-        let h = spawn_sweep(big, Box::new(Reference { threshold: 0 }), Arc::clone(&cancel));
+        let h = spawn_sweep(big, Box::new(Reference { threshold: 0 }), Arc::clone(&cancel), None);
 
         std::thread::sleep(Duration::from_millis(50));
         let start = Instant::now();
@@ -148,7 +181,7 @@ mod tests {
     fn value_slice_request_returns_slice() {
         let ctx = ctx_with_goal();
         let cancel = Arc::new(AtomicBool::new(false));
-        let h = spawn_sweep(ctx, Box::new(Reference { threshold: 0 }), cancel);
+        let h = spawn_sweep(ctx, Box::new(Reference { threshold: 0 }), cancel, None);
         let (tx, rx) = bounded::<Array2<Value>>(1);
         h.request_tx.send(WorkerRequest::ValueSlice { theta_idx: 0, resp: tx }).unwrap();
         let slice = rx.recv_timeout(Duration::from_secs(2)).expect("slice");
@@ -160,11 +193,28 @@ mod tests {
     fn optimal_action_request_returns_action_id() {
         let ctx = ctx_with_goal();
         let cancel = Arc::new(AtomicBool::new(false));
-        let h = spawn_sweep(ctx, Box::new(Reference { threshold: 0 }), cancel);
+        let h = spawn_sweep(ctx, Box::new(Reference { threshold: 0 }), cancel, None);
         let (tx, rx) = bounded::<ActionIdx>(1);
         h.request_tx.send(WorkerRequest::OptimalAction { ix: 0, iy: 0, it: 0, resp: tx }).unwrap();
         let a = rx.recv_timeout(Duration::from_secs(2)).expect("action");
         assert!((a as usize) < vi_core::N_ACTIONS);
         h.join.join().expect("worker panicked");
+    }
+
+    #[test]
+    fn dump_slot_is_filled_on_exit() {
+        use std::sync::Mutex;
+        let ctx = ctx_with_goal();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let slot: Arc<Mutex<Option<DumpData>>> = Arc::new(Mutex::new(None));
+        let h = spawn_sweep(ctx, Box::new(Reference { threshold: 0 }), cancel, Some(Arc::clone(&slot)));
+        h.join.join().expect("worker panicked");
+        let guard = slot.lock().unwrap();
+        let dump = guard.as_ref().expect("dump slot must be filled");
+        assert_eq!(dump.value.shape(), &[8, 8, vi_core::N_THETA]);
+        assert_eq!(dump.policy.shape(), &[8, 8, vi_core::N_THETA]);
+        for &v in dump.policy.iter() {
+            assert!(v == -1 || (0..vi_core::N_ACTIONS as i16).contains(&v));
+        }
     }
 }

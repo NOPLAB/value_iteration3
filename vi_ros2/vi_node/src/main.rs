@@ -9,9 +9,12 @@
 //!   6. Action server, publishers, timers wired
 //!   7. executor.spin()
 //!
-//! NOTE: This file uses the rclrs API as found on ros2-rust/ros2_rust main branch
-//! (commit 2c6b926, Jan 2026). The action-server callback is async (tokio-based).
-//! Compile verification is deferred to Task 11 (make ros2-build inside Docker).
+//! NOTE: This file uses the rclrs API as found on ros2-rust/ros2_rust @ commit
+//! 2c6b926 (rclrs 0.7.0), which is what the Docker image builds. The
+//! action-server callback returns a future that rclrs polls on its own
+//! `futures`-based executor — there is NO tokio runtime, so the feedback pump /
+//! worker-join are run on a dedicated std thread and bridged back to the async
+//! callback via a oneshot channel.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -52,34 +55,41 @@ struct Params {
     goal_margin_theta_deg: f64,
     online: bool,
     cost_drawing_threshold: i64,
+    // Declared for ROS-interface parity with the legacy node; not yet threaded
+    // into the solver factory (which currently fixes the convergence threshold
+    // at 0). Kept so the parameter is still declared/validated on the node.
+    #[allow(dead_code)]
     delta_threshold: i64,
     thread_num: i64,
     map_wait_sec: i64,
     allow_action_mismatch: bool,
+    // Benchmark hook: when non-empty, the action callback dumps the full
+    // value/policy arrays as `.npy` into this directory after the solve
+    // finishes. Empty (default) = off = unchanged production behavior.
+    bench_dump_path: String,
     // Flattened from three parallel arrays (names, fw, rot).
     action_list: Vec<(String, f64, f64)>,
 }
 
 /// Declare all node parameters and collect their values.
 ///
-/// rclrs ParameterBuilder API (upstream node.rs line 1416):
-///   `node.declare_parameter::<T>(name).default(value).mandatory()?`
+/// rclrs ParameterBuilder API (rclrs 0.7 parameter.rs):
+///   `node.declare_parameter(name).default(value).mandatory()?`
 ///   `.get()` → returns a clone of the stored value.
 ///
-/// NOTE: The exact `ParameterVariant` for `String` may be `Arc<str>` rather
-/// than `String` depending on the rclrs version in Docker. If the compiler
-/// complains, change `String` to `Arc<str>` and call `.to_string()` on `.get()`.
-///
-/// TODO(Task 11): adjust types and `.get()` coercions to match the exact
-/// ParameterVariant impls that colcon exposes.
+/// `ParameterVariant` is implemented for `bool`, `i64`, `f64`, `Arc<str>`,
+/// `Arc<[i64]>`, `Arc<[f64]>`, and `Arc<[Arc<str>]>` — there is no `String` /
+/// `Vec<T>` impl, so string params use `Arc<str>` and array params use the
+/// `Arc<[..]>` forms (built via `.default_string_array` / `.default_from_iter`).
 fn read_params(node: &Node) -> Result<Params> {
     // Scalar parameters.
     let solver = node
-        .declare_parameter::<String>("solver")
-        .default("frontier3d".to_string())
+        .declare_parameter::<Arc<str>>("solver")
+        .default("frontier3d".into())
         .mandatory()
         .map_err(|e| anyhow!("declare solver: {e}"))?
-        .get();
+        .get()
+        .to_string();
 
     let theta_cell_num = node
         .declare_parameter::<i64>("theta_cell_num")
@@ -158,38 +168,47 @@ fn read_params(node: &Node) -> Result<Params> {
         .map_err(|e| anyhow!("declare allow_action_mismatch: {e}"))?
         .get();
 
+    // Benchmark dump directory. String params use `Arc<str>` (no `String`
+    // ParameterVariant impl — see the module docstring); empty default = off.
+    let bench_dump_path = node
+        .declare_parameter::<Arc<str>>("bench_dump_path")
+        .default("".into())
+        .mandatory()
+        .map_err(|e| anyhow!("declare bench_dump_path: {e}"))?
+        .get()
+        .to_string();
+
     // Action list — three parallel arrays instead of list-of-dicts (rclrs
-    // Humble does not support nested dict parameters).
-    //
-    // TODO(Task 11): rclrs ParameterVariant for Vec<String> may need
-    // `Arc<[Arc<str>]>` or similar; adjust after `make ros2-build`.
+    // does not support nested dict parameters). rclrs array params are
+    // `Arc<[Arc<str>]>` / `Arc<[f64]>`; the `default_string_array` and
+    // `default_from_iter` builder helpers populate them from iterables.
     let names: Vec<String> = node
-        .declare_parameter::<Vec<String>>("action_names")
-        .default(vec![
-            "forward".into(),
-            "back".into(),
-            "right".into(),
-            "rightfw".into(),
-            "left".into(),
-            "leftfw".into(),
+        .declare_parameter::<Arc<[Arc<str>]>>("action_names")
+        .default_string_array([
+            "forward", "back", "right", "rightfw", "left", "leftfw",
         ])
         .mandatory()
         .map_err(|e| anyhow!("declare action_names: {e}"))?
-        .get();
+        .get()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
     let fws: Vec<f64> = node
-        .declare_parameter::<Vec<f64>>("action_forward_m")
-        .default(vec![0.3, -0.2, 0.0, 0.2, 0.0, 0.2])
+        .declare_parameter::<Arc<[f64]>>("action_forward_m")
+        .default_from_iter([0.3, -0.2, 0.0, 0.2, 0.0, 0.2])
         .mandatory()
         .map_err(|e| anyhow!("declare action_forward_m: {e}"))?
-        .get();
+        .get()
+        .to_vec();
 
     let rots: Vec<f64> = node
-        .declare_parameter::<Vec<f64>>("action_rotation_deg")
-        .default(vec![0.0, 0.0, -20.0, -20.0, 20.0, 20.0])
+        .declare_parameter::<Arc<[f64]>>("action_rotation_deg")
+        .default_from_iter([0.0, 0.0, -20.0, -20.0, 20.0, 20.0])
         .mandatory()
         .map_err(|e| anyhow!("declare action_rotation_deg: {e}"))?
-        .get();
+        .get()
+        .to_vec();
 
     if names.len() != fws.len() || fws.len() != rots.len() {
         return Err(anyhow!(
@@ -221,6 +240,7 @@ fn read_params(node: &Node) -> Result<Params> {
         thread_num,
         map_wait_sec,
         allow_action_mismatch,
+        bench_dump_path,
         action_list,
     })
 }
@@ -412,13 +432,22 @@ fn main() -> Result<()> {
     let sweep_handle: Arc<Mutex<Option<SweepHandle>>> = Arc::new(Mutex::new(None));
 
     // 6. Wire action server.
+    // The action server and timer guards must stay alive for the spin's
+    // lifetime; dropping a timer guard stops the timer from firing.
     let _action_server = spawn_action_server(&node, &params, &sweep_handle, &base_ctx, &grid_meta)?;
 
     // Wire publishers + timers (Task 10 stubs — do not panic before spin).
-    spawn_value_function_publisher(&node, &sweep_handle, &grid_meta, params.cost_drawing_threshold as u16)?;
-    if params.online {
-        spawn_cmd_vel_timer(&node, &sweep_handle, &grid_meta, &params.action_list)?;
-    }
+    let _vf_timer = spawn_value_function_publisher(
+        &node,
+        &sweep_handle,
+        &grid_meta,
+        params.cost_drawing_threshold as u16,
+    )?;
+    let _cmd_vel_timer = if params.online {
+        Some(spawn_cmd_vel_timer(&node, &sweep_handle, &grid_meta, &params.action_list)?)
+    } else {
+        None
+    };
 
     // 7. Spin (blocks until shutdown).
     // `first_error()` converts the Vec<RclrsError> into a single Result.
@@ -436,14 +465,10 @@ fn main() -> Result<()> {
 /// Pattern: create subscription with a `sync_channel(1)` callback, then spin
 /// the executor in short bursts while polling the channel.
 ///
-/// NOTE: `rclrs::QoSProfile` methods `reliable()`, `transient_local()`,
-/// `keep_last(n)` are confirmed in upstream qos.rs lines 258-291.
-/// `SubscriptionOptions` accepts `impl Into<SubscriptionOptions>` which is
-/// satisfied by `(topic_str, qos_profile)` via `IntoPrimitiveOptions` —
-/// see upstream subscription.rs for the exact conversion impl.
-///
-/// TODO(Task 11): if the subscription API rejects the `(topic, qos)` tuple,
-/// construct `SubscriptionOptions::new("map").qos(profile)` explicitly.
+/// QoS is built with the `IntoPrimitiveOptions` builder on the topic `&str`
+/// (`.transient_local()`, `.reliable()`, `.keep_last(n)`), which yields the
+/// `impl Into<SubscriptionOptions>` that `create_subscription` accepts. The
+/// callback takes the message by value.
 fn wait_for_map(
     node: &Node,
     executor: &mut Executor,
@@ -454,15 +479,6 @@ fn wait_for_map(
     let (tx, rx) = sync_channel::<nav_msgs::msg::OccupancyGrid>(1);
     let tx_c = tx.clone();
 
-    // TODO(Task 11): verify exact subscription creation signature.
-    // The upstream `node.create_subscription` takes:
-    //   (options: impl Into<SubscriptionOptions>, callback: impl Callback)
-    // where a bare `&str` satisfies `Into<SubscriptionOptions>` with default QoS.
-    // IntoPrimitiveOptions on `&str` adds `.transient_local()`, `.reliable()`,
-    // `.keep_last(n)` builder methods — upstream subscription.rs line 916 shows
-    // `"my_topic".transient_local()`.
-    // If that doesn't compile, construct QoSProfile explicitly and pass via
-    // SubscriptionOptions: `SubscriptionOptions { topic: "map", qos: <profile> }`.
     let _sub = node.create_subscription::<nav_msgs::msg::OccupancyGrid, _>(
         "map".transient_local().reliable().keep_last(1),
         move |msg: nav_msgs::msg::OccupancyGrid| {
@@ -478,12 +494,8 @@ fn wait_for_map(
         if std::time::Instant::now() > deadline {
             return Err(anyhow!("map not received within {} seconds", wait_sec));
         }
-        // Spin for 100 ms to allow pending subscriptions to deliver.
-        // `SpinOptions::default().timeout(d)` — upstream executor.rs line 416-430
-        // shows SpinOptions builder with `.timeout()`.
-        //
-        // TODO(Task 11): if `SpinOptions::spin_once()` exists (upstream line 416)
-        // prefer that; otherwise this timeout-based spin works.
+        // Spin for up to 100 ms to let pending subscriptions deliver, then poll
+        // the channel again. `SpinOptions::default().timeout(d)` bounds each burst.
         executor.spin(SpinOptions::default().timeout(Duration::from_millis(100)));
     }
 }
@@ -504,15 +516,19 @@ fn wait_for_map(
 ///   4. Pump FeedbackTick at 10 Hz, publish Vi_Feedback.
 ///   5. Join worker → publish Vi_Result.
 ///
-/// NOTE: The exact rosidl-generated type paths for vi_interfaces depend on
-/// how rosidl_generator_rs names them. Two common conventions:
-///   a) `vi_interfaces::action::Vi`   (module path)
-///   b) `vi_interfaces::action::Vi_Goal`, `Vi_Result`, `Vi_Feedback`
-/// The typical ros2_rust convention at the time of writing is (a) for the
-/// action type and the associated types are `Vi::Goal`, `Vi::Result`, `Vi::Feedback`.
+/// # Async runtime
+/// rclrs polls the returned future on its own `futures`-based executor (no
+/// tokio runtime). The blocking feedback-pump + worker-join therefore runs on
+/// a dedicated `std::thread`, communicating the terminal `finished` flag back
+/// to this async callback through a `futures::channel::oneshot`. Feedback is
+/// published from that thread via a cloned `FeedbackPublisher`, which is
+/// `Clone + Send + Sync` and keeps working until the goal reaches a terminal
+/// state.
 ///
-/// TODO(Task 11): Verify the rosidl type paths after `make ros2-build`.
-/// If `vi_interfaces::action::Vi` does not exist, try `vi_interfaces::action::vi::Vi`.
+/// The rosidl-generated type paths follow the `Fibonacci` / `Fibonacci_Goal` /
+/// `Fibonacci_Result` / `Fibonacci_Feedback` convention, so for this action
+/// they are `vi_interfaces::action::{Vi, Vi_Goal, Vi_Result, Vi_Feedback}` and
+/// the action's associated types are `Vi::Goal` / `Vi::Result` / `Vi::Feedback`.
 fn spawn_action_server(
     node: &Node,
     params: &Params,
@@ -526,8 +542,9 @@ fn spawn_action_server(
     let solver_name = params.solver.clone();
     let goal_margin_radius = params.goal_margin_radius;
     let goal_margin_theta_deg = params.goal_margin_theta_deg;
+    let bench_dump_path = params.bench_dump_path.clone();
 
-    // node.create_action_server signature (upstream node.rs line 401-410):
+    // node.create_action_server signature (rclrs 0.7 node.rs):
     //   pub fn create_action_server<'a, A: Action, Task>(
     //       self: &Arc<Self>,
     //       options: impl IntoActionServerOptions<'a>,
@@ -535,7 +552,7 @@ fn spawn_action_server(
     //   ) -> Result<ActionServer<A>, RclrsError>
     //   where Task: Future<Output = TerminatedGoal> + Send + Sync + 'static
     //
-    // A bare &str satisfies `IntoActionServerOptions` (upstream action_server.rs line 135).
+    // A bare &str satisfies `IntoActionServerOptions`.
     let server = node.create_action_server::<vi_interfaces::action::Vi, _>(
         "vi_controller",
         move |requested_goal: RequestedGoal<vi_interfaces::action::Vi>| {
@@ -544,22 +561,19 @@ fn spawn_action_server(
             let mut base_ctx = base_ctx.clone_value();
             let grid_meta = grid_meta.clone();
             let solver_name = solver_name.clone();
+            let bench_dump_path = bench_dump_path.clone();
 
             async move {
                 // ── Step 1: cancel any prior in-flight sweep ──────────────────
+                // The worker checks `cancel` at each sweep boundary, so this
+                // join returns quickly. We are in an async task with no blocking
+                // budget concern (the sweep is already winding down), so join
+                // directly rather than via a runtime-specific spawn_blocking.
                 {
                     let old_handle = sweep_handle.lock().unwrap().take();
                     if let Some(old) = old_handle {
                         old.cancel.store(true, Ordering::SeqCst);
-                        // Blocking join — wrap in spawn_blocking so we don't
-                        // stall the tokio async runtime.
-                        // TODO(Task 11): confirm tokio is available as a dep in
-                        // the rclrs Docker build; if not, join synchronously
-                        // (acceptable since the worker checks cancel at each sweep).
-                        let _ = tokio::task::spawn_blocking(move || {
-                            let _ = old.join.join();
-                        })
-                        .await;
+                        let _ = old.join.join();
                     }
                 }
 
@@ -568,12 +582,8 @@ fn spawn_action_server(
 
                 // ── Step 3: extract goal pose from Vi.action Goal message ──────
                 // Vi.action Goal field: `geometry_msgs/PoseStamped goal`
-                // (see vi_ros2/vi_interfaces/action/Vi.action)
-                //
-                // TODO(Task 11): verify rosidl field access:
-                //   requested_goal.goal().goal.pose.position.{x,y}
-                //   requested_goal.goal().goal.pose.orientation.{w,x,y,z}
-                // The accepted goal still has access to the goal data.
+                // (see vi_ros2/vi_interfaces/action/Vi.action). `accepted.goal()`
+                // returns `&Arc<Vi_Goal>`, so `.goal.pose` reaches the PoseStamped.
                 let goal_pose = &accepted.goal().goal.pose;
                 let yaw = yaw_from_quat(&goal_pose.orientation);
                 let pose_view = PoseView {
@@ -621,15 +631,22 @@ fn spawn_action_server(
                     Err(e) => {
                         eprintln!("ERROR: make_solver failed: {e}");
                         let executing = accepted.execute();
-                        // TODO(Task 11): Vi_Result { finished: bool }
-                        // rosidl type: vi_interfaces::action::Vi_Result or Vi::Result
                         return executing.aborted_with(vi_interfaces::action::Vi_Result {
                             finished: false,
                         });
                     }
                 };
                 let cancel = Arc::new(AtomicBool::new(false));
-                let handle = spawn_sweep(base_ctx, solver, Arc::clone(&cancel));
+                // Benchmark hook: allocate a dump slot when bench_dump_path is
+                // set. The worker fills it with the final value/policy arrays
+                // right before it exits; we read it after the worker is joined.
+                let dump_slot: Option<Arc<Mutex<Option<vi_node::sweep_thread::DumpData>>>> =
+                    if bench_dump_path.is_empty() {
+                        None
+                    } else {
+                        Some(Arc::new(Mutex::new(None)))
+                    };
+                let handle = spawn_sweep(base_ctx, solver, Arc::clone(&cancel), dump_slot.clone());
                 let feedback_rx = handle.feedback_rx.clone();
 
                 // Store handle so publishers can access it and action can cancel.
@@ -639,86 +656,112 @@ fn spawn_action_server(
                 let executing = accepted.execute();
                 let feedback_publisher = executing.feedback_publisher();
 
-                // 10 Hz feedback loop using tokio interval.
-                // TODO(Task 11): confirm tokio::time is available.
-                let mut interval = tokio::time::interval(Duration::from_millis(100));
-                let mut converged = false;
+                // Run the 10 Hz feedback pump + final worker-join on a std thread
+                // (rclrs has no tokio runtime, so we cannot use tokio timers).
+                // The thread reports the terminal `finished` flag back through a
+                // oneshot the async callback awaits.
+                let (done_tx, done_rx) = futures::channel::oneshot::channel::<bool>();
+                let sweep_handle_thread = Arc::clone(&sweep_handle);
+                std::thread::spawn(move || {
+                    let mut converged = false;
+                    loop {
+                        std::thread::sleep(Duration::from_millis(100));
 
-                loop {
-                    interval.tick().await;
+                        // The cancel flag on the SweepHandle doubles as both the
+                        // ROS-cancel signal and the vi_rs cancel; checking it here
+                        // covers both.
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
 
-                    // Check for ROS cancellation request.
-                    // TODO(Task 11): `executing.until_cancel_requested(future)` is the
-                    // rclrs-idiomatic way; for simplicity we check cancel_requested via
-                    // the live goal state. If `ExecutingGoal` exposes `cancel_requested()`
-                    // or a flag, use that instead.
-                    // For now, the cancel flag on the SweepHandle doubles as both
-                    // ROS-cancel and vi_rs cancel — checking `cancel` AtomicBool suffices.
-                    if cancel.load(Ordering::Relaxed) {
-                        break;
-                    }
+                        // Drain all pending feedback ticks.
+                        let mut last_tick = None;
+                        while let Ok(tick) = feedback_rx.try_recv() {
+                            last_tick = Some(tick);
+                        }
 
-                    // Drain all pending feedback ticks.
-                    let mut last_tick = None;
-                    while let Ok(tick) = feedback_rx.try_recv() {
-                        last_tick = Some(tick);
-                    }
+                        if let Some(tick) = last_tick {
+                            converged = tick.final_delta == 0;
 
-                    if let Some(tick) = last_tick {
-                        converged = tick.final_delta == 0;
+                            // Vi.action feedback:
+                            //   std_msgs/UInt32MultiArray current_sweep_times
+                            //   std_msgs/Float32MultiArray deltas
+                            let feedback = vi_interfaces::action::Vi_Feedback {
+                                current_sweep_times: std_msgs::msg::UInt32MultiArray {
+                                    data: vec![tick.sweep_count],
+                                    ..Default::default()
+                                },
+                                deltas: std_msgs::msg::Float32MultiArray {
+                                    data: vec![tick.final_delta as f32],
+                                    ..Default::default()
+                                },
+                            };
+                            let _ = feedback_publisher.publish(feedback);
 
-                        // TODO(Task 11): verify Vi_Feedback field paths.
-                        // Vi.action feedback: `std_msgs/UInt32MultiArray current_sweep_times`
-                        //                    `std_msgs/Float32MultiArray deltas`
-                        let feedback = vi_interfaces::action::Vi_Feedback {
-                            current_sweep_times: std_msgs::msg::UInt32MultiArray {
-                                data: vec![tick.sweep_count],
-                                ..Default::default()
-                            },
-                            deltas: std_msgs::msg::Float32MultiArray {
-                                data: vec![tick.final_delta as f32],
-                                ..Default::default()
-                            },
-                        };
-                        // FeedbackPublisher::publish (upstream feedback_publisher.rs line 14)
-                        let _ = feedback_publisher.publish(feedback);
+                            if converged {
+                                break;
+                            }
+                        }
 
-                        if converged {
+                        // The worker drops feedback_tx on exit; a Disconnected
+                        // result means the sweep has finished.
+                        if matches!(
+                            feedback_rx.try_recv(),
+                            Err(crossbeam_channel::TryRecvError::Disconnected)
+                        ) {
                             break;
                         }
                     }
 
-                    // Check if the worker thread has finished (join handle is_finished).
-                    // TODO(Task 11): JoinHandle::is_finished() is stable Rust 1.61+
-                    // — available on our MSRV 1.75. However, the handle is inside
-                    // the Mutex<Option<SweepHandle>>. We can't call is_finished() without
-                    // temporarily removing it; instead we rely on the feedback channel
-                    // closing (try_recv returning Err(Disconnected)) to detect completion.
-                    // The worker sends on every sweep and drops feedback_tx on exit.
-                    if matches!(feedback_rx.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)) {
-                        break;
+                    // ── Step 7: join worker and report result ─────────────────
+                    let stats = {
+                        let handle = sweep_handle_thread.lock().unwrap().take();
+                        if let Some(hnd) = handle {
+                            hnd.cancel.store(true, Ordering::SeqCst);
+                            hnd.join.join().ok()
+                        } else {
+                            None
+                        }
+                    };
+
+                    let finished = stats.map(|s| s.converged).unwrap_or(converged);
+                    let _ = done_tx.send(finished);
+                });
+
+                // Await the pump thread's terminal result. If the sender is
+                // dropped without sending (thread panicked), treat as not
+                // finished and abort the goal rather than block forever.
+                //
+                // The pump thread joins the sweep worker (`hnd.join.join()`)
+                // BEFORE sending `done_tx`, and the worker fills `dump_slot`
+                // right before it returns — so once `done_rx.await` completes
+                // the slot is guaranteed populated. Read/write it here.
+                match done_rx.await {
+                    Ok(finished) => {
+                        if let Some(slot) = dump_slot {
+                            if let Some(dump) = slot.lock().unwrap().take() {
+                                let vpath = format!("{}/value_ros2.npy", bench_dump_path);
+                                let ppath = format!("{}/policy_ros2.npy", bench_dump_path);
+                                if let Err(e) = vi_node::npy::write_u16(&vpath, &dump.value) {
+                                    eprintln!("ERROR: write {vpath}: {e}");
+                                }
+                                if let Err(e) = vi_node::npy::write_i16(&ppath, &dump.policy) {
+                                    eprintln!("ERROR: write {ppath}: {e}");
+                                }
+                                eprintln!("bench dump written to {bench_dump_path}");
+                            } else {
+                                eprintln!(
+                                    "WARN: bench_dump_path set but dump slot was empty \
+                                     (sweep cancelled before completion?)"
+                                );
+                            }
+                        }
+                        executing.succeeded_with(vi_interfaces::action::Vi_Result { finished })
+                    }
+                    Err(_) => {
+                        executing.aborted_with(vi_interfaces::action::Vi_Result { finished: false })
                     }
                 }
-
-                // ── Step 7: join worker and send result ───────────────────────
-                let stats = {
-                    let handle = sweep_handle.lock().unwrap().take();
-                    if let Some(h) = handle {
-                        h.cancel.store(true, Ordering::SeqCst);
-                        // Blocking join again via spawn_blocking.
-                        tokio::task::spawn_blocking(move || h.join.join().ok())
-                            .await
-                            .ok()
-                            .flatten()
-                    } else {
-                        None
-                    }
-                };
-
-                let finished = stats.map(|s| s.converged).unwrap_or(converged);
-
-                // TODO(Task 11): verify Vi_Result type path and field name.
-                executing.succeeded_with(vi_interfaces::action::Vi_Result { finished })
             }
         },
     )?;
@@ -739,40 +782,36 @@ fn spawn_action_server(
 /// exposes the latest ActionTable. See spec §8 open items — wiring it to
 /// `WorkerRequest::ActionTableSlice` is left as a follow-up.
 ///
-/// # API notes (TODO(Task 11))
-/// - `node.create_publisher::<T>(topic, qos)` — signature matches upstream
-///   node.rs but may vary; adjust if `CreatePublisher` trait or options struct
-///   is required.
-/// - `node.create_wall_timer(duration, callback)` — returns a guard handle.
-///   The handle is discarded here (dropped at function exit). If the timer
-///   requires the guard to be live, return it from this function and bind it
-///   with a leading `_` in main(). See TODO(Task 11) comment inside.
-/// - `node.get_clock().now().to_msg()` — unverified. Fallback: build
-///   `builtin_interfaces::msg::Time` directly from `std::time::SystemTime`.
-/// - `pub.publish(&msg)` — rclrs may require by-value; flip to `pub.publish(msg)`
-///   if `&msg` fails to compile.
+/// # API notes
+/// - `node.create_publisher::<T>("topic".reliable()...)` takes a single options
+///   argument built via `IntoPrimitiveOptions`; QoS is folded into it.
+/// - `node.create_timer_repeating(duration, callback)` returns a `Timer` guard;
+///   we keep it alive by returning it to main() (dropping the guard would stop
+///   the timer). The callback is `FnMut() + Send`.
+/// - `node.get_clock().now().to_ros_msg()` yields the `builtin_interfaces` Time
+///   used in `Header.stamp` (fallible on i64→i32 overflow; default on error).
+/// - `Publisher::publish(msg)` takes the message by value.
 fn spawn_value_function_publisher(
     node: &Node,
     handle: &Arc<Mutex<Option<SweepHandle>>>,
     grid_meta: &GridMeta,
     threshold: u16,
-) -> Result<()> {
+) -> Result<Timer> {
     use nav_msgs::msg::OccupancyGrid;
     use std_msgs::msg::Header;
 
-    let qos = QoSProfile::default().reliable().transient_local().keep_last(1);
-    let pub_value = node.create_publisher::<OccupancyGrid>("value_function", qos.clone())?;
-    let pub_policy = node.create_publisher::<OccupancyGrid>("policy", qos)?;
+    let pub_value = node.create_publisher::<OccupancyGrid>(
+        "value_function".reliable().transient_local().keep_last(1),
+    )?;
+    let pub_policy = node.create_publisher::<OccupancyGrid>(
+        "policy".reliable().transient_local().keep_last(1),
+    )?;
 
     let handle_c = Arc::clone(handle);
     let grid_meta = grid_meta.clone();
     let node_clock = node.get_clock();
 
-    // TODO(Task 11): verify that the returned timer guard does not need to be
-    // kept alive for the timer to fire. If the timer silently stops when the
-    // guard is dropped, return it from this function and bind it in main() with
-    // `let _vf_timer = spawn_value_function_publisher(...)`.
-    node.create_wall_timer(std::time::Duration::from_secs(1), move || {
+    let timer = node.create_timer_repeating(std::time::Duration::from_secs(1), move || {
         let h_guard = handle_c.lock().unwrap();
         let Some(h) = h_guard.as_ref() else { return; };
 
@@ -799,31 +838,37 @@ fn spawn_value_function_publisher(
             threshold,
         );
 
+        // Build the Header stamp from the rclrs clock. The clock yields rclrs's
+        // internal `ros_env::builtin_interfaces` Time, which is a *distinct* type
+        // from the message-side `builtin_interfaces::msg::Time` in Header.stamp;
+        // rather than depend on builtin_interfaces directly just to name that
+        // type, set the stamp fields on a default Header (no type name needed).
+        let (sec, nanosec) = node_clock.now().to_sec_nanosec().unwrap_or((0, 0));
+        let header = || {
+            let mut h = Header::default();
+            h.stamp.sec = sec;
+            h.stamp.nanosec = nanosec;
+            h.frame_id = "map".into();
+            h
+        };
+
         let msg = OccupancyGrid {
-            header: Header {
-                stamp: node_clock.now().to_msg(),
-                frame_id: "map".into(),
-            },
+            header: header(),
             info: grid_meta.to_map_meta_data(),
             data,
         };
-        // TODO(Task 11): if rclrs requires publish by value, change to
-        // `pub_value.publish(msg)`.
-        let _ = pub_value.publish(&msg);
+        let _ = pub_value.publish(msg);
 
         // Policy publisher placeholder — all cells -1 (unknown) until the
         // worker exposes the latest ActionTable. See spec §8 open items.
-        let _ = pub_policy.publish(&OccupancyGrid {
-            header: Header {
-                stamp: node_clock.now().to_msg(),
-                frame_id: "map".into(),
-            },
+        let _ = pub_policy.publish(OccupancyGrid {
+            header: header(),
             info: grid_meta.to_map_meta_data(),
             data: vec![-1i8; (grid_meta.width * grid_meta.height) as usize],
         });
     })?;
 
-    Ok(())
+    Ok(timer)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -847,18 +892,19 @@ fn spawn_value_function_publisher(
 /// Until tf2_rs is available this function is only useful for smoke-testing
 /// the topic flow (confirming cmd_vel appears and responds to value changes).
 ///
-/// # API notes (TODO(Task 11))
-/// - See notes in `spawn_value_function_publisher` regarding timer guard
-///   lifetime, `create_publisher` signature, and `publish` by-ref vs by-value.
+/// # API notes
+/// - See notes in `spawn_value_function_publisher`: `create_publisher` takes a
+///   single options arg (QoS via `IntoPrimitiveOptions`), `create_timer_repeating`
+///   returns a `Timer` guard we must keep alive, and `publish` is by-value.
 fn spawn_cmd_vel_timer(
     node: &Node,
     handle: &Arc<Mutex<Option<SweepHandle>>>,
     _grid_meta: &GridMeta,
     action_list: &[(String, f64, f64)],
-) -> Result<()> {
+) -> Result<Timer> {
     use geometry_msgs::msg::Twist;
 
-    let pub_cmd = node.create_publisher::<Twist>("cmd_vel", QoSProfile::default().keep_last(2))?;
+    let pub_cmd = node.create_publisher::<Twist>("cmd_vel".keep_last(2))?;
 
     // Collect (forward_m, rotation_deg) pairs indexed by action id.
     let actions: Vec<(f64, f64)> = action_list
@@ -869,12 +915,11 @@ fn spawn_cmd_vel_timer(
     let handle_c = Arc::clone(handle);
     let period = std::time::Duration::from_millis(100);
 
-    // TODO(Task 11): see timer guard lifetime note in spawn_value_function_publisher.
-    node.create_wall_timer(period, move || {
+    let timer = node.create_timer_repeating(period, move || {
         let h_guard = handle_c.lock().unwrap();
         let Some(h) = h_guard.as_ref() else {
             // No active sweep — publish zero velocity.
-            let _ = pub_cmd.publish(&Twist::default());
+            let _ = pub_cmd.publish(Twist::default());
             return;
         };
 
@@ -888,13 +933,13 @@ fn spawn_cmd_vel_timer(
             .send(WorkerRequest::OptimalAction { ix, iy, it, resp: tx })
             .is_err()
         {
-            let _ = pub_cmd.publish(&Twist::default());
+            let _ = pub_cmd.publish(Twist::default());
             return;
         }
         let aid = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
             Ok(a) => a as usize,
             Err(_) => {
-                let _ = pub_cmd.publish(&Twist::default());
+                let _ = pub_cmd.publish(Twist::default());
                 return;
             }
         };
@@ -904,8 +949,8 @@ fn spawn_cmd_vel_timer(
         // Convert per-period motion to instantaneous body-frame rates.
         tw.linear.x = fw / period.as_secs_f64();
         tw.angular.z = rot_deg.to_radians() / period.as_secs_f64();
-        let _ = pub_cmd.publish(&tw);
+        let _ = pub_cmd.publish(tw);
     })?;
 
-    Ok(())
+    Ok(timer)
 }

@@ -5,5 +5,6 @@
 //! `cargo test -p vi_node --lib` after each task without churn.
 
 pub mod bridge;
+pub mod npy;
 pub mod solver_factory;
 pub mod sweep_thread;

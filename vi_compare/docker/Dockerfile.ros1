@@ -1,0 +1,18 @@
+FROM ros:noetic-robot
+ENV DEBIAN_FRONTEND=noninteractive
+# The original value_iteration CMakeLists find_package()s the full grid_map_*
+# component set plus cv_bridge and filters. ros-noetic-grid-map is a metapackage
+# pulling the grid_map_* set; cv_bridge and filters must be listed explicitly.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ros-noetic-grid-map \
+      ros-noetic-grid-map-rviz-plugin \
+      ros-noetic-grid-map-visualization \
+      ros-noetic-cv-bridge \
+      ros-noetic-filters \
+      ros-noetic-map-server \
+      python3-numpy \
+      python3-yaml \
+      build-essential \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /catkin_ws
+CMD ["/bin/bash"]
