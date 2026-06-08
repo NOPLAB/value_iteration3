@@ -18,3 +18,6 @@ pub use sweep_status::SweepWorkerStatus;
 pub mod state;
 
 pub use state::State;
+pub mod value_iterator;
+
+pub use value_iterator::ValueIterator;
