@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["vi_core", "vi_algorithm", "vi_fixtures", "vi_bench"]
+members = ["vi_core", "vi_algorithm", "vi_fixtures", "vi_bench", "vi_reference"]
 
 [workspace.package]
 edition = "2021"
