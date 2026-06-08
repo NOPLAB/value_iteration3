@@ -30,8 +30,21 @@ def test_policy_agreement():
     # valid cells (both>=0): (0,0,0)=0==0 ok, (0,0,1)=1!=3, (0,1,0)=2==2 ok ; (0,1,1) excluded(-1)
     assert abs(C.policy_agreement(a, b) - (2 / 3)) < 1e-9
 
+def test_value_metrics_empty_and_constant():
+    H = W = 4; T = 2
+    a = np.full((H, W, T), 7.0)
+    b = np.arange(H * W * T, dtype=np.float64).reshape(H, W, T)
+    # empty reach -> all NaN
+    import math
+    m0 = C.value_metrics(a, b, reach=np.zeros((H, W, T), bool))
+    assert m0['n'] == 0 and math.isnan(m0['rmse']) and math.isnan(m0['spearman'])
+    # constant `a` over full reach -> pearson AND spearman both NaN (the fix)
+    m1 = C.value_metrics(a, b, reach=np.ones((H, W, T), bool))
+    assert math.isnan(m1['pearson']) and math.isnan(m1['spearman'])
+
 if __name__ == '__main__':
     test_orientation_recovers_transpose()
     test_value_metrics_identity()
     test_policy_agreement()
+    test_value_metrics_empty_and_constant()
     print("OK")

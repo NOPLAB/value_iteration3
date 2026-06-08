@@ -4,7 +4,7 @@ import sys, json, os
 import numpy as np
 
 ROS2_UNREACH = 65535
-ROS1_UNREACH = 1e6
+ROS1_UNREACH = 1e6   # detection threshold; actual ROS1 sentinel is ~1e9 (max_cost_/prob_base_)
 
 # 8 dihedral spatial transforms on the (H, W) plane (theta axis preserved).
 # Order matters: when two transforms tie on the unreachable-mask score, the
@@ -51,10 +51,12 @@ def value_metrics(ros1, ros2, reach):
     rmse = float(np.sqrt(np.mean(diff ** 2)))
     mae = float(np.mean(np.abs(diff)))
     max_abs = float(np.max(np.abs(diff)))
-    pearson = float(np.corrcoef(a, b)[0, 1]) if n > 1 and a.std() > 0 and b.std() > 0 else float('nan')
+    nondegenerate = n > 1 and a.std() > 0 and b.std() > 0
+    pearson = float(np.corrcoef(a, b)[0, 1]) if nondegenerate else float('nan')
+    # ordinal tie-breaking (no scipy): slightly differs from avg-rank Spearman on tied data
     ra = np.argsort(np.argsort(a))
     rb = np.argsort(np.argsort(b))
-    spearman = float(np.corrcoef(ra, rb)[0, 1]) if n > 1 else float('nan')
+    spearman = float(np.corrcoef(ra, rb)[0, 1]) if nondegenerate else float('nan')
     return dict(n=int(n), rmse=rmse, mae=mae, max_abs=max_abs,
                 pearson=pearson, spearman=spearman)
 
@@ -83,8 +85,10 @@ def main():
     pa_all = policy_agreement(p1a, p2)
     pa_t0 = policy_agreement(p1a[:, :, 0:1], p2[:, :, 0:1])
 
-    t1 = json.load(open(os.path.join(out_dir, 'timing_ros1.json')))
-    t2 = json.load(open(os.path.join(out_dir, 'timing_ros2.json')))
+    with open(os.path.join(out_dir, 'timing_ros1.json')) as f:
+        t1 = json.load(f)
+    with open(os.path.join(out_dir, 'timing_ros2.json')) as f:
+        t2 = json.load(f)
 
     lines = []
     lines.append("# VI 比較レポート (本家ROS1 vs vi_ros2 ROS2)\n")
