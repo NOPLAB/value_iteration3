@@ -1,0 +1,22 @@
+# Sequential orchestration is done by scripts/compare_bench.sh (not `up`),
+# this file only fixes image/volume wiring for `docker compose run`.
+services:
+  ros1:
+    image: vi_compare_ros1:noetic
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ros1
+    volumes:
+      - ${VI_ORIG:-../../../value_iteration}:/src_value_iteration:ro
+      - ../../:/workspace
+      - ../results:/results
+    working_dir: /workspace
+    command: bash /workspace/vi_compare/ros1/run_ros1_bench.sh
+  ros2:
+    image: vi_ros2_dev:humble
+    volumes:
+      - ${VI_ORIG:-../../../value_iteration}:/src_value_iteration:ro
+      - ../../:/workspace
+      - ../results:/results
+    working_dir: /workspace
+    command: bash /workspace/vi_compare/ros2/run_ros2_bench.sh

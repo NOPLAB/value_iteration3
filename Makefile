@@ -146,3 +146,31 @@ ros2-test:
 	  bash scripts/ros2_test.sh
 
 .PHONY: ros2-docker ros2-shell ros2-build ros2-test
+
+# ----- vi_compare (本家ROS1 vs vi_ros2 ROS2 ベンチ) -------------------
+
+VI_ORIG ?= $(abspath $(PWD)/../value_iteration)
+
+compare-build: ros2-docker
+	docker build -t vi_compare_ros1:noetic -f vi_compare/docker/Dockerfile.ros1 vi_compare/docker
+
+compare-ros1:
+	docker run --rm \
+	  -v $(VI_ORIG):/src_value_iteration:ro \
+	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
+	  vi_compare_ros1:noetic bash /workspace/vi_compare/ros1/run_ros1_bench.sh
+
+compare-ros2:
+	docker run --rm \
+	  -v $(VI_ORIG):/src_value_iteration:ro \
+	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
+	  vi_ros2_dev:humble bash /workspace/vi_compare/ros2/run_ros2_bench.sh
+
+compare-report:
+	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
+	  vi_compare_ros1:noetic bash -lc "cd /workspace/vi_compare/compare && python3 compare.py /results"
+
+compare-bench: compare-build
+	VI_ORIG=$(VI_ORIG) bash scripts/compare_bench.sh
+
+.PHONY: compare-build compare-ros1 compare-ros2 compare-report compare-bench
