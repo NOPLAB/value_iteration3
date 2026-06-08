@@ -42,9 +42,19 @@ def test_value_metrics_empty_and_constant():
     m1 = C.value_metrics(a, b, reach=np.ones((H, W, T), bool))
     assert math.isnan(m1['pearson']) and math.isnan(m1['spearman'])
 
+def test_directional_unreach_agreement():
+    import numpy as np
+    small = np.zeros((4,4,2), bool); small[0,0,0]=True; small[1,1,0]=True  # 2 cells
+    big = np.zeros((4,4,2), bool); big[0,0,0]=True; big[1,1,0]=True; big[2,2,0]=True; big[3,3,0]=True  # superset+extra
+    assert abs(C.directional_unreach_agreement(small, big) - 1.0) < 1e-9
+    small2 = np.zeros((2,2,1), bool)  # empty
+    import math
+    assert math.isnan(C.directional_unreach_agreement(small2, big[:2,:2,:1]))
+
 if __name__ == '__main__':
     test_orientation_recovers_transpose()
     test_value_metrics_identity()
     test_policy_agreement()
     test_value_metrics_empty_and_constant()
+    test_directional_unreach_agreement()
     print("OK")
