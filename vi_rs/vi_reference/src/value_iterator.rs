@@ -107,6 +107,137 @@ impl ValueIterator {
             }
         }
     }
+
+    /// 本家 `setMapWithOccupancyGrid`。
+    pub fn set_map_with_occupancy_grid(
+        &mut self,
+        map: &OccupancyGrid,
+        theta_cell_num: i32,
+        safety_radius: f64,
+        safety_radius_penalty: f64,
+        goal_margin_radius: f64,
+        goal_margin_theta: i32,
+    ) {
+        self.cell_num_t = theta_cell_num;
+        self.goal_margin_radius = goal_margin_radius;
+        self.goal_margin_theta = goal_margin_theta;
+        self.cell_num_x = map.width;
+        self.cell_num_y = map.height;
+        self.xy_resolution = map.resolution;
+        // ★整数除算後に f64 化 (本家 `t_resolution_ = 360/cell_num_t_;`)。
+        self.t_resolution = (360 / self.cell_num_t) as f64;
+        self.map_origin_x = map.origin_x;
+        self.map_origin_y = map.origin_y;
+        self.map_origin_quat = map.origin_quat.clone();
+
+        self.set_state(map, safety_radius, safety_radius_penalty);
+        self.set_state_transition();
+        self.set_sweep_orders();
+    }
+
+    /// 本家 `setState`。
+    fn set_state(&mut self, map: &OccupancyGrid, safety_radius: f64, safety_radius_penalty: f64) {
+        self.states.clear();
+        let margin = (safety_radius / self.xy_resolution).ceil() as i32;
+        for y in 0..self.cell_num_y {
+            for x in 0..self.cell_num_x {
+                for t in 0..self.cell_num_t {
+                    self.states.push(State::from_occupancy(
+                        x,
+                        y,
+                        t,
+                        map,
+                        margin,
+                        safety_radius_penalty,
+                        self.cell_num_x,
+                    ));
+                }
+            }
+        }
+    }
+
+    /// 本家 `setMapWithCostGrid`。`margin` は本家にあるが未使用。
+    pub fn set_map_with_cost_grid(
+        &mut self,
+        map: &OccupancyGrid,
+        theta_cell_num: i32,
+        safety_radius: f64,
+        _safety_radius_penalty: f64,
+        goal_margin_radius: f64,
+        goal_margin_theta: i32,
+    ) {
+        self.cell_num_t = theta_cell_num;
+        self.goal_margin_radius = goal_margin_radius;
+        self.goal_margin_theta = goal_margin_theta;
+        self.cell_num_x = map.width;
+        self.cell_num_y = map.height;
+        self.xy_resolution = map.resolution;
+        self.t_resolution = (360 / self.cell_num_t) as f64;
+        self.map_origin_x = map.origin_x;
+        self.map_origin_y = map.origin_y;
+        self.map_origin_quat = map.origin_quat.clone();
+
+        self.states.clear();
+        let _margin = (safety_radius / self.xy_resolution).ceil() as i32; // 本家にあるが未使用
+        for y in 0..self.cell_num_y {
+            for x in 0..self.cell_num_x {
+                // 本家 `(unsigned int)(map.data[x + cell_num_x_*y] & 0xFF)`。
+                let cost = (map.data[(x + self.cell_num_x * y) as usize] as u8) as u32;
+                for t in 0..self.cell_num_t {
+                    self.states.push(State::from_cost(x, y, t, cost));
+                }
+            }
+        }
+        self.set_state_transition();
+        self.set_sweep_orders();
+    }
+
+    /// 本家 `setSweepOrders`。6 種の走査順を生成。既に生成済みなら何もしない。
+    /// ★[4]=[0]全体+[1]後半、[5]=[1]前半 というアンバランス/重複を逐語再現。
+    pub(crate) fn set_sweep_orders(&mut self) {
+        if !self.sweep_orders.is_empty() {
+            return;
+        }
+        let (nx, ny, nt) = (self.cell_num_x, self.cell_num_y, self.cell_num_t);
+
+        // [0]: y, x, t 順
+        let mut o0 = Vec::new();
+        for y in 0..ny {
+            for x in 0..nx {
+                for t in 0..nt {
+                    o0.push(self.to_index(x, y, t));
+                }
+            }
+        }
+        // [1]: x, y, t 順
+        let mut o1 = Vec::new();
+        for x in 0..nx {
+            for y in 0..ny {
+                for t in 0..nt {
+                    o1.push(self.to_index(x, y, t));
+                }
+            }
+        }
+        let o2: Vec<i32> = o0.iter().rev().cloned().collect();
+        let o3: Vec<i32> = o1.iter().rev().cloned().collect();
+        self.sweep_orders.push(o0); // 0
+        self.sweep_orders.push(o1); // 1
+        self.sweep_orders.push(o2); // 2
+        self.sweep_orders.push(o3); // 3
+
+        // [4],[5]: 本家 `for(i=0;i<2;i++){ push(前半[i]); [4].append(後半[i]); }`
+        let half = self.sweep_orders[0].len() / 2;
+        // i=0
+        let o0_first: Vec<i32> = self.sweep_orders[0][..half].to_vec();
+        self.sweep_orders.push(o0_first); // index 4 = [0]前半
+        let o0_second: Vec<i32> = self.sweep_orders[0][half..].to_vec();
+        self.sweep_orders[4].extend(o0_second); // [4] = [0]全体
+        // i=1
+        let o1_first: Vec<i32> = self.sweep_orders[1][..half].to_vec();
+        self.sweep_orders.push(o1_first); // index 5 = [1]前半
+        let o1_second: Vec<i32> = self.sweep_orders[1][half..].to_vec();
+        self.sweep_orders[4].extend(o1_second); // [4] = [0]全体 + [1]後半
+    }
 }
 
 // ── コア free 関数 (単スレッド経路とマルチスレッド経路で共有) ──
@@ -252,6 +383,53 @@ mod tests {
         let (to_x, to_y, _) = no_noise_state_transition(0.3, 0.0, 0.0, 0.0, 0.0);
         assert!((to_x - 0.3).abs() < 1e-9);
         assert!(to_y.abs() < 1e-9);
+    }
+
+    fn free_grid(w: i32, h: i32) -> OccupancyGrid {
+        OccupancyGrid {
+            width: w,
+            height: h,
+            resolution: 0.05,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Default::default(),
+            data: vec![0; (w * h) as usize],
+        }
+    }
+
+    #[test]
+    fn set_map_occupancy_populates_states_and_transitions() {
+        let actions = vec![Action::new("forward", 0.3, 0.0, 0)];
+        let mut vi = ValueIterator::new(actions, 1);
+        let map = free_grid(3, 2);
+        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.2, 10);
+
+        assert_eq!(vi.cell_num_x, 3);
+        assert_eq!(vi.cell_num_y, 2);
+        assert_eq!(vi.cell_num_t, 60);
+        assert_eq!(vi.t_resolution, 6.0);
+        assert_eq!(vi.states.len(), 3 * 2 * 60);
+        // 各 action の θ ごとに遷移が生成されている。
+        assert_eq!(vi.actions[0].state_transitions.len(), 60);
+        let total: i64 = vi.actions[0].state_transitions[0]
+            .iter()
+            .map(|s| s.prob as i64)
+            .sum();
+        assert_eq!(total, super::PROB_BASE as i64);
+    }
+
+    #[test]
+    fn set_map_cost_grid_free_and_obstacle() {
+        let actions = vec![Action::new("forward", 0.3, 0.0, 0)];
+        let mut vi = ValueIterator::new(actions, 1);
+        let mut map = free_grid(2, 1);
+        map.data = vec![0, 255i32 as i8]; // 1 つ目 free(cost0), 2 つ目 255
+        vi.set_map_with_cost_grid(&map, 60, 0.2, 30.0, 0.2, 10);
+        // index (x=0): free。 (x=1): not free。
+        let s0 = &vi.states[vi.to_index(0, 0, 0) as usize];
+        let s1 = &vi.states[vi.to_index(1, 0, 0) as usize];
+        assert!(s0.free);
+        assert!(!s1.free);
     }
 
     #[test]
