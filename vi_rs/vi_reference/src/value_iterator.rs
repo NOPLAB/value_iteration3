@@ -433,6 +433,39 @@ mod tests {
     }
 
     #[test]
+    fn sweep_orders_structure() {
+        let actions = vec![Action::new("forward", 0.3, 0.0, 0)];
+        let mut vi = ValueIterator::new(actions, 1);
+        let map = free_grid(2, 2);
+        vi.set_map_with_occupancy_grid(&map, 4, 0.2, 30.0, 0.2, 10); // 小さい cell_num_t=4
+        let total = (2 * 2 * 4) as usize;
+        assert_eq!(vi.sweep_orders.len(), 6);
+        assert_eq!(vi.sweep_orders[0].len(), total);
+        assert_eq!(vi.sweep_orders[1].len(), total);
+        // [2],[3] は逆順
+        let rev0: Vec<i32> = vi.sweep_orders[0].iter().rev().cloned().collect();
+        assert_eq!(vi.sweep_orders[2], rev0);
+        // ★[4] = [0]全体 + [1]後半 (size = total + (total - half))
+        let half = total / 2;
+        assert_eq!(vi.sweep_orders[4].len(), total + (total - half));
+        assert_eq!(&vi.sweep_orders[4][..total], &vi.sweep_orders[0][..]);
+        assert_eq!(&vi.sweep_orders[4][total..], &vi.sweep_orders[1][half..]);
+        // ★[5] = [1]前半
+        assert_eq!(vi.sweep_orders[5], vi.sweep_orders[1][..half].to_vec());
+    }
+
+    #[test]
+    fn sweep_orders_idempotent() {
+        let actions = vec![Action::new("forward", 0.3, 0.0, 0)];
+        let mut vi = ValueIterator::new(actions, 1);
+        let map = free_grid(2, 2);
+        vi.set_map_with_occupancy_grid(&map, 4, 0.2, 30.0, 0.2, 10);
+        let len_before = vi.sweep_orders.len();
+        vi.set_sweep_orders(); // 2 回目は no-op
+        assert_eq!(vi.sweep_orders.len(), len_before);
+    }
+
+    #[test]
     fn prob_sum_equals_prob_base() {
         // 任意 action・θで prob 総和 = 64^3 = 262144 = PROB_BASE。
         let list = compute_theta_transitions(0.3, 0.0, 0, 0.05, 6.0);
