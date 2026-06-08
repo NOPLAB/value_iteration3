@@ -3,3 +3,6 @@
 //! 設計: `docs/superpowers/specs/2026-06-08-vi-reference-faithful-port-design.md`
 
 pub mod params;
+pub mod msg;
+
+pub use msg::{LaserScan, OccupancyGrid, Quaternion};
