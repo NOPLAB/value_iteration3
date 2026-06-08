@@ -6,3 +6,6 @@ pub mod params;
 pub mod msg;
 
 pub use msg::{LaserScan, OccupancyGrid, Quaternion};
+pub mod state_transition;
+
+pub use state_transition::StateTransition;
