@@ -9,3 +9,6 @@ pub use msg::{LaserScan, OccupancyGrid, Quaternion};
 pub mod state_transition;
 
 pub use state_transition::StateTransition;
+pub mod action;
+
+pub use action::Action;
