@@ -1,0 +1,4 @@
+*.npy
+*.json
+report.md
+!.gitkeep

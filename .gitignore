@@ -14,3 +14,6 @@ edf/
 /vi_ros2_ws/
 /.cargo/
 /log/
+
+# Python bytecode caches (vi_compare bench clients / compare tooling)
+__pycache__/
