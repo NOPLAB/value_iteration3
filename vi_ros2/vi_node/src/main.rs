@@ -620,7 +620,7 @@ fn spawn_action_server(
                     }
                 };
                 let cancel = Arc::new(AtomicBool::new(false));
-                let handle = spawn_sweep(base_ctx, solver, Arc::clone(&cancel));
+                let handle = spawn_sweep(base_ctx, solver, Arc::clone(&cancel), None);
                 let feedback_rx = handle.feedback_rx.clone();
 
                 // Store handle so publishers can access it and action can cancel.
