@@ -1,0 +1,5 @@
+//! 本家 ROS1 `value_iteration` パッケージ (`ValueIterator` / `ValueIteratorLocal`) の
+//! Rust 忠実移植。型・アルゴリズム・固有バグまで一致させることを目的とする。
+//! 設計: `docs/superpowers/specs/2026-06-08-vi-reference-faithful-port-design.md`
+
+pub mod params;
