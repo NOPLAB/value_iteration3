@@ -8,8 +8,9 @@ use crate::value_iterator::ValueIterator;
 
 // フロンティアには実績ある word 並列 Bitboard を再利用する（u16 frontier の高速化の源）。
 // Bitboard は値の型に非依存なので u64 モデルでもそのまま使える。dilate は theta periodic。
-pub(crate) use vi_algorithm::bitboard::Bitboard3D;
+pub(crate) use vi_algorithm::bitboard::{Bitboard2D, Bitboard3D};
 
+pub mod frontier2d;
 pub mod frontier3d;
 
 /// dilation 変位 `(mx, my, mt)` を `actions` の全遷移から算出する。`dit` は絶対 θ なので、
@@ -38,6 +39,17 @@ pub(crate) fn seed_frontier(vi: &ValueIterator) -> Bitboard3D {
     for s in &vi.states {
         if s.total_cost < MAX_COST {
             bb.set(s.ix as u32, s.iy as u32, s.it as u32);
+        }
+    }
+    bb
+}
+
+/// 初期フロンティア種 (2D): いずれかの θ で `total_cost < MAX_COST` の (ix,iy)。
+pub(crate) fn seed_frontier_2d(vi: &ValueIterator) -> Bitboard2D {
+    let mut bb = Bitboard2D::new(vi.cell_num_x as u32, vi.cell_num_y as u32);
+    for s in &vi.states {
+        if s.total_cost < MAX_COST {
+            bb.set(s.ix as u32, s.iy as u32);
         }
     }
     bb
@@ -107,10 +119,118 @@ pub fn solve(vi: &mut ValueIterator, solver: U64Solver, max_iter: u32) -> U64Sol
     let (iters, updates, converged) = match solver {
         U64Solver::Reference => reference_solve(vi, max_iter),
         U64Solver::Frontier3D => frontier3d::frontier3d_solve(vi, max_iter),
-        // Phase 2/3 で実装次第、各 *_solve に差し替える。
+        U64Solver::Frontier2D => frontier2d::frontier2d_solve(vi, max_iter),
+        // Phase 3 で実装次第、各 *_solve に差し替える。
         other => panic!("u64 solver not yet implemented: {other:?}"),
     };
     U64SolveStats { iters, updates, converged }
+}
+
+/// フロンティア/ブロック系ソルバの parity テスト共有ヘルパ。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::action::Action;
+    use crate::msg::OccupancyGrid;
+    use crate::params::PROB_BASE;
+    use crate::value_iterator::ValueIterator;
+
+    pub(crate) const REACH: u64 = 1_000_000u64 * PROB_BASE;
+
+    pub(crate) fn actions() -> Vec<Action> {
+        vec![
+            Action::new("forward", 0.3, 0.0, 0),
+            Action::new("back", -0.2, 0.0, 1),
+            Action::new("right", 0.0, -20.0, 2),
+            Action::new("rightfw", 0.2, -20.0, 3),
+            Action::new("left", 0.0, 20.0, 4),
+            Action::new("leftfw", 0.2, 20.0, 5),
+        ]
+    }
+
+    pub(crate) fn make_vi(w: i32, h: i32, occ: Vec<i8>) -> ValueIterator {
+        let mut vi = ValueIterator::new(actions(), 1);
+        let map = OccupancyGrid {
+            width: w,
+            height: h,
+            resolution: 0.05,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Default::default(),
+            data: occ,
+        };
+        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.3, 15);
+        vi.set_goal(0.10, 0.10, 0);
+        vi
+    }
+
+    /// Reference 全走査を strict 固定点（到達可能セルが変化しなくなる）まで回す。
+    pub(crate) fn run_reference_to_fixed_point(vi: &mut ValueIterator) {
+        let mut prev: Vec<u64> = vi.states.iter().map(|s| s.total_cost).collect();
+        for _ in 0..2000 {
+            vi.value_iteration_worker(1, 0);
+            let mut changed = false;
+            for (i, s) in vi.states.iter().enumerate() {
+                if s.total_cost < REACH && s.total_cost != prev[i] {
+                    changed = true;
+                }
+                prev[i] = s.total_cost;
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /// `solve_fn` で解いた結果が Reference 固定点と到達可能セルで bit 一致することを assert。
+    pub(crate) fn assert_parity<F>(w: i32, h: i32, occ: Vec<i8>, solve_fn: F)
+    where
+        F: Fn(&mut ValueIterator) -> (u32, u64, bool),
+    {
+        let mut a = make_vi(w, h, occ.clone());
+        let mut b = make_vi(w, h, occ);
+        run_reference_to_fixed_point(&mut a);
+        let (_i, _u, converged) = solve_fn(&mut b);
+        assert!(converged, "solver must converge");
+        let mut n_reach = 0u64;
+        for i in 0..a.states.len() {
+            if a.states[i].total_cost < REACH {
+                n_reach += 1;
+                assert_eq!(
+                    a.states[i].total_cost, b.states[i].total_cost,
+                    "total_cost mismatch @ state {i} (ix={},iy={},it={})",
+                    a.states[i].ix, a.states[i].iy, a.states[i].it
+                );
+                assert_eq!(
+                    a.states[i].optimal_action, b.states[i].optimal_action,
+                    "policy mismatch @ state {i} (ix={},iy={},it={})",
+                    a.states[i].ix, a.states[i].iy, a.states[i].it
+                );
+            }
+        }
+        assert!(n_reach > 0, "到達可能セルが存在するはず");
+    }
+
+    /// 標準の3マップ (empty / obstacle / sentinel) で parity を検証する共通テスト本体。
+    pub(crate) fn parity_standard_maps<F>(solve_fn: F)
+    where
+        F: Fn(&mut ValueIterator) -> (u32, u64, bool) + Copy,
+    {
+        // empty 8x8
+        assert_parity(8, 8, vec![0i8; 64], solve_fn);
+        // obstacle: x=5 の縦壁 (隙間あり)
+        let mut occ = vec![0i8; 64];
+        for iy in 0..8 {
+            occ[(iy * 8 + 5) as usize] = 100;
+        }
+        occ[5] = 0;
+        assert_parity(8, 8, occ, solve_fn);
+        // sentinel: goal(2,2) を3方向で囲む
+        let mut occ = vec![0i8; 64];
+        occ[(1 * 8 + 2) as usize] = 100;
+        occ[(3 * 8 + 2) as usize] = 100;
+        occ[(2 * 8 + 1) as usize] = 100;
+        assert_parity(8, 8, occ, solve_fn);
+    }
 }
 
 #[cfg(test)]
