@@ -201,6 +201,21 @@ compare-f3d-report:
 	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
 	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/compare && python3 compare.py /results f3d"
 
+# vi_reference の u64 高速ソルバ群 (frontier/block を本家 u64 モデルで) を vi_ros2_dev
+# イメージ内でビルド・実行し value_<solver>.npy 等を生成。SOLVERS で集合を上書き可。
+compare-u64:
+	mkdir -p $(PWD)/vi_compare/results
+	docker run --rm \
+	  -v $(VI_ORIG):/src_value_iteration:ro \
+	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
+	  -e SOLVERS="$(SOLVERS)" \
+	  $(VI_ROS2_DOCKER_IMG) bash /workspace/vi_compare/u64/run_u64_bench.sh
+
+# 本家(ros1) vs 各 u64 ソルバの比較レポート (report_u64_<solver>.md)。SIDES で集合を上書き可。
+compare-u64-report:
+	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
+	  $(VI_COMPARE_ROS1_IMG) bash -lc 'cd /workspace/vi_compare/compare && for s in $(SIDES); do python3 compare.py /results $$s; done'
+
 # 本家 vs ref を「真の固定点」で bit 比較 (サブステップ精細化まで収束させ stop-sweep 依存を排除)。
 compare-strict:
 	VI_ORIG=$(VI_ORIG) bash scripts/compare_strict.sh
@@ -208,4 +223,4 @@ compare-strict:
 compare-bench: compare-build
 	VI_ORIG=$(VI_ORIG) bash scripts/compare_bench.sh
 
-.PHONY: compare-build compare-ros1 compare-ros2 compare-report compare-ref compare-ref-report compare-f3d compare-f3d-report compare-strict compare-bench
+.PHONY: compare-build compare-ros1 compare-ros2 compare-report compare-ref compare-ref-report compare-f3d compare-f3d-report compare-u64 compare-u64-report compare-strict compare-bench

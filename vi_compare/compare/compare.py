@@ -23,6 +23,16 @@ SIDES = {
                             '（ros2 reference と同一の数値モデルで、ソルバのみ異なる実装）'),
 }
 
+# vi_u64_bench が出す u64 高速ソルバ群。本家と同一の u64 コストモデル上で frontier/block を
+# 走らせるため、厳密ソルバは本家と bit-exact（RMSE 0）になるはず。出力名は value_<solver>.npy。
+_U64_SOLVERS = ['reference', 'frontier3d', 'frontier2d', 'frontier_stack',
+                'block_refine', 'pyramid_sweep']
+for _s in _U64_SOLVERS:
+    SIDES[_s] = dict(
+        vfile=f'value_{_s}.npy', pfile=f'policy_{_s}.npy', tfile=f'timing_{_s}.json',
+        unreach=1e6, label=f'u64:{_s}', report=f'report_u64_{_s}.md',
+        model_note='本家と同一 u64 コストモデル（vi_reference）上の高速ソルバ → bit-exact を期待')
+
 # 8 dihedral spatial transforms on the (H, W) plane (theta axis preserved).
 # Order matters: when two transforms tie on the unreachable-mask score, the
 # first one in this dict wins (strict < comparison).  Simple/natural transforms
