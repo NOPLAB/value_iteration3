@@ -663,7 +663,16 @@ fn spawn_action_server(
                 let (done_tx, done_rx) = futures::channel::oneshot::channel::<bool>();
                 let sweep_handle_thread = Arc::clone(&sweep_handle);
                 std::thread::spawn(move || {
-                    let mut converged = false;
+                    // The worker thread is the SOLE authority on convergence: it
+                    // breaks its sweep loop on `SolveStats.converged` and drops
+                    // `feedback_tx`, which surfaces here as a `Disconnected` recv
+                    // (handled below). We must NOT infer convergence from
+                    // `final_delta == 0`: frontier-family solvers (Frontier3D — the
+                    // node's DEFAULT solver) always report `final_delta == 0` by
+                    // design and signal convergence only via the `converged` flag,
+                    // so a `final_delta == 0` early-stop here would cut them off
+                    // after the first feedback tick (a few rings of propagation
+                    // from the goal) and dump a partial solve.
                     loop {
                         std::thread::sleep(Duration::from_millis(100));
 
@@ -674,15 +683,13 @@ fn spawn_action_server(
                             break;
                         }
 
-                        // Drain all pending feedback ticks.
+                        // Drain all pending feedback ticks; publish the latest.
                         let mut last_tick = None;
                         while let Ok(tick) = feedback_rx.try_recv() {
                             last_tick = Some(tick);
                         }
 
                         if let Some(tick) = last_tick {
-                            converged = tick.final_delta == 0;
-
                             // Vi.action feedback:
                             //   std_msgs/UInt32MultiArray current_sweep_times
                             //   std_msgs/Float32MultiArray deltas
@@ -697,14 +704,11 @@ fn spawn_action_server(
                                 },
                             };
                             let _ = feedback_publisher.publish(feedback);
-
-                            if converged {
-                                break;
-                            }
                         }
 
                         // The worker drops feedback_tx on exit; a Disconnected
-                        // result means the sweep has finished.
+                        // result means the sweep has finished (converged, or its
+                        // internal budget was exhausted).
                         if matches!(
                             feedback_rx.try_recv(),
                             Err(crossbeam_channel::TryRecvError::Disconnected)
@@ -724,7 +728,10 @@ fn spawn_action_server(
                         }
                     };
 
-                    let finished = stats.map(|s| s.converged).unwrap_or(converged);
+                    // Authoritative: the joined worker's `converged`. If the
+                    // worker handle was missing (already taken / never set),
+                    // report not-finished rather than guessing from feedback.
+                    let finished = stats.map(|s| s.converged).unwrap_or(false);
                     let _ = done_tx.send(finished);
                 });
 
