@@ -13,6 +13,11 @@ pub(crate) use vi_algorithm::bitboard::{Bitboard2D, Bitboard3D};
 pub mod block;
 pub mod coarse_theta;
 pub mod frontier2d;
+pub mod frontier2d_pad;
+pub mod frontier2d_par;
+pub mod frontier2d_soa;
+#[cfg(test)]
+mod measure;
 pub mod frontier3d;
 pub mod pyramid;
 pub mod stack;
@@ -72,6 +77,9 @@ pub enum U64Solver {
     Reference,
     Frontier3D,
     Frontier2D,
+    Frontier2DSoA,
+    Frontier2DPad,
+    Frontier2DPar,
     FrontierStack,
     BlockRefine,
     PyramidSweep,
@@ -87,6 +95,9 @@ impl U64Solver {
             "reference" => U64Solver::Reference,
             "frontier3d" => U64Solver::Frontier3D,
             "frontier2d" => U64Solver::Frontier2D,
+            "frontier2d_soa" => U64Solver::Frontier2DSoA,
+            "frontier2d_pad" => U64Solver::Frontier2DPad,
+            "frontier2d_par" => U64Solver::Frontier2DPar,
             "frontier_stack" => U64Solver::FrontierStack,
             "block_refine" => U64Solver::BlockRefine,
             "pyramid_sweep" => U64Solver::PyramidSweep,
@@ -137,6 +148,9 @@ pub fn solve(vi: &mut ValueIterator, solver: U64Solver, max_iter: u32) -> U64Sol
         U64Solver::Reference => reference_solve(vi, max_iter),
         U64Solver::Frontier3D => frontier3d::frontier3d_solve(vi, max_iter),
         U64Solver::Frontier2D => frontier2d::frontier2d_solve(vi, max_iter),
+        U64Solver::Frontier2DSoA => frontier2d_soa::frontier2d_soa_solve(vi, max_iter),
+        U64Solver::Frontier2DPad => frontier2d_pad::frontier2d_pad_solve(vi, max_iter),
+        U64Solver::Frontier2DPar => frontier2d_par::frontier2d_par_solve(vi, max_iter),
         U64Solver::FrontierStack => stack::frontier_stack_solve(vi, max_iter),
         U64Solver::BlockRefine => block::block_refine_solve(vi, max_iter),
         U64Solver::PyramidSweep => pyramid::pyramid_sweep_solve(vi, max_iter),

@@ -11,7 +11,7 @@ import sys, os, json
 import numpy as np
 import compare as C
 
-SOLVERS = ['reference', 'frontier3d', 'frontier2d', 'frontier_stack', 'block_refine', 'pyramid_sweep']
+SOLVERS = ['reference', 'frontier3d', 'frontier2d', 'frontier2d_soa', 'frontier2d_pad', 'frontier2d_par', 'frontier_stack', 'block_refine', 'pyramid_sweep']
 ROS1_UNREACH = 1e6  # u64 モデル sentinel 検出閾値
 
 
@@ -51,7 +51,8 @@ def main():
 
     lines = []
     lines.append("# u64 高速ソルバ群 vs 本家ROS1 — bit-exact & 速度\n")
-    lines.append(f"house.pgm (384×384×60), 単スレッド。本家 elapsed={t1_elapsed:.3f}s。")
+    lines.append(f"house.pgm (384×384×60)。本家 elapsed={t1_elapsed:.3f}s (単スレッド)。"
+                 "ソルバは原則単スレッド、`frontier2d_par` のみ決定的マルチスレッド (Jacobi) で例外。")
     lines.append("各ソルバは本家と同一 u64 コストモデル上で frontier/block を走らせる "
                  "(vi_reference solvers)。厳密ソルバなので RMSE 0 / 方策 100% を期待。\n")
     lines.append("| ソルバ | elapsed[s] | 反復 | updates | 本家比速度 | RMSE | 方策一致 | converged | bit-exact |")

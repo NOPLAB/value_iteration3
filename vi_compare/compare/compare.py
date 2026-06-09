@@ -25,8 +25,8 @@ SIDES = {
 
 # vi_u64_bench が出す u64 高速ソルバ群。本家と同一の u64 コストモデル上で frontier/block を
 # 走らせるため、厳密ソルバは本家と bit-exact（RMSE 0）になるはず。出力名は value_<solver>.npy。
-_U64_SOLVERS = ['reference', 'frontier3d', 'frontier2d', 'frontier_stack',
-                'block_refine', 'pyramid_sweep']
+_U64_SOLVERS = ['reference', 'frontier3d', 'frontier2d', 'frontier2d_soa', 'frontier2d_pad',
+                'frontier2d_par', 'frontier_stack', 'block_refine', 'pyramid_sweep']
 for _s in _U64_SOLVERS:
     SIDES[_s] = dict(
         vfile=f'value_{_s}.npy', pfile=f'policy_{_s}.npy', tfile=f'timing_{_s}.json',
