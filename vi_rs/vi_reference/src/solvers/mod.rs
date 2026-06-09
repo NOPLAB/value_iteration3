@@ -12,6 +12,7 @@ pub(crate) use vi_algorithm::bitboard::{Bitboard2D, Bitboard3D};
 
 pub mod frontier2d;
 pub mod frontier3d;
+pub mod stack;
 
 /// dilation 変位 `(mx, my, mt)` を `actions` の全遷移から算出する。`dit` は絶対 θ なので、
 /// 各 (action, source theta `t`) について循環距離 `min(|dit-t|, nt-|dit-t|)` を取り `mt` とする。
@@ -120,6 +121,7 @@ pub fn solve(vi: &mut ValueIterator, solver: U64Solver, max_iter: u32) -> U64Sol
         U64Solver::Reference => reference_solve(vi, max_iter),
         U64Solver::Frontier3D => frontier3d::frontier3d_solve(vi, max_iter),
         U64Solver::Frontier2D => frontier2d::frontier2d_solve(vi, max_iter),
+        U64Solver::FrontierStack => stack::frontier_stack_solve(vi, max_iter),
         // Phase 3 で実装次第、各 *_solve に差し替える。
         other => panic!("u64 solver not yet implemented: {other:?}"),
     };
