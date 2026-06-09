@@ -983,7 +983,7 @@ dependencies = [
  "ndarray",
  "vi_algorithm",
  "vi_core",
- "vi_fixtures",
+ "vi_reference",
 ]
 
 [[package]]

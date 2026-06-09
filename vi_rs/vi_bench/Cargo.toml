@@ -6,15 +6,20 @@ rust-version.workspace = true
 
 [dependencies]
 vi_core      = { path = "../vi_core" }
+# bitboard ベンチ (benches/bitboard.rs) のみが参照。ソルバは vi_reference に移行済み。
 vi_algorithm = { path = "../vi_algorithm" }
-vi_fixtures  = { path = "../vi_fixtures" }
+# u64 (本家忠実) ソルバ群。bench_summary / bench_map / criterion ベンチの本体。
+vi_reference = { path = "../vi_reference" }
 criterion    = { workspace = true }
 clap         = { workspace = true }
+# pgm.rs が Array2<Penalty> を扱う。
 ndarray      = { workspace = true }
 
 [features]
 default = []
-parallel = ["vi_algorithm/parallel"]
+# u64 ソルバは現状シリアルのみ。`make rs-bench-parallel` が `--features parallel`
+# を渡すのでフラグ自体は残すが、ベンチ側では no-op（並列パスはまだ無い）。
+parallel = []
 
 [[bench]]
 name = "reference"

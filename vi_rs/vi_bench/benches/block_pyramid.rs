@@ -1,24 +1,20 @@
-//! Criterion bench for BlockRefine and PyramidSweep.
+//! Criterion bench for the u64 BlockRefine and PyramidSweep solvers.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use vi_algorithm::context::{Budget, Solver};
-use vi_algorithm::{BlockRefine, PyramidSweep};
-use vi_bench::fixtures::build_context;
-use vi_fixtures::{MapType, TransitionMode};
+use vi_bench::fixtures::{build_vi, BenchMap};
+use vi_reference::solvers::{solve, U64Solver};
 
 const SIZE: u32 = 8;
-const BUDGET: Budget = Budget::Sweeps(50);
+const MAX_SWEEPS: u32 = 200;
 
-fn run_variant<S: Solver>(c: &mut Criterion, group_name: &str, make_solver: impl Fn() -> S) {
+fn run_variant(c: &mut Criterion, group_name: &str, solver: U64Solver) {
     let mut g = c.benchmark_group(group_name);
-    for (label, map_type) in [("empty", MapType::Empty), ("obstacle", MapType::Obstacle)] {
-        let base = build_context(SIZE, SIZE, map_type, TransitionMode::Trivial);
-        g.bench_with_input(BenchmarkId::new(label, SIZE), &base, |b, base| {
+    for (label, map) in [("empty", BenchMap::Empty), ("obstacle", BenchMap::Obstacle)] {
+        g.bench_with_input(BenchmarkId::new(label, SIZE), &map, |b, &map| {
             b.iter_batched(
-                || base.clone_value(),
-                |mut ctx| {
-                    let solver = make_solver();
-                    solver.run(&mut ctx, BUDGET);
+                || build_vi(SIZE, map),
+                |mut vi| {
+                    solve(&mut vi, solver, MAX_SWEEPS);
                 },
                 criterion::BatchSize::SmallInput,
             );
@@ -28,22 +24,8 @@ fn run_variant<S: Solver>(c: &mut Criterion, group_name: &str, make_solver: impl
 }
 
 fn bench_block_pyramid(c: &mut Criterion) {
-    run_variant(c, "block_refine", || BlockRefine {
-        block_w: 8,
-        block_h: 8,
-        local_sweeps: 2,
-        threshold: 0,
-    });
-    run_variant(c, "pyramid_sweep", || PyramidSweep {
-        threshold: 0,
-        min_size: 4,
-        coarse_sweeps: 8,
-        refine_sweeps: 50,
-        // descend_tau=0 to time the *exact* configuration (matches bench_summary
-        // and the parity tests); a nonzero tau would benchmark a faster but
-        // non-bit-exact variant.
-        descend_tau: 0,
-    });
+    run_variant(c, "block_refine", U64Solver::BlockRefine);
+    run_variant(c, "pyramid_sweep", U64Solver::PyramidSweep);
 }
 
 criterion_group!(benches, bench_block_pyramid);

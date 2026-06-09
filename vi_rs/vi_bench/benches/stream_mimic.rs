@@ -1,27 +1,23 @@
-//! Criterion bench for StreamMimic.
+//! Criterion bench for the u64 StreamMimic solver.
 //!
 //! Mirrors `block_pyramid.rs` shape — same (size=8) × (Empty, Obstacle)
 //! matrix, sweep-based budget.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use vi_algorithm::context::{Budget, Solver};
-use vi_algorithm::StreamMimic;
-use vi_bench::fixtures::build_context;
-use vi_fixtures::{MapType, TransitionMode};
+use vi_bench::fixtures::{build_vi, BenchMap};
+use vi_reference::solvers::{solve, U64Solver};
 
 const SIZE: u32 = 8;
-const BUDGET: Budget = Budget::Sweeps(50);
+const MAX_SWEEPS: u32 = 200;
 
 fn bench_stream_mimic(c: &mut Criterion) {
     let mut g = c.benchmark_group("stream_mimic");
-    for (label, map_type) in [("empty", MapType::Empty), ("obstacle", MapType::Obstacle)] {
-        let base = build_context(SIZE, SIZE, map_type, TransitionMode::Trivial);
-        g.bench_with_input(BenchmarkId::new(label, SIZE), &base, |b, base| {
+    for (label, map) in [("empty", BenchMap::Empty), ("obstacle", BenchMap::Obstacle)] {
+        g.bench_with_input(BenchmarkId::new(label, SIZE), &map, |b, &map| {
             b.iter_batched(
-                || base.clone_value(),
-                |mut ctx| {
-                    let solver = StreamMimic { threshold: 0 };
-                    solver.run(&mut ctx, BUDGET);
+                || build_vi(SIZE, map),
+                |mut vi| {
+                    solve(&mut vi, U64Solver::StreamMimic, MAX_SWEEPS);
                 },
                 criterion::BatchSize::SmallInput,
             );

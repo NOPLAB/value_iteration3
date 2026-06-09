@@ -1,10 +1,10 @@
-//! Shared helpers for vi_bench benches and the bench_summary binary.
+//! Shared helpers for vi_bench benches and the bench_summary / bench_map
+//! binaries.
 //!
-//! See `docs/superpowers/specs/2026-05-22-vi-rs-algorithm-port-design.md` §6.
-//!
-//! Note: spec §6.2 lists `stream_mimic.rs` as a bench file; that bench is
-//! omitted because `StreamMimic` is not yet implemented in `vi_algorithm`.
-//! It will be added once the StreamMimic solver lands.
+//! All solver benchmarking now targets the u64 (本家忠実) solvers in
+//! `vi_reference::solvers`; `fixtures` builds a fully set-up `ValueIterator`
+//! from a synthetic occupancy grid. `pgm` (PGM/YAML loading) is unchanged and
+//! used by `bench_map`.
 
 pub mod fixtures;
 pub mod pgm;

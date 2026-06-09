@@ -1,22 +1,20 @@
-//! `bench_summary` — wall-clock + correctness comparison across solvers.
+//! `bench_summary` — u64 (本家忠実) ソルバ群の wall-clock + 正当性比較。
 //!
-//! Modeled on `vi_matlab/workflows/benchmarks/benchmark_vi.m`. For each
-//! `(map_size, map_type)` case, runs every solver from the same initial
-//! `VIContext`, records `(iters_or_sweeps, updates, total_ms, mismatch)`
-//! against the Reference solver's value table, and emits a Markdown table
-//! to stdout plus an optional CSV.
+//! `vi_matlab/workflows/benchmarks/benchmark_vi.m` を範に取る。各
+//! `(map_size, map_type)` ケースについて、同一の合成マップから全ソルバを走らせ、
+//! `(iters, updates, total_ms, converged, mismatch)` を Reference（=本家全走査の
+//! 固定点）に対して記録し、Markdown 表（+任意の CSV）を出力する。
 //!
-//! Spec: `docs/superpowers/specs/2026-05-22-vi-rs-algorithm-port-design.md` §6.4.
+//! u64 モデルでは到達可能セルの収束値が更新順に依存しないため、全ソルバ
+//! （Frontier/Block/Pyramid/Stream/近似 no-op）が Reference と bit-exact になる。
+//! mismatch は到達可能セル（Reference の `total_cost < REACH`）での `total_cost`
+//! 不一致数で、厳密性ゲートに使う。
 //!
-//! `--smoke` collapses to a single 8×8 Empty case with budgets of 1 and the
-//! Trivial transition mode so the CLI wires up under CI budgets (<30 s).
+//! `--smoke` は単一 8×8 Empty・budget=1 に潰し、CI でワイヤリングだけ検証する
+//! （budget=1 では収束しないのでゲートはスキップ）。
 //!
-//! `--parallel` (only meaningful when compiled with `--features parallel`):
-//! for solvers that have a parallel path (Reference, Frontier3D), emit BOTH
-//! the serial and parallel rows so the table directly compares wall-clock
-//! between the two. Other solvers are always serial and emit one row.
-//! Smoke mode honours this too — `--smoke --parallel` yields 2 rows each for
-//! Reference and Frontier3D, 1 row for everything else.
+//! `--parallel`: u64 ソルバは現状シリアルのみ。フラグは受け付けるが no-op
+//! （`make rs-bench-parallel` 互換のため残す）。
 
 use std::fs;
 use std::io::Write;
@@ -25,55 +23,32 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::Parser;
-use ndarray::{Array3, Zip};
-use vi_algorithm::context::{Budget, Solver, VIContext};
-use vi_algorithm::{
-    BlockRefine, Frontier2D, Frontier3D, Frontier3DCoarseTheta, Frontier3DTau, Frontier3DTopK,
-    FrontierStack, PyramidSweep, Reference, StreamMimic,
-};
-use vi_bench::fixtures::build_context;
-use vi_core::params::MAX_OUTCOMES;
-use vi_core::Value;
-use vi_fixtures::{MapType, TransitionMode};
+use vi_bench::fixtures::{build_vi, BenchMap};
+use vi_reference::params::PROB_BASE;
+use vi_reference::solvers::{solve, U64Solver};
+use vi_reference::ValueIterator;
 
-/// Compile-time flag: was the binary built with `--features parallel`?
-/// Used to decide whether `--parallel` at runtime can actually take effect.
-#[cfg(feature = "parallel")]
-const HAS_PARALLEL: bool = true;
-#[cfg(not(feature = "parallel"))]
-const HAS_PARALLEL: bool = false;
+/// 到達可能とみなす total_cost 上限（compare.py の value>=1e6 境界と整合）。
+const REACH: u64 = 1_000_000u64 * PROB_BASE;
 
-/// Solvers whose output must equal the Reference value table cell-for-cell.
-/// A nonzero mismatch on any of these causes a nonzero exit code.
+/// 全ソルバが Reference と bit-exact であるべき（no-op パラメータ）。
+/// いずれかで mismatch>0 なら非ゼロ終了。
 const EXACT_SOLVERS: &[&str] = &[
     "reference",
-    "frontier_2d",
-    "frontier_3d",
+    "frontier2d",
+    "frontier3d",
     "frontier_stack",
     "block_refine",
     "pyramid_sweep",
-    // StreamMimic is documented as "not required to be bit-exact" (spec §4.8),
-    // but in practice the (CU, strip, Y, X) scan order is just another
-    // Gauss-Seidel ordering — at the fixed point with threshold=0 it must
-    // equal Reference. If a real bench ever flags a mismatch, that's the
-    // signal to investigate.
+    "frontier3d_tau",
+    "frontier3d_topk",
+    "frontier3d_coarse_theta",
     "stream_mimic",
 ];
 
-/// Solvers that currently have an explicit parallel path. When the binary is
-/// compiled with `--features parallel`, `Solver::run` for these dispatches to
-/// the parallel implementation; the explicit serial path is reachable via
-/// `Reference::run_serial` / `Frontier3D::run_serial`.
-///
-/// KEEP IN SYNC with `run_serial_for` — every name returning `true` here must
-/// have a matching arm in that function, or it will panic at runtime.
-fn is_parallel_capable(name: &str) -> bool {
-    matches!(name, "reference" | "frontier_3d")
-}
-
 #[derive(Parser)]
 #[command(
-    about = "Run every VI solver across (map_size × map_type) and emit a comparison table."
+    about = "Run every u64 VI solver across (map_size × map_type) and emit a comparison table."
 )]
 struct Args {
     /// Comma-separated map sizes (square).
@@ -84,11 +59,11 @@ struct Args {
     #[arg(long, value_delimiter = ',', default_value = "empty,obstacle,sentinel,random")]
     types: Vec<String>,
 
-    /// Sweep budget cap for Reference / BlockRefine / PyramidSweep.
+    /// Sweep budget cap for Reference / BlockRefine / PyramidSweep / StreamMimic.
     #[arg(long, default_value_t = 200)]
     max_sweeps: u32,
 
-    /// Iteration budget cap for frontier solvers.
+    /// Iteration budget cap for the frontier-family solvers.
     #[arg(long, default_value_t = 4000)]
     max_iters: u32,
 
@@ -101,121 +76,75 @@ struct Args {
     markdown: bool,
 
     /// CI smoke mode: override sizes to [8], types to [empty], budgets to 1.
-    /// Used to verify every solver wires up without a real-time bench cost.
     #[arg(long, default_value_t = false)]
     smoke: bool,
 
-    /// For solvers that have a parallel path (Reference, Frontier3D), run
-    /// BOTH variants per case and emit them as separate rows tagged
-    /// `serial` / `parallel`. Requires the binary to be built with
-    /// `--features parallel`; otherwise we print a warning and proceed as
-    /// serial. Other solvers emit a single `serial` row.
+    /// Accepted for `make rs-bench-parallel` compatibility. u64 solvers are
+    /// serial-only, so this is a no-op (a note is printed when set).
     #[arg(long, default_value_t = false)]
     parallel: bool,
 }
 
-/// A single (case, solver, mode) measurement.
+/// A single (case, solver) measurement.
 struct CaseRow {
     case_label: String,
     solver: &'static str,
-    /// `"serial"` or `"parallel"`. Indicates which sweep dispatch produced the
-    /// row. Solvers without a parallel implementation always emit `"serial"`.
-    mode: &'static str,
-    iters_or_sweeps: u32,
+    iters: u32,
     updates: u64,
     total_ms: f64,
-    mismatch: u64,
     converged: bool,
+    mismatch: u64,
 }
 
-/// Solver instance + the budget flavor it expects. Built once and reused
-/// across cases — `Solver::run` only needs `&self`.
-struct SolverEntry {
-    boxed: Box<dyn Solver>,
-    budget: Budget,
-}
-
-fn parse_map_type(s: &str) -> Result<MapType, String> {
-    match s {
-        "empty" => Ok(MapType::Empty),
-        "obstacle" => Ok(MapType::Obstacle),
-        "sentinel" => Ok(MapType::Sentinel),
-        "random" => Ok(MapType::Random { density: 0.15, seed: 42 }),
-        other => Err(format!("unknown map type: {other}")),
-    }
-}
-
-/// Cell-wise count of differences between two value tables. Shapes must match.
-fn value_mismatch(a: &Array3<Value>, b: &Array3<Value>) -> u64 {
-    Zip::from(a)
-        .and(b)
-        .fold(0u64, |acc, &x, &y| acc + (x != y) as u64)
-}
-
-/// Build the registry of solvers + their budget flavor. Parameters mirror
-/// the criterion benches and the spec.
-fn build_solver_registry(max_sweeps: u32, max_iters: u32) -> Vec<SolverEntry> {
-    let sweeps = Budget::Sweeps(max_sweeps);
-    let iters = Budget::Iterations(max_iters);
-    // PyramidSweep: cap refine_sweeps at 50 per spec.
-    let pyramid_refine_sweeps = max_sweeps.min(50);
-
+/// Solver registry. Reference MUST be first so it produces the oracle table.
+/// 近似ソルバは no-op パラメータ（tau=0 / k=全 outcome / step=1）で Frontier3D
+/// 等価 → Reference と bit-exact。
+fn registry() -> Vec<(&'static str, U64Solver)> {
+    use U64Solver::*;
     vec![
-        SolverEntry { boxed: Box::new(Reference { threshold: 0 }), budget: sweeps },
-        SolverEntry { boxed: Box::new(Frontier2D), budget: iters },
-        SolverEntry { boxed: Box::new(Frontier3D), budget: iters },
-        SolverEntry { boxed: Box::new(FrontierStack), budget: iters },
-        SolverEntry { boxed: Box::new(Frontier3DTau { tau: 0 }), budget: iters },
-        SolverEntry {
-            boxed: Box::new(Frontier3DTopK { k: MAX_OUTCOMES as u32 }),
-            budget: iters,
-        },
-        SolverEntry {
-            // CLI scales refine_iters with the budget; benches use a fixed small value.
-            boxed: Box::new(Frontier3DCoarseTheta {
-                coarse_step: 4,
-                refine_iters: max_iters / 2,
-            }),
-            budget: iters,
-        },
-        SolverEntry {
-            boxed: Box::new(BlockRefine {
-                block_w: 8,
-                block_h: 8,
-                local_sweeps: 2,
-                threshold: 0,
-            }),
-            budget: sweeps,
-        },
-        SolverEntry {
-            boxed: Box::new(PyramidSweep {
-                threshold: 0,
-                min_size: 4,
-                coarse_sweeps: 8,
-                refine_sweeps: pyramid_refine_sweeps,
-                // descend_tau MUST be 0 for the exact-oracle gate: a nonzero tau
-                // prunes cells whose per-sweep delta <= tau from the descent, so the
-                // finest level's active mask would miss reachable cells (they'd keep
-                // the pessimistic MAX seed) and mismatch Reference. With tau=0 every
-                // changed cell descends, guaranteeing full finest-level coverage.
-                descend_tau: 0,
-            }),
-            budget: sweeps,
-        },
-        SolverEntry { boxed: Box::new(StreamMimic { threshold: 0 }), budget: sweeps },
+        ("reference", Reference),
+        ("frontier2d", Frontier2D),
+        ("frontier3d", Frontier3D),
+        ("frontier_stack", FrontierStack),
+        ("block_refine", BlockRefine),
+        ("pyramid_sweep", PyramidSweep),
+        ("frontier3d_tau", Frontier3DTau { tau: 0 }),
+        ("frontier3d_topk", Frontier3DTopK { k: u32::MAX }),
+        ("frontier3d_coarse_theta", Frontier3DCoarseTheta { step: 1 }),
+        ("stream_mimic", StreamMimic),
     ]
 }
 
+/// Sweep-based solvers take `max_sweeps`; frontier-family take `max_iters`.
+fn budget_for(name: &str, max_sweeps: u32, max_iters: u32) -> u32 {
+    match name {
+        "reference" | "block_refine" | "pyramid_sweep" | "stream_mimic" => max_sweeps,
+        _ => max_iters,
+    }
+}
+
+fn parse_map_type(s: &str) -> Result<BenchMap, String> {
+    BenchMap::from_name(s).ok_or_else(|| format!("unknown map type: {s}"))
+}
+
+/// Count cells where the reference cost is reachable but the solver disagrees.
+fn value_mismatch(ref_costs: &[u64], vi: &ValueIterator) -> u64 {
+    vi.states
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| ref_costs[*i] < REACH && s.total_cost != ref_costs[*i])
+        .count() as u64
+}
+
 fn print_markdown(rows: &[CaseRow]) {
-    println!("| case | solver | mode | iters_or_sweeps | updates | total_ms | converged | mismatch |");
-    println!("|------|--------|------|-----------------|---------|----------|-----------|----------|");
+    println!("| case | solver | iters | updates | total_ms | converged | mismatch |");
+    println!("|------|--------|-------|---------|----------|-----------|----------|");
     for r in rows {
         println!(
-            "| {} | {} | {} | {} | {} | {:.3} | {} | {} |",
+            "| {} | {} | {} | {} | {:.3} | {} | {} |",
             r.case_label,
             r.solver,
-            r.mode,
-            r.iters_or_sweeps,
+            r.iters,
             r.updates,
             r.total_ms,
             if r.converged { "Y" } else { "N" },
@@ -231,18 +160,14 @@ fn write_csv(path: &Path, rows: &[CaseRow]) -> std::io::Result<()> {
         }
     }
     let mut f = fs::File::create(path)?;
-    writeln!(
-        f,
-        "case,solver,mode,iters_or_sweeps,updates,total_ms,converged,mismatch"
-    )?;
+    writeln!(f, "case,solver,iters,updates,total_ms,converged,mismatch")?;
     for r in rows {
         writeln!(
             f,
-            "{},{},{},{},{},{:.3},{},{}",
+            "{},{},{},{},{:.3},{},{}",
             r.case_label,
             r.solver,
-            r.mode,
-            r.iters_or_sweeps,
+            r.iters,
             r.updates,
             r.total_ms,
             if r.converged { "Y" } else { "N" },
@@ -252,75 +177,13 @@ fn write_csv(path: &Path, rows: &[CaseRow]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Smoke mode uses Trivial transitions to skip the 64³ Monte-Carlo build
-/// cost in CI; normal runs use PaperMonteCarlo. Either way, the
-/// `generate_transitions` cache makes repeated calls within a run free.
-fn pick_transition_mode(smoke: bool) -> TransitionMode {
-    if smoke {
-        TransitionMode::Trivial
-    } else {
-        TransitionMode::PaperMonteCarlo { xy_resolution: 0.05 }
-    }
-}
-
-/// Run an explicit serial pass for a `parallel_capable` solver and emit a row
-/// tagged `"serial"`. `Box<dyn Solver>` doesn't downcast cleanly, so we
-/// re-instantiate the small concrete struct by name. This is only called when
-/// the binary was compiled with `--features parallel` AND `--parallel` was
-/// passed; outside that path the dispatched `Solver::run` is already the
-/// serial implementation.
-fn run_serial_for(
-    solver_name: &str,
-    budget: Budget,
-    base: &VIContext,
-    ref_values: &Array3<Value>,
-    case_label: &str,
-) -> CaseRow {
-    let mut ctx = base.clone_value();
-    let t0 = Instant::now();
-    // Pick the concrete struct that owns a public serial entry-point. Both
-    // structs are tiny / zero-sized, so re-instantiating per case is free.
-    // Threshold here MUST match the one used in `build_solver_registry` so the
-    // serial row reflects the same configuration as the parallel one.
-    let stats = match solver_name {
-        "reference" => Reference { threshold: 0 }.run_serial(&mut ctx, budget),
-        "frontier_3d" => Frontier3D.run_serial(&mut ctx, budget),
-        other => panic!("run_serial_for: solver '{other}' has no parallel-capable serial path"),
-    };
-    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let mismatch = value_mismatch(&ctx.value, ref_values);
-
-    // We can't store solver_name (a `&str`) directly into a `&'static str` row;
-    // map back to the known static literal.
-    let static_name: &'static str = match solver_name {
-        "reference" => "reference",
-        "frontier_3d" => "frontier_3d",
-        _ => unreachable!(),
-    };
-
-    eprintln!(
-        "  {case_label} solver={static_name} mode=serial iters={} updates={} ms={:.2} mismatch={mismatch}",
-        stats.iters_or_sweeps, stats.updates, ms,
-    );
-
-    CaseRow {
-        case_label: case_label.to_string(),
-        solver: static_name,
-        mode: "serial",
-        iters_or_sweeps: stats.iters_or_sweeps,
-        updates: stats.updates,
-        total_ms: ms,
-        mismatch,
-        converged: stats.converged,
-    }
-}
-
 fn main() -> ExitCode {
     let mut args = Args::parse();
 
-    // Smoke-mode overrides: keep CI cost trivial. `--parallel` is still
-    // honoured in smoke mode — it only changes the row-emission strategy,
-    // not how much actual work each row does.
+    if args.parallel {
+        eprintln!("note: --parallel is a no-op for u64 solvers (serial-only); proceeding serial");
+    }
+
     if args.smoke {
         args.sizes = vec![8];
         args.types = vec!["empty".to_string()];
@@ -328,8 +191,7 @@ fn main() -> ExitCode {
         args.max_iters = 1;
     }
 
-    // Validate map-type labels up front so a typo fails fast before any
-    // solver runs.
+    // Validate map-type labels up front so a typo fails fast.
     for s in &args.types {
         if let Err(e) = parse_map_type(s) {
             eprintln!("error: {e}");
@@ -337,127 +199,64 @@ fn main() -> ExitCode {
         }
     }
 
-    // Reconcile the runtime --parallel flag with the compile-time feature.
-    // If the user asked for --parallel but the binary lacks the feature,
-    // there's no parallel code path to call into; warn and proceed serial.
-    let want_dual_rows = if args.parallel && !HAS_PARALLEL {
-        eprintln!(
-            "--parallel passed but binary was not compiled with --features parallel; treating as serial"
-        );
-        false
-    } else {
-        args.parallel
-    };
-
-    // Solver registry: built once, reused across all cases (Solver::run only
-    // needs &self).
-    let registry = build_solver_registry(args.max_sweeps, args.max_iters);
-    // Sanity check: Reference must be index 0 so we can run it first and
-    // capture the oracle value table.
-    assert_eq!(registry[0].boxed.name(), "reference");
+    let reg = registry();
+    assert_eq!(reg[0].0, "reference", "Reference must be index 0 (oracle)");
 
     let mut rows: Vec<CaseRow> = Vec::new();
 
     for &size in &args.sizes {
         for type_str in &args.types {
             let case_label = format!("{size}x{size}_{type_str}");
+            let map = parse_map_type(type_str).expect("validated above");
 
-            // Build base context once per case. parse_map_type is cheap and
-            // MapType is consumed by build_context, so we re-parse here.
-            let map_type = parse_map_type(type_str).expect("validated above");
-            let base = build_context(size, size, map_type, pick_transition_mode(args.smoke));
-
-            // Run Reference first to capture the oracle value table.
-            // `Solver::run` dispatches to the parallel path under
-            // --features parallel; that path's converged value is bit-equal
-            // to the serial path at the fixed point, so it's still a valid
-            // oracle.
-            let ref_entry = &registry[0];
-            let mut ref_ctx: VIContext = base.clone_value();
+            // Oracle: Reference に対して到達可能セルの total_cost を控える。
+            let mut ref_vi = build_vi(size, map);
             let t0 = Instant::now();
-            let ref_stats = ref_entry.boxed.run(&mut ref_ctx, ref_entry.budget);
+            let ref_stats = solve(&mut ref_vi, U64Solver::Reference, args.max_sweeps);
             let ref_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let ref_values = ref_ctx.value.clone();
+            let ref_costs: Vec<u64> = ref_vi.states.iter().map(|s| s.total_cost).collect();
+            drop(ref_vi);
 
-            // Default mode for the dispatched run: "parallel" iff the
-            // compile-time feature is on AND this solver has a parallel
-            // path; else "serial".
-            let ref_mode = if HAS_PARALLEL && is_parallel_capable("reference") {
-                "parallel"
-            } else {
-                "serial"
-            };
             eprintln!(
-                "  size={size} type={type_str} solver=reference mode={ref_mode} iters={} updates={} ms={:.2} mismatch=0",
-                ref_stats.iters_or_sweeps, ref_stats.updates, ref_ms,
+                "  {case_label} solver=reference iters={} updates={} ms={:.2} mismatch=0",
+                ref_stats.iters, ref_stats.updates, ref_ms,
             );
             rows.push(CaseRow {
                 case_label: case_label.clone(),
                 solver: "reference",
-                mode: ref_mode,
-                iters_or_sweeps: ref_stats.iters_or_sweeps,
+                iters: ref_stats.iters,
                 updates: ref_stats.updates,
                 total_ms: ref_ms,
-                mismatch: 0,
                 converged: ref_stats.converged,
+                mismatch: 0,
             });
 
-            // If --parallel and Reference is parallel-capable, also emit the
-            // explicit serial row for direct comparison.
-            if want_dual_rows && is_parallel_capable("reference") {
-                rows.push(run_serial_for(
-                    "reference",
-                    ref_entry.budget,
-                    &base,
-                    &ref_values,
-                    &case_label,
-                ));
-            }
-
-            // Run remaining solvers, mismatch-compare each against Reference.
-            for entry in registry.iter().skip(1) {
-                let solver_name = entry.boxed.name();
-                let mut ctx = base.clone_value();
+            // 残りのソルバ。毎回フレッシュな ValueIterator を構築して走らせる。
+            for &(name, solver) in reg.iter().skip(1) {
+                let budget = budget_for(name, args.max_sweeps, args.max_iters);
+                let mut vi = build_vi(size, map);
                 let t0 = Instant::now();
-                let stats = entry.boxed.run(&mut ctx, entry.budget);
+                let stats = solve(&mut vi, solver, budget);
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                let mismatch = value_mismatch(&ctx.value, &ref_values);
+                let mismatch = value_mismatch(&ref_costs, &vi);
 
-                let mode = if HAS_PARALLEL && is_parallel_capable(solver_name) {
-                    "parallel"
-                } else {
-                    "serial"
-                };
                 eprintln!(
-                    "  size={size} type={type_str} solver={solver_name} mode={mode} iters={} updates={} ms={:.2} mismatch={}",
-                    stats.iters_or_sweeps, stats.updates, ms, mismatch,
+                    "  {case_label} solver={name} iters={} updates={} ms={:.2} mismatch={mismatch}",
+                    stats.iters, stats.updates, ms,
                 );
                 rows.push(CaseRow {
                     case_label: case_label.clone(),
-                    solver: solver_name,
-                    mode,
-                    iters_or_sweeps: stats.iters_or_sweeps,
+                    solver: name,
+                    iters: stats.iters,
                     updates: stats.updates,
                     total_ms: ms,
-                    mismatch,
                     converged: stats.converged,
+                    mismatch,
                 });
-
-                // Dual-row for any other parallel-capable solver.
-                if want_dual_rows && is_parallel_capable(solver_name) {
-                    rows.push(run_serial_for(
-                        solver_name,
-                        entry.budget,
-                        &base,
-                        &ref_values,
-                        &case_label,
-                    ));
-                }
             }
         }
     }
 
-    // CSV output (always when --out is set, independent of --markdown).
     if let Some(out_path) = &args.out {
         if let Err(e) = write_csv(out_path, &rows) {
             eprintln!("error: failed to write CSV {}: {e}", out_path.display());
@@ -466,28 +265,15 @@ fn main() -> ExitCode {
         eprintln!("wrote {} ({} rows)", out_path.display(), rows.len());
     }
 
-    // Markdown output (stdout).
     if args.markdown {
         print_markdown(&rows);
     }
 
-    // Exact-set correctness gate: any nonzero mismatch on an exact solver
-    // fails the run. This considers BOTH serial and parallel rows of exact
-    // solvers — a parallel-path regression should fail the gate even if the
-    // serial row would have agreed.
-    //
-    // Skipped in smoke mode — with budget=1 several solvers (notably
-    // PyramidSweep, whose internal coarse/refine schedule is not capped by
-    // the outer budget) can finish before Reference's 1-sweep pass
-    // propagates the goal far enough to agree. Smoke mode is a wiring
-    // check, not a correctness gate.
+    // 厳密性ゲート: smoke 以外で、bit-exact 期待のソルバに mismatch があれば失敗。
     let mut any_exact_mismatch = false;
     for r in &rows {
         if r.mismatch > 0 && EXACT_SOLVERS.contains(&r.solver) {
-            eprintln!(
-                "WARNING: {} {} ({}) mismatch={}",
-                r.case_label, r.solver, r.mode, r.mismatch,
-            );
+            eprintln!("WARNING: {} {} mismatch={}", r.case_label, r.solver, r.mismatch);
             any_exact_mismatch = true;
         }
     }

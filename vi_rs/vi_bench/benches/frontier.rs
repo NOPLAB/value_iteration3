@@ -1,32 +1,24 @@
-//! Criterion bench for all six frontier solver variants.
+//! Criterion bench for the u64 frontier-family solvers.
 //!
-//! Tiny (size 8, Empty / Obstacle) matrix per variant. Iterations(500) gives
-//! every frontier solver room to terminate.
+//! Tiny (size 8, Empty / Obstacle) matrix per variant. `max_iters=4000` gives
+//! every frontier solver room to terminate. 近似ソルバは no-op パラメータ
+//! （tau=0 / k=全 outcome / step=1）で計測する（= Frontier3D 等価）。
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use vi_algorithm::context::{Budget, Solver};
-use vi_algorithm::{
-    Frontier2D, Frontier3D, Frontier3DCoarseTheta, Frontier3DTau, Frontier3DTopK, FrontierStack,
-};
-use vi_bench::fixtures::build_context;
-use vi_core::params::MAX_OUTCOMES;
-use vi_fixtures::{MapType, TransitionMode};
+use vi_bench::fixtures::{build_vi, BenchMap};
+use vi_reference::solvers::{solve, U64Solver};
 
 const SIZE: u32 = 8;
-const BUDGET: Budget = Budget::Iterations(500);
-// k >= MAX_OUTCOMES → no pruning (Frontier3DTopK reduces to plain Frontier3D).
-const TOPK_NO_PRUNE: u32 = MAX_OUTCOMES as u32;
+const MAX_ITERS: u32 = 4000;
 
-fn run_variant<S: Solver>(c: &mut Criterion, group_name: &str, make_solver: impl Fn() -> S) {
+fn run_variant(c: &mut Criterion, group_name: &str, solver: U64Solver) {
     let mut g = c.benchmark_group(group_name);
-    for (label, map_type) in [("empty", MapType::Empty), ("obstacle", MapType::Obstacle)] {
-        let base = build_context(SIZE, SIZE, map_type, TransitionMode::Trivial);
-        g.bench_with_input(BenchmarkId::new(label, SIZE), &base, |b, base| {
+    for (label, map) in [("empty", BenchMap::Empty), ("obstacle", BenchMap::Obstacle)] {
+        g.bench_with_input(BenchmarkId::new(label, SIZE), &map, |b, &map| {
             b.iter_batched(
-                || base.clone_value(),
-                |mut ctx| {
-                    let solver = make_solver();
-                    solver.run(&mut ctx, BUDGET);
+                || build_vi(SIZE, map),
+                |mut vi| {
+                    solve(&mut vi, solver, MAX_ITERS);
                 },
                 criterion::BatchSize::SmallInput,
             );
@@ -36,15 +28,12 @@ fn run_variant<S: Solver>(c: &mut Criterion, group_name: &str, make_solver: impl
 }
 
 fn bench_frontier(c: &mut Criterion) {
-    run_variant(c, "frontier_2d", || Frontier2D);
-    run_variant(c, "frontier_3d", || Frontier3D);
-    run_variant(c, "frontier_stack", || FrontierStack);
-    run_variant(c, "frontier_3d_tau", || Frontier3DTau { tau: 0 });
-    run_variant(c, "frontier_3d_topk", || Frontier3DTopK { k: TOPK_NO_PRUNE });
-    run_variant(c, "frontier_3d_coarse_theta", || Frontier3DCoarseTheta {
-        coarse_step: 4,
-        refine_iters: 200,
-    });
+    run_variant(c, "frontier_2d", U64Solver::Frontier2D);
+    run_variant(c, "frontier_3d", U64Solver::Frontier3D);
+    run_variant(c, "frontier_stack", U64Solver::FrontierStack);
+    run_variant(c, "frontier_3d_tau", U64Solver::Frontier3DTau { tau: 0 });
+    run_variant(c, "frontier_3d_topk", U64Solver::Frontier3DTopK { k: u32::MAX });
+    run_variant(c, "frontier_3d_coarse_theta", U64Solver::Frontier3DCoarseTheta { step: 1 });
 }
 
 criterion_group!(benches, bench_frontier);
