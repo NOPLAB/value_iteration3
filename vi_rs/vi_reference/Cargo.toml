@@ -5,3 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# u64 高速ソルバ群 (solvers/) のフロンティアに、実績ある word 並列 Bitboard を再利用する。
+# default-features は [] (parallel/rayon 無効) なので単スレッド・決定的。忠実移植本体
+# (ValueIterator 等) はこの依存を使わない。
+vi_algorithm = { path = "../vi_algorithm" }
