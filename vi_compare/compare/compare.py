@@ -17,6 +17,10 @@ SIDES = {
     'ref':  dict(vfile='value_ref.npy', pfile='policy_ref.npy', tfile='timing_ref.json',
                  unreach=1e6, label='ref(vi_reference u64忠実)', report='report_ref.md',
                  model_note='ref は本家と同じ u64+sentinel(~1e9) モデル → 価値はほぼ一致するはず'),
+    'f3d':  dict(vfile='value_f3d.npy', pfile='policy_f3d.npy', tfile='timing_f3d.json',
+                 unreach=65535, label='f3d(Frontier3D 16bit)', report='report_f3d.md',
+                 model_note='f3d は vi_rs の Frontier3D ソルバ・16bit 飽和で障害物のみ sentinel'
+                            '（ros2 reference と同一の数値モデルで、ソルバのみ異なる実装）'),
 }
 
 # 8 dihedral spatial transforms on the (H, W) plane (theta axis preserved).
