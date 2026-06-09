@@ -683,6 +683,32 @@ pub(crate) fn action_cost_raw(
 }
 
 /// 本家 `valueIteration`。free でない/final_state なら 0 を返し更新しない。
+/// `final_state`/非 `free` セルは `None`。それ以外は **書き込まずに** min over アクションの
+/// `(min_cost, optimal_action)` を返す。u64 高速ソルバの近似版（Tau の非書込閾値判定等）で使う。
+pub(crate) fn min_action_cost(
+    states: &[State],
+    actions: &[Action],
+    idx: usize,
+    cell_num_x: i32,
+    cell_num_y: i32,
+    cell_num_t: i32,
+) -> Option<(u64, Option<usize>)> {
+    if !states[idx].free || states[idx].final_state {
+        return None;
+    }
+    let mut min_cost: u64 = MAX_COST;
+    let mut min_action: Option<usize> = None;
+    let s = &states[idx];
+    for (ai, a) in actions.iter().enumerate() {
+        let c = action_cost_raw(states, a, s, cell_num_x, cell_num_y, cell_num_t);
+        if c < min_cost {
+            min_cost = c;
+            min_action = Some(ai);
+        }
+    }
+    Some((min_cost, min_action))
+}
+
 pub(crate) fn value_iteration_raw(
     states: &mut [State],
     actions: &[Action],
@@ -691,21 +717,11 @@ pub(crate) fn value_iteration_raw(
     cell_num_y: i32,
     cell_num_t: i32,
 ) -> u64 {
-    if !states[idx].free || states[idx].final_state {
+    let Some((min_cost, min_action)) =
+        min_action_cost(states, actions, idx, cell_num_x, cell_num_y, cell_num_t)
+    else {
         return 0;
-    }
-    let mut min_cost: u64 = MAX_COST;
-    let mut min_action: Option<usize> = None;
-    {
-        let s = &states[idx];
-        for (ai, a) in actions.iter().enumerate() {
-            let c = action_cost_raw(states, a, s, cell_num_x, cell_num_y, cell_num_t);
-            if c < min_cost {
-                min_cost = c;
-                min_action = Some(ai);
-            }
-        }
-    }
+    };
     let old = states[idx].total_cost;
     let delta = (min_cost as i64) - (old as i64);
     states[idx].total_cost = min_cost;

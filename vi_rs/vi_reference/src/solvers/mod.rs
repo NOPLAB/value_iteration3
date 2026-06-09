@@ -11,10 +11,14 @@ use crate::value_iterator::ValueIterator;
 pub(crate) use vi_algorithm::bitboard::{Bitboard2D, Bitboard3D};
 
 pub mod block;
+pub mod coarse_theta;
 pub mod frontier2d;
 pub mod frontier3d;
 pub mod pyramid;
 pub mod stack;
+pub mod stream;
+pub mod tau;
+pub mod topk;
 
 /// dilation 変位 `(mx, my, mt)` を `actions` の全遷移から算出する。`dit` は絶対 θ なので、
 /// 各 (action, source theta `t`) について循環距離 `min(|dit-t|, nt-|dit-t|)` を取り `mt` とする。
@@ -61,7 +65,8 @@ pub(crate) fn seed_frontier_2d(vi: &ValueIterator) -> Bitboard2D {
 /// 到達可能とみなす total_cost 上限（compare.py の value>=1e6 境界と整合）。
 pub(crate) const REACH_THRESH: u64 = 1_000_000u64 * crate::params::PROB_BASE;
 
-/// u64 高速ソルバの種別。
+/// u64 高速ソルバの種別。近似ソルバは no-op パラメータ（tau=0 / k=全 outcome / step=1）で
+/// Frontier3D と等価（bit-exact）になり、移植の正しさを検証できる。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum U64Solver {
     Reference,
@@ -70,6 +75,10 @@ pub enum U64Solver {
     FrontierStack,
     BlockRefine,
     PyramidSweep,
+    Frontier3DTau { tau: u64 },
+    Frontier3DTopK { k: u32 },
+    Frontier3DCoarseTheta { step: u32 },
+    StreamMimic,
 }
 
 impl U64Solver {
@@ -81,6 +90,11 @@ impl U64Solver {
             "frontier_stack" => U64Solver::FrontierStack,
             "block_refine" => U64Solver::BlockRefine,
             "pyramid_sweep" => U64Solver::PyramidSweep,
+            // 近似ソルバ: 既定は no-op（= Frontier3D 等価）。実用近似は param 指定で。
+            "frontier3d_tau" => U64Solver::Frontier3DTau { tau: 0 },
+            "frontier3d_topk" => U64Solver::Frontier3DTopK { k: u32::MAX },
+            "frontier3d_coarse_theta" => U64Solver::Frontier3DCoarseTheta { step: 1 },
+            "stream_mimic" => U64Solver::StreamMimic,
             _ => return None,
         })
     }
@@ -94,7 +108,7 @@ pub struct U64SolveStats {
 }
 
 /// Reference は全走査を strict 固定点（到達可能セルが不変）まで回す。
-fn reference_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+pub(crate) fn reference_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
     let mut prev: Vec<u64> = vi.states.iter().map(|s| s.total_cost).collect();
     let mut iters = 0u32;
     let converged = loop {
@@ -126,6 +140,12 @@ pub fn solve(vi: &mut ValueIterator, solver: U64Solver, max_iter: u32) -> U64Sol
         U64Solver::FrontierStack => stack::frontier_stack_solve(vi, max_iter),
         U64Solver::BlockRefine => block::block_refine_solve(vi, max_iter),
         U64Solver::PyramidSweep => pyramid::pyramid_sweep_solve(vi, max_iter),
+        U64Solver::Frontier3DTau { tau } => tau::frontier3d_tau_solve(vi, tau, max_iter),
+        U64Solver::Frontier3DTopK { k } => topk::frontier3d_topk_solve(vi, k, max_iter),
+        U64Solver::Frontier3DCoarseTheta { step } => {
+            coarse_theta::frontier3d_coarse_theta_solve(vi, step, max_iter)
+        }
+        U64Solver::StreamMimic => stream::stream_mimic_solve(vi, max_iter),
     };
     U64SolveStats { iters, updates, converged }
 }
