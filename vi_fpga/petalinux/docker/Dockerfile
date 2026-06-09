@@ -5,7 +5,7 @@
 #   make -C petalinux docker-build
 #   make -C petalinux edf-setup   # repo init + sync (first time)
 #   make -C petalinux edf-build   # bitbake
-FROM ubuntu:22.04
+FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Asia/Tokyo
