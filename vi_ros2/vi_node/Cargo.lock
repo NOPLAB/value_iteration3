@@ -1213,7 +1213,6 @@ name = "vi_algorithm"
 version = "0.1.0"
 dependencies = [
  "ndarray",
- "vi_core",
 ]
 
 [[package]]

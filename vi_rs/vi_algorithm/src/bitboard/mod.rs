@@ -247,7 +247,6 @@ impl Bitboard3D {
     // --- internal accessors ---
 
     pub(crate) fn data(&self) -> &[u64] { &self.data }
-    pub(crate) fn data_mut(&mut self) -> &mut [u64] { &mut self.data }
     /// Stride in words between consecutive theta layers.
     pub(crate) fn layer_stride(&self) -> usize {
         (self.map_y * self.words_per_row) as usize

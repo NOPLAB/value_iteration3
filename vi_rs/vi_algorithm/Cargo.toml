@@ -4,15 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+# Only the value-type-agnostic `bitboard` module remains here (the u16 Solver
+# family was ported to vi_reference's u64 model and removed), so this crate now
+# depends on nothing but ndarray. proptest drives the bitboard property tests.
 [dependencies]
-vi_core = { path = "../vi_core" }
 ndarray = { workspace = true }
-rayon   = { workspace = true, optional = true }
-
-[features]
-default = []
-parallel = ["dep:rayon"]
 
 [dev-dependencies]
-proptest    = { workspace = true }
-vi_fixtures = { path = "../vi_fixtures" }
+proptest = { workspace = true }
