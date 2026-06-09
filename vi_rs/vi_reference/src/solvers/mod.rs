@@ -39,6 +39,76 @@ pub(crate) fn seed_frontier(vi: &ValueIterator) -> Bitset3D {
     bb
 }
 
+/// 到達可能とみなす total_cost 上限（compare.py の value>=1e6 境界と整合）。
+pub(crate) const REACH_THRESH: u64 = 1_000_000u64 * crate::params::PROB_BASE;
+
+/// u64 高速ソルバの種別。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum U64Solver {
+    Reference,
+    Frontier3D,
+    Frontier2D,
+    FrontierStack,
+    BlockRefine,
+    PyramidSweep,
+}
+
+impl U64Solver {
+    pub fn from_name(s: &str) -> Option<Self> {
+        Some(match s {
+            "reference" => U64Solver::Reference,
+            "frontier3d" => U64Solver::Frontier3D,
+            "frontier2d" => U64Solver::Frontier2D,
+            "frontier_stack" => U64Solver::FrontierStack,
+            "block_refine" => U64Solver::BlockRefine,
+            "pyramid_sweep" => U64Solver::PyramidSweep,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct U64SolveStats {
+    pub iters: u32,
+    pub updates: u64,
+    pub converged: bool,
+}
+
+/// Reference は全走査を strict 固定点（到達可能セルが不変）まで回す。
+fn reference_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+    let mut prev: Vec<u64> = vi.states.iter().map(|s| s.total_cost).collect();
+    let mut iters = 0u32;
+    let converged = loop {
+        vi.value_iteration_worker(1, 0);
+        iters += 1;
+        let mut changed = false;
+        for (i, s) in vi.states.iter().enumerate() {
+            if s.total_cost < REACH_THRESH && s.total_cost != prev[i] {
+                changed = true;
+            }
+            prev[i] = s.total_cost;
+        }
+        if !changed {
+            break true;
+        }
+        if iters >= max_iter {
+            break false;
+        }
+    };
+    (iters, 0, converged)
+}
+
+/// セット済み `ValueIterator` を指定ソルバで収束まで解く。
+pub fn solve(vi: &mut ValueIterator, solver: U64Solver, max_iter: u32) -> U64SolveStats {
+    let (iters, updates, converged) = match solver {
+        U64Solver::Reference => reference_solve(vi, max_iter),
+        U64Solver::Frontier3D => frontier3d::frontier3d_solve(vi, max_iter),
+        // Phase 2/3 で実装次第、各 *_solve に差し替える。
+        other => panic!("u64 solver not yet implemented: {other:?}"),
+    };
+    U64SolveStats { iters, updates, converged }
+}
+
 /// 索引 `it + ix*nt + iy*nt*nx`（本家 `to_index` と整合）のビット集合。
 /// フロンティアの活性セル集合を表現する。
 pub(crate) struct Bitset3D {
@@ -185,5 +255,26 @@ mod helper_tests {
         let n_final = vi.states.iter().filter(|s| s.total_cost < crate::params::MAX_COST).count();
         assert!(n_final > 0, "goal セルが存在するはず");
         assert_eq!(seed.popcount(), n_final as u64);
+    }
+
+    #[test]
+    fn solve_reference_and_frontier3d_agree() {
+        let mut a = small_vi();
+        let mut b = small_vi();
+        solve(&mut a, U64Solver::Reference, 2000);
+        solve(&mut b, U64Solver::Frontier3D, 2000);
+        for i in 0..a.states.len() {
+            if a.states[i].total_cost < REACH_THRESH {
+                assert_eq!(a.states[i].total_cost, b.states[i].total_cost, "@ {i}");
+                assert_eq!(a.states[i].optimal_action, b.states[i].optimal_action, "@ {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn solver_from_str() {
+        assert!(matches!(U64Solver::from_name("frontier3d"), Some(U64Solver::Frontier3D)));
+        assert!(matches!(U64Solver::from_name("reference"), Some(U64Solver::Reference)));
+        assert!(U64Solver::from_name("nope").is_none());
     }
 }
