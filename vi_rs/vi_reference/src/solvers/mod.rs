@@ -10,6 +10,7 @@ use crate::value_iterator::ValueIterator;
 // Bitboard は値の型に非依存なので u64 モデルでもそのまま使える。dilate は theta periodic。
 pub(crate) use vi_algorithm::bitboard::{Bitboard2D, Bitboard3D};
 
+pub mod block;
 pub mod frontier2d;
 pub mod frontier3d;
 pub mod stack;
@@ -122,6 +123,7 @@ pub fn solve(vi: &mut ValueIterator, solver: U64Solver, max_iter: u32) -> U64Sol
         U64Solver::Frontier3D => frontier3d::frontier3d_solve(vi, max_iter),
         U64Solver::Frontier2D => frontier2d::frontier2d_solve(vi, max_iter),
         U64Solver::FrontierStack => stack::frontier_stack_solve(vi, max_iter),
+        U64Solver::BlockRefine => block::block_refine_solve(vi, max_iter),
         // Phase 3 で実装次第、各 *_solve に差し替える。
         other => panic!("u64 solver not yet implemented: {other:?}"),
     };
