@@ -13,7 +13,10 @@
 //!                <goal_x> <goal_y> <goal_yaw_deg> <theta_cell_num> <safety_radius>
 //!                <safety_radius_penalty> <goal_margin_radius> <goal_margin_theta>
 //!                <max_sweeps> <out_dir>
-//!   <solver> ∈ {reference, frontier3d, frontier2d, frontier_stack, block_refine, pyramid_sweep}
+//!   <solver> は `U64Solver::from_name` が受理する名前 (reference / frontier3d / frontier2d /
+//!   frontier2d_soa / frontier2d_pad / frontier2d_par / frontier_stack / block_refine /
+//!   pyramid_sweep / frontier3d_tau / frontier3d_topk / frontier3d_coarse_theta / stream_mimic /
+//!   prio_ls / prio_lc)。正典は `solvers::mod` の `from_name`。
 
 use std::fs::File;
 use std::io::{self, Write};
