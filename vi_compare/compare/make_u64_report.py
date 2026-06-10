@@ -11,7 +11,7 @@ import sys, os, json
 import numpy as np
 import compare as C
 
-SOLVERS = ['reference', 'frontier3d', 'frontier2d', 'frontier2d_soa', 'frontier2d_pad', 'frontier2d_par', 'frontier_stack', 'block_refine', 'pyramid_sweep']
+SOLVERS = ['reference', 'frontier3d', 'frontier2d', 'frontier2d_soa', 'frontier2d_pad', 'frontier2d_par', 'frontier_stack', 'block_refine', 'pyramid_sweep', 'prio_ls', 'prio_lc']
 ROS1_UNREACH = 1e6  # u64 モデル sentinel 検出閾値
 
 

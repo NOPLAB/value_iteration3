@@ -18,7 +18,7 @@ cargo build --release --manifest-path /workspace/vi_rs/Cargo.toml -p vi_referenc
 BIN=$CARGO_TARGET_DIR/release/vi_u64_bench
 
 PARAMS="${PARAMS:-/workspace/vi_compare/params.yaml}"
-SOLVERS="${SOLVERS:-reference frontier3d frontier2d frontier_stack block_refine pyramid_sweep}"
+SOLVERS="${SOLVERS:-reference frontier3d frontier2d frontier_stack block_refine pyramid_sweep prio_ls prio_lc}"
 for s in $SOLVERS; do
   echo "== u64 solver: $s =="
   python3 /workspace/vi_compare/u64/u64_bench.py \
