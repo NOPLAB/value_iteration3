@@ -89,6 +89,8 @@ pub enum U64Solver {
     Frontier3DTopK { k: u32 },
     Frontier3DCoarseTheta { step: u32 },
     StreamMimic,
+    PriorityLabelSetting,
+    PriorityLabelCorrecting,
 }
 
 impl U64Solver {
@@ -108,6 +110,8 @@ impl U64Solver {
             "frontier3d_topk" => U64Solver::Frontier3DTopK { k: u32::MAX },
             "frontier3d_coarse_theta" => U64Solver::Frontier3DCoarseTheta { step: 1 },
             "stream_mimic" => U64Solver::StreamMimic,
+            "prio_ls" => U64Solver::PriorityLabelSetting,
+            "prio_lc" => U64Solver::PriorityLabelCorrecting,
             _ => return None,
         })
     }
@@ -162,6 +166,8 @@ pub fn solve(vi: &mut ValueIterator, solver: U64Solver, max_iter: u32) -> U64Sol
             coarse_theta::frontier3d_coarse_theta_solve(vi, step, max_iter)
         }
         U64Solver::StreamMimic => stream::stream_mimic_solve(vi, max_iter),
+        U64Solver::PriorityLabelSetting => priority::prio_ls_solve(vi, max_iter),
+        U64Solver::PriorityLabelCorrecting => prio_lc::prio_lc_solve(vi, max_iter),
     };
     U64SolveStats { iters, updates, converged }
 }
