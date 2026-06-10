@@ -137,7 +137,10 @@ pub fn prio_ls_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solvers::test_support::make_vi;
+    use crate::params::PROB_BASE;
+    use crate::solvers::test_support::{make_vi, run_reference_to_fixed_point, REACH};
+    use crate::state_transition::StateTransition;
+    use crate::value_iterator::ValueIterator;
 
     #[test]
     fn rev_theta_round_trips_forward_transitions() {
@@ -166,6 +169,89 @@ mod tests {
             sorted.sort_unstable();
             sorted.dedup();
             assert_eq!(&sorted, bucket);
+        }
+    }
+
+    /// 各 action・θ の遷移分布を最頻 outcome 1点 (prob=PROB_BASE) に潰し、決定論化する。
+    fn collapse_to_deterministic(vi: &mut ValueIterator) {
+        let b = PROB_BASE as i32;
+        for a in vi.actions.iter_mut() {
+            for trans in a.state_transitions.iter_mut() {
+                if trans.is_empty() {
+                    continue;
+                }
+                let top = trans.iter().max_by_key(|s| s.prob).unwrap().clone();
+                *trans = vec![StateTransition::new(top.dix, top.diy, top.dit, b)];
+            }
+        }
+    }
+
+    #[test]
+    fn prio_ls_exact_on_deterministic_transitions() {
+        // 決定論遷移では単調性違反が起き得ず、prio_ls (settle-once) も Reference と bit-exact。
+        let mut a = make_vi(8, 8, vec![0i8; 64]);
+        let mut b = make_vi(8, 8, vec![0i8; 64]);
+        collapse_to_deterministic(&mut a);
+        collapse_to_deterministic(&mut b);
+        run_reference_to_fixed_point(&mut a);
+        let (_i, _u, conv) = super::prio_ls_solve(&mut b, 3000);
+        assert!(conv, "prio_ls must converge");
+
+        let mut n_reach = 0u64;
+        for i in 0..a.states.len() {
+            if a.states[i].total_cost < REACH {
+                n_reach += 1;
+                assert_eq!(a.states[i].total_cost, b.states[i].total_cost, "value @ {i}");
+                assert_eq!(
+                    a.states[i].optimal_action, b.states[i].optimal_action,
+                    "policy @ {i}"
+                );
+            }
+        }
+        assert!(n_reach > 0, "決定論グラフでも到達可能セルが存在するはず");
+    }
+
+    fn standard_occ() -> Vec<(&'static str, Vec<i8>)> {
+        let empty = vec![0i8; 64];
+        let mut wall = vec![0i8; 64];
+        for iy in 0..8 {
+            wall[(iy * 8 + 5) as usize] = 100;
+        }
+        wall[5] = 0;
+        let mut sentinel = vec![0i8; 64];
+        sentinel[(1 * 8 + 2) as usize] = 100;
+        sentinel[(3 * 8 + 2) as usize] = 100;
+        sentinel[(2 * 8 + 1) as usize] = 100;
+        vec![("empty", empty), ("obstacle", wall), ("sentinel", sentinel)]
+    }
+
+    #[test]
+    fn prio_ls_characterization_vs_reference() {
+        // prio_ls の近似度を実測（RMSE/方策一致）。ゆるい上限で回帰ガード（厳密値は出力で観察）。
+        for (name, occ) in standard_occ() {
+            let mut a = make_vi(8, 8, occ.clone());
+            let mut b = make_vi(8, 8, occ);
+            run_reference_to_fixed_point(&mut a);
+            super::prio_ls_solve(&mut b, 3000);
+
+            let (mut se, mut n, mut agree) = (0f64, 0u64, 0u64);
+            for i in 0..a.states.len() {
+                if a.states[i].total_cost < REACH {
+                    let va = (a.states[i].total_cost / PROB_BASE) as f64;
+                    let vb = (b.states[i].total_cost / PROB_BASE) as f64;
+                    se += (va - vb) * (va - vb);
+                    n += 1;
+                    if a.states[i].optimal_action == b.states[i].optimal_action {
+                        agree += 1;
+                    }
+                }
+            }
+            let rmse = (se / n as f64).sqrt();
+            let pa = agree as f64 / n as f64;
+            eprintln!("[prio_ls characterization] map={name} rmse={rmse:.3} policy={pa:.4} n={n}");
+            assert!(n > 0, "到達セルが存在するはず ({name})");
+            assert!(rmse <= 10.0, "prio_ls RMSE {rmse} exceeds loose bound ({name})");
+            assert!(pa >= 0.85, "prio_ls policy agreement {pa} below loose bound ({name})");
         }
     }
 }
