@@ -142,6 +142,9 @@ enum UnknownMode {
 enum SolverSel {
     Reference,
     Frontier3d,
+    /// frontier2d_pad の決定的マルチスレッド版 (本家 並列スイープと対になる CPU 並列ベースライン)。
+    #[value(name = "frontier2d_par")]
+    Frontier2dPar,
     Both,
 }
 
@@ -410,6 +413,9 @@ fn main() -> ExitCode {
     }
     if want_fr {
         schedule.push(("frontier3d", U64Solver::Frontier3D, args.max_iters));
+    }
+    if matches!(args.solver, SolverSel::Frontier2dPar) {
+        schedule.push(("frontier2d_par", U64Solver::Frontier2DPar, args.max_iters));
     }
 
     if want_ref && states > 100_000_000 {
