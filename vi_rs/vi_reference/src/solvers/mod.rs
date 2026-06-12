@@ -15,6 +15,9 @@ pub mod coarse_theta;
 pub mod frontier2d;
 pub mod frontier2d_pad;
 pub mod frontier2d_par;
+pub mod frontier2d_fused;
+pub mod frontier2d_sparse;
+pub mod frontier2d_par_unsafe;
 pub mod frontier2d_soa;
 #[cfg(test)]
 mod measure;
@@ -82,6 +85,9 @@ pub enum U64Solver {
     Frontier2DSoA,
     Frontier2DPad,
     Frontier2DPar,
+    Frontier2DParUnsafe,
+    Frontier2DFused,
+    Frontier2DSparse,
     FrontierStack,
     BlockRefine,
     PyramidSweep,
@@ -102,6 +108,9 @@ impl U64Solver {
             "frontier2d_soa" => U64Solver::Frontier2DSoA,
             "frontier2d_pad" => U64Solver::Frontier2DPad,
             "frontier2d_par" => U64Solver::Frontier2DPar,
+            "frontier2d_par_unsafe" => U64Solver::Frontier2DParUnsafe,
+            "frontier2d_fused" => U64Solver::Frontier2DFused,
+            "frontier2d_sparse" => U64Solver::Frontier2DSparse,
             "frontier_stack" => U64Solver::FrontierStack,
             "block_refine" => U64Solver::BlockRefine,
             "pyramid_sweep" => U64Solver::PyramidSweep,
@@ -157,6 +166,11 @@ pub fn solve(vi: &mut ValueIterator, solver: U64Solver, max_iter: u32) -> U64Sol
         U64Solver::Frontier2DSoA => frontier2d_soa::frontier2d_soa_solve(vi, max_iter),
         U64Solver::Frontier2DPad => frontier2d_pad::frontier2d_pad_solve(vi, max_iter),
         U64Solver::Frontier2DPar => frontier2d_par::frontier2d_par_solve(vi, max_iter),
+        U64Solver::Frontier2DFused => frontier2d_fused::frontier2d_fused_solve(vi, max_iter),
+        U64Solver::Frontier2DSparse => frontier2d_sparse::frontier2d_sparse_solve(vi, max_iter),
+        U64Solver::Frontier2DParUnsafe => {
+            frontier2d_par_unsafe::frontier2d_par_unsafe_solve(vi, max_iter)
+        }
         U64Solver::FrontierStack => stack::frontier_stack_solve(vi, max_iter),
         U64Solver::BlockRefine => block::block_refine_solve(vi, max_iter),
         U64Solver::PyramidSweep => pyramid::pyramid_sweep_solve(vi, max_iter),

@@ -57,7 +57,7 @@ use clap::Parser;
 
 use vi_bench::fixtures::canonical_actions;
 use vi_bench::pgm::{self, Occupancy, PgmMap};
-use vi_reference::params::PROB_BASE;
+use vi_reference::params::{MAX_COST, PROB_BASE};
 use vi_reference::solvers::{solve, U64Solver};
 use vi_reference::{OccupancyGrid, Quaternion, State, ValueIterator};
 
@@ -130,6 +130,24 @@ struct Args {
     /// Optional CSV output path (parent dirs created).
     #[arg(long)]
     out: Option<PathBuf>,
+
+    /// Optional path to dump the converged value field (min over theta, seconds)
+    /// as a binary `[i32 ow][i32 oh][f32 ow*oh]` (row-major `v[ix + ow*iy]`,
+    /// NaN for unreachable). For map-overlay visualisation.
+    #[arg(long)]
+    dump_value: Option<PathBuf>,
+
+    /// Robot start X/Y in world metres (for `--dump-path`).
+    #[arg(long)]
+    start_x: Option<f64>,
+    #[arg(long)]
+    start_y: Option<f64>,
+
+    /// Optional path to dump the optimal robot trajectory (following the converged
+    /// policy `optimal_action` from the start pose to the goal) as a binary
+    /// `[i32 n][f32 x0][f32 y0]...` of world-metre waypoints. For overlay viz.
+    #[arg(long)]
+    dump_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -145,6 +163,15 @@ enum SolverSel {
     /// frontier2d_pad の決定的マルチスレッド版 (本家 並列スイープと対になる CPU 並列ベースライン)。
     #[value(name = "frontier2d_par")]
     Frontier2dPar,
+    /// 非同期 (Gauss-Seidel) unsafe 並列版。スレッド間同期を最小化し収束値は bit-exact のまま。
+    #[value(name = "frontier2d_par_unsafe")]
+    Frontier2dParUnsafe,
+    /// 非同期 G-S + penalty 融合レイアウト (バケット 17B→8B)。収束値は bit-exact のまま。
+    #[value(name = "frontier2d_fused")]
+    Frontier2dFused,
+    /// fused + θマスク疎評価 (依存 θ のみ再評価)。収束値は bit-exact のまま。
+    #[value(name = "frontier2d_sparse")]
+    Frontier2dSparse,
     Both,
 }
 
@@ -417,6 +444,19 @@ fn main() -> ExitCode {
     if matches!(args.solver, SolverSel::Frontier2dPar) {
         schedule.push(("frontier2d_par", U64Solver::Frontier2DPar, args.max_iters));
     }
+    if matches!(args.solver, SolverSel::Frontier2dParUnsafe) {
+        schedule.push((
+            "frontier2d_par_unsafe",
+            U64Solver::Frontier2DParUnsafe,
+            args.max_iters,
+        ));
+    }
+    if matches!(args.solver, SolverSel::Frontier2dFused) {
+        schedule.push(("frontier2d_fused", U64Solver::Frontier2DFused, args.max_iters));
+    }
+    if matches!(args.solver, SolverSel::Frontier2dSparse) {
+        schedule.push(("frontier2d_sparse", U64Solver::Frontier2DSparse, args.max_iters));
+    }
 
     if want_ref && states > 100_000_000 {
         eprintln!(
@@ -449,6 +489,132 @@ fn main() -> ExitCode {
             row.total_ms,
             if row.converged { "Y" } else { "N" },
         );
+        // Optional value-field dump (min over theta, seconds) for overlay viz.
+        if let Some(path) = &args.dump_value {
+            use std::io::Write;
+            let mut v = vec![f32::NAN; (ow as usize) * (oh as usize)];
+            for iy in 0..oh {
+                for ix in 0..ow {
+                    let mut best = u64::MAX;
+                    for it in 0..THETA_CELL_NUM {
+                        let idx = vi.to_index(ix, iy, it) as usize;
+                        let c = vi.states[idx].total_cost;
+                        if c < best {
+                            best = c;
+                        }
+                    }
+                    if best < REACH {
+                        v[(ix + ow * iy) as usize] = (best as f64 / PROB_BASE as f64) as f32;
+                    }
+                }
+            }
+            match std::fs::File::create(path) {
+                Ok(mut f) => {
+                    let _ = f.write_all(&ow.to_le_bytes());
+                    let _ = f.write_all(&oh.to_le_bytes());
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
+                    };
+                    let _ = f.write_all(bytes);
+                    eprintln!("dumped value field -> {} ({}x{} f32)", path.display(), ow, oh);
+                }
+                Err(e) => eprintln!("error: failed to write value dump {}: {e}", path.display()),
+            }
+        }
+
+        // Optional optimal-trajectory dump (follow policy from start to goal).
+        if let Some(path_out) = &args.dump_path {
+            use std::io::Write;
+            let (ox, oy) = (grid.origin_x, grid.origin_y);
+            let t_res = 360.0 / THETA_CELL_NUM as f64;
+            let sx_w = args.start_x.unwrap_or(goal_wx);
+            let sy_w = args.start_y.unwrap_or(goal_wy);
+            let six = (((sx_w - ox) / res).floor() as i32).clamp(0, ow - 1);
+            let siy = (((sy_w - oy) / res).floor() as i32).clamp(0, oh - 1);
+            // best start heading = theta minimising total_cost at the start cell
+            let (mut best_it, mut best_c) = (0i32, u64::MAX);
+            for it in 0..THETA_CELL_NUM {
+                let c = vi.states[vi.to_index(six, siy, it) as usize].total_cost;
+                if c < best_c {
+                    best_c = c;
+                    best_it = it;
+                }
+            }
+            // 本家 vi_node の closed-loop を再現: 10 Hz で姿勢→posToAction→cmd_vel 積分。
+            //   cmd_vel.linear.x  = a->_delta_fw            [m/s]  (Δt=1s の前進量を速度として発行)
+            //   cmd_vel.angular.z = a->_delta_rot/180*M_PI  [rad/s]
+            // 姿勢の離散化も本家 posToAction と同一 (deg の int 切り捨て → %360 → 整数除算)。
+            // final_state_ (ゴールマスク) に入ったら "goal" で停止。
+            let dt = 0.1f64;
+            let t_res_i = (360 / THETA_CELL_NUM) as i32;
+            let (mut x, mut y) = (sx_w, sy_w);
+            let mut yaw = ((best_it as f64 + 0.5) * t_res).to_radians();
+            let mut traj: Vec<(f32, f32)> = Vec::new();
+            let mut reached = false;
+            for _ in 0..200_000 {
+                traj.push((x as f32, y as f32));
+                let ix = ((x - ox) / res).floor() as i32;
+                let iy = ((y - oy) / res).floor() as i32;
+                if ix < 0 || iy < 0 || ix >= ow || iy >= oh {
+                    break;
+                }
+                let t = (180.0 * yaw / std::f64::consts::PI) as i32; // 本家: int 切り捨て
+                let it = ((t + 360 * 100) % 360) / t_res_i;
+                let s = &vi.states[vi.to_index(ix, iy, it) as usize];
+                if s.final_state {
+                    reached = true; // 本家: status_="goal"
+                    break;
+                }
+                let a = match s.optimal_action {
+                    Some(ai) => &vi.actions[ai],
+                    None => break,
+                };
+                x += a.delta_fw * yaw.cos() * dt;
+                y += a.delta_fw * yaw.sin() * dt;
+                yaw += a.delta_rot.to_radians() * dt;
+                // tf yaw 相当に正規化 ((-π, π])
+                yaw = yaw.rem_euclid(2.0 * std::f64::consts::PI);
+                if yaw > std::f64::consts::PI {
+                    yaw -= 2.0 * std::f64::consts::PI;
+                }
+            }
+            let _ = (gx, gy);
+            if !reached {
+                // 固着診断: 最終セルの方策テーブル (θごとの optimal_action と V)
+                let fx = ((x - ox) / res).floor() as i32;
+                let fy = ((y - oy) / res).floor() as i32;
+                if fx >= 0 && fy >= 0 && fx < ow && fy < oh {
+                    eprintln!("[path debug] stuck at world ({x:.2},{y:.2}) cell ({fx},{fy}) yaw {:.1}deg", yaw.to_degrees());
+                    for it in 0..THETA_CELL_NUM {
+                        let s = &vi.states[vi.to_index(fx, fy, it) as usize];
+                        let an = s.optimal_action.map(|ai| vi.actions[ai].name.as_str()).unwrap_or("-");
+                        let qs: Vec<String> = vi.actions.iter()
+                            .map(|a| {
+                                let q = vi.action_cost(s, a);
+                                if q >= MAX_COST { format!("{}=INF", a.name) }
+                                else { format!("{}={:.2}", a.name, q as f64 / PROB_BASE as f64) }
+                            })
+                            .collect();
+                        eprintln!("  it={it:2} ({:3}deg) V={:10.2}s a={an}  Q[{}]", it * (360 / THETA_CELL_NUM), s.total_cost as f64 / PROB_BASE as f64, qs.join(" "));
+                    }
+                }
+            }
+            match std::fs::File::create(path_out) {
+                Ok(mut f) => {
+                    let _ = f.write_all(&(traj.len() as i32).to_le_bytes());
+                    for (x, y) in &traj {
+                        let _ = f.write_all(&x.to_le_bytes());
+                        let _ = f.write_all(&y.to_le_bytes());
+                    }
+                    eprintln!(
+                        "dumped path -> {} ({} waypoints; start cell ({},{}) th0={}deg; reached_goal={})",
+                        path_out.display(), traj.len(), six, siy, best_it * (t_res as i32), reached,
+                    );
+                }
+                Err(e) => eprintln!("error: failed to write path dump {}: {e}", path_out.display()),
+            }
+        }
+
         rows.push(row);
     }
 

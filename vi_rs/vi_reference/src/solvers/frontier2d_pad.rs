@@ -11,10 +11,35 @@
 //! コスト数式・演算順序・短絡は `action_cost_raw` と一致。収束値・方策は本家と bit-exact。
 //! パディングモデル (`Padded`) は B1 並列版 (`frontier2d_par`) でも共有する (bit-exact 演算の単一ソース)。
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::params::{MAX_COST, PROB_BASE_BIT};
 use crate::value_iterator::ValueIterator;
 
 use super::{displacement, seed_frontier_2d, Bitboard2D};
+
+/// `hot` 配列の読み出し抽象。直列/Jacobi 版は素の `[[u64; 2]]` スライス、非同期版
+/// (`frontier2d_par_unsafe`) は Relaxed atomic ビューを渡す。Relaxed load は
+/// x86-64/aarch64 で素の load と同一命令なので、monomorphize 後の直列版コードは
+/// 従来と一致する (コスト数式の単一ソースを generic 化だけで保つ)。
+pub(crate) trait HotCells {
+    fn get(&self, i: usize) -> [u64; 2];
+}
+
+impl HotCells for [[u64; 2]] {
+    #[inline(always)]
+    fn get(&self, i: usize) -> [u64; 2] {
+        self[i]
+    }
+}
+
+impl HotCells for [[AtomicU64; 2]] {
+    #[inline(always)]
+    fn get(&self, i: usize) -> [u64; 2] {
+        let c = &self[i];
+        [c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed)]
+    }
+}
 
 /// frontier2d 用パディング SoA モデル。`hot=[total_cost, penalty +ʷ local_penalty]`、
 /// `free`/`finals` は境界が false。`precomp[a][it]` は隣接の `(相対オフセット, prob)`。
@@ -50,27 +75,7 @@ impl Padded {
             finals[idx] = s.final_state;
         }
 
-        // 隣接フラット = col_base + dix·nt + diy·(nt·nx_pad) + nit、nit=(dit+nt)%nt。
-        let precomp = vi
-            .actions
-            .iter()
-            .map(|a| {
-                (0..nt as usize)
-                    .map(|it| {
-                        a.state_transitions[it]
-                            .iter()
-                            .map(|tr| {
-                                let nit = (tr.dit + nt) % nt;
-                                let off = tr.dix as i64 * nt as i64
-                                    + tr.diy as i64 * row_stride
-                                    + nit as i64;
-                                (off, tr.prob as u64)
-                            })
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
+        let precomp = build_precomp(vi, nt, row_stride);
 
         Self { hot, free, finals, precomp, nx, ny, nt, mx, my, nx_pad, row_stride }
     }
@@ -95,11 +100,44 @@ impl Padded {
     }
 }
 
+/// 隣接フラット = col_base + dix·nt + diy·(nt·nx_pad) + nit、nit=(dit+nt)%nt。
+/// `(action, source θ)` ごとの `(相対オフセット, prob)` テーブル (`Padded`/`Geom` 共有)。
+pub(crate) fn build_precomp(
+    vi: &ValueIterator,
+    nt: i32,
+    row_stride: i64,
+) -> Vec<Vec<Vec<(i64, u64)>>> {
+    vi.actions
+        .iter()
+        .map(|a| {
+            (0..nt as usize)
+                .map(|it| {
+                    a.state_transitions[it]
+                        .iter()
+                        .map(|tr| {
+                            let nit = (tr.dit + nt) % nt;
+                            let off =
+                                tr.dix as i64 * nt as i64 + tr.diy as i64 * row_stride + nit as i64;
+                            (off, tr.prob as u64)
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// 本家 `actionCost` のパディング + 事前計算オフセット版。`col_base` はソースセルの θ=0 列ベース。
 /// `buckets` は `(隣接フラット相対オフセット, prob)`。`hot[n]=[total_cost, pen]`。
+///
+/// 本家との意図的な差分が 1 つ: 隣接が**未確定 (初期値 MAX_COST のまま)** なら折返し計算せず
+/// MAX_COST を返す。本家は (MAX_COST+pen)·prob の u64 折返しゴミを Q として返し、毎 sweep の
+/// 無条件代入で後から自己修正するが、frontier 系の「減少時のみ書く」更新ではその偽低 Q を
+/// ラッチして下流全体を汚染する (実マップで観測)。このクランプにより hot には実数値しか
+/// 書かれず (帰納)、固定点では到達可能セルの argmin 連鎖は実数値のみなので収束値は本家と一致。
 #[inline]
-pub(crate) fn action_cost_pad(
-    hot: &[[u64; 2]],
+pub(crate) fn action_cost_pad<H: HotCells + ?Sized>(
+    hot: &H,
     free: &[bool],
     buckets: &[(i64, u64)],
     col_base: i64,
@@ -110,7 +148,10 @@ pub(crate) fn action_cost_pad(
         if !free[n] {
             return MAX_COST;
         }
-        let h = hot[n];
+        let h = hot.get(n);
+        if h[0] == MAX_COST {
+            return MAX_COST; // 未確定隣接: 折返しゴミ Q を作らない
+        }
         cost = cost.wrapping_add(h[0].wrapping_add(h[1]).wrapping_mul(prob));
     }
     cost >> PROB_BASE_BIT
@@ -145,7 +186,8 @@ pub fn frontier2d_pad_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64,
                 let mut min_cost = MAX_COST;
                 let mut min_action: Option<usize> = None;
                 for (ai, per_theta) in m.precomp.iter().enumerate() {
-                    let c = action_cost_pad(&m.hot, &m.free, &per_theta[it as usize], pad_col);
+                    let c =
+                        action_cost_pad(m.hot.as_slice(), &m.free, &per_theta[it as usize], pad_col);
                     if c < min_cost {
                         min_cost = c;
                         min_action = Some(ai);
