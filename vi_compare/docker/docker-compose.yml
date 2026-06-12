@@ -9,14 +9,14 @@ services:
     volumes:
       - ${VI_ORIG:-../../../value_iteration}:/src_value_iteration:ro
       - ../../:/workspace
-      - ../results:/results
+      - ../results/house_oracle:/results
     working_dir: /workspace
-    command: bash /workspace/vi_compare/ros1/run_ros1_bench.sh
+    command: bash /workspace/vi_compare/benches/house/ros1/run_ros1_bench.sh
   ros2:
     image: vi_ros2_dev:humble
     volumes:
       - ${VI_ORIG:-../../../value_iteration}:/src_value_iteration:ro
       - ../../:/workspace
-      - ../results:/results
+      - ../results/house_oracle:/results
     working_dir: /workspace
-    command: bash /workspace/vi_compare/ros2/run_ros2_bench.sh
+    command: bash /workspace/vi_compare/benches/house/ros2/run_ros2_bench.sh

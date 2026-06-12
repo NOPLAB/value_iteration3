@@ -1,5 +1,4 @@
-*.npy
-*.json
-*.raw
-report*.md
+# results/ はベンチ・動画の生成物置き場 — 一切コミットしない
+*
+!.gitignore
 !.gitkeep

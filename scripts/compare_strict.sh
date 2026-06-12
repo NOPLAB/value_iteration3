@@ -10,7 +10,7 @@
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ORIG="${VI_ORIG:-$(cd "$REPO_ROOT/.." && pwd)/value_iteration}"
-RESULTS="$REPO_ROOT/vi_compare/results"
+RESULTS="$REPO_ROOT/vi_compare/results/house_oracle"
 CATKIN_CACHE="$REPO_ROOT/vi_compare/.cache/catkin_ws"
 mkdir -p "$RESULTS"   # .cache 配下は Docker(root) が作成するので host では触らない
 # strict params はホストが書くため /tmp (host 書込可) に置きコンテナへマウントする。
@@ -19,7 +19,7 @@ STRICT_ROS1=/tmp/vi_params_strict_ros1.yaml
 
 # strict ref params: delta_threshold=-1 (ハーネス strict), max_sweeps=2000 (上限)
 sed -e 's/^\( *delta_threshold:\).*/\1 -1/' -e 's/^\( *max_sweeps:\).*/\1 2000/' \
-    "$REPO_ROOT/vi_compare/params.yaml" > "$STRICT_REF"
+    "$REPO_ROOT/vi_compare/benches/house/params.yaml" > "$STRICT_REF"
 
 echo "== [1/3] ref strict (到達可能セルの真の固定点まで) =="
 docker run --rm \
@@ -28,14 +28,14 @@ docker run --rm \
   -v "$RESULTS":/results \
   -v "$STRICT_REF":/params_strict.yaml:ro \
   vi_ros2_dev:humble \
-  bash /workspace/vi_compare/ref/run_ref_bench.sh /params_strict.yaml
+  bash /workspace/vi_compare/benches/house/vi_rs/run_ref_bench.sh /params_strict.yaml
 
 F=$(python3 -c "import json;print(int(json.load(open('$RESULTS/timing_ref.json'))['sweeps']))")
 echo "ref reached reachable fixed point at F=$F sweeps"
 
 # strict ros1 params: delta_threshold=-1 (soft 停止せず), max_sweeps=F → 本家を F スイープ
 sed -e 's/^\( *delta_threshold:\).*/\1 -1/' -e "s/^\( *max_sweeps:\).*/\1 $F/" \
-    "$REPO_ROOT/vi_compare/params.yaml" > "$STRICT_ROS1"
+    "$REPO_ROOT/vi_compare/benches/house/params.yaml" > "$STRICT_ROS1"
 
 echo "== [2/3] ros1 strict (本家を F=$F スイープ = 固定点) =="
 docker run --rm \
@@ -45,13 +45,13 @@ docker run --rm \
   -v "$CATKIN_CACHE":/catkin_ws \
   -v "$STRICT_ROS1":/params_strict.yaml:ro \
   vi_compare_ros1:noetic \
-  bash /workspace/vi_compare/ros1/run_ros1_bench.sh /params_strict.yaml
+  bash /workspace/vi_compare/benches/house/ros1/run_ros1_bench.sh /params_strict.yaml
 
 echo "== [3/3] compare (本家固定点 vs ref固定点) =="
 docker run --rm \
   -v "$REPO_ROOT":/workspace \
   -v "$RESULTS":/results \
   vi_compare_ros1:noetic \
-  bash -lc "cd /workspace/vi_compare/compare && python3 compare.py /results ref"
+  bash -lc "cd /workspace/vi_compare/benches/house/compare && python3 compare.py /results ref"
 
 echo "report: $RESULTS/report_ref.md (strict / 固定点 bit 比較)"

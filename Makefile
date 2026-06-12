@@ -159,67 +159,53 @@ compare-ros1:
 	mkdir -p $(PWD)/vi_compare/.cache/catkin_ws
 	docker run --rm \
 	  -v $(VI_ORIG):/src_value_iteration:ro \
-	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
+	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
 	  -v $(PWD)/vi_compare/.cache/catkin_ws:/catkin_ws \
-	  $(VI_COMPARE_ROS1_IMG) bash /workspace/vi_compare/ros1/run_ros1_bench.sh
+	  $(VI_COMPARE_ROS1_IMG) bash /workspace/vi_compare/benches/house/ros1/run_ros1_bench.sh
 
 compare-ros2:
 	docker run --rm \
 	  -v $(VI_ORIG):/src_value_iteration:ro \
-	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
-	  $(VI_ROS2_DOCKER_IMG) bash /workspace/vi_compare/ros2/run_ros2_bench.sh
+	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
+	  $(VI_ROS2_DOCKER_IMG) bash /workspace/vi_compare/benches/house/ros2/run_ros2_bench.sh
 
 compare-report:
-	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
-	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/compare && python3 compare.py /results"
+	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
+	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/benches/house/compare && python3 compare.py /results"
 
 # vi_reference (本家 u64 忠実移植) を vi_ros2_dev イメージ内でビルド・実行して
 # value_ref.npy 等を生成 (ROS 非依存・cargo のみ)。
 compare-ref:
-	mkdir -p $(PWD)/vi_compare/results
+	mkdir -p $(PWD)/vi_compare/results/house_oracle
 	docker run --rm \
 	  -v $(VI_ORIG):/src_value_iteration:ro \
-	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
-	  $(VI_ROS2_DOCKER_IMG) bash /workspace/vi_compare/ref/run_ref_bench.sh
+	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
+	  $(VI_ROS2_DOCKER_IMG) bash /workspace/vi_compare/benches/house/vi_rs/run_ref_bench.sh
 
 # 本家(ros1) vs ref の比較レポート (report_ref.md)。既存の value_ros1.npy を使う。
 compare-ref-report:
-	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
-	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/compare && python3 compare.py /results ref"
-
-# vi_rs Frontier3D 直接ハーネス (vi_f3d_bench) を vi_ros2_dev イメージ内でビルド・実行して
-# value_f3d.npy 等を生成 (ref と対をなす ROS 非経由・単スレッドのハーネス)。
-compare-f3d:
-	mkdir -p $(PWD)/vi_compare/results
-	docker run --rm \
-	  -v $(VI_ORIG):/src_value_iteration:ro \
-	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
-	  $(VI_ROS2_DOCKER_IMG) bash /workspace/vi_compare/f3d/run_f3d_bench.sh
-
-# 本家(ros1) vs f3d の比較レポート (report_f3d.md)。既存の value_ros1.npy を使う。
-compare-f3d-report:
-	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
-	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/compare && python3 compare.py /results f3d"
+	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
+	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/benches/house/compare && python3 compare.py /results ref"
 
 # vi_reference の u64 高速ソルバ群 (frontier/block を本家 u64 モデルで) を vi_ros2_dev
 # イメージ内でビルド・実行し value_<solver>.npy 等を生成。SOLVERS で集合を上書き可。
 compare-u64:
-	mkdir -p $(PWD)/vi_compare/results
+	mkdir -p $(PWD)/vi_compare/results/house_oracle
 	docker run --rm \
 	  -v $(VI_ORIG):/src_value_iteration:ro \
-	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
+	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
 	  -e SOLVERS="$(SOLVERS)" \
-	  $(VI_ROS2_DOCKER_IMG) bash /workspace/vi_compare/u64/run_u64_bench.sh
+	  $(VI_ROS2_DOCKER_IMG) bash /workspace/vi_compare/benches/house/vi_rs/run_u64_bench.sh
 
 # 本家(ros1) vs 各 u64 ソルバの比較レポート (report_u64_<solver>.md)。SIDES で集合を上書き可。
 compare-u64-report:
-	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
-	  $(VI_COMPARE_ROS1_IMG) bash -lc 'cd /workspace/vi_compare/compare && for s in $(SIDES); do python3 compare.py /results $$s; done'
+	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
+	  $(VI_COMPARE_ROS1_IMG) bash -lc 'cd /workspace/vi_compare/benches/house/compare && for s in $(SIDES); do python3 compare.py /results $$s; done'
 
 # 全 u64 ソルバ vs 本家の一覧レポート report_u64.md (bit-exact & 速度) を生成。
 compare-u64-summary:
-	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
-	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/compare && python3 make_u64_report.py /results"
+	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
+	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/benches/house/compare && python3 make_u64_report.py /results"
 
 # 本家 vs ref を「真の固定点」で bit 比較 (サブステップ精細化まで収束させ stop-sweep 依存を排除)。
 compare-strict:
@@ -228,4 +214,4 @@ compare-strict:
 compare-bench: compare-build
 	VI_ORIG=$(VI_ORIG) bash scripts/compare_bench.sh
 
-.PHONY: compare-build compare-ros1 compare-ros2 compare-report compare-ref compare-ref-report compare-f3d compare-f3d-report compare-u64 compare-u64-report compare-u64-summary compare-strict compare-bench
+.PHONY: compare-build compare-ros1 compare-ros2 compare-report compare-ref compare-ref-report compare-u64 compare-u64-report compare-u64-summary compare-strict compare-bench

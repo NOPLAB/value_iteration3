@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>value_iteration</name>
+  <version>0.0.1</version>
+  <description>The value_iteration package</description>
+
+  <!-- <maintainer email="jane.doe@example.com">Jane Doe</maintainer> -->
+  <maintainer email="ryuichiueda@gmail.com">Ryuichi Ueda</maintainer>
+  <license>BSD</license>
+
+  <!-- <url type="website">http://wiki.ros.org/value_iteration</url> -->
+  <!-- <author email="jane.doe@example.com">Jane Doe</author> -->
+
+  <depend>roscpp</depend>
+  <depend>rospy</depend>
+  <depend>grid_map_core</depend>
+  <depend>grid_map_ros</depend>
+  <depend>grid_map_cv</depend>
+  <depend>grid_map_filters</depend>
+  <depend>grid_map_loader</depend>
+  <depend>grid_map_msgs</depend>
+  <depend>grid_map_octomap</depend>
+  <depend>grid_map_rviz_plugin</depend>
+  <depend>grid_map_visualization</depend>
+  <depend>filters</depend>
+
+  <build_depend>message_generation</build_depend>
+  <build_depend>geometry_msgs</build_depend>
+  <build_depend>actionlib</build_depend>
+  <build_depend>actionlib_msgs</build_depend>
+
+  <build_export_depend>message_generation</build_export_depend>
+
+  <exec_depend>message_runtime</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>actionlib</exec_depend>
+  <exec_depend>actionlib_msgs</exec_depend>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+
+  <!-- The export tag contains other, unspecified, tags -->
+  <export>
+    <!-- Other tools can request additional information be placed here -->
+
+  </export>
+</package>
