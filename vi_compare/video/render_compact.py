@@ -159,6 +159,9 @@ def main():
                     help="map_server の unknown(灰)セルの扱い（既定 obstacle、bench_map と合わせる）")
     ap.add_argument("--nt", type=int, default=60, help="θ セル数（タイトルの状態数表示用、既定 60）")
     ap.add_argument("--vmax-pct", type=float, default=90.0, help="value カラースケール上限の百分位（既定 90）")
+    ap.add_argument("--px-per-cell", type=float, default=1.0,
+                    help="value グリッド1セルあたりの出力ピクセル数（既定 1.0=地図と等倍）。"
+                         "大きいほど高精細・大きい画像。文字/マーカは図サイズに比例して自動拡大。")
     ap.add_argument("--goal-x", type=float, default=None, help="ゴール world X[m]（既定: V 最小セル）")
     ap.add_argument("--goal-y", type=float, default=None, help="ゴール world Y[m]（既定: V 最小セル）")
     ap.add_argument("--start-x", type=float, default=None, help="始点 world X[m]（与えると経路と始点を描く）")
@@ -240,41 +243,52 @@ def main():
         start_rc = (sr, sc)
         path = descend_path(v_img, sr, sc, int(round(gr)), int(round(gc)))
 
-    # --- 描画 ---
-    fig, ax = plt.subplots(figsize=(11, 7.6))
+    # --- 描画: 図サイズを value グリッド解像度に合わせる（既定 1px/cell）。値場を縮小せず
+    #     ネイティブ解像度で描き、文字・マーカは図の拡大率 fs に比例させて読めるサイズを保つ。 ---
+    DPI = 100
+    pxc = args.px_per_cell
+    fig_w_in = ow * pxc / DPI * 1.18  # +余白（右の colorbar・軸ラベル）
+    fig_h_in = oh * pxc / DPI * 1.12  # +余白（上の title・軸ラベル）
+    fs = max(fig_w_in / 11.0, 1.0)    # 旧 11in レイアウト基準に対する文字/マーカ拡大率
+    print(f"figure: {fig_w_in*DPI:.0f}x{fig_h_in*DPI:.0f}px (px/cell={pxc:g}, font scale x{fs:.1f})")
+    fig, ax = plt.subplots(figsize=(fig_w_in, fig_h_in), dpi=DPI)
     if free_img is not None:
-        ax.imshow(np.where(free_img, 0.92, 0.18), cmap="gray", vmin=0, vmax=1, origin="upper")
+        ax.imshow(np.where(free_img, 0.92, 0.18), cmap="gray", vmin=0, vmax=1,
+                  origin="upper", interpolation="nearest")
     else:
         ax.set_facecolor("0.85")
         print("note: --map 未指定。壁は描けません（一様グレー背景）。", file=sys.stderr)
     hm = ax.imshow(np.ma.masked_invalid(v_img), cmap="turbo", origin="upper",
-                   alpha=0.92, vmin=0, vmax=vmax)
+                   alpha=0.92, vmin=0, vmax=vmax, interpolation="nearest")
     if path is not None and len(path) > 1:
-        ax.plot(path[:, 1], path[:, 0], "-", color="white", lw=1.6, alpha=0.9,
+        ax.plot(path[:, 1], path[:, 0], "-", color="white", lw=1.6 * fs, alpha=0.9,
                 label="optimal path (V descent)")
     if start_rc is not None:
         sv = float(v_img[start_rc])
-        ax.plot(start_rc[1], start_rc[0], "o", color="magenta", ms=13, mec="black",
-                mew=1.5, label=f"robot start (V={sv:.0f}s)", zorder=5)
-    ax.plot(gc, gr, "*", color="lime", ms=22, mec="black", mew=1.5, label="goal", zorder=5)
+        ax.plot(start_rc[1], start_rc[0], "o", color="magenta", ms=13 * fs, mec="black",
+                mew=1.5 * fs, label=f"robot start (V={sv:.0f}s)", zorder=5)
+    ax.plot(gc, gr, "*", color="lime", ms=22 * fs, mec="black", mew=1.5 * fs,
+            label="goal", zorder=5)
 
     cb = fig.colorbar(hm, ax=ax, shrink=0.82)
-    cb.set_label(f"cost-to-go V* [s] (min over θ, P{args.vmax_pct:g} scale)")
+    cb.set_label(f"cost-to-go V* [s] (min over θ, P{args.vmax_pct:g} scale)", fontsize=12 * fs)
+    cb.ax.tick_params(labelsize=10 * fs)
 
     res_str = f", {res_grid:.2f} m/cell" if res_grid is not None else ""
     nstates = ow * oh * args.nt
     title = args.title or (
         f"compact mapped output ({ow}×{oh}×{args.nt} = {nstates/1e6:.0f}M states{res_str})"
         f"\nVI value function V* (frontier2d_sparse_compact) · reachable: {n_reach:,} cells")
-    ax.set_title(title)
-    ax.set_xlabel("x [cell]")
-    ax.set_ylabel("y [cell]")
+    ax.set_title(title, fontsize=14 * fs)
+    ax.set_xlabel("x [cell]", fontsize=12 * fs)
+    ax.set_ylabel("y [cell]", fontsize=12 * fs)
+    ax.tick_params(labelsize=10 * fs)
     if path is not None or start_rc is not None:
-        ax.legend(loc="upper right", fontsize=9)
+        ax.legend(loc="upper right", fontsize=9 * fs)
 
     fig.tight_layout()
     out_png = args.out or f"{args.out_dir}/compact_viz.png"
-    fig.savefig(out_png, dpi=120)
+    fig.savefig(out_png, dpi=DPI)
     print("wrote", out_png)
 
 
