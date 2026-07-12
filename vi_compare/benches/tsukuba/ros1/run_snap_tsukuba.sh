@@ -26,6 +26,7 @@ TIMEOUT="${TIMEOUT:-600}"
 
 TS=/workspace/vi_compare/benches/tsukuba
 OUTDIR=/workspace/vi_compare/results/tsukuba
+MAP_YAML="${MAP_YAML:-$OUTDIR/map_tsukuba_pooled.yaml}"
 mkdir -p "$OUTDIR/frames_ros1" "$OUTDIR/snap_run"
 
 export VI_SNAP_DIR="${VI_SNAP_DIR:-$OUTDIR/frames_ros1}"
@@ -41,7 +42,7 @@ source devel/setup.bash
 
 echo "[run_snap] launch vi_node (thread_num=${THREAD_NUM}) + map_server"
 roslaunch "$TS/ros1/bench_tsukuba.launch" \
-  map_yaml:="$OUTDIR/map_tsukuba_pooled.yaml" \
+  map_yaml:="$MAP_YAML" \
   thread_num:=${THREAD_NUM} >"$OUTDIR/snap_run/node_m16.log" 2>&1 &
 LAUNCH_PID=$!
 trap 'kill $LAUNCH_PID 2>/dev/null || true' EXIT

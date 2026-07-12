@@ -2,7 +2,7 @@
 # vi_rs frontier2d_par を lite インスタンス上で VI_THREADS=m 掃引し、収束 wall-clock を記録。
 # 論文 Fig.21 (収束時間 vs m) / Fig.22 (speed rate vs m) の vi_rs 側データ。
 set -e
-cd /home/nop/dev/mywork/value_iteration_new
+cd "${REPO_ROOT:-/home/nop/dev/mywork/value_iteration3}"
 BM=vi_rs/target/release/bench_map
 MAP="${MAP:-vi_compare/results/tsudanuma/lite/map_tsudanuma_lite.yaml}"
 OUT="${OUT:-vi_compare/results/tsudanuma/sweep_vi_rs.csv}"
