@@ -16,6 +16,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use ndarray::{Array2, Array3};
 
 use vi_reference::params::PROB_BASE;
+use vi_reference::planner::optimal_action_at;
 use vi_reference::solvers::{solve, U64Solver};
 use vi_reference::ValueIterator;
 
@@ -112,22 +113,6 @@ fn value_slice(vi: &ValueIterator, theta_idx: usize) -> Array2<u64> {
     out
 }
 
-/// optimal action id at `(ix, iy, it)`, or -1.
-fn optimal_action(vi: &ValueIterator, ix: i32, iy: i32, it: usize) -> i32 {
-    if ix < 0 || iy < 0 || ix >= vi.cell_num_x || iy >= vi.cell_num_y || it >= vi.cell_num_t as usize
-    {
-        return -1;
-    }
-    let s = &vi.states[vi.to_index(ix, iy, it as i32) as usize];
-    if !s.free || s.final_state {
-        return -1;
-    }
-    match s.optimal_action {
-        Some(ai) => vi.actions[ai].id,
-        None => -1,
-    }
-}
-
 /// Spawn the sweep worker. `max_budget` caps total solver units (sweeps /
 /// iterations) as a safety bound; the worker runs to convergence or until
 /// cancelled within that cap.
@@ -156,7 +141,7 @@ pub fn spawn_sweep(
                         let _ = resp.send(value_slice(&vi, theta_idx));
                     }
                     WorkerRequest::OptimalAction { ix, iy, it, resp } => {
-                        let _ = resp.send(optimal_action(&vi, ix, iy, it));
+                        let _ = resp.send(optimal_action_at(&vi, ix, iy, it as i32));
                     }
                 }
             }
