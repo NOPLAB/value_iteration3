@@ -19,6 +19,10 @@ cd "$REPO_ROOT/vi_ros2/vi_node"
 cargo test --lib --no-default-features
 cargo test --lib
 
+# vi_planner core (rclrs-free) unit tests — same --lib technique.
+cd "$REPO_ROOT/vi_ros2/vi_planner"
+cargo test --lib
+
 # Full colcon build (this is what links the rclrs `vi_node` binary; plain cargo
 # cannot link the vi_interfaces C typesupport libs outside colcon).
 cd "$REPO_ROOT"

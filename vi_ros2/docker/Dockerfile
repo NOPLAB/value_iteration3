@@ -45,5 +45,20 @@ WORKDIR /ros2_rust_ws
 RUN . /opt/ros/humble/setup.sh && \
     colcon build --merge-install --packages-up-to rclrs
 
+# nav2_msgs (ComputePathToPose 等、vi_planner が使う) の Rust バインディング。
+# apt バイナリの nav2_msgs は share/nav2_msgs/rust を含まないため、ソースを
+# この ros2_rust ワークスペースでビルドして rosidl_generator_rs を通す
+# (vi_interfaces が vi_ros2_ws で Rust 型を得るのと同じ仕組み)。
+# nav2_common は nav2_msgs の buildtool 依存 (nav2_package() CMake マクロ)。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ros-humble-nav2-common \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch humble \
+      https://github.com/ros-navigation/navigation2.git /tmp/navigation2 && \
+    cp -a /tmp/navigation2/nav2_msgs /ros2_rust_ws/src/nav2_msgs && \
+    rm -rf /tmp/navigation2
+RUN . /opt/ros/humble/setup.sh && . /ros2_rust_ws/install/local_setup.sh && \
+    colcon build --merge-install --packages-select nav2_msgs
+
 WORKDIR /workspace
 CMD ["/bin/bash"]

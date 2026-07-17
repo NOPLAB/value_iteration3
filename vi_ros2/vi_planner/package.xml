@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>vi_planner</name>
+  <version>0.1.0</version>
+  <description>
+    Value-iteration global planner for Nav2: a Rust node that serves the
+    compute_path_to_pose action (nav2_msgs) by solving the vi_rs value
+    iteration on the static map and rolling out the optimal policy into a
+    nav_msgs/Path. Drop-in replacement for nav2_planner's planner_server.
+  </description>
+  <maintainer email="noplab90@gmail.com">nop</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cargo</buildtool_depend>
+
+  <depend>rclrs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav2_msgs</depend>
+
+  <!-- launch/navigation_launch.py (vi 版 Nav2 ナビゲーションスタック) の実行時依存 -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>nav2_common</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_controller</exec_depend>
+  <exec_depend>nav2_smoother</exec_depend>
+  <exec_depend>nav2_behaviors</exec_depend>
+  <exec_depend>nav2_bt_navigator</exec_depend>
+  <exec_depend>nav2_waypoint_follower</exec_depend>
+  <exec_depend>nav2_velocity_smoother</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+
+  <export>
+    <build_type>ament_cargo</build_type>
+    <install>launch</install>
+  </export>
+</package>

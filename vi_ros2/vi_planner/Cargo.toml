@@ -1,0 +1,37 @@
+[package]
+name = "vi_planner"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+publish = false
+
+# vi_node と同じく vi_rs ワークスペースから隔離する (path 依存が workspace を
+# 引き込まないように空の [workspace] を明示)。
+[workspace]
+
+[[bin]]
+name = "vi_planner"
+path = "src/main.rs"
+
+[lib]
+name = "vi_planner"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow  = "1"
+# main.rs が action コールバック (rclrs の futures エグゼキュータ) と
+# 計画ワーカースレッドを橋渡しする oneshot チャネルに使う。
+futures = "0.3"
+# value_function 配信 (bridge::value_slice_to_occupancy) 用。
+ndarray = "0.16"
+
+vi_core      = { path = "../../vi_rs/vi_core" }
+vi_reference = { path = "../../vi_rs/vi_reference" }
+
+# ROS deps。colcon-ros-cargo の生成 config が [patch.crates-io] でローカル
+# ビルド済みクレートへ差し替える (vi_node と同じ仕組み)。nav2_msgs は Docker の
+# ros2_rust ワークスペースでソースビルドして Rust バインディングを得る。
+rclrs         = "*"
+nav_msgs      = "*"
+geometry_msgs = "*"
+nav2_msgs     = "*"
