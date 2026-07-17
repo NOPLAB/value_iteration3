@@ -1,32 +1,27 @@
 //! Maps the `solver: string` ROS parameter to a `vi_reference::solvers::U64Solver`.
 //!
 //! u16 時代は `Box<dyn Solver>` を返していたが、u64 (本家忠実) 移行で `U64Solver`
-//! (Copy な enum) を返す。近似ソルバは no-op パラメータ（tau=0 / k=全 outcome /
-//! step=1）= Frontier3D 等価で渡す（本家と bit-exact）。
+//! (Copy な enum) を返す。名前解決は `U64Solver::from_name` へ委譲する —
+//! ここに独自ホワイトリストを持つと本体に追加されたソルバ (frontier2d_sparse 等)
+//! が ROS 側から選べなくなるため。近似ソルバは from_name が no-op パラメータ
+//! (tau=0 / k=全 outcome / step=1) = Frontier3D 等価で返す (本家と bit-exact)。
+//!
+//! 旧 ROS パラメータ名 "pyramid" のみ互換エイリアスとしてここで吸収する。
 
 use anyhow::{anyhow, Result};
 use vi_reference::solvers::U64Solver;
 
 pub fn make_solver(name: &str) -> Result<U64Solver> {
-    Ok(match name {
-        "reference" => U64Solver::Reference,
-        "frontier3d" => U64Solver::Frontier3D,
-        "frontier3d_topk" => U64Solver::Frontier3DTopK { k: u32::MAX },
-        "frontier3d_tau" => U64Solver::Frontier3DTau { tau: 0 },
-        "frontier3d_coarse_theta" => U64Solver::Frontier3DCoarseTheta { step: 1 },
-        "frontier2d" => U64Solver::Frontier2D,
-        "frontier_stack" => U64Solver::FrontierStack,
-        "block_refine" => U64Solver::BlockRefine,
-        // 旧 ROS パラメータ名 "pyramid" を PyramidSweep にマップ（"pyramid_sweep" も許容）。
-        "pyramid" | "pyramid_sweep" => U64Solver::PyramidSweep,
-        "stream_mimic" => U64Solver::StreamMimic,
-        other => {
-            return Err(anyhow!(
-                "unknown solver: {other}. Supported: reference | frontier3d | frontier3d_topk | \
-                 frontier3d_tau | frontier3d_coarse_theta | frontier2d | frontier_stack | \
-                 block_refine | pyramid | stream_mimic"
-            ))
-        }
+    // 旧 ROS パラメータ名 "pyramid" を PyramidSweep にマップ ("pyramid_sweep" も可)。
+    let canonical = if name == "pyramid" { "pyramid_sweep" } else { name };
+    U64Solver::from_name(canonical).ok_or_else(|| {
+        anyhow!(
+            "unknown solver: {name}. Supported: reference | frontier3d | frontier3d_topk | \
+             frontier3d_tau | frontier3d_coarse_theta | frontier2d | frontier2d_soa | \
+             frontier2d_pad | frontier2d_par | frontier2d_par_unsafe | frontier2d_fused | \
+             frontier2d_sparse | frontier2d_sparse_compact | frontier_stack | block_refine | \
+             pyramid | pyramid_sweep | stream_mimic | prio_ls | prio_lc"
+        )
     })
 }
 
@@ -43,6 +38,8 @@ mod tests {
             "frontier3d_tau",
             "frontier3d_coarse_theta",
             "frontier2d",
+            "frontier2d_sparse",
+            "frontier2d_sparse_compact",
             "frontier_stack",
             "block_refine",
             "pyramid",
@@ -57,6 +54,14 @@ mod tests {
     fn pyramid_alias_maps_to_pyramid_sweep() {
         assert_eq!(make_solver("pyramid").unwrap(), U64Solver::PyramidSweep);
         assert_eq!(make_solver("pyramid_sweep").unwrap(), U64Solver::PyramidSweep);
+    }
+
+    #[test]
+    fn sparse_solver_resolves_for_planner_use() {
+        assert_eq!(
+            make_solver("frontier2d_sparse").unwrap(),
+            U64Solver::Frontier2DSparse
+        );
     }
 
     #[test]
