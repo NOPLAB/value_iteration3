@@ -23,10 +23,15 @@ GOAL_YAW="${GOAL_YAW:-0}"
 DELTA_THR="${DELTA_THR:-0}"      # 0 = 収束しきい raw fixed-point (627M では TIMEOUT まで未収束)
 MAX_SWEEPS="${MAX_SWEEPS:-100000}"
 TIMEOUT="${TIMEOUT:-600}"
+GOAL_MARGIN_RADIUS="${GOAL_MARGIN_RADIUS:-0.5}"
+GOAL_MARGIN_THETA="${GOAL_MARGIN_THETA:-180}"
+export GOAL_MARGIN_RADIUS GOAL_MARGIN_THETA
 
 TS=/workspace/vi_compare/benches/tsukuba
 OUTDIR=/workspace/vi_compare/results/tsukuba
 MAP_YAML="${MAP_YAML:-$OUTDIR/map_tsukuba_pooled.yaml}"
+export MAP_YAML
+OUT_PREFIX="${OUT_PREFIX:-ros1_m16}"
 mkdir -p "$OUTDIR/frames_ros1" "$OUTDIR/snap_run"
 
 export VI_SNAP_DIR="${VI_SNAP_DIR:-$OUTDIR/frames_ros1}"
@@ -43,16 +48,18 @@ source devel/setup.bash
 echo "[run_snap] launch vi_node (thread_num=${THREAD_NUM}) + map_server"
 roslaunch "$TS/ros1/bench_tsukuba.launch" \
   map_yaml:="$MAP_YAML" \
-  thread_num:=${THREAD_NUM} >"$OUTDIR/snap_run/node_m16.log" 2>&1 &
+  goal_margin_radius:=${GOAL_MARGIN_RADIUS} \
+  goal_margin_theta:=${GOAL_MARGIN_THETA} \
+  thread_num:=${THREAD_NUM} >"$OUTDIR/snap_run/${OUT_PREFIX}_node.log" 2>&1 &
 LAUNCH_PID=$!
 trap 'kill $LAUNCH_PID 2>/dev/null || true' EXIT
 
-echo "[run_snap] client: goal=(${GOAL_X},${GOAL_Y},${GOAL_YAW}) thr=${DELTA_THR} timeout=${TIMEOUT}s"
+echo "[run_snap] client: goal=(${GOAL_X},${GOAL_Y},${GOAL_YAW}) margin=(${GOAL_MARGIN_RADIUS}m,${GOAL_MARGIN_THETA}deg) thr=${DELTA_THR} timeout=${TIMEOUT}s"
 python3 "$TS/ros1/bench_client_tsukuba.py" \
   "$GOAL_X" "$GOAL_Y" "$GOAL_YAW" "$DELTA_THR" "$MAX_SWEEPS" "$TIMEOUT" "$THREAD_NUM" \
-  "$OUTDIR/snap_run/ros1_m16"
+  "$OUTDIR/snap_run/${OUT_PREFIX}"
 
 echo "[run_snap] done. results:"
-cat "$OUTDIR/snap_run/ros1_m16.json"
+cat "$OUTDIR/snap_run/${OUT_PREFIX}.json"
 echo
 echo "[run_snap] frames: $(ls "$VI_SNAP_DIR"/snap_*.bin 2>/dev/null | wc -l)"

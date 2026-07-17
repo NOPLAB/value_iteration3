@@ -1,14 +1,17 @@
 <launch>
-  <!-- 本家 value_iteration を tsukuba 0.15m プールマップ (4417x2367x60 = 627M states)
-       上で並列スイープ実行するベンチ用 launch。map_server(プールPGM) + vi_node。
+  <!-- 本家 value_iteration を tsukuba プールマップ上で並列スイープ実行する
+       ベンチ用 launch。map_server(プールPGM) + vi_node。
        planning params は vi_rs (bench_map) 側と一致させてある:
-         theta=60, safety_radius=0.2m, safety_radius_penalty=100000,
-         goal_margin_radius=0.5m, goal_margin_theta=180 (全θ受容)。
-       tsukuba の goal セル (2297,238) は θ窓が狭いと予測状態が無く孤立するため、
-       両側とも goal_margin_theta=180 (全周) で揃える。 -->
+         theta=60, safety_radius=0.2m, safety_radius_penalty=100000。
+       goal margin は arg で可変 (default は動画向けの 0.5m/180=全θ受容)。
+       0.25m 格子 (s5) で goal セル (2297,238) を使う場合、θ窓 ±15° だと
+       予測状態が無く孤立するため margin=180 が必要。統一条件ベンチ
+       (0.3m/±15°) では距離変換で選んだ開放セルを goal に渡すこと。 -->
   <arg name="map_yaml"   default="/workspace/vi_compare/results/tsukuba/map_tsukuba_pooled.yaml"/>
   <arg name="thread_num" default="16"/>
   <arg name="online"     default="false"/>
+  <arg name="goal_margin_radius" default="0.5"/>
+  <arg name="goal_margin_theta"  default="180"/>
   <rosparam>
     vi_node:
       action_list:
@@ -26,8 +29,8 @@
     <param name="thread_num" value="$(arg thread_num)"/>
     <param name="safety_radius" value="0.2"/>
     <param name="safety_radius_penalty" value="100000.0"/>
-    <param name="goal_margin_radius" value="0.5"/>
-    <param name="goal_margin_theta" value="180"/>
+    <param name="goal_margin_radius" value="$(arg goal_margin_radius)"/>
+    <param name="goal_margin_theta" value="$(arg goal_margin_theta)"/>
     <param name="map_type" value="occupancy"/>
   </node>
 </launch>
