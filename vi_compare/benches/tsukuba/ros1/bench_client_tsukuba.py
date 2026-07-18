@@ -96,7 +96,9 @@ def main():
     timing = dict(elapsed_sec=b.elapsed, sweeps=b.sweeps, converged=b.converged,
                   last_max_delta=b.last_delta, thread_num=thread_num,
                   delta_threshold=thr, goal=[gx, gy, gyaw], side='ros1',
-                  map='map_tsukuba_pooled (0.15m, scale3, 627M states)')
+                  map=os.path.basename(os.environ.get('MAP_YAML', 'map_tsukuba_pooled.yaml')),
+                  goal_margin_radius=float(os.environ.get('GOAL_MARGIN_RADIUS', 'nan')),
+                  goal_margin_theta=float(os.environ.get('GOAL_MARGIN_THETA', 'nan')))
     with open(out_prefix + '.json', 'w') as f:
         json.dump(timing, f, indent=2)
     with open(out_prefix + '.csv', 'w') as f:
