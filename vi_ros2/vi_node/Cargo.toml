@@ -22,7 +22,7 @@ path = "src/lib.rs"
 ndarray            = "0.16"
 crossbeam-channel  = "0.5"
 anyhow             = "1"
-thiserror          = "1"
+thiserror          = "2"
 # Used by main.rs to bridge the action server's blocking feedback/join thread
 # back to the rclrs `futures`-based async callback (oneshot channel). rclrs has
 # no tokio runtime, so we await a futures oneshot rather than use tokio timers.
