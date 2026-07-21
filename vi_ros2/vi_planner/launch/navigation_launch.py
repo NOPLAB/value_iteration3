@@ -11,10 +11,11 @@
 #     stack is unchanged. vi_planner is not a lifecycle node (rclrs has no
 #     lifecycle support) and runs as a plain process in both composition
 #     modes.
-#   * `local_planner:=vi` additionally swaps nav2_controller's
-#     controller_server for vi_local_planner (the value-iteration local
-#     planner, same follow_path action) — also a plain non-lifecycle process.
-#     The default (`local_planner:=nav2`) keeps controller_server (DWB etc.).
+#   * The local planner defaults to value iteration too (`local_planner:=vi`,
+#     matching the VI global planner this file always brings up):
+#     nav2_controller's controller_server is swapped for vi_local_planner
+#     (same follow_path action) — also a plain non-lifecycle process.
+#     `local_planner:=nav2` keeps controller_server (DWB etc.) instead.
 #
 # Any Nav2 robot can include this file in place of nav2_bringup's
 # navigation_launch.py to switch to value-iteration global planning.
@@ -132,9 +133,10 @@ def generate_launch_description():
                     '(only with local_planner:=vi)')
 
     declare_local_planner_cmd = DeclareLaunchArgument(
-        'local_planner', default_value='nav2',
-        description="Local planner: 'nav2' = nav2_controller's controller_server, "
-                    "'vi' = vi_local_planner (value-iteration follow_path server)")
+        'local_planner', default_value='vi',
+        description="Local planner: 'vi' (default, matching the VI global planner) = "
+                    "vi_local_planner (value-iteration follow_path server), "
+                    "'nav2' = nav2_controller's controller_server")
 
     # vi_planner は Rust ノード (非 composable・非 lifecycle) なので、
     # composition の有無によらず単独プロセスとして起動する。
