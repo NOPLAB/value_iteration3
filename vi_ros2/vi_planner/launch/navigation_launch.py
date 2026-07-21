@@ -2,7 +2,7 @@
 #
 # Robot-agnostic counterpart of nav2_bringup/launch/navigation_launch.py
 # (Humble, Copyright (c) 2018 Intel Corporation, Apache License 2.0), with
-# two changes:
+# these changes:
 #
 #   * nav2_planner's planner_server is NOT launched and is removed from the
 #     lifecycle manager's node list.
@@ -11,14 +11,18 @@
 #     stack is unchanged. vi_planner is not a lifecycle node (rclrs has no
 #     lifecycle support) and runs as a plain process in both composition
 #     modes.
+#   * `local_planner:=vi` additionally swaps nav2_controller's
+#     controller_server for vi_local_planner (the value-iteration local
+#     planner, same follow_path action) — also a plain non-lifecycle process.
+#     The default (`local_planner:=nav2`) keeps controller_server (DWB etc.).
 #
 # Any Nav2 robot can include this file in place of nav2_bringup's
 # navigation_launch.py to switch to value-iteration global planning.
 # vi_planner reads the robot pose from a PoseWithCovarianceStamped topic
 # (`pose_topic` launch argument; emcl2: mcl_pose / AMCL: amcl_pose) because
-# rclrs has no tf2 binding yet. vi_planner parameters may be supplied via a
-# `vi_planner:` section in `params_file`; anything unset falls back to the
-# node's built-in defaults.
+# rclrs has no tf2 binding yet. vi_planner / vi_local_planner parameters may
+# be supplied via `vi_planner:` / `vi_local_planner:` sections in
+# `params_file`; anything unset falls back to the node's built-in defaults.
 
 import os
 
@@ -26,7 +30,7 @@ from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, SetEnvironmentVariable
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import LoadComposableNodes
 from launch_ros.actions import Node
@@ -47,6 +51,12 @@ def generate_launch_description():
     use_respawn = LaunchConfiguration('use_respawn')
     log_level = LaunchConfiguration('log_level')
     pose_topic = LaunchConfiguration('pose_topic')
+    scan_topic = LaunchConfiguration('scan_topic')
+    local_planner = LaunchConfiguration('local_planner')
+
+    # local_planner:=vi のとき controller_server の代わりに vi_local_planner
+    # (非 lifecycle) を起動する。
+    use_vi_local = PythonExpression(["'", local_planner, "' == 'vi'"])
 
     # planner_server を除いた lifecycle 管理リスト。
     lifecycle_nodes = ['controller_server',
@@ -55,6 +65,8 @@ def generate_launch_description():
                        'bt_navigator',
                        'waypoint_follower',
                        'velocity_smoother']
+    # local_planner:=vi ではさらに controller_server も抜く。
+    lifecycle_nodes_vi_local = [n for n in lifecycle_nodes if n != 'controller_server']
 
     remappings = [('/tf', 'tf'),
                   ('/tf_static', 'tf_static')]
@@ -114,6 +126,16 @@ def generate_launch_description():
         description='PoseWithCovarianceStamped topic vi_planner uses as the robot pose '
                     '(emcl2: mcl_pose / AMCL: amcl_pose)')
 
+    declare_scan_topic_cmd = DeclareLaunchArgument(
+        'scan_topic', default_value='scan',
+        description='LaserScan topic vi_local_planner uses for local penalties '
+                    '(only with local_planner:=vi)')
+
+    declare_local_planner_cmd = DeclareLaunchArgument(
+        'local_planner', default_value='nav2',
+        description="Local planner: 'nav2' = nav2_controller's controller_server, "
+                    "'vi' = vi_local_planner (value-iteration follow_path server)")
+
     # vi_planner は Rust ノード (非 composable・非 lifecycle) なので、
     # composition の有無によらず単独プロセスとして起動する。
     vi_planner_node = Node(
@@ -129,10 +151,29 @@ def generate_launch_description():
         arguments=['--ros-args', '--log-level', log_level],
         remappings=remappings)
 
+    # vi_local_planner も Rust ノード (非 composable・非 lifecycle) なので、
+    # composition の有無によらず単独プロセスとして起動する。cmd_vel は
+    # controller_server と同じく velocity_smoother 経由 (cmd_vel_nav)。
+    vi_local_planner_node = Node(
+        condition=IfCondition(use_vi_local),
+        package='vi_local_planner',
+        executable='vi_local_planner',
+        name='vi_local_planner',
+        output='screen',
+        respawn=use_respawn,
+        respawn_delay=2.0,
+        parameters=[configured_params,
+                    {'use_sim_time': use_sim_time,
+                     'pose_topic': pose_topic,
+                     'scan_topic': scan_topic}],
+        arguments=['--ros-args', '--log-level', log_level],
+        remappings=remappings + [('cmd_vel', 'cmd_vel_nav')])
+
     load_nodes = GroupAction(
         condition=IfCondition(PythonExpression(['not ', use_composition])),
         actions=[
             Node(
+                condition=UnlessCondition(use_vi_local),
                 package='nav2_controller',
                 executable='controller_server',
                 output='screen',
@@ -193,6 +234,7 @@ def generate_launch_description():
                 remappings=remappings +
                         [('cmd_vel', 'cmd_vel_nav'), ('cmd_vel_smoothed', 'cmd_vel')]),
             Node(
+                condition=UnlessCondition(use_vi_local),
                 package='nav2_lifecycle_manager',
                 executable='lifecycle_manager',
                 name='lifecycle_manager_navigation',
@@ -201,11 +243,29 @@ def generate_launch_description():
                 parameters=[{'use_sim_time': use_sim_time},
                             {'autostart': autostart},
                             {'node_names': lifecycle_nodes}]),
+            Node(
+                condition=IfCondition(use_vi_local),
+                package='nav2_lifecycle_manager',
+                executable='lifecycle_manager',
+                name='lifecycle_manager_navigation',
+                output='screen',
+                arguments=['--ros-args', '--log-level', log_level],
+                parameters=[{'use_sim_time': use_sim_time},
+                            {'autostart': autostart},
+                            {'node_names': lifecycle_nodes_vi_local}]),
         ]
     )
 
-    load_composable_nodes = LoadComposableNodes(
-        condition=IfCondition(use_composition),
+    # ComposableNode 単体には condition を付けられないため、controller_server と
+    # lifecycle_manager は local_planner の値で切り替える別 LoadComposableNodes に
+    # 分離する。
+    composition_and_nav2_controller = PythonExpression(
+        [use_composition, " and '", local_planner, "' != 'vi'"])
+    composition_and_vi_local = PythonExpression(
+        [use_composition, " and '", local_planner, "' == 'vi'"])
+
+    load_composable_controller = LoadComposableNodes(
+        condition=IfCondition(composition_and_nav2_controller),
         target_container=container_name_full,
         composable_node_descriptions=[
             ComposableNode(
@@ -214,6 +274,13 @@ def generate_launch_description():
                 name='controller_server',
                 parameters=[configured_params],
                 remappings=remappings + [('cmd_vel', 'cmd_vel_nav')]),
+        ],
+    )
+
+    load_composable_nodes = LoadComposableNodes(
+        condition=IfCondition(use_composition),
+        target_container=container_name_full,
+        composable_node_descriptions=[
             ComposableNode(
                 package='nav2_smoother',
                 plugin='nav2_smoother::SmootherServer',
@@ -245,6 +312,13 @@ def generate_launch_description():
                 parameters=[configured_params],
                 remappings=remappings +
                            [('cmd_vel', 'cmd_vel_nav'), ('cmd_vel_smoothed', 'cmd_vel')]),
+        ],
+    )
+
+    load_composable_lifecycle = LoadComposableNodes(
+        condition=IfCondition(composition_and_nav2_controller),
+        target_container=container_name_full,
+        composable_node_descriptions=[
             ComposableNode(
                 package='nav2_lifecycle_manager',
                 plugin='nav2_lifecycle_manager::LifecycleManager',
@@ -252,6 +326,20 @@ def generate_launch_description():
                 parameters=[{'use_sim_time': use_sim_time,
                              'autostart': autostart,
                              'node_names': lifecycle_nodes}]),
+        ],
+    )
+
+    load_composable_lifecycle_vi_local = LoadComposableNodes(
+        condition=IfCondition(composition_and_vi_local),
+        target_container=container_name_full,
+        composable_node_descriptions=[
+            ComposableNode(
+                package='nav2_lifecycle_manager',
+                plugin='nav2_lifecycle_manager::LifecycleManager',
+                name='lifecycle_manager_navigation',
+                parameters=[{'use_sim_time': use_sim_time,
+                             'autostart': autostart,
+                             'node_names': lifecycle_nodes_vi_local}]),
         ],
     )
 
@@ -268,9 +356,15 @@ def generate_launch_description():
     ld.add_action(declare_use_respawn_cmd)
     ld.add_action(declare_log_level_cmd)
     ld.add_action(declare_pose_topic_cmd)
+    ld.add_action(declare_scan_topic_cmd)
+    ld.add_action(declare_local_planner_cmd)
 
     ld.add_action(vi_planner_node)
+    ld.add_action(vi_local_planner_node)
     ld.add_action(load_nodes)
+    ld.add_action(load_composable_controller)
     ld.add_action(load_composable_nodes)
+    ld.add_action(load_composable_lifecycle)
+    ld.add_action(load_composable_lifecycle_vi_local)
 
     return ld

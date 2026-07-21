@@ -19,6 +19,9 @@
   <depend>nav2_msgs</depend>
 
   <!-- launch/navigation_launch.py (vi 版 Nav2 ナビゲーションスタック) の実行時依存 -->
+  <!-- vi_local_planner は local_planner:=vi のときのみ起動されるが、依存に
+       含めて colcon のビルド順と Docker イメージへの同梱を保証する -->
+  <exec_depend>vi_local_planner</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>nav2_common</exec_depend>
