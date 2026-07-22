@@ -124,6 +124,19 @@ impl PlannerCore {
         goal: PoseView,
         cancel: &AtomicBool,
     ) -> Result<(Vec<PathPose>, PlanStats), PlanError> {
+        self.plan_with_progress(start, goal, cancel, &mut |_| {})
+    }
+
+    /// `plan` と同じだが、solve 中に `solve_chunk` ごとの write_back 後
+    /// `on_chunk` を呼ぶ (途中経過の value_function 可視化用)。
+    /// キャッシュヒット時 (solve なし) は呼ばれない。
+    pub fn plan_with_progress(
+        &mut self,
+        start: PoseView,
+        goal: PoseView,
+        cancel: &AtomicBool,
+        on_chunk: &mut dyn FnMut(&ValueIterator),
+    ) -> Result<(Vec<PathPose>, PlanStats), PlanError> {
         let goal_t_deg = yaw_to_goal_theta_deg(goal.yaw_rad);
 
         let mut stats = PlanStats { solved_now: false, iters: 0, poses: 0 };
@@ -153,6 +166,7 @@ impl PlannerCore {
                 let s = solve(&mut vi, self.cfg.solver, chunk);
                 stats.iters = stats.iters.saturating_add(s.iters);
                 remaining -= chunk;
+                on_chunk(&vi);
                 if s.converged {
                     break true;
                 }
@@ -272,6 +286,30 @@ mod tests {
             let d = ((w[1].x - w[0].x).powi(2) + (w[1].y - w[0].y).powi(2)).sqrt();
             assert!(d <= RES + 1e-9);
         }
+    }
+
+    /// 進捗コールバックは新規 solve でのみ発火し、キャッシュヒットでは
+    /// 発火しない (途中経過の value_function 配信の前提)。
+    #[test]
+    fn progress_callback_fires_only_when_solving() {
+        let mut core = PlannerCore::new(build(64), cfg());
+        let cancel = AtomicBool::new(false);
+        let goal = pose(2.0, 2.0, 0.0);
+
+        let mut calls = 0usize;
+        core.plan_with_progress(pose(0.6, 0.6, 0.0), goal, &cancel, &mut |vi| {
+            calls += 1;
+            assert!(vi.cell_num_x > 0);
+        })
+        .expect("first plan");
+        assert!(calls > 0);
+
+        let mut calls_cached = 0usize;
+        core.plan_with_progress(pose(0.4, 1.8, 0.0), goal, &cancel, &mut |_| {
+            calls_cached += 1;
+        })
+        .expect("replan");
+        assert_eq!(calls_cached, 0);
     }
 
     #[test]

@@ -70,6 +70,8 @@ struct Params {
     goal_tolerance_deg: f64,
     cost_drawing_threshold: i64,
     publish_value_function: bool,
+    /// solve 途中経過の value_function 配信間隔 [ms] (0 = 完了時のみ)。
+    value_publish_interval_ms: i64,
     unknown_as_obstacle: bool,
 }
 
@@ -105,6 +107,7 @@ fn read_params(node: &Node) -> Result<Params> {
     let goal_tolerance_deg = p!("goal_tolerance_deg", f64, 10.0);
     let cost_drawing_threshold = p!("cost_drawing_threshold", i64, 60);
     let publish_value_function = p!("publish_value_function", bool, true);
+    let value_publish_interval_ms = p!("value_publish_interval_ms", i64, 500);
     let unknown_as_obstacle = p!("unknown_as_obstacle", bool, true);
 
     let names: Vec<String> = node
@@ -165,6 +168,7 @@ fn read_params(node: &Node) -> Result<Params> {
         goal_tolerance_deg,
         cost_drawing_threshold,
         publish_value_function,
+        value_publish_interval_ms,
         unknown_as_obstacle,
     })
 }
@@ -349,7 +353,8 @@ fn main() -> Result<()> {
         },
     )?;
 
-    // 6b. value_function デバッグ配信 (solve 完了ごとに 1 回)。
+    // 6b. value_function デバッグ配信 (solve 中は value_publish_interval_ms
+    //     ごとの途中経過 + 完了時に 1 回)。
     let vf_pub = if params.publish_value_function {
         Some(Arc::new(node.create_publisher::<nav_msgs::msg::OccupancyGrid>(
             "value_function".reliable().transient_local().keep_last(1),
@@ -364,6 +369,7 @@ fn main() -> Result<()> {
     let node_clock = node.get_clock();
     let frame_id = params.global_frame.clone();
     let threshold_steps = params.cost_drawing_threshold.max(0) as u64;
+    let publish_interval_ms = params.value_publish_interval_ms.max(0) as u64;
 
     let _server = node.create_action_server::<nav2_msgs::action::ComputePathToPose, _>(
         "compute_path_to_pose",
@@ -423,7 +429,29 @@ fn main() -> Result<()> {
                 let clock_thread = node_clock.clone();
                 std::thread::spawn(move || {
                     let mut core = core_thread.lock().unwrap();
-                    let result = core.plan(start, goal, &my_cancel);
+                    // solve 中の途中経過配信 (チャンク write_back 後の値なので
+                    // ゴールから波面が広がる様子が RViz で見える)。
+                    let mut last_pub: Option<Instant> = None;
+                    let result = core.plan_with_progress(start, goal, &my_cancel, &mut |vi| {
+                        let Some(pub_) = &vf_pub_thread else { return };
+                        if publish_interval_ms == 0 {
+                            return;
+                        }
+                        let due = last_pub.map_or(true, |t| {
+                            t.elapsed() >= Duration::from_millis(publish_interval_ms)
+                        });
+                        if !due {
+                            return;
+                        }
+                        let stamp = clock_thread.now().to_sec_nanosec().unwrap_or((0, 0));
+                        let _ = pub_.publish(value_function_grid(
+                            vi,
+                            threshold_steps,
+                            &frame_thread,
+                            stamp,
+                        ));
+                        last_pub = Some(Instant::now());
+                    });
                     // solve が走った場合のみ value_function を配信し直す。
                     if let (Ok((_, stats)), Some(pub_)) = (&result, &vf_pub_thread) {
                         if stats.solved_now {

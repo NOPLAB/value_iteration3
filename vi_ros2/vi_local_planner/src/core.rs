@@ -19,7 +19,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use vi_reference::bridge::{yaw_to_goal_theta_deg, PoseView};
+use ndarray::Array2;
+
+use vi_reference::bridge::{value_slice_to_occupancy, yaw_to_goal_theta_deg, PoseView};
 use vi_reference::msg::{LaserScan, OccupancyGrid};
 use vi_reference::planner::{optimal_action_at, pose_to_cell};
 use vi_reference::solvers::{solve, U64Solver};
@@ -124,6 +126,30 @@ fn action_at(vi: &ValueIterator, ix: i32, iy: i32, it: i32) -> Option<Decision> 
     Some(Decision::Action { id: id as usize, fw: a.delta_fw, rot_deg: a.delta_rot })
 }
 
+/// solve 済み ValueIterator の θ=0 全域スライスを可視化用 OccupancyGrid に
+/// 描画する (スケールは vi_planner の value_function 配信と同じ:
+/// 0..=100 と未到達 -1)。solve 中の途中経過 (`prepare_goal_with_progress` の
+/// コールバック) からも呼べるよう関数にしてある。
+pub fn value_grid_of(vi: &ValueIterator, threshold_steps: u64) -> OccupancyGrid {
+    let (nx, ny) = (vi.cell_num_x, vi.cell_num_y);
+    let mut slice = Array2::<u64>::zeros((ny as usize, nx as usize));
+    for iy in 0..ny {
+        for ix in 0..nx {
+            slice[[iy as usize, ix as usize]] =
+                vi.states[vi.to_index(ix, iy, 0) as usize].total_cost;
+        }
+    }
+    OccupancyGrid {
+        width: nx,
+        height: ny,
+        resolution: vi.xy_resolution,
+        origin_x: vi.map_origin_x,
+        origin_y: vi.map_origin_y,
+        origin_quat: vi.map_origin_quat.clone(),
+        data: value_slice_to_occupancy(&slice, threshold_steps),
+    }
+}
+
 /// 範囲内で final_state か (境界チェック込み)。
 fn is_final(vi: &ValueIterator, ix: i32, iy: i32, it: i32) -> bool {
     vi.in_map_area(ix, iy)
@@ -151,6 +177,18 @@ impl LocalPlannerCore {
         &mut self,
         goal: PoseView,
         cancel: &AtomicBool,
+    ) -> Result<SolveStats, SolveError> {
+        self.prepare_goal_with_progress(goal, cancel, &mut |_| {})
+    }
+
+    /// `prepare_goal` と同じだが、solve 中に `solve_chunk` ごとの write_back 後
+    /// `on_chunk` を呼ぶ (途中経過の value function 可視化用)。
+    /// キャッシュヒット時 (solve なし) は呼ばれない。
+    pub fn prepare_goal_with_progress(
+        &mut self,
+        goal: PoseView,
+        cancel: &AtomicBool,
+        on_chunk: &mut dyn FnMut(&ValueIterator),
     ) -> Result<SolveStats, SolveError> {
         let goal_t_deg = yaw_to_goal_theta_deg(goal.yaw_rad);
         let mut stats = SolveStats { solved_now: false, iters: 0 };
@@ -180,6 +218,7 @@ impl LocalPlannerCore {
                 let s = solve(&mut vi.base, self.cfg.solver, chunk);
                 stats.iters = stats.iters.saturating_add(s.iters);
                 remaining -= chunk;
+                on_chunk(&vi.base);
                 if s.converged {
                     break true;
                 }
@@ -199,6 +238,51 @@ impl LocalPlannerCore {
         self.cached
             .as_ref()
             .map(|c| ((c.goal_x - x).powi(2) + (c.goal_y - y).powi(2)).sqrt())
+    }
+
+    /// θ=0 全域スライスの可視化グリッド (`value_grid_of`)。ゴール未設定なら
+    /// None。
+    pub fn value_grid(&self, threshold_steps: u64) -> Option<OccupancyGrid> {
+        self.cached
+            .as_ref()
+            .map(|c| value_grid_of(&c.vi.base, threshold_steps))
+    }
+
+    /// ローカルウィンドウ範囲だけを現在方位の θ スライスで描画した可視化
+    /// グリッド。`set_window` 後に呼ぶこと。地図端ではクランプ後の実範囲を
+    /// 使うので、本家 `makeLocalValueFunctionMap` と違い幅とデータ長が常に
+    /// 一致する (RViz の Map 表示にそのまま流せる)。
+    pub fn window_value_grid(
+        &self,
+        pose: PoseView,
+        threshold_steps: u64,
+    ) -> Option<OccupancyGrid> {
+        let c = self.cached.as_ref()?;
+        let vi = &c.vi;
+        let (_, _, it) = pose_to_cell(&vi.base, pose.x, pose.y, pose.yaw_rad);
+        let it = it.clamp(0, vi.base.cell_num_t - 1);
+        let (x0, x1) = (vi.local_ix_min, vi.local_ix_max);
+        let (y0, y1) = (vi.local_iy_min, vi.local_iy_max);
+        if x1 < x0 || y1 < y0 {
+            return None;
+        }
+        let (w, h) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
+        let mut slice = Array2::<u64>::zeros((h, w));
+        for iy in y0..=y1 {
+            for ix in x0..=x1 {
+                slice[[(iy - y0) as usize, (ix - x0) as usize]] =
+                    vi.base.states[vi.base.to_index(ix, iy, it) as usize].total_cost;
+            }
+        }
+        Some(OccupancyGrid {
+            width: w as i32,
+            height: h as i32,
+            resolution: vi.base.xy_resolution,
+            origin_x: vi.base.map_origin_x + x0 as f64 * vi.base.xy_resolution,
+            origin_y: vi.base.map_origin_y + y0 as f64 * vi.base.xy_resolution,
+            origin_quat: vi.base.map_origin_quat.clone(),
+            data: value_slice_to_occupancy(&slice, threshold_steps),
+        })
     }
 
     /// ローカルウィンドウをロボット位置中心へ移動 (本家 `setLocalWindow`)。
@@ -407,6 +491,57 @@ mod tests {
         let cancel = AtomicBool::new(true);
         let err = core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).unwrap_err();
         assert_eq!(err, SolveError::Cancelled);
+    }
+
+    /// 進捗コールバックは新規 solve でのみ発火し、キャッシュヒットでは
+    /// 発火しない (途中経過の value function 配信の前提)。
+    #[test]
+    fn progress_callback_fires_only_when_solving() {
+        let mut core = LocalPlannerCore::new(build(64), cfg());
+        let cancel = AtomicBool::new(false);
+        let goal = pose(2.0, 2.0, 0.0);
+
+        let mut calls = 0usize;
+        core.prepare_goal_with_progress(goal, &cancel, &mut |vi| {
+            calls += 1;
+            assert!(vi.cell_num_x > 0);
+        })
+        .expect("first solve");
+        assert!(calls > 0);
+
+        let mut calls_cached = 0usize;
+        core.prepare_goal_with_progress(goal, &cancel, &mut |_| calls_cached += 1)
+            .expect("replan");
+        assert_eq!(calls_cached, 0);
+    }
+
+    /// value_grid は全域、window_value_grid はクランプ後の実ウィンドウと
+    /// 寸法・原点・データ長が一致し、値は OccupancyGrid の規約 (-1..=100) に
+    /// 収まる。
+    #[test]
+    fn visualization_grids_match_geometry() {
+        let mut core = LocalPlannerCore::new(build(64), cfg());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).expect("solve");
+
+        let g = core.value_grid(60).expect("full grid");
+        assert_eq!((g.width, g.height), (64, 64));
+        assert_eq!(g.data.len(), 64 * 64);
+
+        // 地図端 (原点) にウィンドウ → min 側がクランプされ 21x21 になる
+        // (local_ixy_range = 1.0m / 0.05m = 20)。
+        let robot = pose(0.0, 0.0, 0.0);
+        core.set_window(robot);
+        let w = core.window_value_grid(robot, 60).expect("window grid");
+        assert_eq!((w.width, w.height), (21, 21));
+        assert_eq!(w.data.len(), (w.width * w.height) as usize);
+        assert_eq!((w.origin_x, w.origin_y), (0.0, 0.0));
+        assert!(w.data.iter().all(|&v| (-1..=100).contains(&i32::from(v))));
+
+        // ゴール未設定なら None。
+        let empty = LocalPlannerCore::new(build(64), cfg());
+        assert!(empty.value_grid(60).is_none());
+        assert!(empty.window_value_grid(robot, 60).is_none());
     }
 
     /// スキャンで注入された local_penalty が、ローカル反復を経て「ヒット帯へ

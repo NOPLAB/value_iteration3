@@ -45,7 +45,7 @@ use vi_reference::solvers::U64Solver;
 use vi_reference::Action;
 
 use vi_local_planner::core::{
-    BuildParams, Decision, FollowConfig, LocalPlannerCore, SolveError,
+    value_grid_of, BuildParams, Decision, FollowConfig, LocalPlannerCore, SolveError,
 };
 
 use rclrs::*;
@@ -83,6 +83,12 @@ struct Params {
     action_tolerance: f64,
     no_action_timeout_sec: f64,
     unknown_as_obstacle: bool,
+    // 可視化 (RViz 向け value function 配信)
+    global_frame: String,
+    cost_drawing_threshold: i64,
+    publish_value_function: bool,
+    /// 可視化配信の間隔 [ms] (0 = solve 完了時のみ)。
+    value_publish_interval_ms: i64,
 }
 
 fn read_params(node: &Node) -> Result<Params> {
@@ -117,6 +123,10 @@ fn read_params(node: &Node) -> Result<Params> {
     let action_tolerance = p!("action_tolerance", f64, 0.2);
     let no_action_timeout_sec = p!("no_action_timeout_sec", f64, 3.0);
     let unknown_as_obstacle = p!("unknown_as_obstacle", bool, true);
+    let global_frame = p!("global_frame", Arc<str>, "map".into()).to_string();
+    let cost_drawing_threshold = p!("cost_drawing_threshold", i64, 60);
+    let publish_value_function = p!("publish_value_function", bool, true);
+    let value_publish_interval_ms = p!("value_publish_interval_ms", i64, 500);
 
     let names: Vec<String> = node
         .declare_parameter::<Arc<[Arc<str>]>>("action_names")
@@ -176,6 +186,10 @@ fn read_params(node: &Node) -> Result<Params> {
         action_tolerance,
         no_action_timeout_sec,
         unknown_as_obstacle,
+        global_frame,
+        cost_drawing_threshold,
+        publish_value_function,
+        value_publish_interval_ms,
     })
 }
 
@@ -257,6 +271,52 @@ fn stop_cmd(pub_cmd: &Publisher<geometry_msgs::msg::Twist>) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Value function visualization (publish_value_function=true)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// value function 可視化の配信一式。
+struct Viz {
+    /// θ=0 全域スライス (solve の途中経過 + 完了時)。
+    vf_pub: Publisher<nav_msgs::msg::OccupancyGrid>,
+    /// ローカルウィンドウの現在方位スライス (追従中、スキャン penalty 込み)。
+    win_pub: Publisher<nav_msgs::msg::OccupancyGrid>,
+    clock: Clock,
+    frame_id: String,
+    threshold_steps: u64,
+    /// 配信間隔。0 で solve 完了時のみ。
+    interval: Duration,
+}
+
+impl Viz {
+    fn stamp(&self) -> (i32, u32) {
+        self.clock.now().to_sec_nanosec().unwrap_or((0, 0))
+    }
+}
+
+/// vi_reference の可視化描画済み OccupancyGrid → ROS メッセージ。
+fn ros_grid_from(
+    g: &vi_reference::msg::OccupancyGrid,
+    frame_id: &str,
+    stamp: (i32, u32),
+) -> nav_msgs::msg::OccupancyGrid {
+    let mut msg = nav_msgs::msg::OccupancyGrid::default();
+    msg.header.frame_id = frame_id.into();
+    msg.header.stamp.sec = stamp.0;
+    msg.header.stamp.nanosec = stamp.1;
+    msg.info.resolution = g.resolution as f32;
+    msg.info.width = g.width as u32;
+    msg.info.height = g.height as u32;
+    msg.info.origin.position.x = g.origin_x;
+    msg.info.origin.position.y = g.origin_y;
+    msg.info.origin.orientation.x = g.origin_quat.x;
+    msg.info.origin.orientation.y = g.origin_quat.y;
+    msg.info.origin.orientation.z = g.origin_quat.z;
+    msg.info.origin.orientation.w = g.origin_quat.w;
+    msg.data = g.data.clone();
+    msg
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Follow loop (dedicated thread per goal)
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -288,13 +348,28 @@ fn run_follow(
     cmd_pub: &Publisher<geometry_msgs::msg::Twist>,
     feedback: &FeedbackPublisher<nav2_msgs::action::FollowPath>,
     tuning: FollowTuning,
+    viz: Option<&Viz>,
 ) -> Outcome {
     let mut core = core.lock().unwrap();
 
     // solve 中は静止 (velocity_smoother のタイムアウト任せにしない)。
     stop_cmd(cmd_pub);
     let t0 = Instant::now();
-    match core.prepare_goal(goal, cancel) {
+    // solve 途中経過 + 追従中ウィンドウの可視化を共通の間隔で間引く。
+    let mut last_viz: Option<Instant> = None;
+    let prepared = core.prepare_goal_with_progress(goal, cancel, &mut |vi| {
+        let Some(v) = viz else { return };
+        if v.interval.is_zero() {
+            return;
+        }
+        if last_viz.map_or(false, |t| t.elapsed() < v.interval) {
+            return;
+        }
+        let g = value_grid_of(vi, v.threshold_steps);
+        let _ = v.vf_pub.publish(ros_grid_from(&g, &v.frame_id, v.stamp()));
+        last_viz = Some(Instant::now());
+    });
+    match prepared {
         Ok(stats) => {
             if stats.solved_now {
                 eprintln!(
@@ -302,6 +377,13 @@ fn run_follow(
                     t0.elapsed().as_secs_f64(),
                     stats.iters
                 );
+                // 収束後の最終状態を必ず 1 回配信する (間引きで最後のチャンク
+                // が落ちても RViz は完成形を得る)。
+                if let Some(v) = viz {
+                    if let Some(g) = core.value_grid(v.threshold_steps) {
+                        let _ = v.vf_pub.publish(ros_grid_from(&g, &v.frame_id, v.stamp()));
+                    }
+                }
             }
         }
         Err(SolveError::Cancelled) => return Outcome::Preempted,
@@ -329,6 +411,20 @@ fn run_follow(
                     core.observe_scan(scan, pose);
                 }
                 core.refine_for(tuning.refine_budget);
+
+                // ローカルウィンドウの可視化 (現在方位の θ スライス。スキャン
+                // 由来の local_penalty と局所反復の結果が見える)。
+                if let Some(v) = viz {
+                    if !v.interval.is_zero()
+                        && last_viz.map_or(true, |t| t.elapsed() >= v.interval)
+                    {
+                        if let Some(g) = core.window_value_grid(pose, v.threshold_steps) {
+                            let _ =
+                                v.win_pub.publish(ros_grid_from(&g, &v.frame_id, v.stamp()));
+                        }
+                        last_viz = Some(Instant::now());
+                    }
+                }
 
                 let mut speed = 0.0f32;
                 match core.decide(pose) {
@@ -477,7 +573,26 @@ fn main() -> Result<()> {
     //     Arc エイリアスなのでそのまま clone してスレッドへ渡せる。
     let cmd_pub = node.create_publisher::<geometry_msgs::msg::Twist>("cmd_vel".keep_last(1))?;
 
-    // 6d. follow_path action サーバ。
+    // 6d. value function 可視化 (RViz 向け)。vi_planner の value_function と
+    //     衝突しないよう local_ プレフィクスのトピック名にする。
+    let viz: Option<Arc<Viz>> = if params.publish_value_function {
+        Some(Arc::new(Viz {
+            vf_pub: node.create_publisher::<nav_msgs::msg::OccupancyGrid>(
+                "local_value_function".reliable().transient_local().keep_last(1),
+            )?,
+            win_pub: node.create_publisher::<nav_msgs::msg::OccupancyGrid>(
+                "local_window_value".reliable().transient_local().keep_last(1),
+            )?,
+            clock: node.get_clock(),
+            frame_id: params.global_frame.clone(),
+            threshold_steps: params.cost_drawing_threshold.max(0) as u64,
+            interval: Duration::from_millis(params.value_publish_interval_ms.max(0) as u64),
+        }))
+    } else {
+        None
+    };
+
+    // 6e. follow_path action サーバ。
     let active_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
 
     let _server = node.create_action_server::<nav2_msgs::action::FollowPath, _>(
@@ -488,6 +603,7 @@ fn main() -> Result<()> {
             let scan_queue = Arc::clone(&scan_queue);
             let cmd_pub = cmd_pub.clone();
             let active_cancel = Arc::clone(&active_cancel);
+            let viz = viz.clone();
 
             async move {
                 // ── プリエンプト: 前の追従を止め、自分の cancel を登録 ──
@@ -523,6 +639,7 @@ fn main() -> Result<()> {
                 let latest_pose_t = Arc::clone(&latest_pose);
                 let scan_queue_t = Arc::clone(&scan_queue);
                 let cmd_pub_t = cmd_pub.clone();
+                let viz_t = viz.clone();
                 std::thread::spawn(move || {
                     let outcome = run_follow(
                         &core_t,
@@ -533,6 +650,7 @@ fn main() -> Result<()> {
                         &cmd_pub_t,
                         &feedback,
                         tuning,
+                        viz_t.as_deref(),
                     );
                     let _ = done_tx.send(outcome);
                 });
