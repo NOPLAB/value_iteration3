@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>vi_planner</name>
+  <name>vi_global_planner</name>
   <version>0.1.0</version>
   <description>
     Value-iteration global planner for Nav2: a Rust node that serves the

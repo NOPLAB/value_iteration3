@@ -13,7 +13,7 @@ WS="$REPO_ROOT/vi_ros2_ws"
 mkdir -p "$WS/src"
 ln -sfn "$REPO_ROOT/vi_ros2/vi_interfaces"    "$WS/src/vi_interfaces"
 ln -sfn "$REPO_ROOT/vi_ros2/vi_node"          "$WS/src/vi_node"
-ln -sfn "$REPO_ROOT/vi_ros2/vi_planner"       "$WS/src/vi_planner"
+ln -sfn "$REPO_ROOT/vi_ros2/vi_global_planner"       "$WS/src/vi_global_planner"
 ln -sfn "$REPO_ROOT/vi_ros2/vi_local_planner" "$WS/src/vi_local_planner"
 
 # Run colcon from $REPO_ROOT (not $WS) so the generated cargo config is found,
@@ -48,7 +48,7 @@ cd "$REPO_ROOT"
 # to that cargo invocation, so release artifacts land in $WS/build/vi_node/release/.
 # It is placed BEFORE --cmake-args so the trailing "$@" still forwards to
 # cmake-args.
-colcon build --merge-install --packages-select vi_interfaces vi_node vi_planner vi_local_planner \
+colcon build --merge-install --packages-select vi_interfaces vi_node vi_global_planner vi_local_planner \
        --base-paths "$WS/src" \
        --build-base "$WS/build" \
        --install-base "$WS/install" \

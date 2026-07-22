@@ -5,7 +5,7 @@ PoseWithCovarianceStamped pose topic (emcl2: mcl_pose, AMCL: amcl_pose) and a
 sensor_msgs/LaserScan topic to be provided by the surrounding bringup.
 cmd_vel is published as-is here; in a full Nav2 bringup remap it to
 cmd_vel_nav so it passes through velocity_smoother (see
-vi_planner/launch/navigation_launch.py with local_planner:=vi).
+vi_global_planner/launch/navigation_launch.py with local_planner:=vi).
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument

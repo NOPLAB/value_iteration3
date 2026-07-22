@@ -19,8 +19,8 @@ cd "$REPO_ROOT/vi_ros2/vi_node"
 cargo test --lib --no-default-features
 cargo test --lib
 
-# vi_planner core (rclrs-free) unit tests — same --lib technique.
-cd "$REPO_ROOT/vi_ros2/vi_planner"
+# vi_global_planner core (rclrs-free) unit tests — same --lib technique.
+cd "$REPO_ROOT/vi_ros2/vi_global_planner"
 cargo test --lib
 
 # vi_local_planner core (rclrs-free) unit tests — same --lib technique.

@@ -1,5 +1,5 @@
 [package]
-name = "vi_planner"
+name = "vi_global_planner"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
@@ -10,11 +10,11 @@ publish = false
 [workspace]
 
 [[bin]]
-name = "vi_planner"
+name = "vi_global_planner"
 path = "src/main.rs"
 
 [lib]
-name = "vi_planner"
+name = "vi_global_planner"
 path = "src/lib.rs"
 
 [dependencies]

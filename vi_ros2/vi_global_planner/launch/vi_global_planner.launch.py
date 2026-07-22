@@ -1,4 +1,4 @@
-"""Standalone launch for vi_planner (Nav2 planner_server replacement).
+"""Standalone launch for vi_global_planner (Nav2 planner_server replacement).
 
 Expects /map (transient_local, e.g. nav2_map_server) and a
 PoseWithCovarianceStamped pose topic (emcl2: mcl_pose, AMCL: amcl_pose)
@@ -23,9 +23,9 @@ def generate_launch_description():
                         '(rclrs has no tf2 yet). emcl2: mcl_pose / AMCL: amcl_pose.'),
         DeclareLaunchArgument('solver', default_value='frontier2d_sparse'),
         Node(
-            package='vi_planner',
-            executable='vi_planner',
-            name='vi_planner',
+            package='vi_global_planner',
+            executable='vi_global_planner',
+            name='vi_global_planner',
             output='screen',
             parameters=[{
                 'use_sim_time': use_sim_time,

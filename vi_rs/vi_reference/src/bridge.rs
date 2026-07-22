@@ -1,12 +1,12 @@
 //! ROS-free conversion layer between ROS message views and vi_reference types.
 //!
 //! Bridge functions take "view" structs (plain borrowed POD) rather than ROS
-//! message types. ROS nodes (vi_ros2/vi_node, vi_ros2/vi_planner) pull fields
+//! message types. ROS nodes (vi_ros2/vi_node, vi_ros2/vi_global_planner) pull fields
 //! out of `nav_msgs::msg::OccupancyGrid` / `geometry_msgs::msg::PoseStamped`
 //! and construct these views, so this module stays pure and host-testable —
 //! and is shared by every embedding (ROS2 nodes, future FFI).
 //!
-//! (旧 vi_ros2/vi_node/src/bridge.rs から移設。vi_planner と共有するため
+//! (旧 vi_ros2/vi_node/src/bridge.rs から移設。vi_global_planner と共有するため
 //! vi_reference 本体に置く。)
 //!
 //! In the u64 (本家忠実) port the penalty field and goal mask are not built

@@ -1,4 +1,4 @@
-//! vi_planner library — rclrs 非依存モジュール。
+//! vi_global_planner library — rclrs 非依存モジュール。
 //!
 //! `core` は vi_reference のみに依存し、ホストの分離クレート方式
 //! (CLAUDE.md 参照) で `cargo test` できる。ROS 型との変換・ノード配線は

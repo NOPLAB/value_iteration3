@@ -1,4 +1,4 @@
-//! vi_planner entry point — Nav2 の planner_server を置き換える
+//! vi_global_planner entry point — Nav2 の planner_server を置き換える
 //! `compute_path_to_pose` action サーバ (全 Rust)。
 //!
 //! Boot order (vi_node と同型):
@@ -39,7 +39,7 @@ use vi_reference::planner::PathPose;
 use vi_reference::solvers::U64Solver;
 use vi_reference::{Action, ValueIterator};
 
-use vi_planner::core::{BuildParams, PlanConfig, PlannerCore};
+use vi_global_planner::core::{BuildParams, PlanConfig, PlannerCore};
 
 use rclrs::*;
 
@@ -57,7 +57,7 @@ struct Params {
     map_wait_sec: i64,
     allow_action_mismatch: bool,
     action_list: Vec<(String, f64, f64)>,
-    // vi_planner 固有
+    // vi_global_planner 固有
     pose_topic: String,
     global_frame: String,
     vi_threads: i64,
@@ -285,7 +285,7 @@ fn main() -> Result<()> {
     // 1. ROS context + executor + node.
     let context = Context::default_from_env().context("rclrs context init")?;
     let mut executor = context.create_basic_executor();
-    let node = executor.create_node("vi_planner").context("create vi_planner")?;
+    let node = executor.create_node("vi_global_planner").context("create vi_global_planner")?;
 
     // 2. Parameters + validation.
     let params = read_params(&node).context("reading parameters")?;
@@ -300,7 +300,7 @@ fn main() -> Result<()> {
     let map_msg = wait_for_map(&node, &mut executor, params.map_wait_sec)
         .context("waiting for /map")?;
     eprintln!(
-        "vi_planner: got map {}x{} @{}m",
+        "vi_global_planner: got map {}x{} @{}m",
         map_msg.info.width, map_msg.info.height, map_msg.info.resolution
     );
 
@@ -412,15 +412,15 @@ fn main() -> Result<()> {
                 };
 
                 eprintln!(
-                    "vi_planner: plan ({:.2}, {:.2}) -> ({:.2}, {:.2})",
+                    "vi_global_planner: plan ({:.2}, {:.2}) -> ({:.2}, {:.2})",
                     start.x, start.y, goal.x, goal.y
                 );
 
                 // ── 計画本体は専用スレッドで実行 (solve は数秒〜数十秒ブロック) ──
                 let t0 = Instant::now();
                 type PlanOutcome = std::result::Result<
-                    (Vec<PathPose>, vi_planner::core::PlanStats),
-                    vi_planner::core::PlanError,
+                    (Vec<PathPose>, vi_global_planner::core::PlanStats),
+                    vi_global_planner::core::PlanError,
                 >;
                 let (done_tx, done_rx) = futures::channel::oneshot::channel::<PlanOutcome>();
                 let core_thread = Arc::clone(&core);
@@ -474,7 +474,7 @@ fn main() -> Result<()> {
                     Ok(Ok((poses, stats))) => {
                         let dt = t0.elapsed();
                         eprintln!(
-                            "vi_planner: path with {} poses in {:.2}s (solved_now={}, iters={})",
+                            "vi_global_planner: path with {} poses in {:.2}s (solved_now={}, iters={})",
                             stats.poses,
                             dt.as_secs_f64(),
                             stats.solved_now,
@@ -488,7 +488,7 @@ fn main() -> Result<()> {
                         executing.succeeded_with(result)
                     }
                     Ok(Err(e)) => {
-                        eprintln!("ERROR: vi_planner: {e}");
+                        eprintln!("ERROR: vi_global_planner: {e}");
                         executing.aborted_with(
                             nav2_msgs::action::ComputePathToPose_Result::default(),
                         )
@@ -501,7 +501,7 @@ fn main() -> Result<()> {
         },
     )?;
 
-    eprintln!("vi_planner: ready (solver={}, action=compute_path_to_pose)", params.solver);
+    eprintln!("vi_global_planner: ready (solver={}, action=compute_path_to_pose)", params.solver);
 
     // 7. Spin.
     executor.spin(SpinOptions::default()).first_error()?;

@@ -27,13 +27,13 @@ pub use local::ValueIteratorLocal;
 pub mod solvers;
 
 // 収束済み方策から経路 (世界座標の姿勢列) を生成するプランナ層。
-// vi_ros2/vi_planner (Nav2 の compute_path_to_pose 代替サーバ) の中核。
+// vi_ros2/vi_global_planner (Nav2 の compute_path_to_pose 代替サーバ) の中核。
 pub mod planner;
 
 pub use planner::{PathPose, Rollout, RolloutStatus};
 
 // ROS メッセージ「ビュー」と vi_reference 型の変換層 (ROS 非依存)。
-// vi_ros2/vi_node と vi_ros2/vi_planner が共有する (旧 vi_node/src/bridge.rs)。
+// vi_ros2/vi_node と vi_ros2/vi_global_planner が共有する (旧 vi_node/src/bridge.rs)。
 pub mod bridge;
 
 // 旧 vi_algorithm から取り込んだ word 並列 bitboard プリミティブ。solvers のフロンティアが

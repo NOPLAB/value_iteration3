@@ -8,7 +8,7 @@
 //!
 //! - 直近ゴールの solve 済み `ValueIteratorLocal` をキャッシュし、同一ゴールの
 //!   FollowPath 再送 (Nav2 BT の経路更新プリエンプト) は solve をスキップする
-//!   (vi_planner::core::PlannerCore と同じキャッシュ規約)。
+//!   (vi_global_planner::core::PlannerCore と同じキャッシュ規約)。
 //! - solve は `solve_chunk` イテレーションごとに cancel フラグを観測する。
 //! - ローカル反復は `value_iteration_raw` 経由なので `optimal_action` も
 //!   書き戻され、スキャンによる penalty 変化が方策に反映される。
@@ -28,7 +28,7 @@ use vi_reference::solvers::{solve, U64Solver};
 use vi_reference::value_iterator::ValueIterator;
 use vi_reference::{Action, ValueIteratorLocal};
 
-/// ゴールごとの ValueIterator 構築入力 (vi_planner::core::BuildParams と同型。
+/// ゴールごとの ValueIterator 構築入力 (vi_global_planner::core::BuildParams と同型。
 /// クレート間依存を避けるため重複定義)。地図は起動時に一度だけ取り込む。
 #[derive(Clone)]
 pub struct BuildParams {
@@ -127,7 +127,7 @@ fn action_at(vi: &ValueIterator, ix: i32, iy: i32, it: i32) -> Option<Decision> 
 }
 
 /// solve 済み ValueIterator の θ=0 全域スライスを可視化用 OccupancyGrid に
-/// 描画する (スケールは vi_planner の value_function 配信と同じ:
+/// 描画する (スケールは vi_global_planner の value_function 配信と同じ:
 /// 0..=100 と未到達 -1)。solve 中の途中経過 (`prepare_goal_with_progress` の
 /// コールバック) からも呼べるよう関数にしてある。
 pub fn value_grid_of(vi: &ValueIterator, threshold_steps: u64) -> OccupancyGrid {

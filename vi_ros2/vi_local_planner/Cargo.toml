@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.75"
 publish = false
 
-# vi_node / vi_planner と同じく vi_rs ワークスペースから隔離する (path 依存が
+# vi_node / vi_global_planner と同じく vi_rs ワークスペースから隔離する (path 依存が
 # workspace を引き込まないように空の [workspace] を明示)。
 [workspace]
 
@@ -29,7 +29,7 @@ vi_core      = { path = "../../vi_rs/vi_core" }
 vi_reference = { path = "../../vi_rs/vi_reference" }
 
 # ROS deps。colcon-ros-cargo の生成 config が [patch.crates-io] でローカル
-# ビルド済みクレートへ差し替える (vi_node / vi_planner と同じ仕組み)。
+# ビルド済みクレートへ差し替える (vi_node / vi_global_planner と同じ仕組み)。
 # nav2_msgs は Docker の ros2_rust ワークスペースでソースビルドして
 # Rust バインディングを得る。
 rclrs         = "*"

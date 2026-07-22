@@ -5,9 +5,9 @@
 //! 100ms タイマ + `/scan` 由来の local_penalty) を Nav2 の作法に載せ替える:
 //! bt_navigator は経路追従に `follow_path` (nav2_msgs/action/FollowPath) を
 //! 使うので、controller_server を起動せずこのノードを立てればスタックの残りは
-//! 無変更で済む (vi_planner が planner_server を置き換えるのと同型)。
+//! 無変更で済む (vi_global_planner が planner_server を置き換えるのと同型)。
 //!
-//! Boot order (vi_planner と同型):
+//! Boot order (vi_global_planner と同型):
 //!   1. `Context::default_from_env` + basic executor + node 作成
 //!   2. パラメータ宣言・検証 (アクション定数は vi_core と照合し fail-fast)
 //!   3. `VI_THREADS` 設定 (vi_threads > 0 のとき)
@@ -27,10 +27,10 @@
 //!   - final_state 到達で succeeded / 方策なし・pose 欠落が続けば aborted /
 //!     クライアント cancel は `until_cancel_requested` で観測し cancelled
 //!   - 自己位置は tf2 の代わりに pose トピック (emcl2: mcl_pose / AMCL:
-//!     amcl_pose) — vi_planner と同じ制約 (rclrs に tf2 が無い)
+//!     amcl_pose) — vi_global_planner と同じ制約 (rclrs に tf2 が無い)
 //!
 //! NOTE: rclrs API は ros2-rust/ros2_rust @ 2c6b926 (rclrs 0.7.0) — Docker
-//! イメージがビルドする版 — に合わせている (vi_node / vi_planner と同一)。
+//! イメージがビルドする版 — に合わせている (vi_node / vi_global_planner と同一)。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -193,7 +193,7 @@ fn read_params(node: &Node) -> Result<Params> {
     })
 }
 
-/// vi_core のコンパイル時定数とパラメータを照合 (vi_planner と同じ fail-fast)。
+/// vi_core のコンパイル時定数とパラメータを照合 (vi_global_planner と同じ fail-fast)。
 fn validate(p: &Params) -> Result<U64Solver> {
     if p.theta_cell_num != N_THETA as i64 {
         return Err(anyhow!(
@@ -573,7 +573,7 @@ fn main() -> Result<()> {
     //     Arc エイリアスなのでそのまま clone してスレッドへ渡せる。
     let cmd_pub = node.create_publisher::<geometry_msgs::msg::Twist>("cmd_vel".keep_last(1))?;
 
-    // 6d. value function 可視化 (RViz 向け)。vi_planner の value_function と
+    // 6d. value function 可視化 (RViz 向け)。vi_global_planner の value_function と
     //     衝突しないよう local_ プレフィクスのトピック名にする。
     let viz: Option<Arc<Viz>> = if params.publish_value_function {
         Some(Arc::new(Viz {

@@ -1,4 +1,4 @@
-# Nav2 navigation bringup with vi_planner as the global planner.
+# Nav2 navigation bringup with vi_global_planner as the global planner.
 #
 # Robot-agnostic counterpart of nav2_bringup/launch/navigation_launch.py
 # (Humble, Copyright (c) 2018 Intel Corporation, Apache License 2.0), with
@@ -6,9 +6,9 @@
 #
 #   * nav2_planner's planner_server is NOT launched and is removed from the
 #     lifecycle manager's node list.
-#   * vi_planner (this package) is launched instead. It serves the same
+#   * vi_global_planner (this package) is launched instead. It serves the same
 #     `compute_path_to_pose` action bt_navigator uses, so the rest of the
-#     stack is unchanged. vi_planner is not a lifecycle node (rclrs has no
+#     stack is unchanged. vi_global_planner is not a lifecycle node (rclrs has no
 #     lifecycle support) and runs as a plain process in both composition
 #     modes.
 #   * The local planner defaults to value iteration too (`local_planner:=vi`,
@@ -19,10 +19,10 @@
 #
 # Any Nav2 robot can include this file in place of nav2_bringup's
 # navigation_launch.py to switch to value-iteration global planning.
-# vi_planner reads the robot pose from a PoseWithCovarianceStamped topic
+# vi_global_planner reads the robot pose from a PoseWithCovarianceStamped topic
 # (`pose_topic` launch argument; emcl2: mcl_pose / AMCL: amcl_pose) because
-# rclrs has no tf2 binding yet. vi_planner / vi_local_planner parameters may
-# be supplied via `vi_planner:` / `vi_local_planner:` sections in
+# rclrs has no tf2 binding yet. vi_global_planner / vi_local_planner parameters may
+# be supplied via `vi_global_planner:` / `vi_local_planner:` sections in
 # `params_file`; anything unset falls back to the node's built-in defaults.
 
 import os
@@ -124,7 +124,7 @@ def generate_launch_description():
 
     declare_pose_topic_cmd = DeclareLaunchArgument(
         'pose_topic', default_value='mcl_pose',
-        description='PoseWithCovarianceStamped topic vi_planner uses as the robot pose '
+        description='PoseWithCovarianceStamped topic vi_global_planner uses as the robot pose '
                     '(emcl2: mcl_pose / AMCL: amcl_pose)')
 
     declare_scan_topic_cmd = DeclareLaunchArgument(
@@ -138,12 +138,12 @@ def generate_launch_description():
                     "vi_local_planner (value-iteration follow_path server), "
                     "'nav2' = nav2_controller's controller_server")
 
-    # vi_planner は Rust ノード (非 composable・非 lifecycle) なので、
+    # vi_global_planner は Rust ノード (非 composable・非 lifecycle) なので、
     # composition の有無によらず単独プロセスとして起動する。
-    vi_planner_node = Node(
-        package='vi_planner',
-        executable='vi_planner',
-        name='vi_planner',
+    vi_global_planner_node = Node(
+        package='vi_global_planner',
+        executable='vi_global_planner',
+        name='vi_global_planner',
         output='screen',
         respawn=use_respawn,
         respawn_delay=2.0,
@@ -361,7 +361,7 @@ def generate_launch_description():
     ld.add_action(declare_scan_topic_cmd)
     ld.add_action(declare_local_planner_cmd)
 
-    ld.add_action(vi_planner_node)
+    ld.add_action(vi_global_planner_node)
     ld.add_action(vi_local_planner_node)
     ld.add_action(load_nodes)
     ld.add_action(load_composable_controller)
