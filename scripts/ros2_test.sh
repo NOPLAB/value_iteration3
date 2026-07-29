@@ -23,8 +23,9 @@ cargo test --lib
 cd "$REPO_ROOT/vi_ros2/vi_global_planner"
 cargo test --lib
 
-# vi_local_planner core (rclrs-free) unit tests — same --lib technique.
-cd "$REPO_ROOT/vi_ros2/vi_local_planner"
+# vi_planner core (rclrs-free) unit tests — same --lib technique. This is the
+# unified core: one value function shared by compute_path_to_pose and follow_path.
+cd "$REPO_ROOT/vi_ros2/vi_planner"
 cargo test --lib
 
 # Full colcon build (this is what links the rclrs `vi_node` binary; plain cargo

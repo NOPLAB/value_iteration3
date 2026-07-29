@@ -45,7 +45,8 @@ WORKDIR /ros2_rust_ws
 RUN . /opt/ros/humble/setup.sh && \
     colcon build --merge-install --packages-up-to rclrs
 
-# nav2_msgs (ComputePathToPose 等、vi_global_planner が使う) の Rust バインディング。
+# nav2_msgs (ComputePathToPose / FollowPath。vi_planner と vi_global_planner が使う)
+# の Rust バインディング。
 # apt バイナリの nav2_msgs は share/nav2_msgs/rust を含まないため、ソースを
 # この ros2_rust ワークスペースでビルドして rosidl_generator_rs を通す
 # (vi_interfaces が vi_ros2_ws で Rust 型を得るのと同じ仕組み)。

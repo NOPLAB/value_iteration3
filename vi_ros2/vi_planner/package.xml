@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>vi_planner</name>
+  <version>0.1.0</version>
+  <description>
+    Unified value-iteration planner for Nav2: a single Rust node that serves
+    BOTH the compute_path_to_pose and follow_path actions (nav2_msgs) from ONE
+    value function. Replaces nav2_planner's planner_server and
+    nav2_controller's controller_server at the same time, so a goal is solved
+    once instead of twice (as it was when vi_global_planner and
+    vi_local_planner ran side by side). The global path is a greedy rollout of
+    the solved value function; the local control loop refines the same value
+    function inside a moving +-1m window with laser-scan penalties and
+    publishes the greedy action as cmd_vel.
+
+    No out-of-core (compact) path and no map_scale: the local window writes
+    into ValueIterator::states directly, which a compact solve does not
+    allocate. For maps too large to solve densely, use vi_global_planner plus
+    nav2_controller's controller_server instead.
+  </description>
+  <maintainer email="noplab90@gmail.com">nop</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cargo</buildtool_depend>
+
+  <depend>rclrs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav2_msgs</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cargo</build_type>
+    <install>launch</install>
+  </export>
+</package>

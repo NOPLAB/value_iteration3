@@ -1,5 +1,5 @@
 [package]
-name = "vi_local_planner"
+name = "vi_planner"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
@@ -10,17 +10,17 @@ publish = false
 [workspace]
 
 [[bin]]
-name = "vi_local_planner"
+name = "vi_planner"
 path = "src/main.rs"
 
 [lib]
-name = "vi_local_planner"
+name = "vi_planner"
 path = "src/lib.rs"
 
 [dependencies]
 anyhow  = "1"
 # main.rs が action コールバック (rclrs の futures エグゼキュータ) と
-# 追従スレッドを橋渡しする oneshot チャネルに使う。
+# 計画/追従スレッドを橋渡しする oneshot チャネルに使う。
 futures = "0.3"
 # 価値関数の可視化描画 (bridge::value_slice_to_occupancy) 用。
 ndarray = "0.16"
