@@ -17,7 +17,7 @@
 //! RAM を band に抑える。後続: ディスク mmap → 並列化 → CLI。
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::action::Action;
 use crate::msg::OccupancyGrid;
@@ -778,6 +778,9 @@ pub struct CompactStats {
     pub iters: u32,
     pub updates: u64,
     pub converged: bool,
+    /// `converged == false` の内訳: `cancel` フラグで中断されたなら true、
+    /// `max_iter` 打ち切りなら false。中断時の `sink` の内容は未完成なので使えない。
+    pub cancelled: bool,
     /// final 化された eval_ok セル数。
     pub finalized: u64,
     /// 到達可能（eval_ok かつ `cp != UNREACHED`）セル数。
@@ -796,6 +799,7 @@ pub struct CompactStats {
 
 /// 波内バンドを直列 Gauss–Seidel で収束させる。frontier から始め、減少 θ があった in-band 列の
 /// 依存窓を膨張して次フロンティアにし、丸ごと無変化になったら `true`。`max_iter` 到達で `false`。
+/// `cancel` が立っていてもラウンド境界で `false` を返す（呼び出し側が両者を区別する）。
 /// store/col_min/col_max/reached/live/iters/total_updates を更新する（波ループ本体から切り出し）。
 #[allow(clippy::too_many_arguments)]
 fn converge_band_serial(
@@ -808,6 +812,7 @@ fn converge_band_serial(
     dy: u32,
     t: u64,
     max_iter: u32,
+    cancel: &AtomicBool,
     frontier: &mut Vec<(u32, u32)>,
     col_min: &mut [u64],
     col_max: &mut [u64],
@@ -819,6 +824,9 @@ fn converge_band_serial(
 ) -> bool {
     let cidx = |ix: i32, iy: i32| (iy * nx + ix) as usize;
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
         let mut changed = Bitboard2D::new(nx as u32, ny as u32);
         let mut any = false;
         for &(ixu, iyu) in frontier.iter() {
@@ -883,6 +891,7 @@ fn converge_band_async(
     dy: u32,
     t: u64,
     max_iter: u32,
+    cancel: &AtomicBool,
     frontier: &mut Vec<(u32, u32)>,
     col_min: &mut [u64],
     col_max: &mut [u64],
@@ -905,6 +914,9 @@ fn converge_band_async(
     let mut prev_cells: Vec<(u32, u32)> = Vec::new();
     let mut first = true;
     let outcome = loop {
+        if cancel.load(Ordering::Relaxed) {
+            break false;
+        }
         // ① 直列: frontier 全列の窓ブロックを確保（並列 compute 中は確保/退避できないため）。
         for &(ixu, iyu) in frontier.iter() {
             ensure_window(store, ixu as i32, iyu as i32, src);
@@ -1051,10 +1063,11 @@ pub(crate) fn solve_compact_into_nthreads(
 ) -> CompactStats {
     let g = Geom::build(vi);
     let mt = displacement(vi).2;
+    let never = AtomicBool::new(false); // slice 経路に中断はない（`solve_compact_mapped` のみ対応）。
     // states を源にバンドスキャンを回す（src の借用は core 内で完結し、write_back と競合しない）。
     let mut stats = {
         let src = SliceSource::new(&vi.states, g.nx, g.nt);
-        solve_compact_core(&g, mt, &src, max_iter, band_override, sink, nthreads)
+        solve_compact_core(&g, mt, &src, max_iter, band_override, sink, nthreads, &never)
     };
     write_back_sink(vi, &g, sink);
     // slice 経路は states があるので reachable を厳密にカウント（mapped 経路は core 内の finalized）。
@@ -1070,6 +1083,11 @@ pub(crate) fn solve_compact_into_nthreads(
 /// に下げる）。`vi.states`（O(total)）を一切確保せず、geometry/transitions だけ持つ `ValueIterator`
 /// を作り `MapSource` を源にする。出力は `sink`（ディスク mmap 推奨）に確定し、write_back はしない
 /// （結果は sink にある）。到達可能セルの収束値・方策は slice 経路（= 本家）と bit-exact。
+///
+/// `cancel` はバンド内ラウンド境界で観測される中断フラグ。立てると `converged=false,
+/// cancelled=true` で即座に戻る（`sink` の内容は未完成なので破棄すること）。中断を使わない
+/// 呼び出し側は `&AtomicBool::new(false)` を渡す。ROS プランナがゴール変更でプリエンプトする
+/// ために必要（solve は巨大マップで数十秒〜数分ブロックする）。
 #[allow(clippy::too_many_arguments)]
 pub fn solve_compact_mapped(
     actions: Vec<Action>,
@@ -1087,6 +1105,7 @@ pub fn solve_compact_mapped(
     band_override: Option<u64>,
     sink: &mut dyn CompactSink,
     nthreads: usize,
+    cancel: &AtomicBool,
 ) -> CompactStats {
     let mut vi = ValueIterator::new(actions, thread_num);
     // geometry + transitions のみ（states / sweep_orders は作らない = O(total) 確保なし）。
@@ -1096,7 +1115,7 @@ pub fn solve_compact_mapped(
     let g = Geom::build(&vi);
     let mt = displacement(&vi).2;
     let src = MapSource::build(map, &vi, safety_radius, safety_radius_penalty);
-    solve_compact_core(&g, mt, &src, max_iter, band_override, sink, nthreads)
+    solve_compact_core(&g, mt, &src, max_iter, band_override, sink, nthreads, cancel)
 }
 
 /// 既定スレッド数（環境変数 `VI_THREADS` 上書き可）。`solve_compact_mapped` にスレッド数を渡すための
@@ -1137,6 +1156,7 @@ fn solve_compact_core(
     band_override: Option<u64>,
     sink: &mut dyn CompactSink,
     nthreads: usize,
+    cancel: &AtomicBool,
 ) -> CompactStats {
     let (nx, ny) = (g.nx, g.ny);
     let (dx, dy) = (g.mx as u32, g.my as u32);
@@ -1197,14 +1217,15 @@ fn solve_compact_core(
         //    'outer を false で抜ける。 ──
         let band_ok = if nthreads >= 2 {
             converge_band_async(
-                &mut store, g, src, nthreads, nx, ny, dx, dy, t, max_iter, &mut frontier,
+                &mut store, g, src, nthreads, nx, ny, dx, dy, t, max_iter, cancel, &mut frontier,
                 &mut col_min, &mut col_max, &col_final, &mut reached, &mut live, &mut iters,
                 &mut total_updates, &mut mask, mw, mt, full_mask,
             )
         } else {
             converge_band_serial(
-                &mut store, g, src, nx, ny, dx, dy, t, max_iter, &mut frontier, &mut col_min,
-                &mut col_max, &col_final, &mut reached, &mut live, &mut iters, &mut total_updates,
+                &mut store, g, src, nx, ny, dx, dy, t, max_iter, cancel, &mut frontier,
+                &mut col_min, &mut col_max, &col_final, &mut reached, &mut live, &mut iters,
+                &mut total_updates,
             )
         };
         if !band_ok {
@@ -1290,6 +1311,8 @@ fn solve_compact_core(
         iters,
         updates: total_updates,
         converged,
+        // 非収束の内訳: cancel が立っていれば中断、そうでなければ max_iter 打ち切り。
+        cancelled: !converged && cancel.load(Ordering::Relaxed),
         finalized,
         // 収束時は finalized == 到達可能 eval セル数。slice 入口は states から厳密値で上書きする。
         reachable: finalized,
@@ -1635,7 +1658,7 @@ mod tests {
         // make_vi と同一パラメータ: theta=60, sr=0.2, srp=30.0, gmr=0.3, gmt=15, goal(0.10,0.10,0)。
         let s = solve_compact_mapped(
             actions(), 1, &map, 60, 0.2, 30.0, 0.3, 15, 0.10, 0.10, 0, 4000, None, &mut sink,
-            nthreads,
+            nthreads, &AtomicBool::new(false),
         );
         assert!(s.converged, "mapped solver must converge (nthreads={nthreads})");
 

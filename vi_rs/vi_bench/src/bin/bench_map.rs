@@ -612,6 +612,8 @@ fn main() -> ExitCode {
                         bo,
                         sink,
                         nthreads,
+                        // bench は中断しない (ROS プランナ側だけがプリエンプトに使う)。
+                        &std::sync::atomic::AtomicBool::new(false),
                     )
                 };
                 let (s, sink): (_, Box<dyn CompactSink>) = if let Some(dir) = &args.compact_out_dir {

@@ -15,9 +15,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use vi_reference::bridge::{yaw_to_goal_theta_deg, PoseView};
 use vi_reference::msg::OccupancyGrid;
-use vi_reference::planner::{densify, rollout_path, PathPose, RolloutStatus};
+use vi_reference::params::MAX_COST;
+use vi_reference::planner::{
+    densify, rollout_path_on, CompactPolicy, PathPose, PolicyView, Rollout, RolloutStatus,
+};
+use vi_reference::solvers::frontier2d_sparse_compact::{
+    default_threads, solve_compact_mapped, CompactSink, RamSink,
+};
 use vi_reference::solvers::{solve, U64Solver};
 use vi_reference::{Action, ValueIterator};
+
+/// 巨大マップ用アウトオブコア経路の出力先。`None` = RAM (`RamSink`)、`Some(dir)` = その
+/// ディレクトリ上の mmap ファイル。必要量は `nx·ny·theta_cell_num × 12 B`
+/// (津田沼 0.15 m/cell で約 1.9 GB) なので、Pi4 のような小メモリ機ではディスクに逃がす。
+pub type SinkDir = Option<std::path::PathBuf>;
 
 /// ゴールごとの ValueIterator 構築入力 (地図は起動時に一度だけ取り込む)。
 #[derive(Clone)]
@@ -32,7 +43,7 @@ pub struct BuildParams {
 }
 
 /// 計画動作の設定。
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct PlanConfig {
     pub solver: U64Solver,
     /// solve 総イテレーション上限 (発散ガード)。
@@ -48,6 +59,22 @@ pub struct PlanConfig {
     pub goal_tolerance_xy: f64,
     /// キャッシュ再利用とみなすゴール方位差 (度)。
     pub goal_tolerance_deg: f64,
+    /// アウトオブコア (compact) 経路の出力先。`solver` が
+    /// `frontier2d_sparse_compact` のときのみ参照される。
+    pub compact_sink_dir: SinkDir,
+    /// compact 経路のワーカースレッド数 (0 = `default_threads()`)。
+    pub vi_threads: usize,
+}
+
+impl PlanConfig {
+    /// アウトオブコア (states を作らない) 経路を使うか。
+    ///
+    /// `frontier2d_sparse_compact` を選んだときだけ `solve_compact_mapped` に切り替える。
+    /// 他のソルバは `ValueIterator::states` (56 B × nx·ny·nθ) を密に確保するので、
+    /// 津田沼のような広域地図では確保だけで数十 GB になり起動不能。
+    pub fn use_compact(&self) -> bool {
+        matches!(self.solver, U64Solver::Frontier2DSparseCompact { .. })
+    }
 }
 
 /// 1 回の plan の統計 (ログ/Feedback 用)。
@@ -60,7 +87,7 @@ pub struct PlanStats {
     pub poses: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
     /// cancel フラグにより中断された (新ゴールによるプリエンプト)。
     Cancelled,
@@ -68,6 +95,8 @@ pub enum PlanError {
     NotConverged,
     /// 価値関数は収束したがロールアウトが失敗した。
     Rollout(RolloutStatus),
+    /// compact 経路の出力先 (mmap ファイル) を用意できなかった。
+    Sink(String),
 }
 
 impl std::fmt::Display for PlanError {
@@ -76,7 +105,39 @@ impl std::fmt::Display for PlanError {
             PlanError::Cancelled => write!(f, "planning cancelled (preempted)"),
             PlanError::NotConverged => write!(f, "value iteration did not converge"),
             PlanError::Rollout(s) => write!(f, "policy rollout failed: {s:?}"),
+            PlanError::Sink(e) => write!(f, "compact output sink unavailable: {e}"),
         }
+    }
+}
+
+/// solve 済み価値関数の実体。密経路は `ValueIterator` をそのまま、compact 経路は
+/// `solve_compact_mapped` が確定した sink (+ 幾何) を保持する。
+enum SolvedField {
+    Dense(Box<ValueIterator>),
+    Compact(CompactField),
+}
+
+/// compact 経路の solve 結果。`sink` は orig 索引で `(total_cost, action)` を返す確定出力で、
+/// `CompactPolicy` がロールアウト用の方策ビューとして読む。
+struct CompactField {
+    sink: Box<dyn CompactSink + Send>,
+    actions: Vec<Action>,
+    cell_num: (i32, i32, i32),
+    resolution: f64,
+    origin: (f64, f64),
+    goal: (f64, f64, i32),
+}
+
+impl CompactField {
+    fn policy(&self) -> CompactPolicy<'_> {
+        CompactPolicy::new(
+            self.sink.as_ref(),
+            &self.actions,
+            self.cell_num,
+            self.resolution,
+            self.origin,
+            self.goal,
+        )
     }
 }
 
@@ -84,7 +145,18 @@ struct CachedSolve {
     goal_x: f64,
     goal_y: f64,
     goal_t_deg: i32,
-    vi: ValueIterator,
+    field: SolvedField,
+}
+
+/// value_function 配信用の θ=0 スライス (密/compact 共通)。
+pub struct ValueSlice {
+    pub width: i32,
+    pub height: i32,
+    pub resolution: f64,
+    pub origin_x: f64,
+    pub origin_y: f64,
+    /// 長さ `width*height`、`total_cost` の生値 (未到達は `MAX_COST`)。
+    pub values: Vec<u64>,
 }
 
 pub struct PlannerCore {
@@ -104,9 +176,28 @@ impl PlannerCore {
         Self { build, cfg, cached: None }
     }
 
-    /// solve 済みキャッシュ (value_function 配信などの読み取り用)。
+    /// solve 済みキャッシュ (密経路のみ; compact 経路は `states` を持たないので `None`)。
     pub fn cached_vi(&self) -> Option<&ValueIterator> {
-        self.cached.as_ref().map(|c| &c.vi)
+        match self.cached.as_ref()?.field {
+            SolvedField::Dense(ref vi) => Some(vi),
+            SolvedField::Compact(_) => None,
+        }
+    }
+
+    /// solve 済みキャッシュの θ=0 スライス (value_function 配信用。密/compact 共通)。
+    pub fn cached_value_slice(&self) -> Option<ValueSlice> {
+        let field = &self.cached.as_ref()?.field;
+        Some(match field {
+            SolvedField::Dense(vi) => value_slice_from_vi(vi),
+            SolvedField::Compact(c) => ValueSlice {
+                width: c.cell_num.0,
+                height: c.cell_num.1,
+                resolution: c.resolution,
+                origin_x: c.origin.0,
+                origin_y: c.origin.1,
+                values: c.policy().value_slice_theta0(),
+            },
+        })
     }
 
     fn cache_matches(&self, goal: &PoseView, goal_t_deg: i32) -> bool {
@@ -143,51 +234,21 @@ impl PlannerCore {
 
         if !self.cache_matches(&goal, goal_t_deg) {
             self.cached = None; // 旧キャッシュ (数 GB になり得る) を先に解放
-            let mut vi = ValueIterator::new(self.build.actions.clone(), 1);
-            vi.set_map_with_occupancy_grid(
-                &self.build.grid,
-                self.build.theta_cell_num,
-                self.build.safety_radius,
-                self.build.safety_radius_penalty,
-                self.build.goal_margin_radius,
-                self.build.goal_margin_theta,
-            );
-            vi.set_goal(goal.x, goal.y, goal_t_deg);
-
-            let mut remaining = self.cfg.max_solve_iter;
-            let converged = loop {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(PlanError::Cancelled);
-                }
-                if remaining == 0 {
-                    break false;
-                }
-                let chunk = remaining.min(self.cfg.solve_chunk.max(1));
-                let s = solve(&mut vi, self.cfg.solver, chunk);
-                stats.iters = stats.iters.saturating_add(s.iters);
-                remaining -= chunk;
-                on_chunk(&vi);
-                if s.converged {
-                    break true;
-                }
+            let field = if self.cfg.use_compact() {
+                self.solve_compact(&goal, goal_t_deg, cancel, &mut stats)?
+            } else {
+                self.solve_dense(&goal, goal_t_deg, cancel, &mut stats, on_chunk)?
             };
-            if !converged {
-                return Err(PlanError::NotConverged);
-            }
             stats.solved_now = true;
             self.cached =
-                Some(CachedSolve { goal_x: goal.x, goal_y: goal.y, goal_t_deg, vi });
+                Some(CachedSolve { goal_x: goal.x, goal_y: goal.y, goal_t_deg, field });
         }
 
-        let vi = &self.cached.as_ref().expect("cache filled above").vi;
-        let r = rollout_path(
-            vi,
-            start.x,
-            start.y,
-            start.yaw_rad,
-            self.cfg.max_rollout_steps,
-            self.cfg.start_tolerance_cells,
-        );
+        let cached = self.cached.as_ref().expect("cache filled above");
+        let r = match &cached.field {
+            SolvedField::Dense(vi) => self.rollout(vi.as_ref(), start),
+            SolvedField::Compact(c) => self.rollout(&c.policy(), start),
+        };
         if !r.reached_goal() {
             return Err(PlanError::Rollout(r.status));
         }
@@ -198,6 +259,144 @@ impl PlannerCore {
         };
         stats.poses = poses.len();
         Ok((poses, stats))
+    }
+
+    fn rollout(&self, policy: &dyn PolicyView, start: PoseView) -> Rollout {
+        rollout_path_on(
+            policy,
+            start.x,
+            start.y,
+            start.yaw_rad,
+            self.cfg.max_rollout_steps,
+            self.cfg.start_tolerance_cells,
+        )
+    }
+
+    /// 密経路: `ValueIterator::states` を確保し、`solve_chunk` ごとに cancel を観測しながら解く。
+    fn solve_dense(
+        &self,
+        goal: &PoseView,
+        goal_t_deg: i32,
+        cancel: &AtomicBool,
+        stats: &mut PlanStats,
+        on_chunk: &mut dyn FnMut(&ValueIterator),
+    ) -> Result<SolvedField, PlanError> {
+        let mut vi = ValueIterator::new(self.build.actions.clone(), 1);
+        vi.set_map_with_occupancy_grid(
+            &self.build.grid,
+            self.build.theta_cell_num,
+            self.build.safety_radius,
+            self.build.safety_radius_penalty,
+            self.build.goal_margin_radius,
+            self.build.goal_margin_theta,
+        );
+        vi.set_goal(goal.x, goal.y, goal_t_deg);
+
+        let mut remaining = self.cfg.max_solve_iter;
+        let converged = loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(PlanError::Cancelled);
+            }
+            if remaining == 0 {
+                break false;
+            }
+            let chunk = remaining.min(self.cfg.solve_chunk.max(1));
+            let s = solve(&mut vi, self.cfg.solver, chunk);
+            stats.iters = stats.iters.saturating_add(s.iters);
+            remaining -= chunk;
+            on_chunk(&vi);
+            if s.converged {
+                break true;
+            }
+        };
+        if !converged {
+            return Err(PlanError::NotConverged);
+        }
+        Ok(SolvedField::Dense(Box::new(vi)))
+    }
+
+    /// compact (アウトオブコア) 経路: `states` を作らず地図とゴールから直接解き、確定出力を
+    /// sink に置く。solve は 1 回で走り切るので `solve_chunk` は使わず、`cancel` は
+    /// `solve_compact_mapped` 内のラウンド境界で観測される (途中経過の on_chunk は無い)。
+    fn solve_compact(
+        &self,
+        goal: &PoseView,
+        goal_t_deg: i32,
+        cancel: &AtomicBool,
+        stats: &mut PlanStats,
+    ) -> Result<SolvedField, PlanError> {
+        let g = &self.build.grid;
+        let nt = self.build.theta_cell_num;
+        let nstates = g.width as usize * g.height as usize * nt as usize;
+        let mut sink = make_sink(nstates, &self.cfg.compact_sink_dir)?;
+        let nthreads = if self.cfg.vi_threads > 0 { self.cfg.vi_threads } else { default_threads() };
+
+        let s = solve_compact_mapped(
+            self.build.actions.clone(),
+            1,
+            g,
+            nt,
+            self.build.safety_radius,
+            self.build.safety_radius_penalty,
+            self.build.goal_margin_radius,
+            self.build.goal_margin_theta,
+            goal.x,
+            goal.y,
+            goal_t_deg,
+            self.cfg.max_solve_iter,
+            None,
+            sink.as_mut(),
+            nthreads,
+            cancel,
+        );
+        stats.iters = s.iters;
+        if s.cancelled {
+            return Err(PlanError::Cancelled);
+        }
+        if !s.converged {
+            return Err(PlanError::NotConverged);
+        }
+        Ok(SolvedField::Compact(CompactField {
+            sink,
+            actions: self.build.actions.clone(),
+            cell_num: (g.width, g.height, nt),
+            resolution: g.resolution,
+            origin: (g.origin_x, g.origin_y),
+            goal: (goal.x, goal.y, goal_t_deg),
+        }))
+    }
+}
+
+/// 密な `ValueIterator` の θ=0 スライスを取り出す (solve 途中経過の配信にも使う)。
+pub fn value_slice_from_vi(vi: &ValueIterator) -> ValueSlice {
+    let (nx, ny) = (vi.cell_num_x, vi.cell_num_y);
+    let mut values = vec![MAX_COST; nx as usize * ny as usize];
+    for iy in 0..ny {
+        for ix in 0..nx {
+            values[iy as usize * nx as usize + ix as usize] =
+                vi.states[vi.to_index(ix, iy, 0) as usize].total_cost;
+        }
+    }
+    ValueSlice {
+        width: nx,
+        height: ny,
+        resolution: vi.xy_resolution,
+        origin_x: vi.map_origin_x,
+        origin_y: vi.map_origin_y,
+        values,
+    }
+}
+
+/// compact 出力 sink を作る。`dir` 指定時はディスク mmap、無指定は RAM。
+fn make_sink(
+    nstates: usize,
+    dir: &SinkDir,
+) -> Result<Box<dyn CompactSink + Send>, PlanError> {
+    match dir {
+        Some(dir) => crate::sink::MmapSink::new(dir, nstates)
+            .map(|s| Box::new(s) as Box<dyn CompactSink + Send>)
+            .map_err(|e| PlanError::Sink(e.to_string())),
+        None => Ok(Box::new(RamSink::new(nstates))),
     }
 }
 
@@ -250,7 +449,14 @@ mod tests {
             path_spacing: RES,
             goal_tolerance_xy: 0.25,
             goal_tolerance_deg: 10.0,
+            compact_sink_dir: None,
+            vi_threads: 1,
         }
+    }
+
+    /// アウトオブコア経路 (states を作らない) の設定。
+    fn cfg_compact() -> PlanConfig {
+        PlanConfig { solver: U64Solver::Frontier2DSparseCompact { band: 0 }, ..cfg() }
     }
 
     fn pose(x: f64, y: f64, yaw: f64) -> PoseView {
@@ -275,6 +481,59 @@ mod tests {
         // ゴール移動で再 solve。
         let (_, s3) = core.plan(pose(0.6, 0.6, 0.0), pose(0.8, 2.4, 0.0), &cancel).expect("new goal");
         assert!(s3.solved_now);
+    }
+
+    /// compact 経路が密経路と同じ経路を返し、キャッシュ規約も同じであること。
+    /// (広域地図では密経路が states の確保だけで数十 GB になるので、この経路が唯一の選択肢になる。)
+    #[test]
+    fn compact_path_matches_dense_and_caches() {
+        let cancel = AtomicBool::new(false);
+        let goal = pose(2.0, 2.0, 0.0);
+        let start = pose(0.6, 0.6, 0.0);
+
+        let (dense, _) =
+            PlannerCore::new(build(64), cfg()).plan(start, goal, &cancel).expect("dense plan");
+
+        let mut core = PlannerCore::new(build(64), cfg_compact());
+        let (p1, s1) = core.plan(start, goal, &cancel).expect("compact plan");
+        assert!(s1.solved_now && s1.iters > 0);
+        assert_eq!(p1.len(), dense.len(), "compact path length differs from dense");
+        for (a, b) in p1.iter().zip(dense.iter()) {
+            assert!(
+                (a.x - b.x).abs() < 1e-12 && (a.y - b.y).abs() < 1e-12,
+                "compact pose {a:?} != dense pose {b:?}"
+            );
+        }
+        // 同一ゴールの再計画は solve なし (キャッシュヒット)。
+        let (_, s2) = core.plan(pose(0.4, 1.8, 1.0), goal, &cancel).expect("compact replan");
+        assert!(!s2.solved_now);
+        // compact 経路は states を持たないので cached_vi は None、value スライスは取れる。
+        assert!(core.cached_vi().is_none());
+        let slice = core.cached_value_slice().expect("value slice");
+        assert_eq!((slice.width, slice.height), (64, 64));
+    }
+
+    /// compact 経路でも事前に立てた cancel でプリエンプトされること
+    /// (solve_compact_mapped はチャンク分割できないので、中断はソルバ内部の観測に依る)。
+    #[test]
+    fn compact_pre_raised_cancel_aborts() {
+        let mut core = PlannerCore::new(build(64), cfg_compact());
+        let cancel = AtomicBool::new(true);
+        let err = core.plan(pose(0.6, 0.6, 0.0), pose(2.0, 2.0, 0.0), &cancel).unwrap_err();
+        assert_eq!(err, PlanError::Cancelled);
+    }
+
+    /// ディスク mmap sink 経由でも同じ経路が出ること (Pi4 のような小メモリ機の経路)。
+    #[test]
+    fn compact_with_mmap_sink_plans() {
+        let dir = std::env::temp_dir().join("vi_global_planner_core_mmap_test");
+        let cfg = PlanConfig { compact_sink_dir: Some(dir.clone()), ..cfg_compact() };
+        let cancel = AtomicBool::new(false);
+        let mut core = PlannerCore::new(build(64), cfg);
+        let (p, s) = core.plan(pose(0.6, 0.6, 0.0), pose(2.0, 2.0, 0.0), &cancel).expect("plan");
+        assert!(s.solved_now && p.len() > 2);
+        drop(core);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

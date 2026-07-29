@@ -83,6 +83,58 @@ pub fn occupancy_view_to_vi_grid(
     }
 }
 
+/// `OccupancyGrid` を整数倍でダウンサンプルする (障害物優先プーリング)。
+///
+/// 出力寸法は `ceil(dim/scale)`、解像度は `resolution*scale`、原点は不変。ブロック内に 1 つでも
+/// 非 free があれば出力セルは占有 (`100`) = 保守的。`scale <= 1` は入力のクローン。
+///
+/// VI はゴールごとに `nx·ny·theta_cell_num` の状態空間を扱うので、地図の解像度が計算量・メモリを
+/// 直接支配する。津田沼のような広域地図 (5888x4000 @0.05m = 14 億状態) を 0.05 m のまま解くのは
+/// 非現実的なので、**プランナ内部だけ**粗くする (map_server / costmap / emcl2 は元解像度のまま)。
+/// scale=3 (0.15 m) は Ueda et al. 2023 の津田沼評価と同じセルサイズ。
+///
+/// 障害物優先なので通路は片側最大 `(scale-1)·resolution` 細る。ロボット半径・安全半径に対して
+/// 通路が細すぎないかは適用時に確認すること。
+pub fn downsample_occupancy(grid: &OccupancyGrid, scale: i32) -> OccupancyGrid {
+    if scale <= 1 {
+        return grid.clone();
+    }
+    let (w, h, s) = (grid.width as usize, grid.height as usize, scale as usize);
+    let (ow, oh) = (w.div_ceil(s), h.div_ceil(s));
+    let mut data = vec![0i8; ow * oh];
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let mut blocked = false;
+            'blk: for dy in 0..s {
+                let iy = oy * s + dy;
+                if iy >= h {
+                    break;
+                }
+                for dx in 0..s {
+                    let ix = ox * s + dx;
+                    if ix >= w {
+                        break;
+                    }
+                    if grid.data[iy * w + ix] != 0 {
+                        blocked = true;
+                        break 'blk;
+                    }
+                }
+            }
+            data[oy * ow + ox] = if blocked { 100 } else { 0 };
+        }
+    }
+    OccupancyGrid {
+        width: ow as i32,
+        height: oh as i32,
+        resolution: grid.resolution * scale as f64,
+        origin_x: grid.origin_x,
+        origin_y: grid.origin_y,
+        origin_quat: grid.origin_quat.clone(),
+        data,
+    }
+}
+
 /// total_cost slice → `OccupancyGrid` `data[]` (length `width*height`).
 ///
 /// - `total_cost == MAX_COST` (never reached) → `-1` (unknown).
@@ -151,6 +203,28 @@ mod tests {
         let data = [-1i8, 0];
         let g = occupancy_view_to_vi_grid(&view(2, 1, &data), false);
         assert_eq!(g.data, vec![0, 0]); // unknown -> free
+    }
+
+    #[test]
+    fn downsample_is_obstacle_priority_and_ceils_dims() {
+        // 3x3 のうち 1 セルだけ占有 → scale 2 の出力は 2x2、左上ブロックだけ占有。
+        // 端 (奇数) は範囲内セルのみで判定する (bench_map::build_occupancy と同じ規約)。
+        let g = OccupancyGrid {
+            width: 3,
+            height: 3,
+            resolution: 0.05,
+            origin_x: -1.0,
+            origin_y: 2.0,
+            origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            data: vec![0, 100, 0, 0, 0, 0, 0, 0, 0],
+        };
+        let d = downsample_occupancy(&g, 2);
+        assert_eq!((d.width, d.height), (2, 2));
+        assert_eq!(d.data, vec![100, 0, 0, 0]);
+        assert!((d.resolution - 0.10).abs() < 1e-12);
+        assert_eq!((d.origin_x, d.origin_y), (-1.0, 2.0));
+        // scale<=1 は素通し。
+        assert_eq!(downsample_occupancy(&g, 1).data, g.data);
     }
 
     #[test]

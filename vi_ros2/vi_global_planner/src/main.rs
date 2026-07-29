@@ -24,6 +24,7 @@
 //! NOTE: rclrs API は ros2-rust/ros2_rust @ 2c6b926 (rclrs 0.7.0) — Docker
 //! イメージがビルドする版 — に合わせている (vi_node と同一)。
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,13 +34,16 @@ use ndarray::Array2;
 
 use vi_core::{ACTION_FW, ACTION_ROT, N_ACTIONS, N_THETA};
 use vi_reference::bridge::{
-    occupancy_view_to_vi_grid, value_slice_to_occupancy, OccupancyGridView, PoseView,
+    downsample_occupancy, occupancy_view_to_vi_grid, value_slice_to_occupancy, OccupancyGridView,
+    PoseView,
 };
 use vi_reference::planner::PathPose;
 use vi_reference::solvers::U64Solver;
-use vi_reference::{Action, ValueIterator};
+use vi_reference::Action;
 
-use vi_global_planner::core::{BuildParams, PlanConfig, PlannerCore};
+use vi_global_planner::core::{
+    value_slice_from_vi, BuildParams, PlanConfig, PlannerCore, ValueSlice,
+};
 
 use rclrs::*;
 
@@ -73,6 +77,13 @@ struct Params {
     /// solve 途中経過の value_function 配信間隔 [ms] (0 = 完了時のみ)。
     value_publish_interval_ms: i64,
     unknown_as_obstacle: bool,
+    /// プランナ内部で地図を何倍に粗くするか (1 = /map のまま)。
+    map_scale: i64,
+    /// compact (アウトオブコア) 経路の確定出力を置くディレクトリ ("" = RAM)。
+    compact_sink_dir: String,
+    /// RAM sink の上限 [MB]。compact 経路で `compact_sink_dir` 未指定かつ推定サイズが
+    /// これを超えるとき、自動でディスク sink に逃がす。
+    compact_ram_limit_mb: i64,
 }
 
 fn read_params(node: &Node) -> Result<Params> {
@@ -109,6 +120,9 @@ fn read_params(node: &Node) -> Result<Params> {
     let publish_value_function = p!("publish_value_function", bool, true);
     let value_publish_interval_ms = p!("value_publish_interval_ms", i64, 500);
     let unknown_as_obstacle = p!("unknown_as_obstacle", bool, true);
+    let map_scale = p!("map_scale", i64, 1);
+    let compact_sink_dir = p!("compact_sink_dir", Arc<str>, "".into()).to_string();
+    let compact_ram_limit_mb = p!("compact_ram_limit_mb", i64, 512);
 
     let names: Vec<String> = node
         .declare_parameter::<Arc<[Arc<str>]>>("action_names")
@@ -170,11 +184,17 @@ fn read_params(node: &Node) -> Result<Params> {
         publish_value_function,
         value_publish_interval_ms,
         unknown_as_obstacle,
+        map_scale,
+        compact_sink_dir,
+        compact_ram_limit_mb,
     })
 }
 
 /// vi_core のコンパイル時定数とパラメータを照合 (vi_node と同じ fail-fast)。
 fn validate(p: &Params) -> Result<U64Solver> {
+    if p.map_scale < 1 {
+        return Err(anyhow!("map_scale must be >= 1, got {}", p.map_scale));
+    }
     if p.theta_cell_num != N_THETA as i64 {
         return Err(anyhow!(
             "vi_rs is compiled with N_THETA={}, got theta_cell_num={}",
@@ -248,33 +268,69 @@ fn poses_to_path(
     path
 }
 
-/// solve 済み ValueIterator の θ=0 スライスを OccupancyGrid data に描画。
+/// solve 済み価値関数の θ=0 スライス (密/compact 共通) を OccupancyGrid に描画。
 fn value_function_grid(
-    vi: &ValueIterator,
+    slice: &ValueSlice,
     threshold_steps: u64,
     frame_id: &str,
     stamp: (i32, u32),
 ) -> nav_msgs::msg::OccupancyGrid {
-    let (nx, ny) = (vi.cell_num_x, vi.cell_num_y);
-    let mut slice = Array2::<u64>::zeros((ny as usize, nx as usize));
-    for iy in 0..ny {
-        for ix in 0..nx {
-            slice[[iy as usize, ix as usize]] =
-                vi.states[vi.to_index(ix, iy, 0) as usize].total_cost;
+    let (nx, ny) = (slice.width, slice.height);
+    let mut arr = Array2::<u64>::zeros((ny as usize, nx as usize));
+    for iy in 0..ny as usize {
+        for ix in 0..nx as usize {
+            arr[[iy, ix]] = slice.values[iy * nx as usize + ix];
         }
     }
     let mut msg = nav_msgs::msg::OccupancyGrid::default();
     msg.header.frame_id = frame_id.into();
     msg.header.stamp.sec = stamp.0;
     msg.header.stamp.nanosec = stamp.1;
-    msg.info.resolution = vi.xy_resolution as f32;
+    msg.info.resolution = slice.resolution as f32;
     msg.info.width = nx as u32;
     msg.info.height = ny as u32;
-    msg.info.origin.position.x = vi.map_origin_x;
-    msg.info.origin.position.y = vi.map_origin_y;
+    msg.info.origin.position.x = slice.origin_x;
+    msg.info.origin.position.y = slice.origin_y;
     msg.info.origin.orientation.w = 1.0;
-    msg.data = value_slice_to_occupancy(&slice, threshold_steps);
+    msg.data = value_slice_to_occupancy(&arr, threshold_steps);
     msg
+}
+
+/// compact 経路の出力先ディレクトリを決める。
+///
+/// - compact 以外のソルバでは常に `None` (使われない)。
+/// - `compact_sink_dir` が明示されていればそれを使う。
+/// - 未指定でも確定出力 (`nstates × 12 B`) が `compact_ram_limit_mb` を超えるなら
+///   `/tmp/vi_global_planner_sink` に逃がす。小メモリ機で黙って GB 級の `RamSink` を
+///   確保すると OOM killer に落とされるため。
+fn compact_sink_dir(params: &Params, solver: U64Solver, nstates: usize) -> Option<PathBuf> {
+    if !matches!(solver, U64Solver::Frontier2DSparseCompact { .. }) {
+        return None;
+    }
+    let bytes = nstates as u64 * 12;
+    if !params.compact_sink_dir.is_empty() {
+        let dir = PathBuf::from(&params.compact_sink_dir);
+        eprintln!(
+            "vi_global_planner: compact output -> disk mmap {} ({:.2} GB)",
+            dir.display(),
+            bytes as f64 / 1e9
+        );
+        return Some(dir);
+    }
+    let limit = params.compact_ram_limit_mb.max(0) as u64 * 1024 * 1024;
+    if bytes > limit {
+        let dir = PathBuf::from("/tmp/vi_global_planner_sink");
+        eprintln!(
+            "WARN: compact output would need {:.2} GB of RAM (> compact_ram_limit_mb={}); \
+             spilling to disk mmap {}",
+            bytes as f64 / 1e9,
+            params.compact_ram_limit_mb,
+            dir.display()
+        );
+        return Some(dir);
+    }
+    eprintln!("vi_global_planner: compact output -> RAM ({:.2} GB)", bytes as f64 / 1e9);
+    None
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -313,9 +369,27 @@ fn main() -> Result<()> {
         origin_y: map_msg.info.origin.position.y,
         data: &map_msg.data[..],
     };
-    let vi_grid = occupancy_view_to_vi_grid(&grid_view, params.unknown_as_obstacle);
+    // プランナ内部の作業解像度。VI の状態数は nx·ny·nθ なので、広域地図 (津田沼 5888x4000
+    // @0.05m = 14 億状態) は map_scale で粗くしないと解けない。map_server / costmap /
+    // 自己位置は元解像度のまま (ここで粗くするのはプランナの内部表現だけ)。
+    let vi_grid = downsample_occupancy(
+        &occupancy_view_to_vi_grid(&grid_view, params.unknown_as_obstacle),
+        params.map_scale as i32,
+    );
+    let nstates =
+        vi_grid.width as usize * vi_grid.height as usize * params.theta_cell_num as usize;
+    eprintln!(
+        "vi_global_planner: planner grid {}x{} @{:.3}m (map_scale={}) x{} theta = {} states",
+        vi_grid.width, vi_grid.height, vi_grid.resolution, params.map_scale,
+        params.theta_cell_num, nstates,
+    );
+    // start 近傍スナップの半径はプランナ側の解像度で数える。
     let start_tolerance_cells =
-        (params.start_tolerance / grid_view.resolution).ceil() as i32;
+        (params.start_tolerance / vi_grid.resolution).ceil() as i32;
+
+    // compact 経路の出力先。確定出力は nstates × 12 B。未指定でも RAM 上限を超えるなら
+    // ディスクへ逃がす (Pi4 で 2GB の RamSink を黙って確保すると OOM kill される)。
+    let sink_dir = compact_sink_dir(&params, solver, nstates);
 
     let build = BuildParams {
         grid: vi_grid,
@@ -340,6 +414,8 @@ fn main() -> Result<()> {
         path_spacing: params.path_spacing,
         goal_tolerance_xy: params.goal_tolerance_xy,
         goal_tolerance_deg: params.goal_tolerance_deg,
+        compact_sink_dir: sink_dir,
+        vi_threads: params.vi_threads.max(0) as usize,
     };
     let core = Arc::new(Mutex::new(PlannerCore::new(build, cfg)));
 
@@ -369,6 +445,8 @@ fn main() -> Result<()> {
     let node_clock = node.get_clock();
     let frame_id = params.global_frame.clone();
     let threshold_steps = params.cost_drawing_threshold.max(0) as u64;
+    // ロールアウト固着時のヒント表示用 (safety_radius_penalty [秒/セル], safety_radius [m])。
+    let params_hint = (params.safety_radius_penalty, params.safety_radius);
     let publish_interval_ms = params.value_publish_interval_ms.max(0) as u64;
 
     let _server = node.create_action_server::<nav2_msgs::action::ComputePathToPose, _>(
@@ -445,21 +523,22 @@ fn main() -> Result<()> {
                         }
                         let stamp = clock_thread.now().to_sec_nanosec().unwrap_or((0, 0));
                         let _ = pub_.publish(value_function_grid(
-                            vi,
+                            &value_slice_from_vi(vi),
                             threshold_steps,
                             &frame_thread,
                             stamp,
                         ));
                         last_pub = Some(Instant::now());
                     });
-                    // solve が走った場合のみ value_function を配信し直す。
+                    // solve が走った場合のみ value_function を配信し直す
+                    // (compact 経路は途中経過が無いので、この 1 回だけが配信される)。
                     if let (Ok((_, stats)), Some(pub_)) = (&result, &vf_pub_thread) {
                         if stats.solved_now {
-                            if let Some(vi) = core.cached_vi() {
+                            if let Some(slice) = core.cached_value_slice() {
                                 let stamp =
                                     clock_thread.now().to_sec_nanosec().unwrap_or((0, 0));
                                 let _ = pub_.publish(value_function_grid(
-                                    vi,
+                                    &slice,
                                     threshold_steps,
                                     &frame_thread,
                                     stamp,
@@ -489,6 +568,25 @@ fn main() -> Result<()> {
                     }
                     Ok(Err(e)) => {
                         eprintln!("ERROR: vi_global_planner: {e}");
+                        // ロールアウトの固着は「価値関数の局所的なゆらぎ > 1 手の
+                        // 進捗」で起きる。safety_radius_penalty (秒/セル) が 1 手の
+                        // コスト 1 秒に対して大きすぎ、かつ経路の大半がペナルティ域に
+                        // 入る地図 (細い通路 / 粗いセル) で顕在化する。
+                        if matches!(
+                            e,
+                            vi_global_planner::core::PlanError::Rollout(
+                                vi_reference::planner::RolloutStatus::LoopDetected
+                            )
+                        ) {
+                            eprintln!(
+                                "HINT: value function converged but the greedy rollout \
+                                 oscillated. Lower safety_radius_penalty (currently {}) or \
+                                 safety_radius (currently {}) — a penalty much larger than \
+                                 the 1s per-step cost makes the value landscape jitter more \
+                                 than one step of progress.",
+                                params_hint.0, params_hint.1
+                            );
+                        }
                         executing.aborted_with(
                             nav2_msgs::action::ComputePathToPose_Result::default(),
                         )

@@ -5,3 +5,4 @@
 //! main.rs 側に置く。
 
 pub mod core;
+pub mod sink;

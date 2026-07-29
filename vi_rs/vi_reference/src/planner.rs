@@ -17,6 +17,8 @@
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
+use crate::params::MAX_COST;
+use crate::solvers::frontier2d_sparse_compact::CompactSink;
 use crate::value_iterator::ValueIterator;
 
 /// ロールアウト終了理由。
@@ -60,6 +62,194 @@ impl Rollout {
 /// 毎回異なるため 1 度の再訪は巡回と断定できないが、これを超えたら打ち切る。
 const REVISIT_LIMIT: u32 = 8;
 
+/// ロールアウトが読む「解けた価値関数」の最小ビュー。
+///
+/// `ValueIterator`（密な `states` を持つ通常経路）と、`solve_compact_mapped` の出力
+/// `CompactSink`（states を作らないアウトオブコア経路）の両方を同じロールアウトで辿るための
+/// 抽象。geometry とゴールはビュー側が持ち、per-state に必要なのは「ゴール圏か」「最適行動は何か」
+/// の 2 つだけ。
+pub trait PolicyView {
+    /// `(cell_num_x, cell_num_y, cell_num_t)`。
+    fn cell_num(&self) -> (i32, i32, i32);
+    fn xy_resolution(&self) -> f64;
+    /// `(map_origin_x, map_origin_y)`。
+    fn map_origin(&self) -> (f64, f64);
+    /// `(goal_x, goal_y, goal_t[deg])`。
+    fn goal(&self) -> (f64, f64, i32);
+    /// `(ix,iy,it)` がゴール圏 (`final_state`) か。範囲外は false。
+    fn is_final(&self, ix: i32, iy: i32, it: i32) -> bool;
+    /// `(ix,iy,it)` の最適行動 index。範囲外 / 非 free / final / 方策なしは `None`。
+    fn action_index(&self, ix: i32, iy: i32, it: i32) -> Option<usize>;
+    /// 行動 index → `(delta_fw[m], delta_rot[deg])`。
+    fn action_delta(&self, ai: usize) -> (f64, f64);
+
+    /// 本家 `t_resolution_ = 360/cell_num_t_`（整数除算後に f64 化）。
+    fn t_resolution(&self) -> f64 {
+        (360 / self.cell_num().2) as f64
+    }
+    fn in_map_area(&self, ix: i32, iy: i32) -> bool {
+        let (nx, ny, _) = self.cell_num();
+        ix >= 0 && ix < nx && iy >= 0 && iy < ny
+    }
+}
+
+impl PolicyView for ValueIterator {
+    fn cell_num(&self) -> (i32, i32, i32) {
+        (self.cell_num_x, self.cell_num_y, self.cell_num_t)
+    }
+    fn xy_resolution(&self) -> f64 {
+        self.xy_resolution
+    }
+    fn map_origin(&self) -> (f64, f64) {
+        (self.map_origin_x, self.map_origin_y)
+    }
+    fn goal(&self) -> (f64, f64, i32) {
+        (self.goal_x, self.goal_y, self.goal_t)
+    }
+    fn t_resolution(&self) -> f64 {
+        self.t_resolution
+    }
+    fn is_final(&self, ix: i32, iy: i32, it: i32) -> bool {
+        self.in_map_area(ix, iy)
+            && it >= 0
+            && it < self.cell_num_t
+            && self.states[self.to_index(ix, iy, it) as usize].final_state
+    }
+    fn action_index(&self, ix: i32, iy: i32, it: i32) -> Option<usize> {
+        if !PolicyView::in_map_area(self, ix, iy) || it < 0 || it >= self.cell_num_t {
+            return None;
+        }
+        let s = &self.states[self.to_index(ix, iy, it) as usize];
+        if !s.free || s.final_state {
+            return None;
+        }
+        s.optimal_action
+    }
+    fn action_delta(&self, ai: usize) -> (f64, f64) {
+        let a = &self.actions[ai];
+        (a.delta_fw, a.delta_rot)
+    }
+}
+
+/// `solve_compact_mapped` が確定した `CompactSink` を方策ビューとして読む。
+///
+/// sink は orig 索引 `it + ix·nt + iy·nt·nx` に `(total_cost, action)` を持ち、
+/// - 未到達 (障害物 / ゴールから到達不能) = `(MAX_COST, -1)`
+/// - ゴール圏 (`final_state`) = `(0, -1)`   ← `set_state_values` が値を 0 にピン留めするため
+/// - それ以外の到達セル = `(cost, action>=0)`
+///
+/// なので `final_state` の再計算 (距離+向き判定) は不要で、`value == 0` が一意にゴール圏を表す。
+/// 津田沼地図 (1963x1334x60) で実測確認済み: `value == 0` は 28 状態のみ、いずれも action = -1、
+/// 到達状態 41,879,880 のうち action < 0 はその 28 状態だけ。
+pub struct CompactPolicy<'a> {
+    sink: &'a dyn CompactSink,
+    actions: &'a [crate::action::Action],
+    cell_num_x: i32,
+    cell_num_y: i32,
+    cell_num_t: i32,
+    xy_resolution: f64,
+    map_origin_x: f64,
+    map_origin_y: f64,
+    goal_x: f64,
+    goal_y: f64,
+    goal_t: i32,
+}
+
+impl<'a> CompactPolicy<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        sink: &'a dyn CompactSink,
+        actions: &'a [crate::action::Action],
+        cell_num: (i32, i32, i32),
+        xy_resolution: f64,
+        map_origin: (f64, f64),
+        goal: (f64, f64, i32),
+    ) -> Self {
+        Self {
+            sink,
+            actions,
+            cell_num_x: cell_num.0,
+            cell_num_y: cell_num.1,
+            cell_num_t: cell_num.2,
+            xy_resolution,
+            map_origin_x: map_origin.0,
+            map_origin_y: map_origin.1,
+            goal_x: goal.0,
+            goal_y: goal.1,
+            goal_t: goal.2,
+        }
+    }
+
+    /// orig 索引 (usize 演算。巨大マップで i32 が溢れるため)。
+    #[inline]
+    fn orig(&self, ix: i32, iy: i32, it: i32) -> usize {
+        it as usize
+            + ix as usize * self.cell_num_t as usize
+            + iy as usize * self.cell_num_x as usize * self.cell_num_t as usize
+    }
+
+    /// `(ix,iy,it)` の `(total_cost, action)`。範囲外は未到達扱い。
+    #[inline]
+    fn read(&self, ix: i32, iy: i32, it: i32) -> (u64, i32) {
+        if !self.in_map_area(ix, iy) || it < 0 || it >= self.cell_num_t {
+            return (MAX_COST, -1);
+        }
+        self.sink.read(self.orig(ix, iy, it))
+    }
+
+    /// θ=0 スライスの `total_cost`（value_function 可視化用、長さ `nx*ny`）。
+    pub fn value_slice_theta0(&self) -> Vec<u64> {
+        let (nx, ny) = (self.cell_num_x, self.cell_num_y);
+        let mut out = vec![MAX_COST; nx as usize * ny as usize];
+        for iy in 0..ny {
+            for ix in 0..nx {
+                out[iy as usize * nx as usize + ix as usize] = self.read(ix, iy, 0).0;
+            }
+        }
+        out
+    }
+}
+
+impl PolicyView for CompactPolicy<'_> {
+    fn cell_num(&self) -> (i32, i32, i32) {
+        (self.cell_num_x, self.cell_num_y, self.cell_num_t)
+    }
+    fn xy_resolution(&self) -> f64 {
+        self.xy_resolution
+    }
+    fn map_origin(&self) -> (f64, f64) {
+        (self.map_origin_x, self.map_origin_y)
+    }
+    fn goal(&self) -> (f64, f64, i32) {
+        (self.goal_x, self.goal_y, self.goal_t)
+    }
+    fn is_final(&self, ix: i32, iy: i32, it: i32) -> bool {
+        self.read(ix, iy, it).0 == 0
+    }
+    fn action_index(&self, ix: i32, iy: i32, it: i32) -> Option<usize> {
+        let (v, a) = self.read(ix, iy, it);
+        if v == 0 || v >= MAX_COST || a < 0 {
+            return None; // ゴール圏 / 未到達 / 方策なし。
+        }
+        Some(a as usize)
+    }
+    fn action_delta(&self, ai: usize) -> (f64, f64) {
+        let a = &self.actions[ai];
+        (a.delta_fw, a.delta_rot)
+    }
+}
+
+/// `pose_to_cell` の `PolicyView` 版（式は本家 `posToAction` と同一）。
+pub fn pose_to_cell_on(p: &dyn PolicyView, x: f64, y: f64, yaw_rad: f64) -> (i32, i32, i32) {
+    let (ox, oy) = p.map_origin();
+    let res = p.xy_resolution();
+    let ix = ((x - ox) / res).floor() as i32;
+    let iy = ((y - oy) / res).floor() as i32;
+    let t = (180.0 * yaw_rad / PI) as i32;
+    let it = (((t + 360 * 100) % 360) as f64 / p.t_resolution()).floor() as i32;
+    (ix, iy, it)
+}
+
 /// 世界座標をセル (ix, iy, it) へ変換する。本家 `posToAction` の変換式を逐語再現
 /// (度は i32 切り捨て、`+360*100 (mod 360)` 正規化、`/t_resolution` の floor)。
 /// 範囲チェックはしない (呼び出し側で `in_map_area` / it 範囲を確認すること)。
@@ -94,24 +284,20 @@ pub fn optimal_action_at(vi: &ValueIterator, ix: i32, iy: i32, it: i32) -> i32 {
 /// 未知セルの縁に僅かに掛かった状態からでも計画できるようにするための救済。
 /// 戻り値はセル中心の世界座標。見つからなければ None。
 fn find_plannable_start(
-    vi: &ValueIterator,
+    p: &dyn PolicyView,
     x: f64,
     y: f64,
     yaw_rad: f64,
     tolerance_cells: i32,
 ) -> Option<(f64, f64)> {
-    let (ix0, iy0, it) = pose_to_cell(vi, x, y, yaw_rad);
+    let (ix0, iy0, it) = pose_to_cell_on(p, x, y, yaw_rad);
     let mut best: Option<(i64, i32, i32)> = None;
     for dy in -tolerance_cells..=tolerance_cells {
         for dx in -tolerance_cells..=tolerance_cells {
             let (ix, iy) = (ix0 + dx, iy0 + dy);
-            if optimal_action_at(vi, ix, iy, it) < 0 {
+            if p.action_index(ix, iy, it).is_none() {
                 // final_state セル (既にゴール圏内) も救済対象に含める。
-                let inside = vi.in_map_area(ix, iy)
-                    && it >= 0
-                    && it < vi.cell_num_t
-                    && vi.states[vi.to_index(ix, iy, it) as usize].final_state;
-                if !inside {
+                if !p.is_final(ix, iy, it) {
                     continue;
                 }
             }
@@ -121,12 +307,9 @@ fn find_plannable_start(
             }
         }
     }
-    best.map(|(_, ix, iy)| {
-        (
-            (ix as f64 + 0.5) * vi.xy_resolution + vi.map_origin_x,
-            (iy as f64 + 0.5) * vi.xy_resolution + vi.map_origin_y,
-        )
-    })
+    let (ox, oy) = p.map_origin();
+    let res = p.xy_resolution();
+    best.map(|(_, ix, iy)| ((ix as f64 + 0.5) * res + ox, (iy as f64 + 0.5) * res + oy))
 }
 
 /// 貪欲方策ロールアウト。solve 済み (`set_goal` 後に収束させた) `ValueIterator` の
@@ -148,19 +331,31 @@ pub fn rollout_path(
     max_steps: usize,
     start_tolerance_cells: i32,
 ) -> Rollout {
+    rollout_path_on(vi, start_x, start_y, start_yaw_rad, max_steps, start_tolerance_cells)
+}
+
+/// [`rollout_path`] の `PolicyView` 版。密な `ValueIterator` でも compact sink
+/// ([`CompactPolicy`]) でも同じ経路生成を行う (どちらも同じ方策・同じ遷移モデル)。
+pub fn rollout_path_on(
+    p: &dyn PolicyView,
+    start_x: f64,
+    start_y: f64,
+    start_yaw_rad: f64,
+    max_steps: usize,
+    start_tolerance_cells: i32,
+) -> Rollout {
     let (mut x, mut y) = (start_x, start_y);
     // 内部では度で保持 (本家の遷移生成・セル変換が度基準のため)。
     let mut yaw_deg = normalize_deg(start_yaw_rad.to_degrees());
+    let (nt, goal) = (p.cell_num().2, p.goal());
 
     // start 救済: 現セルに方策が無ければ近傍の計画可能セル中心へスナップ。
     {
-        let (ix, iy, it) = pose_to_cell(vi, x, y, start_yaw_rad);
-        let on_final = vi.in_map_area(ix, iy)
-            && it >= 0
-            && it < vi.cell_num_t
-            && vi.states[vi.to_index(ix, iy, it) as usize].final_state;
-        if !on_final && optimal_action_at(vi, ix, iy, it) < 0 && start_tolerance_cells > 0 {
-            if let Some((sx, sy)) = find_plannable_start(vi, x, y, start_yaw_rad, start_tolerance_cells)
+        let (ix, iy, it) = pose_to_cell_on(p, x, y, start_yaw_rad);
+        let on_final = p.is_final(ix, iy, it);
+        if !on_final && p.action_index(ix, iy, it).is_none() && start_tolerance_cells > 0 {
+            if let Some((sx, sy)) =
+                find_plannable_start(p, x, y, start_yaw_rad, start_tolerance_cells)
             {
                 x = sx;
                 y = sy;
@@ -172,21 +367,16 @@ pub fn rollout_path(
     let mut visits: HashMap<(i32, i32, i32), u32> = HashMap::new();
 
     for _ in 0..max_steps {
-        let (ix, iy, it) = pose_to_cell(vi, x, y, yaw_deg.to_radians());
-        if !vi.in_map_area(ix, iy) || it < 0 || it >= vi.cell_num_t {
+        let (ix, iy, it) = pose_to_cell_on(p, x, y, yaw_deg.to_radians());
+        if !p.in_map_area(ix, iy) || it < 0 || it >= nt {
             return Rollout { poses, status: RolloutStatus::OutOfMap };
         }
-        let s = &vi.states[vi.to_index(ix, iy, it) as usize];
-        if s.final_state {
+        if p.is_final(ix, iy, it) {
             // ゴール圏に入った: 末尾を正確なゴール姿勢で締める。
-            poses.push(PathPose {
-                x: vi.goal_x,
-                y: vi.goal_y,
-                yaw: (vi.goal_t as f64).to_radians(),
-            });
+            poses.push(PathPose { x: goal.0, y: goal.1, yaw: (goal.2 as f64).to_radians() });
             return Rollout { poses, status: RolloutStatus::ReachedGoal };
         }
-        let Some(ai) = s.optimal_action.filter(|_| s.free) else {
+        let Some(ai) = p.action_index(ix, iy, it) else {
             return Rollout { poses, status: RolloutStatus::NoAction };
         };
 
@@ -197,11 +387,11 @@ pub fn rollout_path(
         }
 
         // no_noise_state_transition と同じ: 現在向きで並進 → 回転。
-        let a = &vi.actions[ai];
+        let (delta_fw, delta_rot) = p.action_delta(ai);
         let ang = yaw_deg.to_radians();
-        x += a.delta_fw * ang.cos();
-        y += a.delta_fw * ang.sin();
-        yaw_deg = normalize_deg(yaw_deg + a.delta_rot);
+        x += delta_fw * ang.cos();
+        y += delta_fw * ang.sin();
+        yaw_deg = normalize_deg(yaw_deg + delta_rot);
         poses.push(PathPose { x, y, yaw: yaw_deg.to_radians() });
     }
 
@@ -415,6 +605,84 @@ mod tests {
             let d = ((w[1].x - w[0].x).powi(2) + (w[1].y - w[0].y).powi(2)).sqrt();
             assert!(d <= RES + 1e-9, "spacing {d} exceeds max");
         }
+    }
+
+    /// compact(mapped) sink 経由のロールアウトが、密な `ValueIterator` 経由と同一経路を返すこと。
+    /// mapped 経路は `states` を作らないので `final_state` フラグが無く、`CompactPolicy` は
+    /// 「value == 0 がゴール圏」という sink の規約で終端判定する。その規約の回帰ガード。
+    #[test]
+    fn compact_sink_rollout_matches_dense() {
+        use crate::solvers::frontier2d_sparse_compact::{solve_compact_mapped, RamSink};
+        use std::sync::atomic::AtomicBool;
+
+        let size = 64;
+        let data = walled_map(size);
+        let goal = (2.8, 0.6, 0);
+        let grid = OccupancyGrid {
+            width: size,
+            height: size,
+            resolution: RES,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            data: data.clone(),
+        };
+
+        // 密経路 (基準)。set_map_with_occupancy_grid と同じ safety/goal パラメータを使う。
+        let mut vi = ValueIterator::new(actions(), 1);
+        vi.set_map_with_occupancy_grid(&grid, NT, 0.1, 30.0, 0.2, 180);
+        vi.set_goal(goal.0, goal.1, goal.2);
+        assert!(solve(&mut vi, U64Solver::Frontier2DSparseCompact { band: 0 }, 100_000).converged);
+        let dense = rollout_path(&vi, 0.4, 0.4, 0.0, 10_000, 0);
+        assert!(dense.reached_goal(), "dense status = {:?}", dense.status);
+
+        // mapped 経路 (states を作らず sink に確定)。
+        let mut sink = RamSink::new((size * size * NT) as usize);
+        let s = solve_compact_mapped(
+            actions(), 1, &grid, NT, 0.1, 30.0, 0.2, 180, goal.0, goal.1, goal.2, 100_000, None,
+            &mut sink, 1, &AtomicBool::new(false),
+        );
+        assert!(s.converged && !s.cancelled);
+
+        let acts = actions();
+        let policy = CompactPolicy::new(
+            &sink,
+            &acts,
+            (size, size, NT),
+            RES,
+            (0.0, 0.0),
+            (goal.0, goal.1, goal.2),
+        );
+        let compact = rollout_path_on(&policy, 0.4, 0.4, 0.0, 10_000, 0);
+        assert!(compact.reached_goal(), "compact status = {:?}", compact.status);
+        assert_eq!(compact.poses.len(), dense.poses.len(), "path length differs");
+        for (a, b) in compact.poses.iter().zip(dense.poses.iter()) {
+            assert_eq!(a, b, "pose differs between compact sink and dense rollout");
+        }
+    }
+
+    /// 中断フラグを立てた mapped solve は `cancelled` を立てて未収束で戻る。
+    #[test]
+    fn compact_mapped_solve_honours_cancel() {
+        use crate::solvers::frontier2d_sparse_compact::{solve_compact_mapped, RamSink};
+        use std::sync::atomic::AtomicBool;
+
+        let size = 64;
+        let grid = OccupancyGrid {
+            width: size,
+            height: size,
+            resolution: RES,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            data: empty_map(size),
+        };
+        let mut sink = RamSink::new((size * size * NT) as usize);
+        let s = solve_compact_mapped(
+            actions(), 1, &grid, NT, 0.1, 30.0, 0.2, 180, 2.0, 2.0, 0, 100_000, None, &mut sink, 1,
+            &AtomicBool::new(true),
+        );
+        assert!(!s.converged && s.cancelled);
     }
 
     #[test]
