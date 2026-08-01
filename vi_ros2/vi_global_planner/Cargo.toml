@@ -23,7 +23,7 @@ anyhow  = "1"
 # 計画ワーカースレッドを橋渡しする oneshot チャネルに使う。
 futures = "0.3"
 # value_function 配信 (bridge::value_slice_to_occupancy) 用。
-ndarray = "0.16"
+ndarray = "0.17"
 # compact (アウトオブコア) 経路の確定出力をディスクに置く sink 用 (src/sink.rs)。
 # 広域地図では確定出力が nx·ny·nθ × 12 B になり RAM に載らない。
 memmap2 = "0.9"
