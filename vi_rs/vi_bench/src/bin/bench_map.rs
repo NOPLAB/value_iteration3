@@ -63,7 +63,7 @@ use vi_reference::solvers::frontier2d_sparse_compact::{
     default_threads, mapped_goal_cell_count, solve_compact_mapped, CompactSink, RamSink,
 };
 use vi_reference::solvers::{solve, U64SolveStats, U64Solver};
-use vi_reference::{OccupancyGrid, Quaternion, State, ValueIterator};
+use vi_reference::{Action, OccupancyGrid, Quaternion, State, ValueIterator};
 
 /// Canonical theta cell count (本家 launch / data contract).
 const THETA_CELL_NUM: i32 = 60;
@@ -71,6 +71,16 @@ const THETA_CELL_NUM: i32 = 60;
 const MAX_ACTION_FW_M: f64 = 0.3;
 /// 到達可能とみなす total_cost 上限（compare.py の value>=1e6 境界と整合）。
 const REACH: u64 = 1_000_000u64 * PROB_BASE;
+
+/// `canonical_actions()` の前進量だけを `scale` 倍した行動集合。回転量と名前は不変なので
+/// θ 遷移表は変わらず、「1 手で何セル進むか」だけがセルサイズに追従する。
+fn scaled_actions(scale: f64) -> Vec<Action> {
+    canonical_actions()
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| Action::new(&a.name, a.delta_fw * scale, a.delta_rot, i as i32))
+        .collect()
+}
 
 #[derive(Parser)]
 #[command(about = "Benchmark u64 VI solvers on a real PGM/YAML map (wall-clock to convergence).")]
@@ -130,6 +140,12 @@ struct Args {
     /// Iteration budget cap for Frontier3D.
     #[arg(long, default_value_t = 2_000_000)]
     max_iters: u32,
+
+    /// 前進歩幅の倍率。`--scale` でセルを粗くすると既定の 0.3 m 前進がセル境界を越えなく
+    /// なり値が伝播しない。歩幅をセルサイズに比例させれば「1 手で何セル進むか」が保たれる
+    /// （既定 0.15 m セル / 0.3 m 歩幅 = 2 セル）。回転量は変えない。
+    #[arg(long, default_value_t = 1.0)]
+    action_scale: f64,
 
     /// 値バンド幅（`frontier2d_sparse_compact` 専用、18bit 固定小数点単位）。0=auto（結合深さの
     /// 安全側）。小さいほど常駐メモリは減るが、結合深さ未満だと bit-exact が壊れる。
@@ -432,7 +448,7 @@ fn main() -> ExitCode {
     // Build a fresh, fully set-up ValueIterator (map + goal). Cheap relative to
     // the solve; called once per solver so each run starts from a clean state.
     let build = || -> ValueIterator {
-        let mut vi = ValueIterator::new(canonical_actions(), 1);
+        let mut vi = ValueIterator::new(scaled_actions(args.action_scale), 1);
         vi.set_map_with_occupancy_grid(
             &grid,
             THETA_CELL_NUM,
@@ -457,7 +473,7 @@ fn main() -> ExitCode {
         p.states.iter().filter(|s| s.total_cost < REACH).count()
     } else {
         mapped_goal_cell_count(
-            canonical_actions(),
+            scaled_actions(args.action_scale),
             &grid,
             THETA_CELL_NUM,
             args.safety_radius_m,
@@ -525,14 +541,17 @@ fn main() -> ExitCode {
         );
     }
 
-    // Degenerate-dynamics guard.
-    if res > MAX_ACTION_FW_M {
+    // Degenerate-dynamics guard. `--action-scale` で歩幅を伸ばした分だけ上限も伸びる。
+    let max_fw = MAX_ACTION_FW_M * args.action_scale;
+    if res > max_fw {
         eprintln!(
             "WARNING: cell size {:.3} m > max action step {:.3} m: moves no longer cross cells. \
-             Value will not propagate and convergence is trivial/degenerate. Use --scale <= {}.",
+             Value will not propagate and convergence is trivial/degenerate. Use --scale <= {} \
+             or raise --action-scale to >= {:.2}.",
             res,
-            MAX_ACTION_FW_M,
-            (MAX_ACTION_FW_M / full_res).floor().max(1.0) as u32,
+            max_fw,
+            (max_fw / full_res).floor().max(1.0) as u32,
+            res / MAX_ACTION_FW_M,
         );
     }
 
@@ -597,7 +616,7 @@ fn main() -> ExitCode {
                 // sink（--compact-out-dir でディスク mmap、なければ RAM）に確定。
                 let run = |sink: &mut dyn CompactSink| {
                     solve_compact_mapped(
-                        canonical_actions(),
+                        scaled_actions(args.action_scale),
                         1,
                         &grid,
                         THETA_CELL_NUM,

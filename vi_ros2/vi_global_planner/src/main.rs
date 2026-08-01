@@ -40,6 +40,8 @@ use vi_reference::bridge::{
 use vi_reference::planner::PathPose;
 use vi_reference::solvers::U64Solver;
 use vi_reference::Action;
+// nav_msgs::msg::OccupancyGrid と名前が衝突するので別名で入れる。
+use vi_reference::OccupancyGrid as ViOccupancyGrid;
 
 use vi_global_planner::core::{
     value_slice_from_vi, BuildParams, PlanConfig, PlannerCore, ValueSlice,
@@ -77,6 +79,7 @@ struct Params {
     /// solve 途中経過の value_function 配信間隔 [ms] (0 = 完了時のみ)。
     value_publish_interval_ms: i64,
     unknown_as_obstacle: bool,
+    downsample_policy: String,
     /// プランナ内部で地図を何倍に粗くするか (1 = /map のまま)。
     map_scale: i64,
     /// compact (アウトオブコア) 経路の確定出力を置くディレクトリ ("" = RAM)。
@@ -120,6 +123,9 @@ fn read_params(node: &Node) -> Result<Params> {
     let publish_value_function = p!("publish_value_function", bool, true);
     let value_publish_interval_ms = p!("value_publish_interval_ms", i64, 500);
     let unknown_as_obstacle = p!("unknown_as_obstacle", bool, true);
+    // "conservative" = 本家 downsample_occupancy (障害物優先)。"optimistic" = ブロック内に free が
+    // 1 つでもあれば free。map_scale >= 4 で通路のセル幅を保つために必要 (既定は挙動不変の保守側)。
+    let downsample_policy = p!("downsample_policy", Arc<str>, "conservative".into()).to_string();
     let map_scale = p!("map_scale", i64, 1);
     let compact_sink_dir = p!("compact_sink_dir", Arc<str>, "".into()).to_string();
     let compact_ram_limit_mb = p!("compact_ram_limit_mb", i64, 512);
@@ -184,6 +190,7 @@ fn read_params(node: &Node) -> Result<Params> {
         publish_value_function,
         value_publish_interval_ms,
         unknown_as_obstacle,
+        downsample_policy,
         map_scale,
         compact_sink_dir,
         compact_ram_limit_mb,
@@ -333,6 +340,58 @@ fn compact_sink_dir(params: &Params, solver: U64Solver, nstates: usize) -> Optio
     None
 }
 
+/// `downsample_occupancy` の楽観版。ブロック内に 1 つでも free があれば出力セルを free にする。
+///
+/// 本家の `downsample_occupancy` は障害物優先 (ブロック内に非 free が 1 つでもあれば占有) なので、
+/// 通路が片側最大 `(scale-1)·resolution` 細る。map_tsudanuma は unknown が 68% あり、`map_scale >= 4`
+/// では free **面積**は数 % しか減らないのに**通路のセル幅**が落ちる。VI の遷移はサブセル
+/// サンプリングによる約 2 セル幅の分布なので、散り先に 1 つでも未到達セルがあると期待値が
+/// MAX_COST 側に張り付き、波がゴール近傍で止まる (実測: scale 4 で到達列 1、`--unknown free` に
+/// すると完全に伝播)。楽観側にすると通路のセル幅が保たれ、scale 5 まで解けるようになる。
+///
+/// 安全余裕を地図に焼き込んではいけない点に注意。VI の `safety_radius` は硬い壁ではなく
+/// 秒/セルのソフトなペナルティで、これを膨張として焼き込むと scale 3 でも波が死ぬ (実測)。
+/// ここでは通路を開けるだけにして、余裕は `safety_radius` / `safety_radius_penalty` に任せる。
+fn downsample_occupancy_optimistic(grid: &ViOccupancyGrid, scale: i32) -> ViOccupancyGrid {
+    if scale <= 1 {
+        return grid.clone();
+    }
+    let (w, h, s) = (grid.width as usize, grid.height as usize, scale as usize);
+    let (ow, oh) = (w.div_ceil(s), h.div_ceil(s));
+    let mut data = vec![100i8; ow * oh];
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let mut free = false;
+            'blk: for dy in 0..s {
+                let iy = oy * s + dy;
+                if iy >= h {
+                    break;
+                }
+                for dx in 0..s {
+                    let ix = ox * s + dx;
+                    if ix >= w {
+                        break;
+                    }
+                    if grid.data[iy * w + ix] == 0 {
+                        free = true;
+                        break 'blk;
+                    }
+                }
+            }
+            data[oy * ow + ox] = if free { 0 } else { 100 };
+        }
+    }
+    ViOccupancyGrid {
+        width: ow as i32,
+        height: oh as i32,
+        resolution: grid.resolution * scale as f64,
+        origin_x: grid.origin_x,
+        origin_y: grid.origin_y,
+        origin_quat: grid.origin_quat.clone(),
+        data,
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // main
 // ──────────────────────────────────────────────────────────────────────────────
@@ -372,16 +431,24 @@ fn main() -> Result<()> {
     // プランナ内部の作業解像度。VI の状態数は nx·ny·nθ なので、広域地図 (津田沼 5888x4000
     // @0.05m = 14 億状態) は map_scale で粗くしないと解けない。map_server / costmap /
     // 自己位置は元解像度のまま (ここで粗くするのはプランナの内部表現だけ)。
-    let vi_grid = downsample_occupancy(
-        &occupancy_view_to_vi_grid(&grid_view, params.unknown_as_obstacle),
-        params.map_scale as i32,
-    );
+    let binary_grid = occupancy_view_to_vi_grid(&grid_view, params.unknown_as_obstacle);
+    let vi_grid = match params.downsample_policy.as_str() {
+        "optimistic" => downsample_occupancy_optimistic(&binary_grid, params.map_scale as i32),
+        "conservative" => downsample_occupancy(&binary_grid, params.map_scale as i32),
+        other => {
+            return Err(anyhow!(
+                "downsample_policy must be \"conservative\" or \"optimistic\", got {other:?}"
+            ))
+        }
+    };
+    drop(binary_grid);
     let nstates =
         vi_grid.width as usize * vi_grid.height as usize * params.theta_cell_num as usize;
     eprintln!(
-        "vi_global_planner: planner grid {}x{} @{:.3}m (map_scale={}) x{} theta = {} states",
+        "vi_global_planner: planner grid {}x{} @{:.3}m (map_scale={}, downsample={}) x{} theta \
+         = {} states",
         vi_grid.width, vi_grid.height, vi_grid.resolution, params.map_scale,
-        params.theta_cell_num, nstates,
+        params.downsample_policy, params.theta_cell_num, nstates,
     );
     // start 近傍スナップの半径はプランナ側の解像度で数える。
     let start_tolerance_cells =
