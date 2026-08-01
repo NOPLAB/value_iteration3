@@ -6,21 +6,39 @@
 //! 価値反復を 2 回解くことになる (走り出しまでの時間も、常駐する価値関数の
 //! メモリも 2 倍)。しかも広域側が作った `nav_msgs/Path` は狭域側が終端姿勢しか
 //! 読まないので、ロールアウトの成果はほぼ捨てられていた。ここではその 2 つを
-//! 1 つの `ValueIteratorLocal` の上に載せ直す:
+//! 1 つの価値関数の上に載せ直す:
 //!
 //!   - solve はゴールごとに 1 回だけ (`prepare_goal_with_progress`)
 //!   - `plan_*` は解決済み価値関数の貪欲ロールアウト = 旧実装の
 //!     「キャッシュヒット経路」そのもの
 //!   - 追従は同じ価値関数の ±1m ウィンドウをスキャンで補正しながら回す
 //!
-//! 副次的な性質として、ロールアウトは追従中にスキャン由来の `local_penalty` が
-//! 注入された後の値を読む。旧構成では広域側が静的地図しか知らなかったので、
-//! これは退化ではなく改善方向の差異だが、「経路は毎回同じ」ではなくなる。
+//! # 2 つの経路: 密 (dense) とアウトオブコア (compact)
 //!
-//! アウトオブコア (compact) 経路と `map_scale` はここには無い。狭域側は
-//! `ValueIterator::states` を直接書き換えるので、状態配列を持たない compact 解には
-//! 載らない。広域地図 (津田沼など) は従来どおり vi_global_planner +
-//! controller_server の構成を使うこと。
+//! `PlanConfig::solver` が `frontier2d_sparse_compact` かどうかで価値関数の持ち方が
+//! 変わる。広域と狭域が 1 本の場を共有するという上の性質はどちらでも同じ。
+//!
+//! - **密**: `ValueIteratorLocal` を全域ぶん確保する (`State` は 56 B/state)。
+//!   狭域はその `states` をその場で書き換える。小〜中規模の地図はこちら。
+//! - **compact**: `solve_compact_mapped` が `states` を作らずに解き、確定出力
+//!   (12 B/state) だけを `CompactSink` (既定は mmap ファイル) に置く。追従は
+//!   `states` を必要とするので、**ロボット近傍だけを compact の場から起こした
+//!   小さな密パッチ** ([`Patch`]) の上で回す。津田沼のような広域地図 (0.25 m/cell で
+//!   5650 万状態 = 密なら 3.17 GB) を Pi4 4GB に載せるための経路。
+//!
+//! パッチは「ローカルウィンドウ (±1m) + 遷移が届く距離 + 動ける余裕」の大きさで、
+//! ウィンドウの外側は compact の値のまま凍結して境界条件に使う。凍結境界が
+//! 成り立つ条件は「ウィンドウ内のセルの遷移先がパッチ内に収まる」ことで、
+//! これは遷移表の実測値で起動時に検証する ([`transition_reach`])。
+//!
+//! compact 経路には密経路と 2 点だけ差異がある (どちらも意図的):
+//!
+//! 1. `plan_*` のロールアウトは sink (静的地図の解) を読む。密経路では追従中に
+//!    注入されたスキャン由来の `local_penalty` 込みの値を読むので、動的障害物が
+//!    経路にも反映されていた。compact ではされない (走行はパッチ側の方策に従うので
+//!    避けること自体はできる)。
+//! 2. パッチを置き直すとその周期のローカル精密化は捨てられる (密経路は全域 `states`
+//!    に書くので残る)。スキャンは毎 tick 注入されるので次の tick で復元される。
 //!
 //! `BuildParams` が vi_global_planner::core と重複しているのは意図的
 //! (クレート間依存を避けるため; vi_local_planner から引き継いだ規約)。
@@ -34,13 +52,24 @@ use std::time::{Duration, Instant};
 use ndarray::Array2;
 
 use vi_reference::bridge::{value_slice_to_occupancy, yaw_to_goal_theta_deg, PoseView};
-use vi_reference::msg::{LaserScan, OccupancyGrid};
+use vi_reference::msg::{LaserScan, OccupancyGrid, Quaternion};
+use vi_reference::params::{MAX_COST, PROB_BASE};
 use vi_reference::planner::{
-    densify, optimal_action_at, pose_to_cell, rollout_path_on, PathPose, RolloutStatus,
+    densify, optimal_action_at, pose_to_cell, rollout_path_on, CompactPolicy, PathPose,
+    RolloutStatus,
+};
+use vi_reference::solvers::frontier2d_sparse_compact::{
+    default_threads, solve_compact_mapped, CompactSink, RamSink,
 };
 use vi_reference::solvers::{solve, U64Solver};
+use vi_reference::state::State;
 use vi_reference::value_iterator::ValueIterator;
 use vi_reference::{Action, ValueIteratorLocal};
+
+/// `ValueIteratorLocal::set_map_with_occupancy_grid` が固定で入れるローカル
+/// ウィンドウ半径 [m]。パッチの寸法を決めるのに先に知る必要があるので写しを持つ
+/// (vi_rs 側は変更しない。ズレたら `new_patch` の検証が落ちる)。
+const LOCAL_XY_RANGE_M: f64 = 1.0;
 
 /// ゴールごとの ValueIterator 構築入力 (地図は起動時に一度だけ取り込む)。
 /// vi_global_planner::core::BuildParams と同型 — クレート間依存を避けるための
@@ -56,14 +85,19 @@ pub struct BuildParams {
     pub goal_margin_theta: i32,
 }
 
+/// アウトオブコア (compact) 経路の確定出力の置き場。`None` = RAM (`RamSink`)、
+/// `Some(dir)` = そのディレクトリ上の mmap ファイル。必要量は
+/// `nx·ny·theta_cell_num × 12 B` なので、小メモリ機ではディスクに逃がす。
+pub type SinkDir = Option<std::path::PathBuf>;
+
 /// 計画・追従の設定。前半は solve とキャッシュ、後半は用途別
 /// (`plan_*` = 広域ロールアウト / `decide` = 狭域追従)。
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct PlanConfig {
     pub solver: U64Solver,
     /// solve 総イテレーション上限 (発散ガード)。
     pub max_solve_iter: u32,
-    /// cancel 観測間隔 (イテレーション数)。
+    /// cancel 観測間隔 (イテレーション数)。密経路のみ (compact は 1 回で走り切る)。
     pub solve_chunk: u32,
     /// キャッシュ再利用とみなすゴール位置差 (m)。
     pub goal_tolerance_xy: f64,
@@ -80,6 +114,19 @@ pub struct PlanConfig {
     // ── 狭域 (follow_path) ──
     /// 現在セルに方策が無いとき近傍から行動を借りる範囲 (セル数)。
     pub action_tolerance_cells: i32,
+
+    // ── アウトオブコア (compact) 経路 ──
+    /// 確定出力の置き場。`solver` が `frontier2d_sparse_compact` のときだけ参照する。
+    pub compact_sink_dir: SinkDir,
+    /// compact 経路のワーカースレッド数 (0 = `default_threads()`)。
+    pub vi_threads: usize,
+}
+
+impl PlanConfig {
+    /// アウトオブコア (`states` を作らない) 経路を使うか。
+    pub fn use_compact(&self) -> bool {
+        matches!(self.solver, U64Solver::Frontier2DSparseCompact { .. })
+    }
 }
 
 /// solve 単体の統計 (ログ用)。
@@ -99,7 +146,7 @@ pub struct PlanStats {
     pub poses: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
     /// cancel フラグにより中断された (プリエンプト / client cancel)。
     Cancelled,
@@ -107,6 +154,10 @@ pub enum PlanError {
     NotConverged,
     /// 価値関数は収束したがロールアウトが失敗した (`plan_*` のみ)。
     Rollout(RolloutStatus),
+    /// compact 経路の出力先 (mmap ファイル) を用意できなかった。
+    Sink(String),
+    /// compact 経路の追従用パッチを構成できなかった (幾何が破綻している)。
+    Patch(String),
 }
 
 impl std::fmt::Display for PlanError {
@@ -115,6 +166,8 @@ impl std::fmt::Display for PlanError {
             PlanError::Cancelled => write!(f, "cancelled (preempted)"),
             PlanError::NotConverged => write!(f, "value iteration did not converge"),
             PlanError::Rollout(s) => write!(f, "policy rollout failed: {s:?}"),
+            PlanError::Sink(e) => write!(f, "compact output sink unavailable: {e}"),
+            PlanError::Patch(e) => write!(f, "follow patch cannot be built: {e}"),
         }
     }
 }
@@ -131,17 +184,76 @@ pub enum Decision {
     NoAction,
 }
 
+/// solve 済み価値関数の実体。
+enum Field {
+    /// 密経路: 全域の `ValueIteratorLocal`。広域も狭域もこれを直接読む。
+    Dense(Box<ValueIteratorLocal>),
+    /// compact 経路: 確定出力 (sink) + 幾何。狭域は [`Patch`] を経由する。
+    Compact(Box<CompactField>),
+}
+
+/// compact 経路の solve 結果。`sink` は orig 索引で `(total_cost, action)` を返す確定出力。
+struct CompactField {
+    sink: Box<dyn CompactSink + Send>,
+    actions: Vec<Action>,
+    cell_num: (i32, i32, i32),
+    resolution: f64,
+    origin: (f64, f64),
+    origin_quat: Quaternion,
+    goal: (f64, f64, i32),
+}
+
+impl CompactField {
+    fn policy(&self) -> CompactPolicy<'_> {
+        CompactPolicy::new(
+            self.sink.as_ref(),
+            &self.actions,
+            self.cell_num,
+            self.resolution,
+            self.origin,
+            self.goal,
+        )
+    }
+
+    /// グローバルセル `(ix,iy,it)` の sink 索引 (usize 演算; 広域地図で i32 が溢れる)。
+    fn orig(&self, ix: i32, iy: i32, it: i32) -> usize {
+        it as usize
+            + ix as usize * self.cell_num.2 as usize
+            + iy as usize * self.cell_num.0 as usize * self.cell_num.2 as usize
+    }
+}
+
+/// compact 経路の追従用パッチ: ロボット近傍だけを compact の場から起こした密な
+/// `ValueIteratorLocal`。幾何 (解像度・θ 数・行動) だけで決まりゴールには依らないので、
+/// ゴールが変わってもパッチ自体は作り直さず、中身 (`at` とハイドレート値) だけ入れ替える。
+///
+/// 寸法: `half = 2*ウィンドウ半径 + 遷移到達距離 + 2` セル。ウィンドウの外側は
+/// compact の値のまま凍結して境界条件に使う。ロボットがパッチの縁に近づいたら
+/// 置き直す (`needs_recenter`)。
+struct Patch {
+    vi: ValueIteratorLocal,
+    /// パッチ半径 [セル] (パッチは `2*half+1` 辺の正方形)。
+    half: i32,
+    /// 遷移が届く最大セル数 (遷移表の実測値)。凍結境界の成立条件に使う。
+    reach: i32,
+    /// パッチ左下のグローバルセル座標。`None` = 未ハイドレート。
+    at: Option<(i32, i32)>,
+}
+
 struct CachedGoal {
     goal_x: f64,
     goal_y: f64,
     goal_t_deg: i32,
-    vi: ValueIteratorLocal,
+    field: Field,
 }
 
 pub struct PlannerCore {
     build: BuildParams,
     cfg: PlanConfig,
     cached: Option<CachedGoal>,
+    /// compact 経路の追従用パッチ (ゴール非依存なのでキャッシュの外に置く)。
+    /// 密経路では使わない。
+    patch: Option<Patch>,
 }
 
 /// 円環上の角度差 (度、0..=180)。
@@ -168,6 +280,17 @@ fn is_final(vi: &ValueIterator, ix: i32, iy: i32, it: i32) -> bool {
         && vi.states[vi.to_index(ix, iy, it) as usize].final_state
 }
 
+/// 遷移表が届く最大セル数 (x/y のチェビシェフ距離)。遷移は解像度と θ 数だけで
+/// 決まるので、パッチの凍結境界が成り立つかはこの実測値で判定できる。
+fn transition_reach(vi: &ValueIterator) -> i32 {
+    vi.actions
+        .iter()
+        .flat_map(|a| a.state_transitions.iter().flatten())
+        .map(|t| t.dix.abs().max(t.diy.abs()))
+        .max()
+        .unwrap_or(0)
+}
+
 /// solve 済み ValueIterator の θ=0 全域スライスを可視化用 OccupancyGrid に描画する
 /// (0..=100、未到達 -1)。solve 中の途中経過 (`*_with_progress` のコールバック) からも
 /// 呼べるよう自由関数にしてある。
@@ -191,9 +314,163 @@ pub fn value_grid_of(vi: &ValueIterator, threshold_steps: u64) -> OccupancyGrid 
     }
 }
 
+/// compact 経路の追従用パッチを 1 つ作る (ゴール非依存)。
+///
+/// 中身はまだ空 (`at: None`)。寸法は「ローカルウィンドウ半径 + 遷移到達距離 +
+/// 動ける余裕 (= ウィンドウ半径ぶん)」で、余裕を使い切ったら `hydrate` で置き直す。
+fn new_patch(build: &BuildParams) -> Result<Patch, PlanError> {
+    let res = build.grid.resolution;
+    if res <= 0.0 {
+        return Err(PlanError::Patch(format!("planner grid resolution is {res}")));
+    }
+    let win = (LOCAL_XY_RANGE_M / res) as i32; // ValueIteratorLocal と同じ式
+                                               // 遷移の x/y 変位の上界。`cell_delta` はセル内オフセット (0..res) を足してから
+                                               // floor するので、正側は floor(|fw|/res)、負側は -floor(|fw|/res)-1 まで届く。
+    let max_fw = build.actions.iter().map(|a| a.delta_fw.abs()).fold(0.0f64, f64::max);
+    let reach_bound = (max_fw / res).floor() as i32 + 1;
+    let half = 2 * win + reach_bound + 2;
+    let side = 2 * half + 1;
+
+    let mut vi = ValueIteratorLocal::new(build.actions.clone(), 1);
+    // 中身は hydrate が全部上書きするので、地図は全 free のダミーでよい
+    // (ここで確定するのは幾何と遷移表と sweep_orders)。
+    let dummy = OccupancyGrid {
+        width: side,
+        height: side,
+        resolution: res,
+        origin_x: 0.0,
+        origin_y: 0.0,
+        origin_quat: build.grid.origin_quat.clone(),
+        data: vec![0i8; (side as usize) * (side as usize)],
+    };
+    vi.set_map_with_occupancy_grid(
+        &dummy,
+        build.theta_cell_num,
+        build.safety_radius,
+        build.safety_radius_penalty,
+        build.goal_margin_radius,
+        build.goal_margin_theta,
+    );
+
+    // 凍結境界の成立条件: ウィンドウ内のセルの遷移先がパッチに収まること。
+    // 解析上界ではなく遷移表の実測で確かめる (1 セル足りないと、ある方位でだけ
+    // ウィンドウ端の値が MAX_COST に見えて NoAction で止まる — 気付きにくい)。
+    let reach = transition_reach(&vi.base);
+    let win = vi.local_ixy_range;
+    if win + reach >= half {
+        return Err(PlanError::Patch(format!(
+            "window {win} + transition reach {reach} cells does not fit in the follow patch \
+             (half = {half} cells) at {res:.3} m/cell; action_forward_m is too large"
+        )));
+    }
+    Ok(Patch { vi, half, reach, at: None })
+}
+
+impl Patch {
+    /// ロボットのグローバルセル `(gx, gy)` に対してパッチを置き直す必要があるか。
+    /// 判定は寸法ではなく凍結境界の条件そのもの: ウィンドウ (±`local_ixy_range`) と
+    /// そこから遷移が届く先 (±`reach`) がパッチに収まらなくなったら置き直す。
+    fn needs_recenter(&self, gx: i32, gy: i32) -> bool {
+        let Some((p0x, p0y)) = self.at else { return true };
+        let need = self.vi.local_ixy_range + self.reach;
+        let side_max = 2 * self.half;
+        gx - need < p0x
+            || gy - need < p0y
+            || gx - p0x + need > side_max
+            || gy - p0y + need > side_max
+    }
+
+    /// compact の場と静的地図からパッチの `states` を起こす。
+    /// `p0` はパッチ左下のグローバルセル座標 (地図外へ食い込んでよい — その分は
+    /// 占有セル扱いになり、`action_cost` が MAX_COST を返す = 元の地図外判定と同じ)。
+    fn hydrate(&mut self, f: &CompactField, build: &BuildParams, p0: (i32, i32)) {
+        let (gnx, gny, nt) = f.cell_num;
+        let res = f.resolution;
+        let side = 2 * self.half + 1;
+        let margin = (build.safety_radius / res).ceil() as i32;
+
+        self.at = Some(p0);
+        let base = &mut self.vi.base;
+        base.map_origin_x = f.origin.0 + p0.0 as f64 * res;
+        base.map_origin_y = f.origin.1 + p0.1 as f64 * res;
+        base.map_origin_quat = f.origin_quat.clone();
+        // ゴールは sink 側の規約 (value == 0) で判定するので final_state の再計算は
+        // 要らないが、幾何の一貫性のために持たせておく。
+        base.goal_x = f.goal.0;
+        base.goal_y = f.goal.1;
+        base.goal_t = f.goal.2;
+
+        for py in 0..side {
+            let gy = p0.1 + py;
+            for px in 0..side {
+                let gx = p0.0 + px;
+                let inside = gx >= 0 && gx < gnx && gy >= 0 && gy < gny;
+                // free / penalty は**グローバル座標・グローバル幅**で評価する。
+                // `State::from_occupancy` の margin ループは行跨ぎバグを持つので、
+                // パッチを切り出してから評価すると compact solve が見た値とズレる。
+                let proto = if inside {
+                    State::from_occupancy(
+                        gx,
+                        gy,
+                        0,
+                        &build.grid,
+                        margin,
+                        build.safety_radius_penalty,
+                        gnx,
+                    )
+                } else {
+                    // 地図外。`from_occupancy` の非 free 早期リターンと同じ形。
+                    State {
+                        total_cost: MAX_COST,
+                        penalty: PROB_BASE,
+                        local_penalty: 0,
+                        ix: 0,
+                        iy: 0,
+                        it: 0,
+                        free: false,
+                        final_state: false,
+                        optimal_action: None,
+                    }
+                };
+                let orig0 = if inside { Some(f.orig(gx, gy, 0)) } else { None };
+                for it in 0..nt {
+                    let (v, a) = match orig0 {
+                        Some(o) => f.sink.read(o + it as usize),
+                        None => (MAX_COST, -1),
+                    };
+                    let idx = base.to_index(px, py, it) as usize;
+                    let s = &mut base.states[idx];
+                    s.ix = px;
+                    s.iy = py;
+                    s.it = it;
+                    s.free = proto.free;
+                    s.penalty = proto.penalty;
+                    s.local_penalty = 0;
+                    s.total_cost = v;
+                    s.optimal_action = if a >= 0 { Some(a as usize) } else { None };
+                    // sink の規約: 未到達 = MAX_COST、ゴール圏 = 0 (`CompactPolicy::is_final`
+                    // と同じ判定)。`value_iteration_raw` は final_state を更新しないので、
+                    // ゴール圏はローカル精密化でも 0 に留まる。
+                    s.final_state = v == 0;
+                }
+            }
+        }
+    }
+}
+
+/// compact 出力 sink を作る。`dir` 指定時はディスク mmap、無指定は RAM。
+fn make_sink(nstates: usize, dir: &SinkDir) -> Result<Box<dyn CompactSink + Send>, PlanError> {
+    match dir {
+        Some(dir) => crate::sink::MmapSink::new(dir, nstates)
+            .map(|s| Box::new(s) as Box<dyn CompactSink + Send>)
+            .map_err(|e| PlanError::Sink(e.to_string())),
+        None => Ok(Box::new(RamSink::new(nstates))),
+    }
+}
+
 impl PlannerCore {
     pub fn new(build: BuildParams, cfg: PlanConfig) -> Self {
-        Self { build, cfg, cached: None }
+        Self { build, cfg, cached: None, patch: None }
     }
 
     /// キャッシュ中のゴールが `goal` と同一 (許容差内) か。追従スレッドが
@@ -208,6 +485,37 @@ impl PlannerCore {
         let d2 = (c.goal_x - goal.x).powi(2) + (c.goal_y - goal.y).powi(2);
         d2.sqrt() <= self.cfg.goal_tolerance_xy
             && circ_deg_diff(c.goal_t_deg, goal_t_deg) as f64 <= self.cfg.goal_tolerance_deg
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 狭域が読み書きする密な局所 VI
+    //
+    // 密経路は全域の ValueIteratorLocal そのもの、compact 経路はハイドレート済み
+    // パッチ。追従側 (observe_scan / refine_* / decide / window_value_grid) は
+    // この 2 つを区別しない。
+    // ──────────────────────────────────────────────────────────────────────
+
+    fn local(&self) -> Option<&ValueIteratorLocal> {
+        match &self.cached.as_ref()?.field {
+            Field::Dense(vi) => Some(vi),
+            Field::Compact(_) => {
+                let p = self.patch.as_ref()?;
+                p.at.map(|_| &p.vi)
+            }
+        }
+    }
+
+    fn local_mut(&mut self) -> Option<&mut ValueIteratorLocal> {
+        let compact = matches!(self.cached.as_ref()?.field, Field::Compact(_));
+        if compact {
+            let p = self.patch.as_mut()?;
+            p.at?;
+            return Some(&mut p.vi);
+        }
+        match &mut self.cached.as_mut()?.field {
+            Field::Dense(vi) => Some(vi),
+            Field::Compact(_) => None,
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -227,6 +535,7 @@ impl PlannerCore {
 
     /// `prepare_goal` と同じだが、`solve_chunk` ごとの write_back 後に `on_chunk`
     /// を呼ぶ (途中経過の value_function 可視化用)。キャッシュヒット時は呼ばれない。
+    /// compact 経路は 1 回で走り切るので `on_chunk` は呼ばれない。
     pub fn prepare_goal_with_progress(
         &mut self,
         goal: PoseView,
@@ -241,6 +550,34 @@ impl PlannerCore {
         }
 
         self.cached = None; // 旧キャッシュ (数 GB になり得る) を先に解放
+        if let Some(p) = self.patch.as_mut() {
+            p.at = None; // 別ゴールの値が残ったパッチで走らせない
+        }
+
+        let field = if self.cfg.use_compact() {
+            // パッチは幾何だけで決まるので初回だけ作る (遷移表の再計算を避ける)。
+            if self.patch.is_none() {
+                self.patch = Some(new_patch(&self.build)?);
+            }
+            self.solve_compact(&goal, goal_t_deg, &mut stats, cancel)?
+        } else {
+            self.solve_dense(&goal, goal_t_deg, &mut stats, cancel, on_chunk)?
+        };
+
+        stats.solved_now = true;
+        self.cached = Some(CachedGoal { goal_x: goal.x, goal_y: goal.y, goal_t_deg, field });
+        Ok(stats)
+    }
+
+    /// 密経路: `ValueIterator::states` を確保し、`solve_chunk` ごとに cancel を観測しながら解く。
+    fn solve_dense(
+        &self,
+        goal: &PoseView,
+        goal_t_deg: i32,
+        stats: &mut SolveStats,
+        cancel: &AtomicBool,
+        on_chunk: &mut dyn FnMut(&ValueIterator),
+    ) -> Result<Field, PlanError> {
         let mut vi = ValueIteratorLocal::new(self.build.actions.clone(), 1);
         vi.set_map_with_occupancy_grid(
             &self.build.grid,
@@ -272,9 +609,60 @@ impl PlannerCore {
         if !converged {
             return Err(PlanError::NotConverged);
         }
-        stats.solved_now = true;
-        self.cached = Some(CachedGoal { goal_x: goal.x, goal_y: goal.y, goal_t_deg, vi });
-        Ok(stats)
+        Ok(Field::Dense(Box::new(vi)))
+    }
+
+    /// compact (アウトオブコア) 経路: `states` を作らず地図とゴールから直接解き、
+    /// 確定出力を sink に置く。solve は 1 回で走り切るので `solve_chunk` は使わず、
+    /// `cancel` は `solve_compact_mapped` 内のラウンド境界で観測される。
+    fn solve_compact(
+        &self,
+        goal: &PoseView,
+        goal_t_deg: i32,
+        stats: &mut SolveStats,
+        cancel: &AtomicBool,
+    ) -> Result<Field, PlanError> {
+        let g = &self.build.grid;
+        let nt = self.build.theta_cell_num;
+        let nstates = g.width as usize * g.height as usize * nt as usize;
+        let mut sink = make_sink(nstates, &self.cfg.compact_sink_dir)?;
+        let nthreads =
+            if self.cfg.vi_threads > 0 { self.cfg.vi_threads } else { default_threads() };
+
+        let s = solve_compact_mapped(
+            self.build.actions.clone(),
+            1,
+            g,
+            nt,
+            self.build.safety_radius,
+            self.build.safety_radius_penalty,
+            self.build.goal_margin_radius,
+            self.build.goal_margin_theta,
+            goal.x,
+            goal.y,
+            goal_t_deg,
+            self.cfg.max_solve_iter,
+            None,
+            sink.as_mut(),
+            nthreads,
+            cancel,
+        );
+        stats.iters = s.iters;
+        if s.cancelled {
+            return Err(PlanError::Cancelled);
+        }
+        if !s.converged {
+            return Err(PlanError::NotConverged);
+        }
+        Ok(Field::Compact(Box::new(CompactField {
+            sink,
+            actions: self.build.actions.clone(),
+            cell_num: (g.width, g.height, nt),
+            resolution: g.resolution,
+            origin: (g.origin_x, g.origin_y),
+            origin_quat: g.origin_quat.clone(),
+            goal: (goal.x, goal.y, goal_t_deg),
+        })))
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -302,15 +690,27 @@ impl PlannerCore {
     ) -> Result<(Vec<PathPose>, PlanStats), PlanError> {
         let s = self.prepare_goal_with_progress(goal, cancel, on_chunk)?;
 
-        let vi = &self.cached.as_ref().expect("cache filled above").vi;
-        let r = rollout_path_on(
-            &vi.base,
-            start.x,
-            start.y,
-            start.yaw_rad,
-            self.cfg.max_rollout_steps,
-            self.cfg.start_tolerance_cells,
-        );
+        let cached = self.cached.as_ref().expect("cache filled above");
+        // 密経路は追従で注入された local_penalty 込みの値を読む。compact 経路は
+        // sink (静的地図の解) を読む — モジュール冒頭の差異 1。
+        let r = match &cached.field {
+            Field::Dense(vi) => rollout_path_on(
+                &vi.base,
+                start.x,
+                start.y,
+                start.yaw_rad,
+                self.cfg.max_rollout_steps,
+                self.cfg.start_tolerance_cells,
+            ),
+            Field::Compact(f) => rollout_path_on(
+                &f.policy(),
+                start.x,
+                start.y,
+                start.yaw_rad,
+                self.cfg.max_rollout_steps,
+                self.cfg.start_tolerance_cells,
+            ),
+        };
         if !r.reached_goal() {
             return Err(PlanError::Rollout(r.status));
         }
@@ -336,9 +736,30 @@ impl PlannerCore {
             .map(|c| ((c.goal_x - x).powi(2) + (c.goal_y - y).powi(2)).sqrt())
     }
 
-    /// θ=0 全域スライスの可視化グリッド (`value_grid_of`)。ゴール未設定なら None。
+    /// θ=0 全域スライスの可視化グリッド。ゴール未設定なら None。
+    /// compact 経路では sink を全走査するので、広域地図では相応に重い
+    /// (`publish_value_function: false` を推奨)。
     pub fn value_grid(&self, threshold_steps: u64) -> Option<OccupancyGrid> {
-        self.cached.as_ref().map(|c| value_grid_of(&c.vi.base, threshold_steps))
+        match &self.cached.as_ref()?.field {
+            Field::Dense(vi) => Some(value_grid_of(&vi.base, threshold_steps)),
+            Field::Compact(f) => {
+                let (nx, ny) = (f.cell_num.0, f.cell_num.1);
+                let slice = Array2::from_shape_vec(
+                    (ny as usize, nx as usize),
+                    f.policy().value_slice_theta0(),
+                )
+                .ok()?;
+                Some(OccupancyGrid {
+                    width: nx,
+                    height: ny,
+                    resolution: f.resolution,
+                    origin_x: f.origin.0,
+                    origin_y: f.origin.1,
+                    origin_quat: f.origin_quat.clone(),
+                    data: value_slice_to_occupancy(&slice, threshold_steps),
+                })
+            }
+        }
     }
 
     /// ローカルウィンドウ範囲だけを現在方位の θ スライスで描画した可視化グリッド。
@@ -349,8 +770,7 @@ impl PlannerCore {
         pose: PoseView,
         threshold_steps: u64,
     ) -> Option<OccupancyGrid> {
-        let c = self.cached.as_ref()?;
-        let vi = &c.vi;
+        let vi = self.local()?;
         let (_, _, it) = pose_to_cell(&vi.base, pose.x, pose.y, pose.yaw_rad);
         let it = it.clamp(0, vi.base.cell_num_t - 1);
         let (x0, x1) = (vi.local_ix_min, vi.local_ix_max);
@@ -378,17 +798,33 @@ impl PlannerCore {
     }
 
     /// ローカルウィンドウをロボット位置中心へ移動 (本家 `setLocalWindow`)。
+    /// compact 経路では、必要ならその前にパッチを置き直して compact の場から
+    /// 起こし直す (置き直した周期のローカル精密化は捨てられる — 冒頭の差異 2)。
     pub fn set_window(&mut self, pose: PoseView) {
-        if let Some(c) = self.cached.as_mut() {
-            c.vi.set_local_window(pose.x, pose.y);
+        // build / cached / patch は別フィールドなので分割して借りられる。
+        let build = &self.build;
+        let patch = &mut self.patch;
+        let Some(c) = self.cached.as_mut() else { return };
+        match &mut c.field {
+            Field::Dense(vi) => vi.set_local_window(pose.x, pose.y),
+            Field::Compact(f) => {
+                let Some(p) = patch.as_mut() else { return };
+                let res = f.resolution;
+                let gx = ((pose.x - f.origin.0) / res).floor() as i32;
+                let gy = ((pose.y - f.origin.1) / res).floor() as i32;
+                if p.needs_recenter(gx, gy) {
+                    p.hydrate(f, build, (gx - p.half, gy - p.half));
+                }
+                p.vi.set_local_window(pose.x, pose.y);
+            }
         }
     }
 
     /// スキャンのヒット点周辺に local_penalty を注入 (本家 `setLocalCost`)。
     /// `set_window` 後に呼ぶこと (ウィンドウ外のヒットは無視される)。
     pub fn observe_scan(&mut self, scan: &LaserScan, pose: PoseView) {
-        if let Some(c) = self.cached.as_mut() {
-            c.vi.set_local_cost(scan, pose.x, pose.y, pose.yaw_rad);
+        if let Some(vi) = self.local_mut() {
+            vi.set_local_cost(scan, pose.x, pose.y, pose.yaw_rad);
         }
     }
 
@@ -416,8 +852,7 @@ impl PlannerCore {
     /// ウィンドウ 1 パス。`should_stop` は x 列ごとに観測し、途中打ち切り時は
     /// `(それまでの Δ 合計, true)` を返す。
     fn refine_pass_until(&mut self, should_stop: impl Fn() -> bool) -> (u64, bool) {
-        let Some(c) = self.cached.as_mut() else { return (0, true) };
-        let vi = &mut c.vi;
+        let Some(vi) = self.local_mut() else { return (0, true) };
         let nt = vi.base.cell_num_t;
         let mut delta = 0u64;
         for iix in vi.local_ix_min..=vi.local_ix_max {
@@ -437,9 +872,10 @@ impl PlannerCore {
     /// 現在姿勢の判断 (本家 `ViNode::decision` の `posToAction` 相当、読み取り
     /// 専用)。現在セルに方策が無ければ同一 θ の近傍 (チェビシェフ距離
     /// `action_tolerance_cells` 以内) から最近傍の行動 / ゴールセルを借りる。
+    /// compact 経路では `set_window` でパッチを起こしてから呼ぶこと。
     pub fn decide(&self, pose: PoseView) -> Decision {
-        let Some(c) = self.cached.as_ref() else { return Decision::NoAction };
-        let vi = &c.vi.base;
+        let Some(local) = self.local() else { return Decision::NoAction };
+        let vi = &local.base;
         let (ix, iy, it) = pose_to_cell(vi, pose.x, pose.y, pose.yaw_rad);
 
         if is_final(vi, ix, iy, it) {
@@ -478,7 +914,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use vi_reference::params::PROB_BASE_BIT;
-    use vi_reference::Quaternion;
 
     const RES: f64 = 0.05;
 
@@ -524,7 +959,14 @@ mod tests {
             start_tolerance_cells: 10,
             path_spacing: RES,
             action_tolerance_cells: 4,
+            compact_sink_dir: None,
+            vi_threads: 1,
         }
+    }
+
+    /// アウトオブコア経路 (states を作らない) の設定。
+    fn cfg_compact() -> PlanConfig {
+        PlanConfig { solver: U64Solver::Frontier2DSparseCompact { band: 0 }, ..cfg() }
     }
 
     fn pose(x: f64, y: f64, yaw: f64) -> PoseView {
@@ -591,6 +1033,200 @@ mod tests {
         panic!("did not reach the goal in 500 steps");
     }
 
+    /// **compact 経路の本題**: `states` を確保せずに解いた場でも、追従ループ
+    /// (set_window → refine → decide) がゴール圏まで走り切れること。パッチは
+    /// 走行中に何度も置き直される (`needs_recenter`)。
+    #[test]
+    fn compact_follows_policy_to_goal() {
+        let mut core = PlannerCore::new(build(96), cfg_compact());
+        let cancel = AtomicBool::new(false);
+        let goal = pose(4.0, 4.0, 0.0);
+        let stats = core.prepare_goal(goal, &cancel).expect("compact solve");
+        assert!(stats.solved_now && stats.iters > 0);
+
+        let (mut x, mut y, mut yaw) = (0.6f64, 0.6f64, 0.0f64);
+        let mut hydrations = 0usize;
+        let mut last_at = None;
+        for _ in 0..500 {
+            let p = pose(x, y, yaw);
+            core.set_window(p);
+            let at = core.patch.as_ref().and_then(|p| p.at);
+            if at != last_at {
+                hydrations += 1;
+                last_at = at;
+            }
+            core.refine_passes(1);
+            match core.decide(p) {
+                Decision::Goal => {
+                    let d = core.goal_distance(x, y).unwrap();
+                    assert!(d <= 0.3, "goal margin: d = {d}");
+                    assert!(hydrations > 1, "the patch must have moved along the way");
+                    return;
+                }
+                Decision::Action { fw, rot_deg, .. } => {
+                    x += fw * yaw.cos();
+                    y += fw * yaw.sin();
+                    yaw += rot_deg.to_radians();
+                }
+                Decision::NoAction => panic!("no action at ({x:.2}, {y:.2})"),
+            }
+        }
+        panic!("did not reach the goal in 500 steps");
+    }
+
+    /// 上のテストは 0.05m セルなのでパッチ (99 セル角) が地図より大きく、凍結境界は
+    /// ほぼ地図外の壁になる。こちらは **map_tsudanuma と同じ幾何** (0.25m セル、
+    /// 歩幅 0.5m → パッチ 27 セル角) で、パッチが地図の内側に完全に収まったまま
+    /// 何度も置き直される経路を走らせる。凍結境界の 4 辺すべてに compact の実値が
+    /// 入る唯一のケースで、1 セルずれると「1.5m 走るごとに、ある方位でだけ NoAction」
+    /// という気付きにくい壊れ方をする。
+    #[test]
+    fn compact_recenters_repeatedly_with_an_interior_patch() {
+        // 120x120 @0.25m = 30m x 30m。
+        let mut b = build(120);
+        b.grid.resolution = 0.25;
+        b.actions = vec![
+            Action::new("forward", 0.5, 0.0, 0),
+            Action::new("back", -0.3333, 0.0, 1),
+            Action::new("right", 0.0, -20.0, 2),
+            Action::new("rightfw", 0.3333, -20.0, 3),
+            Action::new("left", 0.0, 20.0, 4),
+            Action::new("leftfw", 0.3333, 20.0, 5),
+        ];
+        b.goal_margin_radius = 0.5; // セルサイズに比例 (overrides と同じ)
+        b.safety_radius_penalty = 1.0;
+
+        let mut core = PlannerCore::new(b, cfg_compact());
+        let cancel = AtomicBool::new(false);
+        let goal = pose(25.0, 25.0, 0.0);
+        core.prepare_goal(goal, &cancel).expect("compact solve");
+
+        let (mut x, mut y, mut yaw) = (4.0f64, 4.0f64, 0.0f64);
+        let (mut hydrations, mut interior) = (0usize, 0usize);
+        let mut last_at = None;
+        for _ in 0..500 {
+            let p = pose(x, y, yaw);
+            core.set_window(p);
+            let patch = core.patch.as_ref().unwrap();
+            if patch.at != last_at {
+                hydrations += 1;
+                last_at = patch.at;
+                let (p0x, p0y) = patch.at.unwrap();
+                let side_max = 2 * patch.half;
+                if p0x >= 0 && p0y >= 0 && p0x + side_max < 120 && p0y + side_max < 120 {
+                    interior += 1;
+                }
+            }
+            core.refine_passes(1);
+            match core.decide(p) {
+                Decision::Goal => {
+                    assert!(hydrations >= 3, "patch must move several times: {hydrations}");
+                    assert!(
+                        interior >= 3,
+                        "the patch must sit strictly inside the map at least a few times, \
+                         so all four frozen edges carry real compact values: {interior}"
+                    );
+                    return;
+                }
+                Decision::Action { fw, rot_deg, .. } => {
+                    x += fw * yaw.cos();
+                    y += fw * yaw.sin();
+                    yaw += rot_deg.to_radians();
+                }
+                Decision::NoAction => panic!(
+                    "no action at ({x:.2}, {y:.2}) yaw={:.0}deg after {hydrations} hydrations",
+                    yaw.to_degrees()
+                ),
+            }
+        }
+        panic!("did not reach the goal in 500 steps ({hydrations} hydrations)");
+    }
+
+    /// compact 経路の広域側が密経路と同じ経路を返すこと (ロールアウトは sink を読む)。
+    #[test]
+    fn compact_plan_matches_dense() {
+        let cancel = AtomicBool::new(false);
+        let goal = pose(2.0, 2.0, 0.0);
+        let start = pose(0.6, 0.6, 0.0);
+
+        let (dense, _) =
+            PlannerCore::new(build(64), cfg()).plan(start, goal, &cancel).expect("dense plan");
+
+        let mut core = PlannerCore::new(build(64), cfg_compact());
+        let (p1, s1) = core.plan(start, goal, &cancel).expect("compact plan");
+        assert!(s1.solved_now && s1.iters > 0);
+        assert_eq!(p1.len(), dense.len(), "compact path length differs from dense");
+        for (a, b) in p1.iter().zip(dense.iter()) {
+            assert!(
+                (a.x - b.x).abs() < 1e-12 && (a.y - b.y).abs() < 1e-12,
+                "compact pose {a:?} != dense pose {b:?}"
+            );
+        }
+        // 同一ゴールの再計画は solve なし (キャッシュヒット)。
+        let (_, s2) = core.plan(pose(0.4, 1.8, 1.0), goal, &cancel).expect("compact replan");
+        assert!(!s2.solved_now);
+    }
+
+    /// パッチのハイドレートが compact の場を忠実に写していること。
+    /// ウィンドウ内の各セルについて、パッチの `(total_cost, optimal_action, free)` が
+    /// sink / 静的地図と一致する = 凍結境界とローカル反復の前提。
+    #[test]
+    fn hydrated_patch_matches_the_compact_field() {
+        let mut core = PlannerCore::new(build(64), cfg_compact());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).expect("compact solve");
+        let robot = pose(1.0, 1.0, 0.0);
+        core.set_window(robot);
+
+        let p = core.patch.as_ref().expect("patch built");
+        let (p0x, p0y) = p.at.expect("patch hydrated");
+        // 遷移がパッチからはみ出さないこと (凍結境界の成立条件)。
+        assert!(p.vi.local_ixy_range + p.reach < p.half);
+
+        let Some(CachedGoal { field: Field::Compact(f), .. }) = core.cached.as_ref() else {
+            panic!("compact field expected");
+        };
+        let nt = f.cell_num.2;
+        let mut checked = 0usize;
+        for py in 0..=(2 * p.half) {
+            for px in 0..=(2 * p.half) {
+                let (gx, gy) = (p0x + px, p0y + py);
+                if gx < 0 || gy < 0 || gx >= f.cell_num.0 || gy >= f.cell_num.1 {
+                    continue;
+                }
+                for it in [0, nt / 3, nt - 1] {
+                    let (v, a) = f.sink.read(f.orig(gx, gy, it));
+                    let s = &p.vi.base.states[p.vi.base.to_index(px, py, it) as usize];
+                    assert_eq!(s.total_cost, v, "value at ({gx},{gy},{it})");
+                    assert_eq!(
+                        s.optimal_action,
+                        if a >= 0 { Some(a as usize) } else { None },
+                        "policy at ({gx},{gy},{it})"
+                    );
+                    assert_eq!(s.final_state, v == 0, "final_state at ({gx},{gy},{it})");
+                    assert!(s.free, "empty map: every in-map cell is free");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "the patch must overlap the map");
+    }
+
+    /// ディスク mmap sink 経由でも追従判断が出ること (Pi4 のような小メモリ機の経路)。
+    #[test]
+    fn compact_with_mmap_sink_follows() {
+        let dir = std::env::temp_dir().join("vi_planner_core_mmap_test");
+        let cfg = PlanConfig { compact_sink_dir: Some(dir.clone()), ..cfg_compact() };
+        let mut core = PlannerCore::new(build(64), cfg);
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).expect("solve");
+        let robot = pose(0.6, 0.6, 0.0);
+        core.set_window(robot);
+        assert!(matches!(core.decide(robot), Decision::Action { .. }));
+        drop(core);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn plans_and_caches_for_same_goal() {
         let mut core = PlannerCore::new(build(64), cfg());
@@ -629,6 +1265,25 @@ mod tests {
         assert!(!core.is_cached_goal(followed));
     }
 
+    /// ゴールが変わったらパッチは無効化され、次の `set_window` で新しい場から
+    /// 起こし直されること (古いゴールの方策で走らせない)。
+    #[test]
+    fn compact_patch_is_invalidated_on_a_new_goal() {
+        let mut core = PlannerCore::new(build(64), cfg_compact());
+        let cancel = AtomicBool::new(false);
+        let robot = pose(0.6, 0.6, 0.0);
+
+        core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).expect("solve");
+        core.set_window(robot);
+        assert!(core.patch.as_ref().unwrap().at.is_some());
+
+        core.prepare_goal(pose(0.8, 2.4, 0.0), &cancel).expect("new goal");
+        assert!(core.patch.as_ref().unwrap().at.is_none(), "stale patch must be dropped");
+        assert_eq!(core.decide(robot), Decision::NoAction, "no policy before set_window");
+        core.set_window(robot);
+        assert!(matches!(core.decide(robot), Decision::Action { .. }));
+    }
+
     #[test]
     fn densified_path_spacing_bounded() {
         let mut core = PlannerCore::new(build(64), cfg());
@@ -651,6 +1306,12 @@ mod tests {
         let mut core = PlannerCore::new(build(64), cfg());
         assert_eq!(
             core.plan(pose(0.6, 0.6, 0.0), pose(2.0, 2.0, 0.0), &cancel).unwrap_err(),
+            PlanError::Cancelled
+        );
+        // compact 経路も同じ (中断はソルバ内部のラウンド境界で観測される)。
+        let mut core = PlannerCore::new(build(64), cfg_compact());
+        assert_eq!(
+            core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).unwrap_err(),
             PlanError::Cancelled
         );
     }
@@ -704,6 +1365,27 @@ mod tests {
         assert!(empty.window_value_grid(robot, 60).is_none());
     }
 
+    /// compact 経路でも可視化グリッドが同じ幾何で出ること (全域は sink 走査)。
+    #[test]
+    fn compact_visualization_grids_match_geometry() {
+        let mut core = PlannerCore::new(build(64), cfg_compact());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).expect("solve");
+
+        let g = core.value_grid(60).expect("full grid");
+        assert_eq!((g.width, g.height), (64, 64));
+        assert_eq!(g.data.len(), 64 * 64);
+
+        let robot = pose(1.0, 1.0, 0.0);
+        core.set_window(robot);
+        let w = core.window_value_grid(robot, 60).expect("window grid");
+        // ウィンドウはパッチの内側に丸ごと収まるのでクランプされない
+        // (local_ixy_range = 1.0m / 0.05m = 20 → 41x41)。密経路で地図端に寄せたとき
+        // だけ 21x21 にクランプされる (visualization_grids_match_geometry 参照)。
+        assert_eq!((w.width, w.height), (41, 41));
+        assert!(w.data.iter().all(|&v| (-1..=100).contains(&i32::from(v))));
+    }
+
     /// スキャンで注入された local_penalty が、ローカル反復を経て「ヒット帯へ
     /// 踏み込む行動を持つ上流セル」の価値を引き上げること (障害物回避の根拠)。
     #[test]
@@ -718,28 +1400,59 @@ mod tests {
 
         // 前進 1 ステップ (0.3m) でヒット帯 (1.5, 1.0)±2 セルに着地する上流セル。
         let (uix, uiy, uit) = {
-            let c = core.cached.as_ref().unwrap();
-            pose_to_cell(&c.vi.base, 1.2, 1.0, 0.0)
+            let vi = core.local().unwrap();
+            pose_to_cell(&vi.base, 1.2, 1.0, 0.0)
         };
         let before = {
-            let c = core.cached.as_ref().unwrap();
-            c.vi.base.states[c.vi.base.to_index(uix, uiy, uit) as usize].total_cost
+            let vi = core.local().unwrap();
+            vi.base.states[vi.base.to_index(uix, uiy, uit) as usize].total_cost
         };
 
         // 正面 0.5m にヒット 1 ビーム → (1.5, 1.0) 周辺へ 2048<<PROB_BASE_BIT。
         let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.5] };
         core.observe_scan(&scan, robot);
         {
-            let c = core.cached.as_ref().unwrap();
-            let (hx, hy, _) = pose_to_cell(&c.vi.base, 1.5, 1.0, 0.0);
-            let hit = c.vi.base.to_index(hx, hy, 0) as usize;
-            assert_eq!(c.vi.base.states[hit].local_penalty, 2048u64 << PROB_BASE_BIT);
+            let vi = core.local().unwrap();
+            let (hx, hy, _) = pose_to_cell(&vi.base, 1.5, 1.0, 0.0);
+            let hit = vi.base.to_index(hx, hy, 0) as usize;
+            assert_eq!(vi.base.states[hit].local_penalty, 2048u64 << PROB_BASE_BIT);
         }
 
         core.refine_passes(5);
         let after = {
-            let c = core.cached.as_ref().unwrap();
-            c.vi.base.states[c.vi.base.to_index(uix, uiy, uit) as usize].total_cost
+            let vi = core.local().unwrap();
+            vi.base.states[vi.base.to_index(uix, uiy, uit) as usize].total_cost
+        };
+        assert!(after > before, "upstream value must rise: before={before}, after={after}");
+    }
+
+    /// 同じことが compact 経路のパッチ上でも成り立つこと (狭域が compact の場の
+    /// 上でも障害物回避として機能する = この実装の目的)。
+    #[test]
+    fn compact_scan_penalty_raises_upstream_value() {
+        let mut core = PlannerCore::new(build(64), cfg_compact());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(2.5, 1.0, 0.0), &cancel).expect("solve");
+
+        let robot = pose(1.0, 1.0, 0.0);
+        core.set_window(robot);
+
+        let (uix, uiy, uit) = {
+            let vi = core.local().unwrap();
+            pose_to_cell(&vi.base, 1.2, 1.0, 0.0)
+        };
+        let before = {
+            let vi = core.local().unwrap();
+            vi.base.states[vi.base.to_index(uix, uiy, uit) as usize].total_cost
+        };
+        assert!(before < MAX_COST, "the patch must carry the compact solution");
+
+        let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.5] };
+        core.observe_scan(&scan, robot);
+        core.refine_passes(5);
+        let after = {
+            let vi = core.local().unwrap();
+            vi.base.states[vi.base.to_index(uix, uiy, uit) as usize].total_cost
         };
         assert!(after > before, "upstream value must rise: before={before}, after={after}");
     }
@@ -782,6 +1495,7 @@ mod tests {
             build: core.build.clone(),
             cfg: strict,
             cached: core.cached.take(),
+            patch: core.patch.take(),
         };
         assert_eq!(strict_core.decide(on_obstacle), Decision::NoAction);
         // tolerance 4 (0.2m) なら近傍の行動を借りられる。
@@ -789,6 +1503,7 @@ mod tests {
             build: strict_core.build.clone(),
             cfg: cfg(),
             cached: strict_core.cached,
+            patch: strict_core.patch,
         };
         assert!(matches!(relaxed_core.decide(on_obstacle), Decision::Action { .. }));
     }
@@ -812,5 +1527,30 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let err = core.plan(pose(0.6, 0.6, 0.0), pose(2.8, 2.8, 0.0), &cancel).unwrap_err();
         assert!(matches!(err, PlanError::Rollout(RolloutStatus::NoAction)), "{err:?}");
+    }
+
+    /// パッチの寸法は「ウィンドウ + 遷移到達距離」を必ず超えること
+    /// (凍結境界が成り立つ条件そのもの)。粗いセルでも成り立つ。
+    #[test]
+    fn patch_geometry_covers_the_transition_reach() {
+        for res in [0.05, 0.15, 0.25, 0.5] {
+            let mut b = build(8);
+            b.grid.resolution = res;
+            // 津田沼構成と同じく歩幅をセルサイズに比例させた場合も見る。
+            let k = res / 0.05;
+            b.actions = actions()
+                .into_iter()
+                .enumerate()
+                .map(|(i, a)| Action::new(&a.name, a.delta_fw * k, a.delta_rot, i as i32))
+                .collect();
+            let p = new_patch(&b).unwrap_or_else(|e| panic!("res={res}: {e}"));
+            assert!(
+                p.vi.local_ixy_range + p.reach < p.half,
+                "res={res}: window {} + reach {} must fit in half {}",
+                p.vi.local_ixy_range,
+                p.reach,
+                p.half
+            );
+        }
     }
 }

@@ -48,11 +48,15 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context as ACtx, Result};
 
 use vi_core::{ACTION_FW, ACTION_ROT, N_ACTIONS, N_THETA};
-use vi_reference::bridge::{occupancy_view_to_vi_grid, OccupancyGridView, PoseView};
+use vi_reference::bridge::{
+    downsample_occupancy, occupancy_view_to_vi_grid, OccupancyGridView, PoseView,
+};
 use vi_reference::msg::LaserScan as ViLaserScan;
 use vi_reference::planner::PathPose;
 use vi_reference::solvers::U64Solver;
 use vi_reference::Action;
+// nav_msgs::msg::OccupancyGrid と名前が衝突するので別名で入れる。
+use vi_reference::OccupancyGrid as ViOccupancyGrid;
 
 use vi_planner::core::{
     value_grid_of, BuildParams, Decision, PlanConfig, PlanError, PlanStats, PlannerCore,
@@ -87,6 +91,12 @@ struct Params {
     allow_action_mismatch: bool,
     action_list: Vec<(String, f64, f64)>,
     unknown_as_obstacle: bool,
+    /// プランナ内部で地図を何倍に粗くするか (1 = /map のまま)。
+    map_scale: i64,
+    /// ダウンサンプルの方針 ("conservative" | "optimistic")。
+    downsample_policy: String,
+    /// compact ソルバの確定出力を置くディレクトリ (空文字 = RAM)。
+    compact_sink_dir: String,
     vi_threads: i64,
     max_solve_iter: i64,
     solve_chunk: i64,
@@ -131,6 +141,13 @@ fn read_params(node: &Node) -> Result<Params> {
     let map_wait_sec = p!("map_wait_sec", i64, 30);
     let allow_action_mismatch = p!("allow_action_mismatch", bool, false);
     let unknown_as_obstacle = p!("unknown_as_obstacle", bool, true);
+    let map_scale = p!("map_scale", i64, 1);
+    // "conservative" = 本家 downsample_occupancy (障害物優先)。"optimistic" = ブロック内に free が
+    // 1 つでもあれば free。map_scale >= 4 で通路のセル幅を保つために必要 (既定は挙動不変の保守側)。
+    let downsample_policy = p!("downsample_policy", Arc<str>, "conservative".into()).to_string();
+    // solver = frontier2d_sparse_compact のときだけ効く。空文字なら RAM (RamSink)。
+    // 指定先が tmpfs だと結局 RAM に載るので、メモリ退避が目的なら実ディスクを指すこと。
+    let compact_sink_dir = p!("compact_sink_dir", Arc<str>, "".into()).to_string();
     let vi_threads = p!("vi_threads", i64, 0);
     let max_solve_iter = p!("max_solve_iter", i64, 1_000_000);
     let solve_chunk = p!("solve_chunk", i64, 64);
@@ -201,6 +218,9 @@ fn read_params(node: &Node) -> Result<Params> {
         allow_action_mismatch,
         action_list,
         unknown_as_obstacle,
+        map_scale,
+        downsample_policy,
+        compact_sink_dir,
         vi_threads,
         max_solve_iter,
         solve_chunk,
@@ -224,7 +244,6 @@ fn read_params(node: &Node) -> Result<Params> {
 }
 
 /// vi_core のコンパイル時定数とパラメータを照合 (vi_node と同じ fail-fast)。
-/// 併せて、このノードが扱えないソルバ (アウトオブコア) を弾く。
 fn validate(p: &Params) -> Result<U64Solver> {
     if p.theta_cell_num != N_THETA as i64 {
         return Err(anyhow!(
@@ -259,18 +278,6 @@ fn validate(p: &Params) -> Result<U64Solver> {
     }
     let solver = U64Solver::from_name(&p.solver)
         .ok_or_else(|| anyhow!("unknown solver: {} (see U64Solver::from_name)", p.solver))?;
-    // 追従はローカルウィンドウを ValueIterator::states に直接書き戻すので、
-    // states を確保しない compact 経路には載らない。広域地図は
-    // vi_global_planner + controller_server の構成を使うこと。
-    if matches!(solver, U64Solver::Frontier2DSparseCompact { .. }) {
-        return Err(anyhow!(
-            "solver '{}' is out-of-core and has no dense state array, which the \
-             follow_path control loop writes into. vi_planner cannot use it.\n\
-             For maps that need the compact solver, run vi_global_planner (compute_path_to_pose \
-             only) together with nav2_controller's controller_server instead.",
-            p.solver
-        ));
-    }
     Ok(solver)
 }
 
@@ -335,6 +342,57 @@ fn vi_scan_from(msg: &sensor_msgs::msg::LaserScan) -> ViLaserScan {
 
 fn stop_cmd(pub_cmd: &Publisher<geometry_msgs::msg::Twist>) {
     let _ = pub_cmd.publish(geometry_msgs::msg::Twist::default());
+}
+
+/// `downsample_occupancy` の楽観版。ブロック内に 1 つでも free があれば出力セルを free にする。
+///
+/// 本家の `downsample_occupancy` は障害物優先なので通路が片側最大 `(scale-1)·resolution` 細る。
+/// map_tsudanuma は unknown が 68% あり、`map_scale >= 4` では free **面積**は数 % しか減らないのに
+/// **通路のセル幅**が落ちる。VI の遷移はサブセルサンプリングによる約 2 セル幅の分布なので、
+/// 散り先に 1 つでも未到達セルがあると期待値が MAX_COST 側に張り付き、波がゴール近傍で止まる。
+///
+/// 安全余裕を地図に焼き込んではいけない。VI の `safety_radius` は硬い壁ではなく秒/セルのソフトな
+/// ペナルティで、膨張として焼き込むと scale 3 でも波が死ぬ (実測)。ここでは通路を開けるだけにする。
+///
+/// `vi_global_planner` にも同じ関数がある (別クレートなので共有できない)。片方を直したら両方直すこと。
+fn downsample_occupancy_optimistic(grid: &ViOccupancyGrid, scale: i32) -> ViOccupancyGrid {
+    if scale <= 1 {
+        return grid.clone();
+    }
+    let (w, h, s) = (grid.width as usize, grid.height as usize, scale as usize);
+    let (ow, oh) = (w.div_ceil(s), h.div_ceil(s));
+    let mut data = vec![100i8; ow * oh];
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let mut free = false;
+            'blk: for dy in 0..s {
+                let iy = oy * s + dy;
+                if iy >= h {
+                    break;
+                }
+                for dx in 0..s {
+                    let ix = ox * s + dx;
+                    if ix >= w {
+                        break;
+                    }
+                    if grid.data[iy * w + ix] == 0 {
+                        free = true;
+                        break 'blk;
+                    }
+                }
+            }
+            data[oy * ow + ox] = if free { 0 } else { 100 };
+        }
+    }
+    ViOccupancyGrid {
+        width: ow as i32,
+        height: oh as i32,
+        resolution: grid.resolution * scale as f64,
+        origin_x: grid.origin_x,
+        origin_y: grid.origin_y,
+        origin_quat: grid.origin_quat.clone(),
+        data,
+    }
 }
 
 /// vi_reference の可視化描画済み OccupancyGrid → ROS メッセージ。
@@ -650,13 +708,67 @@ fn main() -> Result<()> {
         origin_y: map_msg.info.origin.position.y,
         data: &map_msg.data[..],
     };
-    let vi_grid = occupancy_view_to_vi_grid(&grid_view, params.unknown_as_obstacle);
+    // プランナ内部の作業解像度。密ソルバは状態配列 (56 B/state) を全域ぶん確保するので、
+    // 広域地図では map_scale がそのままメモリを決める。compact ソルバなら確定出力
+    // 12 B/state を sink (mmap) に逃がし、追従はロボット近傍のパッチだけを密に起こす。
+    let binary_grid = occupancy_view_to_vi_grid(&grid_view, params.unknown_as_obstacle);
+    let vi_grid = match params.downsample_policy.as_str() {
+        "optimistic" => downsample_occupancy_optimistic(&binary_grid, params.map_scale as i32),
+        "conservative" => downsample_occupancy(&binary_grid, params.map_scale as i32),
+        other => {
+            return Err(anyhow!(
+                "downsample_policy must be \"conservative\" or \"optimistic\", got {other:?}"
+            ))
+        }
+    };
+    drop(binary_grid);
     let nstates =
         vi_grid.width as usize * vi_grid.height as usize * params.theta_cell_num as usize;
+    let use_compact = matches!(solver, U64Solver::Frontier2DSparseCompact { .. });
+    // 密は State 56 B/state を実際に確保する。compact は確定出力 12 B/state だけを
+    // sink に置く (compact_sink_dir 指定なら mmap ファイル = ディスク常駐)。
+    let states_gb = nstates as f64 * 56.0 / 1e9;
+    let sink_gb = nstates as f64 * 12.0 / 1e9;
     eprintln!(
-        "vi_planner: planner grid {}x{} @{:.3}m x{} theta = {} states",
-        vi_grid.width, vi_grid.height, vi_grid.resolution, params.theta_cell_num, nstates,
+        "vi_planner: planner grid {}x{} @{:.3}m (map_scale={}, downsample={}) x{} theta \
+         = {} states ({})",
+        vi_grid.width,
+        vi_grid.height,
+        vi_grid.resolution,
+        params.map_scale,
+        params.downsample_policy,
+        params.theta_cell_num,
+        nstates,
+        if use_compact {
+            format!(
+                "compact sink {:.2} GB in {}",
+                sink_gb,
+                if params.compact_sink_dir.is_empty() {
+                    "RAM".to_string()
+                } else {
+                    params.compact_sink_dir.clone()
+                }
+            )
+        } else {
+            format!("dense states {states_gb:.2} GB")
+        },
     );
+    if use_compact && params.compact_sink_dir.is_empty() && sink_gb > 0.5 {
+        eprintln!(
+            "WARN: the compact sink needs {:.2} GB and compact_sink_dir is unset, so it stays in \
+             RAM. Point compact_sink_dir at a real (non-tmpfs) directory to spill it to disk.",
+            sink_gb
+        );
+    }
+    if !use_compact && states_gb > 2.0 {
+        eprintln!(
+            "WARN: the dense state array alone needs {:.2} GB and is really allocated. On a 4 GB \
+             machine this will be OOM-killed; raise map_scale, or switch to \
+             solver: frontier2d_sparse_compact (+ compact_sink_dir), which keeps only {:.2} GB of \
+             finalized output on disk and hydrates a small patch around the robot for following.",
+            states_gb, sink_gb
+        );
+    }
     let start_tolerance_cells = (params.start_tolerance / vi_grid.resolution).ceil() as i32;
     let action_tolerance_cells = (params.action_tolerance / vi_grid.resolution).ceil() as i32;
 
@@ -684,6 +796,12 @@ fn main() -> Result<()> {
         start_tolerance_cells,
         path_spacing: params.path_spacing,
         action_tolerance_cells,
+        compact_sink_dir: if params.compact_sink_dir.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(&params.compact_sink_dir))
+        },
+        vi_threads: params.vi_threads.max(0) as usize,
     };
     let core = Arc::new(Mutex::new(PlannerCore::new(build, cfg)));
 

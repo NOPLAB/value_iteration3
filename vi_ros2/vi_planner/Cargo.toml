@@ -24,6 +24,9 @@ anyhow  = "1"
 futures = "0.3"
 # 価値関数の可視化描画 (bridge::value_slice_to_occupancy) 用。
 ndarray = "0.16"
+# compact (アウトオブコア) 経路の確定出力をディスクへ逃がす MmapSink 用
+# (src/sink.rs; vi_global_planner と同じ)。
+memmap2 = "0.9"
 
 vi_core      = { path = "../../vi_rs/vi_core" }
 vi_reference = { path = "../../vi_rs/vi_reference" }
