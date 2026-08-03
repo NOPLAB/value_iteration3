@@ -28,7 +28,6 @@ ndarray = "0.16"
 # (src/sink.rs; vi_global_planner と同じ)。
 memmap2 = "0.9"
 
-vi_core      = { path = "../../vi_rs/vi_core" }
 vi_reference = { path = "../../vi_rs/vi_reference" }
 
 # ROS deps。colcon-ros-cargo の生成 config が [patch.crates-io] でローカル

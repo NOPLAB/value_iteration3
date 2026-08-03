@@ -28,7 +28,6 @@ thiserror          = "1"
 # no tokio runtime, so we await a futures oneshot rather than use tokio timers.
 futures            = "0.3"
 
-vi_core      = { path = "../../vi_rs/vi_core" }
 # u64 (本家忠実) ソルバ群 + ValueIterator。u16 の vi_algorithm/vi_fixtures から移行。
 vi_reference = { path = "../../vi_rs/vi_reference" }
 

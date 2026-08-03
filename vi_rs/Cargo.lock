@@ -944,9 +944,6 @@ dependencies = [
 [[package]]
 name = "vi_core"
 version = "0.1.0"
-dependencies = [
- "ndarray",
-]
 
 [[package]]
 name = "vi_reference"

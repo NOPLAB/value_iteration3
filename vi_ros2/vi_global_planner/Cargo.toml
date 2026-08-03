@@ -28,7 +28,6 @@ ndarray = "0.16"
 # 広域地図では確定出力が nx·ny·nθ × 12 B になり RAM に載らない。
 memmap2 = "0.9"
 
-vi_core      = { path = "../../vi_rs/vi_core" }
 vi_reference = { path = "../../vi_rs/vi_reference" }
 
 # ROS deps。colcon-ros-cargo の生成 config が [patch.crates-io] でローカル

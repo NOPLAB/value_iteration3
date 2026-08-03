@@ -4,5 +4,5 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+# 型エイリアスだけのクレートなので依存は無い (params を外して ndarray も不要になった)。
 [dependencies]
-ndarray = { workspace = true }

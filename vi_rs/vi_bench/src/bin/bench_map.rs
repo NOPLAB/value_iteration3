@@ -55,7 +55,7 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use vi_bench::fixtures::canonical_actions;
+use vi_bench::params::{canonical_actions, MAX_ACTION_FW_M, N_THETA};
 use vi_bench::pgm::{self, Occupancy, PgmMap};
 use vi_reference::params::{MAX_COST, PROB_BASE};
 use memmap2::MmapMut;
@@ -65,10 +65,8 @@ use vi_reference::solvers::frontier2d_sparse_compact::{
 use vi_reference::solvers::{solve, U64SolveStats, U64Solver};
 use vi_reference::{Action, OccupancyGrid, Quaternion, State, ValueIterator};
 
-/// Canonical theta cell count (本家 launch / data contract).
-const THETA_CELL_NUM: i32 = 60;
-/// 最大前進アクション歩幅 [m]（degenerate-dynamics ガード用）。
-const MAX_ACTION_FW_M: f64 = 0.3;
+/// Canonical theta cell count (本家 launch / data contract)。
+const THETA_CELL_NUM: i32 = N_THETA;
 /// 到達可能とみなす total_cost 上限（compare.py の value>=1e6 境界と整合）。
 const REACH: u64 = 1_000_000u64 * PROB_BASE;
 

@@ -22,7 +22,6 @@ def generate_launch_description():
                 'delta_threshold': 0,
                 'thread_num': 0,
                 'map_wait_sec': 30,
-                'allow_action_mismatch': False,
                 'action_names': ['forward','back','right','rightfw','left','leftfw'],
                 'action_forward_m':  [ 0.3, -0.2,  0.0,  0.2,  0.0,  0.2],
                 'action_rotation_deg': [ 0.0,  0.0, -20.0, -20.0, 20.0, 20.0],

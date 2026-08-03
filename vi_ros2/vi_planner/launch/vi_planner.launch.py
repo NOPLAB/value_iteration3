@@ -65,7 +65,7 @@ def generate_launch_description():
                 'pose_topic': pose_topic,
                 'scan_topic': scan_topic,
                 # ── 価値関数の定義 (広域・狭域で共有) ──
-                'theta_cell_num': 60,
+                'theta_cell_num': 60,        # 360 を割り切る値であること (t_resolution が整数除算)
                 'safety_radius': 0.2,
                 'safety_radius_penalty': 30,
                 'goal_margin_radius': 0.3,   # [m] final_state = ゴール許容差
@@ -91,7 +91,10 @@ def generate_launch_description():
                 'value_publish_interval_ms': 500,
                 'cost_drawing_threshold': 60,         # value_function のスケール上限
                 'window_cost_drawing_threshold': 60,  # local_window_value のスケール上限
-                # ── vi_core のコンパイル時定数と一致すること ──
+                # ── 行動集合 (ここで決めた値がそのまま効く) ──
+                # 遷移表は起動時にこの値から作られるので、名前も歩幅も回転量も
+                # 好きに変えてよい (数も 6 でなくてよい)。3 本の配列は同じ長さで
+                # あること。既定は本家 launch と同じ 6 行動。
                 'action_names': ['forward', 'back', 'right', 'rightfw', 'left', 'leftfw'],
                 'action_forward_m': [0.3, -0.2, 0.0, 0.2, 0.0, 0.2],
                 'action_rotation_deg': [0.0, 0.0, -20.0, -20.0, 20.0, 20.0],

@@ -5,29 +5,19 @@
 //! ベンチ入力は本家モデル（PROB_BASE 固定小数）なので、`vi_reference::solvers::solve`
 //! の全ソルバが Reference（=本家）と bit-exact になる。
 
-use vi_reference::{Action, OccupancyGrid, Quaternion, ValueIterator};
+use vi_reference::{OccupancyGrid, Quaternion, ValueIterator};
+
+use crate::params::{canonical_actions, N_THETA};
 
 /// ベンチ共通パラメータ（vi_compare / 本家 launch と整合）。
 const RES: f64 = 0.05;
-const THETA_CELL_NUM: i32 = 60;
+const THETA_CELL_NUM: i32 = N_THETA;
 const SAFETY_RADIUS: f64 = 0.2;
 const SAFETY_PENALTY: f64 = 30.0;
 /// 小さめのゴール半径（2 セル）。大きいと小マップでほぼ全セルが goal=cost0 になり
 /// 伝播仕事が消えるため、ベンチとして意味を持たせるため控えめにする。
 const GOAL_MARGIN_RADIUS: f64 = 0.10;
 const GOAL_MARGIN_THETA: i32 = 15;
-
-/// 本家 launch と ID 順まで一致する正典 6 アクション。
-pub fn canonical_actions() -> Vec<Action> {
-    vec![
-        Action::new("forward", 0.3, 0.0, 0),
-        Action::new("back", -0.2, 0.0, 1),
-        Action::new("right", 0.0, -20.0, 2),
-        Action::new("rightfw", 0.2, -20.0, 3),
-        Action::new("left", 0.0, 20.0, 4),
-        Action::new("leftfw", 0.2, 20.0, 5),
-    ]
-}
 
 /// 合成マップ種別。u16 ベンチの `vi_fixtures::MapType` 相当を vi_reference 入力
 /// （occupancy i8）として再現する。

@@ -27,7 +27,6 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context as ACtx, Result};
 
-use vi_core::{ACTION_FW, ACTION_ROT, N_ACTIONS, N_THETA};
 use vi_reference::{Action, OccupancyGrid, ValueIterator};
 
 use vi_node::bridge::{
@@ -65,7 +64,6 @@ struct Params {
     delta_threshold: i64,
     thread_num: i64,
     map_wait_sec: i64,
-    allow_action_mismatch: bool,
     // Benchmark hook: when non-empty, the action callback dumps the full
     // value/policy arrays as `.npy` into this directory after the solve
     // finishes. Empty (default) = off = unchanged production behavior.
@@ -154,13 +152,6 @@ fn read_params(node: &Node) -> Result<Params> {
         .map_err(|e| anyhow!("declare map_wait_sec: {e}"))?
         .get();
 
-    let allow_action_mismatch = node
-        .declare_parameter::<bool>("allow_action_mismatch")
-        .default(false)
-        .mandatory()
-        .map_err(|e| anyhow!("declare allow_action_mismatch: {e}"))?
-        .get();
-
     let bench_dump_path = node
         .declare_parameter::<Arc<str>>("bench_dump_path")
         .default("".into())
@@ -226,7 +217,6 @@ fn read_params(node: &Node) -> Result<Params> {
         delta_threshold,
         thread_num,
         map_wait_sec,
-        allow_action_mismatch,
         bench_dump_path,
         action_list,
     })
@@ -236,35 +226,25 @@ fn read_params(node: &Node) -> Result<Params> {
 // Parameter validation
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Validate parameters against compiled-in vi_rs constants (fail-fast).
+/// Validate that the parameters are self-consistent (fail-fast).
+///
+/// `ValueIterator` takes the action set and the theta count at run time, so the
+/// values themselves are the launch file's business — this used to compare them
+/// against vi_core's compile-time constants, which only got in the way of
+/// changing them. What is left are the constraints the code downstream actually
+/// imposes.
 fn validate(p: &Params) -> Result<()> {
-    if p.theta_cell_num != N_THETA as i64 {
+    // 本家 `t_resolution_ = 360/cell_num_t_` は整数除算。割り切れないと
+    // `it = (t % 360) / t_resolution` が cell_num_t 以上を返し、states の範囲外を指す。
+    if p.theta_cell_num <= 0 || p.theta_cell_num > 360 || 360 % p.theta_cell_num != 0 {
         return Err(anyhow!(
-            "vi_rs is compiled with N_THETA={}, got theta_cell_num={}",
-            N_THETA,
+            "theta_cell_num must divide 360 (t_resolution = 360/theta_cell_num is an \
+             integer division), got {}",
             p.theta_cell_num
         ));
     }
-    if p.action_list.len() != N_ACTIONS {
-        return Err(anyhow!(
-            "vi_rs requires exactly {} actions, got {}",
-            N_ACTIONS,
-            p.action_list.len()
-        ));
-    }
-    for (i, (_, fw, rot)) in p.action_list.iter().enumerate() {
-        if (fw - ACTION_FW[i]).abs() > 1e-6 || (rot - ACTION_ROT[i]).abs() > 1e-6 {
-            let msg = format!(
-                "action[{i}] differs from vi_rs constants: got (fw={fw}, rot={rot}), \
-                 expected (fw={}, rot={})",
-                ACTION_FW[i], ACTION_ROT[i]
-            );
-            if p.allow_action_mismatch {
-                eprintln!("WARN: {msg}");
-            } else {
-                return Err(anyhow!(msg));
-            }
-        }
+    if p.action_list.is_empty() {
+        return Err(anyhow!("action_names/action_forward_m/action_rotation_deg are empty"));
     }
     // Verify solver string is known; make_solver is pure-Rust and checkable here.
     make_solver(&p.solver)?;

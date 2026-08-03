@@ -12,7 +12,7 @@
 //!
 //! Boot order (vi_global_planner と同型):
 //!   1. `Context::default_from_env` + basic executor + node 作成
-//!   2. パラメータ宣言・検証 (アクション定数は vi_core と照合し fail-fast)
+//!   2. パラメータ宣言・検証 (行動集合と θ 数は起動パラメータがそのまま効く)
 //!   3. `VI_THREADS` 設定 (vi_threads > 0 のとき)
 //!   4. /map 受信 (transient_local, 初回メッセージまでブロック)
 //!   5. PlannerCore 構築 (静的地図前提)
@@ -48,7 +48,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as ACtx, Result};
 
-use vi_core::{ACTION_FW, ACTION_ROT, N_ACTIONS, N_THETA};
 use vi_reference::bridge::{
     downsample_occupancy, occupancy_view_to_vi_grid, OccupancyGridView, PoseView,
 };
@@ -90,7 +89,6 @@ struct Params {
     goal_margin_radius: f64,
     goal_margin_theta_deg: f64,
     map_wait_sec: i64,
-    allow_action_mismatch: bool,
     action_list: Vec<(String, f64, f64)>,
     unknown_as_obstacle: bool,
     /// プランナ内部で地図を何倍に粗くするか (1 = /map のまま)。
@@ -151,7 +149,6 @@ fn read_params(node: &Node) -> Result<Params> {
     let goal_margin_radius = p!("goal_margin_radius", f64, 0.3);
     let goal_margin_theta_deg = p!("goal_margin_theta", f64, 15.0);
     let map_wait_sec = p!("map_wait_sec", i64, 30);
-    let allow_action_mismatch = p!("allow_action_mismatch", bool, false);
     let unknown_as_obstacle = p!("unknown_as_obstacle", bool, true);
     let map_scale = p!("map_scale", i64, 1);
     // "conservative" = 本家 downsample_occupancy (障害物優先)。"optimistic" = ブロック内に free が
@@ -245,7 +242,6 @@ fn read_params(node: &Node) -> Result<Params> {
         goal_margin_radius,
         goal_margin_theta_deg,
         map_wait_sec,
-        allow_action_mismatch,
         action_list,
         unknown_as_obstacle,
         map_scale,
@@ -278,38 +274,27 @@ fn read_params(node: &Node) -> Result<Params> {
     })
 }
 
-/// vi_core のコンパイル時定数とパラメータを照合 (vi_node と同じ fail-fast)。
+/// パラメータの自己整合検査 (vi_node / vi_global_planner と同じ fail-fast)。
+///
+/// 行動集合も θ 数も `ValueIterator` は実行時に受け取るので、値そのものは launch
+/// から自由に決めてよい (かつてここで vi_core のコンパイル時定数と照合していた
+/// のは、値を変えたいときの邪魔にしかならなかった)。落とすのは、後段のどこかで
+/// 実際に割り算・添字になって壊れるものだけ。
 fn validate(p: &Params) -> Result<U64Solver> {
     if p.map_scale < 1 {
         return Err(anyhow!("map_scale must be >= 1, got {}", p.map_scale));
     }
-    if p.theta_cell_num != N_THETA as i64 {
+    // 本家 `t_resolution_ = 360/cell_num_t_` は整数除算。割り切れないと
+    // `it = (t % 360) / t_resolution` が cell_num_t 以上を返し、states の範囲外を指す。
+    if p.theta_cell_num <= 0 || p.theta_cell_num > 360 || 360 % p.theta_cell_num != 0 {
         return Err(anyhow!(
-            "vi_rs is compiled with N_THETA={}, got theta_cell_num={}",
-            N_THETA,
+            "theta_cell_num must divide 360 (t_resolution = 360/theta_cell_num is an \
+             integer division), got {}",
             p.theta_cell_num
         ));
     }
-    if p.action_list.len() != N_ACTIONS {
-        return Err(anyhow!(
-            "vi_rs requires exactly {} actions, got {}",
-            N_ACTIONS,
-            p.action_list.len()
-        ));
-    }
-    for (i, (_, fw, rot)) in p.action_list.iter().enumerate() {
-        if (fw - ACTION_FW[i]).abs() > 1e-6 || (rot - ACTION_ROT[i]).abs() > 1e-6 {
-            let msg = format!(
-                "action[{i}] differs from vi_rs constants: got (fw={fw}, rot={rot}), \
-                 expected (fw={}, rot={})",
-                ACTION_FW[i], ACTION_ROT[i]
-            );
-            if p.allow_action_mismatch {
-                eprintln!("WARN: {msg}");
-            } else {
-                return Err(anyhow!(msg));
-            }
-        }
+    if p.action_list.is_empty() {
+        return Err(anyhow!("action_names/action_forward_m/action_rotation_deg are empty"));
     }
     if p.control_frequency <= 0.0 {
         return Err(anyhow!("control_frequency must be > 0, got {}", p.control_frequency));
