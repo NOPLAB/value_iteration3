@@ -13,6 +13,21 @@
 //!     「キャッシュヒット経路」そのもの
 //!   - 追従は同じ価値関数の ±1m ウィンドウをスキャンで補正しながら回す
 //!
+//! # 狭域 → 広域のフィードバック ([`PlannerCore::sweep_global`])
+//!
+//! 上の 3 つ目で狭域が書き込む `local_penalty` は、密経路では**同じ `states` に
+//! 載る**。共有場はここで既に成立している。足りないのは伝播で、局所精密化
+//! (`refine_pass_until`) が掃くのはウィンドウの中だけなので、上がった値はそこで
+//! 止まり広域のロールアウトは塞がった通路へ降り続ける。`sweep_global` が同じ
+//! `states` を全域 Gauss–Seidel で掃き直してそれを外へ広げる (詳細はそちらの doc)。
+//!
+//! `local_penalty` はウィンドウの外では**誰も消さない** (`set_local_cost` は
+//! `in_local_area` の中しか触らない)。障害物の脇を通り過ぎるとその penalty は
+//! そのゴールの間ずっと `states` に残り、全域掃きのたびに広域の場を歪め続ける。
+//! これは本家 `ViNode` から引き継いだ挙動で、意図的にそのままにしてある
+//! (「一度通れないと分かった場所は覚えておく」= 望ましい側の効果でもあるため)。
+//! 消したければゴールを取り直すこと。
+//!
 //! # 2 つの経路: 密 (dense) とアウトオブコア (compact)
 //!
 //! `PlanConfig::solver` が `frontier2d_sparse_compact` かどうかで価値関数の持ち方が
@@ -247,6 +262,19 @@ struct CachedGoal {
     field: Field,
 }
 
+/// 全域掃き ([`PlannerCore::sweep_global`]) の再開位置。10 Hz の追従ループと同じ
+/// `Mutex<PlannerCore>` を共有するので、掃きはチャンクに切ってロックを手放しながら
+/// 進める。その「続き」を呼び出し側が持つための値。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SweepCursor {
+    /// `sweep_orders` のどれを掃いているか。1 掃き終わるごとに次へ回す。
+    order: usize,
+    /// その掃き順の中の位置。
+    pos: usize,
+    /// 今の 1 掃きでこれまでに積んだ Δ 合計 (1 掃き丸ごとで 0 なら収束)。
+    delta: u64,
+}
+
 pub struct PlannerCore {
     build: BuildParams,
     cfg: PlanConfig,
@@ -254,6 +282,11 @@ pub struct PlannerCore {
     /// compact 経路の追従用パッチ (ゴール非依存なのでキャッシュの外に置く)。
     /// 密経路では使わない。
     patch: Option<Patch>,
+    /// 狭域が共有場を動かしたか。`refine_for` が Δ>0 を出すと立ち、全域掃きが
+    /// Δ=0 で 1 周し終えると落ちる。全域掃きを回すかの唯一の判断材料
+    /// (「狭域が通れないと言っている」を別途検出する必要はない — 通れないなら
+    /// 必ず値が動くので、これがその信号そのものになる)。
+    dirty: bool,
 }
 
 /// 円環上の角度差 (度、0..=180)。
@@ -470,7 +503,7 @@ fn make_sink(nstates: usize, dir: &SinkDir) -> Result<Box<dyn CompactSink + Send
 
 impl PlannerCore {
     pub fn new(build: BuildParams, cfg: PlanConfig) -> Self {
-        Self { build, cfg, cached: None, patch: None }
+        Self { build, cfg, cached: None, patch: None, dirty: false }
     }
 
     /// キャッシュ中のゴールが `goal` と同一 (許容差内) か。追従スレッドが
@@ -553,6 +586,9 @@ impl PlannerCore {
         if let Some(p) = self.patch.as_mut() {
             p.at = None; // 別ゴールの値が残ったパッチで走らせない
         }
+        // 解き直した直後は収束済み。前のゴールで積んだ「伝播させる仕事がある」印は
+        // 持ち越さない (持ち越すと最初の 1 掃きが必ず無駄に回る)。
+        self.dirty = false;
 
         let field = if self.cfg.use_compact() {
             // パッチは幾何だけで決まるので初回だけ作る (遷移表の再計算を避ける)。
@@ -836,6 +872,11 @@ impl PlannerCore {
         let t0 = Instant::now();
         loop {
             let (pass_delta, stopped) = self.refine_pass_until(|| t0.elapsed() >= budget);
+            if pass_delta > 0 {
+                // 狭域が共有場を動かした。全域掃きに伝播させる仕事があると印を付ける
+                // (`sweep_global`)。
+                self.dirty = true;
+            }
             if stopped || pass_delta == 0 {
                 return pass_delta;
             }
@@ -847,6 +888,85 @@ impl PlannerCore {
         for _ in 0..n {
             let _ = self.refine_pass_until(|| false);
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 狭域 → 広域: 共有場の全域掃き
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// 狭域が共有場を動かしてから、まだ全域へ伝播させ切っていないか。
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// 共有価値関数を全域で最大 `max_cells` セルぶん掃き進める (Gauss–Seidel)。
+    /// 戻り値は `(このチャンクの Δ 合計, 1 掃きを終えたか)`。
+    ///
+    /// # これが狭域 → 広域のフィードバック経路そのもの
+    ///
+    /// 密経路の `states` は最初から共有場になっている。狭域は `observe_scan` で
+    /// `local_penalty` を書き込み、広域は `plan_*` のロールアウトで同じ配列を読む。
+    /// 足りていなかったのは**伝播**だけで、`refine_pass_until` が掃くのは
+    /// ローカルウィンドウ (±1m) の中だけなので、局所で上がった値はそこで止まって
+    /// いた。20m 先から降りてくるロールアウトは塞がった通路へ降り続け、着いてから
+    /// 初めて気づいて `decide` が NoAction を返すか貪欲降下が往復する。
+    ///
+    /// ここで同じ `states` を全域 Gauss–Seidel で掃けば、その値の上昇が外へ
+    /// 広がり、広域の経路が自然に迂回へ変わる。新しい Bellman 更新は書かず
+    /// `value_iteration_at` をそのまま使うので、狭域・広域・solve の 3 者は
+    /// 同一の更新式のままになる (vi_rs 側には手を入れない)。
+    ///
+    /// # 呼び出し規約
+    ///
+    /// 10 Hz の追従ループと同じ `Mutex<PlannerCore>` を共有するので、**1 掃きを
+    /// ロックの中で走り切らせないこと**。`cur` を持ち回してチャンクごとに
+    /// ロックを手放す (`run_follow` は `try_lock` に 3 回続けて失敗するとロボットを
+    /// 止める)。1 掃き終わるごとに掃き順を次へ回すので、伝播方向は偏らない。
+    ///
+    /// # compact 経路では何もしない
+    ///
+    /// compact は `states` を作らないので共有場が無い (確定出力の sink は
+    /// 読み出し用で、狭域はそこから起こしたパッチの上で回り、置き直しで捨てられる
+    /// — モジュール冒頭の差異 1・2)。この機能を使うには密ソルバが要る。
+    pub fn sweep_global(&mut self, cur: &mut SweepCursor, max_cells: usize) -> (u64, bool) {
+        let Some(c) = self.cached.as_mut() else { return (0, true) };
+        let Field::Dense(vi) = &mut c.field else {
+            self.dirty = false; // compact には伝播させる場が無い
+            return (0, true);
+        };
+
+        let orders = vi.base.sweep_orders.len();
+        if orders == 0 {
+            self.dirty = false;
+            return (0, true);
+        }
+        // ゴールが変わってもセル数は変わらない (地図が同じ) ので、持ち越した
+        // カーソルは掃きの途中から再開するだけで害はない。念のため丸める。
+        let order = cur.order % orders;
+        let len = vi.base.sweep_orders[order].len();
+        let start = cur.pos.min(len);
+        let end = start.saturating_add(max_cells.max(1)).min(len);
+
+        let mut delta = 0u64;
+        for k in start..end {
+            let i = vi.base.sweep_orders[order][k] as usize;
+            delta = delta.saturating_add(vi.base.value_iteration_at(i));
+        }
+        cur.delta = cur.delta.saturating_add(delta);
+        cur.pos = end;
+        if end < len {
+            return (delta, false);
+        }
+
+        // 1 掃き完了。丸ごと Δ=0 なら新しい不動点に達している。
+        let swept_delta = cur.delta;
+        cur.order = (order + 1) % orders;
+        cur.pos = 0;
+        cur.delta = 0;
+        if swept_delta == 0 {
+            self.dirty = false;
+        }
+        (delta, true)
     }
 
     /// ウィンドウ 1 パス。`should_stop` は x 列ごとに観測し、途中打ち切り時は
@@ -1496,6 +1616,7 @@ mod tests {
             cfg: strict,
             cached: core.cached.take(),
             patch: core.patch.take(),
+            dirty: false,
         };
         assert_eq!(strict_core.decide(on_obstacle), Decision::NoAction);
         // tolerance 4 (0.2m) なら近傍の行動を借りられる。
@@ -1504,6 +1625,7 @@ mod tests {
             cfg: cfg(),
             cached: strict_core.cached,
             patch: strict_core.patch,
+            dirty: false,
         };
         assert!(matches!(relaxed_core.decide(on_obstacle), Decision::Action { .. }));
     }
@@ -1552,5 +1674,202 @@ mod tests {
                 p.half
             );
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 狭域 → 広域のフィードバック (sweep_global)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// 横一本の通路だけが自由な地図。迂回路が無いので、通路を塞げばその西側
+    /// (ゴールと反対側) の価値は必ず上がる。
+    fn corridor(size: i32, y_lo: i32, y_hi: i32) -> BuildParams {
+        let mut b = build(size);
+        for iy in 0..size {
+            for ix in 0..size {
+                if iy < y_lo || iy > y_hi {
+                    b.grid.data[(iy * size + ix) as usize] = 100;
+                }
+            }
+        }
+        b
+    }
+
+    /// 全域掃きを `n` 回まわす (カーソルは持ち回す = ロックを手放しながら進める形)。
+    fn sweep_n(core: &mut PlannerCore, cur: &mut SweepCursor, n: usize) {
+        for _ in 0..n {
+            while !core.sweep_global(cur, usize::MAX).1 {}
+        }
+    }
+
+    /// **この機能の本題。** 狭域が注入した local_penalty は、ローカル精密化だけでは
+    /// ウィンドウ (±1m) の外へ出ない。全域掃きを通して初めて広域の価値関数が動く。
+    ///
+    /// 通路の真ん中を塞ぎ、ウィンドウの外にある西側のセルの価値を 3 時点で見る:
+    /// solve 直後 → 局所精密化の後 (変わらない) → 全域掃きの後 (上がる)。
+    ///
+    /// **1 掃きで届く**ことを見ている。この地図での実測は 1 掃き目で +12%、30 掃きで
+    /// ほぼ収束、数値的な完全収束 (Δ=0) は約 80 掃き。運用上は収束を待つ必要はない —
+    /// 掃くたび不動点へ単調に近づき、経路が変わるのは遥かに手前なので、背景掃きは
+    /// 予算内で回し続ければよい (`sweep_global` の呼び出し規約)。
+    #[test]
+    fn local_penalty_reaches_the_global_field_only_after_a_global_sweep() {
+        // 通路は iy 20..=30 (0.55m 幅)、ゴールは東の端。
+        let mut core = PlannerCore::new(corridor(64, 20, 30), cfg());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(2.8, 1.25, 0.0), &cancel).expect("solve");
+
+        let robot = pose(1.5, 1.25, 0.0); // セル (30, 25)
+        // ウィンドウは ±20 セル = 10..=50。西の観測点はその外に取る。
+        let west = {
+            let vi = core.local().unwrap();
+            pose_to_cell(&vi.base, 0.3, 1.25, 0.0) // セル (6, 25)
+        };
+        let value_at = |core: &PlannerCore, (ix, iy, it): (i32, i32, i32)| {
+            let vi = core.local().unwrap();
+            vi.base.states[vi.base.to_index(ix, iy, it) as usize].total_cost
+        };
+
+        let before = value_at(&core, west);
+        assert!(before < MAX_COST, "西の観測点はゴールへ到達可能であること");
+        assert!(!core.is_dirty(), "solve 直後は伝播させる仕事が無いこと");
+
+        // 通路の断面を塞ぐ。1 本のビームでは ±2 セルしか立たないので、向きを
+        // 振って 0.55m 幅を覆う (set_local_cost はビーム方向を pose の yaw で読む)。
+        core.set_window(robot);
+        for k in -3..=3 {
+            let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.55] };
+            core.observe_scan(&scan, pose(robot.x, robot.y, k as f64 * 0.12));
+        }
+        core.refine_for(Duration::from_secs(5));
+
+        // 局所精密化はウィンドウの外を掃かないので、西側は動いていない。
+        assert_eq!(
+            value_at(&core, west),
+            before,
+            "ローカル精密化はウィンドウ (±1m) の外へ伝播しないこと"
+        );
+        assert!(core.is_dirty(), "狭域が場を動かしたら印が立つこと");
+
+        // 1 掃きで広域に届くこと。
+        let mut cur = SweepCursor::default();
+        sweep_n(&mut core, &mut cur, 1);
+        let after_one = value_at(&core, west);
+        assert!(
+            after_one > before,
+            "1 掃きで広域の価値が上がっていること: before={before}, after={after_one}"
+        );
+
+        // 掃くほど不動点へ近づく (単調)。
+        sweep_n(&mut core, &mut cur, 29);
+        let after_thirty = value_at(&core, west);
+        assert!(
+            after_thirty > after_one,
+            "掃くほど不動点へ近づくこと: 1 掃き={after_one}, 30 掃き={after_thirty}"
+        );
+    }
+
+    /// 新しい不動点に達したら印が落ちて掃きが止まること (背景スレッドが収束後も
+    /// CPU を焼き続けないための性質)。上の本題と同じ状況を小さい地図で見る。
+    #[test]
+    fn sweeping_stops_once_the_field_settles() {
+        let mut core = PlannerCore::new(corridor(24, 8, 14), cfg());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(1.0, 0.55, 0.0), &cancel).expect("solve");
+
+        let robot = pose(0.5, 0.55, 0.0);
+        core.set_window(robot);
+        let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.3] };
+        core.observe_scan(&scan, robot);
+        core.refine_for(Duration::from_secs(5));
+        assert!(core.is_dirty());
+
+        let mut cur = SweepCursor::default();
+        let mut sweeps = 0;
+        while core.is_dirty() && sweeps < 500 {
+            if core.sweep_global(&mut cur, usize::MAX).1 {
+                sweeps += 1;
+            }
+        }
+        assert!(!core.is_dirty(), "新しい不動点に達したら印は落ちること");
+        assert!(sweeps > 0 && sweeps < 500, "有限回で収束すること (sweeps={sweeps})");
+    }
+
+    /// カーソルを持ち回してチャンクに切っても、1 掃きの結果は一気に掃いたときと
+    /// 同じになること (ロックを手放しながら進めるための性質)。
+    #[test]
+    fn chunked_sweeping_covers_the_same_cells_as_one_pass() {
+        let goal = pose(2.0, 2.0, 0.0);
+        let cancel = AtomicBool::new(false);
+
+        let mut whole = PlannerCore::new(build(48), cfg());
+        whole.prepare_goal(goal, &cancel).expect("solve");
+        let mut cur = SweepCursor::default();
+        let (_, done) = whole.sweep_global(&mut cur, usize::MAX);
+        assert!(done, "max_cells が全体以上なら 1 回で掃き終わること");
+
+        let mut chunked = PlannerCore::new(build(48), cfg());
+        chunked.prepare_goal(goal, &cancel).expect("solve");
+        let mut cur = SweepCursor::default();
+        let mut chunks = 0;
+        loop {
+            let (_, done) = chunked.sweep_global(&mut cur, 1000);
+            chunks += 1;
+            if done {
+                break;
+            }
+            assert!(chunks < 10_000, "チャンク掃きが終わらない");
+        }
+        assert!(chunks > 1, "1000 セル刻みなら複数チャンクに分かれること");
+
+        let (a, b) = (whole.local().unwrap(), chunked.local().unwrap());
+        assert_eq!(
+            a.base.states.iter().map(|s| s.total_cost).collect::<Vec<_>>(),
+            b.base.states.iter().map(|s| s.total_cost).collect::<Vec<_>>(),
+            "チャンクに切っても 1 掃きの結果は変わらないこと"
+        );
+    }
+
+    /// 1 掃き終わるごとに掃き順を次へ回すこと (伝播方向が偏らないように)。
+    #[test]
+    fn sweeps_rotate_through_the_sweep_orders() {
+        let mut core = PlannerCore::new(build(32), cfg());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(1.0, 1.0, 0.0), &cancel).expect("solve");
+        let orders = core.local().unwrap().base.sweep_orders.len();
+        assert!(orders > 1);
+
+        let mut cur = SweepCursor::default();
+        for i in 0..orders {
+            assert_eq!(cur.order, i, "掃き順は 1 掃きごとに進むこと");
+            let (_, done) = core.sweep_global(&mut cur, usize::MAX);
+            assert!(done);
+        }
+        assert_eq!(cur.order, 0, "一周したら戻ること");
+    }
+
+    /// compact 経路には共有場が無い (states を作らない) ので、全域掃きは何もせず
+    /// 印だけ落とすこと — 呼び出し側が空回りしないように。
+    #[test]
+    fn compact_has_no_shared_field_to_sweep() {
+        let mut core = PlannerCore::new(build(64), cfg_compact());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).expect("solve");
+        core.dirty = true;
+
+        let mut cur = SweepCursor::default();
+        let (delta, done) = core.sweep_global(&mut cur, usize::MAX);
+        assert_eq!((delta, done), (0, true));
+        assert!(!core.is_dirty(), "掃く場が無いなら印は落とすこと");
+    }
+
+    /// ゴールを解き直したら印は持ち越さないこと (最初の 1 掃きが無駄に回らない)。
+    #[test]
+    fn resolving_a_new_goal_clears_the_pending_propagation() {
+        let mut core = PlannerCore::new(build(48), cfg());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).expect("solve");
+        core.dirty = true;
+        core.prepare_goal(pose(0.5, 0.5, 0.0), &cancel).expect("re-solve");
+        assert!(!core.is_dirty());
     }
 }

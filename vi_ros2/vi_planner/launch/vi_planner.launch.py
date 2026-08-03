@@ -12,10 +12,24 @@ LaserScan topic to be provided by the surrounding bringup. In a full Nav2
 bringup, remap cmd_vel to cmd_vel_nav so velocity_smoother stays in the loop
 (vi_global_planner/launch/navigation_launch.py does this).
 
-Not supported here: the out-of-core (compact) solver and map_scale. The follow
-loop writes into the dense state array, which a compact solve never allocates.
-For maps that large, run vi_global_planner together with nav2_controller's
-controller_server instead.
+Both actions read the same ValueIterator::states, so the laser penalties the
+follow loop injects are visible to the global rollout -- but only once they are
+propagated. The windowed refinement stops at the +-1m window, so global_sweep
+(on by default) sweeps the whole shared field in the background, in chunks that
+yield the lock so the 10Hz follow loop keeps running. Without it the robot
+avoids obstacles locally while compute_path_to_pose keeps returning a path
+through them.
+
+map_scale and the out-of-core (compact) solver are both supported, but a compact
+solve never allocates states -- the follow loop hydrates only a patch around the
+robot, and that patch is discarded on every recenter -- so there is no shared
+field to sweep and global_sweep does nothing under compact. Prefer a dense
+solver with map_scale sized to fit: dense costs 80 B/state (56 for states plus
+24 for sweep_orders) and dense_limit_mb refuses to start above the limit.
+compact_ram_limit_mb (default 512 MB) spills the sink to disk when
+compact_sink_dir is unset and the finalized output would not fit -- but the
+follow loop re-reads the sink on every patch recenter, so prefer pointing
+compact_sink_dir at the fastest real disk rather than leaning on that fallback.
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument

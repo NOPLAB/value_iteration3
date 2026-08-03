@@ -13,10 +13,22 @@
     function inside a moving +-1m window with laser-scan penalties and
     publishes the greedy action as cmd_vel.
 
-    No out-of-core (compact) path and no map_scale: the local window writes
-    into ValueIterator::states directly, which a compact solve does not
-    allocate. For maps too large to solve densely, use vi_global_planner plus
-    nav2_controller's controller_server instead.
+    Because both actions read the same ValueIterator::states, what the local
+    window learns from the laser is visible to the global rollout -- but only
+    after it is propagated: the windowed refinement sweeps the +-1m window and
+    stops there, so a blocked corridor stays invisible to a rollout descending
+    from 20m away. global_sweep (on by default) closes that loop by sweeping the
+    whole shared field with Gauss-Seidel in the background, in chunks that yield
+    the lock so the 10Hz follow loop keeps running.
+
+    map_scale and the out-of-core (compact) solver are both supported, but a
+    compact solve never allocates states -- the follow loop hydrates only a patch
+    around the robot from the sink, and that patch is discarded on every recenter.
+    So there is no shared field under compact and global_sweep does nothing;
+    prefer a dense solver with map_scale sized to fit (dense costs 80 B/state:
+    56 for states plus 24 for sweep_orders, and dense_limit_mb refuses to start
+    above the limit). compact_ram_limit_mb spills the compact sink to disk when
+    compact_sink_dir is unset and it would not fit in RAM.
   </description>
   <maintainer email="noplab90@gmail.com">nop</maintainer>
   <license>Apache-2.0</license>

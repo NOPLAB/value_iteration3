@@ -41,6 +41,7 @@
 //! NOTE: rclrs API は ros2-rust/ros2_rust @ 2c6b926 (rclrs 0.7.0) — Docker
 //! イメージがビルドする版 — に合わせている (vi_node / vi_global_planner と同一)。
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -60,6 +61,7 @@ use vi_reference::OccupancyGrid as ViOccupancyGrid;
 
 use vi_planner::core::{
     value_grid_of, BuildParams, Decision, PlanConfig, PlanError, PlanStats, PlannerCore,
+    SweepCursor,
 };
 
 use rclrs::*;
@@ -97,6 +99,12 @@ struct Params {
     downsample_policy: String,
     /// compact ソルバの確定出力を置くディレクトリ (空文字 = RAM)。
     compact_sink_dir: String,
+    /// RAM sink の上限 [MB]。compact 経路で `compact_sink_dir` 未指定かつ推定サイズが
+    /// これを超えるとき、自動でディスク sink に逃がす。
+    compact_ram_limit_mb: i64,
+    /// 密ソルバで確保してよい価値関数の上限 [MB] (states + sweep_orders)。
+    /// 超えたら起動を止める。
+    dense_limit_mb: i64,
     vi_threads: i64,
     max_solve_iter: i64,
     solve_chunk: i64,
@@ -114,6 +122,10 @@ struct Params {
     refine_budget_ms: i64,
     action_tolerance: f64,
     no_action_timeout_sec: f64,
+    // ── 狭域 → 広域のフィードバック (全域掃き) ──
+    global_sweep: bool,
+    global_sweep_budget_ms: i64,
+    global_sweep_idle_ms: i64,
     // ── 可視化 ──
     publish_value_function: bool,
     value_publish_interval_ms: i64,
@@ -148,6 +160,13 @@ fn read_params(node: &Node) -> Result<Params> {
     // solver = frontier2d_sparse_compact のときだけ効く。空文字なら RAM (RamSink)。
     // 指定先が tmpfs だと結局 RAM に載るので、メモリ退避が目的なら実ディスクを指すこと。
     let compact_sink_dir = p!("compact_sink_dir", Arc<str>, "".into()).to_string();
+    // compact_sink_dir 未指定でも、確定出力がこれを超えるならディスクへ逃がす。小メモリ機で
+    // 黙って GB 級の RamSink を確保すると OOM killer に落とされるため (vi_global_planner と同じ)。
+    let compact_ram_limit_mb = p!("compact_ram_limit_mb", i64, 512);
+    // 密ソルバの価値関数 (states 56 B/state + sweep_orders 24 B/state) の上限。
+    // 超えたら起動を止める。既定 1500 は 4GB 機 (Pi4) で他のノードと同居できる線
+    // — 19F を map_scale 2 で解くと実測 655 MB。
+    let dense_limit_mb = p!("dense_limit_mb", i64, 1500);
     let vi_threads = p!("vi_threads", i64, 0);
     let max_solve_iter = p!("max_solve_iter", i64, 1_000_000);
     let solve_chunk = p!("solve_chunk", i64, 64);
@@ -165,6 +184,17 @@ fn read_params(node: &Node) -> Result<Params> {
     let refine_budget_ms = p!("refine_budget_ms", i64, 40);
     let action_tolerance = p!("action_tolerance", f64, 0.2);
     let no_action_timeout_sec = p!("no_action_timeout_sec", f64, 3.0);
+
+    // 狭域が書いた local_penalty を全域へ伝播させる背景掃き (core::sweep_global)。
+    // これを止めると、狭域が「通れない」と判断しても広域の経路は塞がった通路を
+    // 指し続ける (旧挙動)。密ソルバ専用 — compact には共有場が無い。
+    let global_sweep = p!("global_sweep", bool, true);
+    // 1 回のロック取得で掃きに使う時間と、そのあとロックを手放して待つ時間。
+    // 比がそのまま CPU の取り分になる (既定 20:60 = 1 コアの 25%)。追従ループは
+    // 同じ Mutex を try_lock で取り、3 tick 続けて取れないとロボットを止めるので、
+    // budget を伸ばすときは idle も一緒に伸ばすこと。
+    let global_sweep_budget_ms = p!("global_sweep_budget_ms", i64, 20);
+    let global_sweep_idle_ms = p!("global_sweep_idle_ms", i64, 60);
 
     let publish_value_function = p!("publish_value_function", bool, true);
     let value_publish_interval_ms = p!("value_publish_interval_ms", i64, 500);
@@ -221,6 +251,8 @@ fn read_params(node: &Node) -> Result<Params> {
         map_scale,
         downsample_policy,
         compact_sink_dir,
+        compact_ram_limit_mb,
+        dense_limit_mb,
         vi_threads,
         max_solve_iter,
         solve_chunk,
@@ -236,6 +268,9 @@ fn read_params(node: &Node) -> Result<Params> {
         refine_budget_ms,
         action_tolerance,
         no_action_timeout_sec,
+        global_sweep,
+        global_sweep_budget_ms,
+        global_sweep_idle_ms,
         publish_value_function,
         value_publish_interval_ms,
         cost_drawing_threshold,
@@ -245,6 +280,9 @@ fn read_params(node: &Node) -> Result<Params> {
 
 /// vi_core のコンパイル時定数とパラメータを照合 (vi_node と同じ fail-fast)。
 fn validate(p: &Params) -> Result<U64Solver> {
+    if p.map_scale < 1 {
+        return Err(anyhow!("map_scale must be >= 1, got {}", p.map_scale));
+    }
     if p.theta_cell_num != N_THETA as i64 {
         return Err(anyhow!(
             "vi_rs is compiled with N_THETA={}, got theta_cell_num={}",
@@ -342,6 +380,50 @@ fn vi_scan_from(msg: &sensor_msgs::msg::LaserScan) -> ViLaserScan {
 
 fn stop_cmd(pub_cmd: &Publisher<geometry_msgs::msg::Twist>) {
     let _ = pub_cmd.publish(geometry_msgs::msg::Twist::default());
+}
+
+/// compact 経路の出力先ディレクトリを決める。
+///
+/// - compact 以外のソルバでは常に `None` (使われない)。
+/// - `compact_sink_dir` が明示されていればそれを使う。
+/// - 未指定でも確定出力 (`nstates × 12 B`) が `compact_ram_limit_mb` を超えるなら
+///   `/tmp/vi_planner_sink` に逃がす。小メモリ機で黙って GB 級の `RamSink` を確保すると
+///   OOM killer に落とされるため。
+///
+/// `vi_global_planner` の同名関数と同じ判断順 (明示指定が先、上限による自動退避が後) だが、
+/// **ディスクに置いたときの代償はこちらのほうが大きい**。広域だけを解く
+/// `vi_global_planner` と違い、`vi_planner` の追従はパッチを置き直すたびに sink を読むので
+/// (10Hz の制御ループ)、SD カード上の sink は追従の遅延に直結する。逃がす先は
+/// できるだけ実ディスクでも速いところを `compact_sink_dir` で明示すること。
+fn compact_sink_dir(params: &Params, solver: U64Solver, nstates: usize) -> Option<PathBuf> {
+    if !matches!(solver, U64Solver::Frontier2DSparseCompact { .. }) {
+        return None;
+    }
+    let bytes = nstates as u64 * 12;
+    if !params.compact_sink_dir.is_empty() {
+        let dir = PathBuf::from(&params.compact_sink_dir);
+        eprintln!(
+            "vi_planner: compact output -> disk mmap {} ({:.2} GB)",
+            dir.display(),
+            bytes as f64 / 1e9
+        );
+        return Some(dir);
+    }
+    let limit = params.compact_ram_limit_mb.max(0) as u64 * 1024 * 1024;
+    if bytes > limit {
+        let dir = PathBuf::from("/tmp/vi_planner_sink");
+        eprintln!(
+            "WARN: compact output would need {:.2} GB of RAM (> compact_ram_limit_mb={}); \
+             spilling to disk mmap {}. The follow loop re-reads the sink on every patch \
+             recenter, so point compact_sink_dir at the fastest real disk available.",
+            bytes as f64 / 1e9,
+            params.compact_ram_limit_mb,
+            dir.display()
+        );
+        return Some(dir);
+    }
+    eprintln!("vi_planner: compact output -> RAM ({:.2} GB)", bytes as f64 / 1e9);
+    None
 }
 
 /// `downsample_occupancy` の楽観版。ブロック内に 1 つでも free があれば出力セルを free にする。
@@ -725,13 +807,16 @@ fn main() -> Result<()> {
     let nstates =
         vi_grid.width as usize * vi_grid.height as usize * params.theta_cell_num as usize;
     let use_compact = matches!(solver, U64Solver::Frontier2DSparseCompact { .. });
-    // 密は State 56 B/state を実際に確保する。compact は確定出力 12 B/state だけを
-    // sink に置く (compact_sink_dir 指定なら mmap ファイル = ディスク常駐)。
-    let states_gb = nstates as f64 * 56.0 / 1e9;
+    // 密が実際に確保するのは `states` (State 56 B/state) だけではない。
+    // `set_sweep_orders` が掃き順を 6 本ぶん持つ (`[0..3]` 各 total、`[4]` 1.5×total、
+    // `[5]` 0.5×total = 合わせて 6.0×total の i32) ので +24 B/state。
+    // 19F を map_scale 2 で解いたときの実測は 654.8 MB (states 444.7 + orders 210.1) で、
+    // 56 B/state だけで見積もると 4 割以上足りない。compact は確定出力 12 B/state だけ。
+    let states_gb = nstates as f64 * 80.0 / 1e9;
     let sink_gb = nstates as f64 * 12.0 / 1e9;
     eprintln!(
         "vi_planner: planner grid {}x{} @{:.3}m (map_scale={}, downsample={}) x{} theta \
-         = {} states ({})",
+         = {} states{}",
         vi_grid.width,
         vi_grid.height,
         vi_grid.resolution,
@@ -740,34 +825,32 @@ fn main() -> Result<()> {
         params.theta_cell_num,
         nstates,
         if use_compact {
-            format!(
-                "compact sink {:.2} GB in {}",
-                sink_gb,
-                if params.compact_sink_dir.is_empty() {
-                    "RAM".to_string()
-                } else {
-                    params.compact_sink_dir.clone()
-                }
-            )
+            String::new()
         } else {
-            format!("dense states {states_gb:.2} GB")
+            format!(", dense states+sweep_orders {states_gb:.2} GB")
         },
     );
-    if use_compact && params.compact_sink_dir.is_empty() && sink_gb > 0.5 {
-        eprintln!(
-            "WARN: the compact sink needs {:.2} GB and compact_sink_dir is unset, so it stays in \
-             RAM. Point compact_sink_dir at a real (non-tmpfs) directory to spill it to disk.",
+    // sink の置き場と、そこを選んだ理由の 1 行はこの中で出る (明示指定 →
+    // compact_ram_limit_mb による自動退避 → RAM)。密ソルバなら None。
+    let sink_dir = compact_sink_dir(&params, solver, nstates);
+    // 密の見積もりが限度を超えたら**起動を止める**。ここまで来れば地図の実寸が
+    // 分かっているので、launch 側の代理判定 (map_scale > 1 なら密を禁止) より正確。
+    // 黙って確保して OOM killer に落とされるより、理由を出して止めるほうがよい。
+    if !use_compact && states_gb * 1000.0 > params.dense_limit_mb.max(0) as f64 {
+        return Err(anyhow!(
+            "the dense value function needs {:.2} GB (states + sweep_orders) for {} states, over \
+             dense_limit_mb={}.\n\
+             Raise map_scale (halving the resolution quarters this), raise dense_limit_mb if the \
+             machine really has the room, or switch to solver: frontier2d_sparse_compact \
+             (+ compact_sink_dir), which keeps only {:.2} GB of finalized output and hydrates a \
+             small patch around the robot for following.\n\
+             Note that compact has no shared value field, so global_sweep (the local -> global \
+             feedback) does nothing there.",
+            states_gb,
+            nstates,
+            params.dense_limit_mb,
             sink_gb
-        );
-    }
-    if !use_compact && states_gb > 2.0 {
-        eprintln!(
-            "WARN: the dense state array alone needs {:.2} GB and is really allocated. On a 4 GB \
-             machine this will be OOM-killed; raise map_scale, or switch to \
-             solver: frontier2d_sparse_compact (+ compact_sink_dir), which keeps only {:.2} GB of \
-             finalized output on disk and hydrates a small patch around the robot for following.",
-            states_gb, sink_gb
-        );
+        ));
     }
     let start_tolerance_cells = (params.start_tolerance / vi_grid.resolution).ceil() as i32;
     let action_tolerance_cells = (params.action_tolerance / vi_grid.resolution).ceil() as i32;
@@ -796,11 +879,7 @@ fn main() -> Result<()> {
         start_tolerance_cells,
         path_spacing: params.path_spacing,
         action_tolerance_cells,
-        compact_sink_dir: if params.compact_sink_dir.is_empty() {
-            None
-        } else {
-            Some(std::path::PathBuf::from(&params.compact_sink_dir))
-        },
+        compact_sink_dir: sink_dir,
         vi_threads: params.vi_threads.max(0) as usize,
     };
     let core = Arc::new(Mutex::new(PlannerCore::new(build, cfg)));
@@ -854,6 +933,80 @@ fn main() -> Result<()> {
     } else {
         None
     };
+
+    // 6d-2. 狭域 → 広域のフィードバック: 共有価値関数の全域掃き。
+    //
+    // 追従 (`observe_scan`) が書いた local_penalty はローカルウィンドウ (±1m) の
+    // 中で値を上げるだけで、そこから外へは広がらない。ここで同じ `states` を
+    // 全域 Gauss–Seidel で掃き直して初めて、広域の経路が塞がった通路を避ける
+    // ようになる (`core::sweep_global` の doc)。
+    //
+    // ロックの持ち方が肝。10 Hz の追従ループは同じ Mutex を `try_lock` で取り、
+    // 3 tick 続けて取れないとロボットを止める。そこで 1 掃きを走り切らせず、
+    // budget ms だけ掃いてロックを手放し、idle ms 待つ形にしてある
+    // (既定 20:60 = 1 コアの 25%)。
+    if params.global_sweep && use_compact {
+        eprintln!(
+            "WARN: global_sweep is on but solver={} has no shared field to sweep (compact never \
+             builds `states`; the follow patch is discarded on every recenter). The local planner \
+             will avoid obstacles, but the global path will keep insisting on the blocked route. \
+             Use a dense solver (frontier2d_sparse) if the map fits — 19F at map_scale 2 measures \
+             655 MB.",
+            params.solver
+        );
+    }
+    if params.global_sweep && !use_compact {
+        let core = Arc::clone(&core);
+        let budget = Duration::from_millis(params.global_sweep_budget_ms.max(1) as u64);
+        let idle = Duration::from_millis(params.global_sweep_idle_ms.max(0) as u64);
+        std::thread::spawn(move || {
+            // 1 チャンクの粒度。budget の中で経過時間を見る刻みでもあるので、
+            // Pi4 (実測 1 掃き 7.9M セルで 8-11 秒 = 約 1M cells/s) で数 ms に
+            // なる大きさにしてある。
+            const CELLS_PER_STEP: usize = 5_000;
+            let mut cur = SweepCursor::default();
+            let mut sweep_start: Option<Instant> = None;
+            loop {
+                {
+                    let mut c = match core.lock() {
+                        Ok(g) => g,
+                        // 他スレッドの panic で毒されても価値関数自体は一貫している。
+                        Err(p) => p.into_inner(),
+                    };
+                    if !c.is_dirty() {
+                        // 掃く仕事が無い。ロックはすぐ返して、次に狭域が場を動かす
+                        // まで長めに待つ (この確認自体もロックを要るので、間隔を
+                        // 詰めると追従ループから取り上げてしまう)。
+                        drop(c);
+                        std::thread::sleep(idle.max(Duration::from_millis(200)));
+                        continue;
+                    }
+                    let t0 = Instant::now();
+                    let started = *sweep_start.get_or_insert(t0);
+                    loop {
+                        let (_, done) = c.sweep_global(&mut cur, CELLS_PER_STEP);
+                        if done {
+                            // 全域 1 掃きに実際かかった時間 (idle を含む実時間 =
+                            // 狭域の判断が広域に届くまでの遅れそのもの)。budget/idle を
+                            // 実測から詰められるよう必ず出す。`still_dirty=false` なら
+                            // 新しい不動点に達したので、次の狭域の書き込みまで止まる。
+                            eprintln!(
+                                "vi_planner: global sweep done in {:.1}s (still_dirty={})",
+                                started.elapsed().as_secs_f64(),
+                                c.is_dirty()
+                            );
+                            sweep_start = None;
+                            break;
+                        }
+                        if t0.elapsed() >= budget {
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(idle);
+            }
+        });
+    }
 
     // 進行中の solve / 追従をプリエンプトするための cancel フラグ置き場。
     // 2 つのアクションは互いを止めない (広域の再計画で追従が死んではいけないし、
