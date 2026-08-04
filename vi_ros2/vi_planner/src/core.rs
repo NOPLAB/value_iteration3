@@ -1801,6 +1801,82 @@ mod tests {
         );
     }
 
+    /// 書き戻したあとも広域が経路を返せること。
+    ///
+    /// sink は `total_cost >= MAX_COST` を「未到達」として扱う
+    /// (`CompactPolicy::action_index`) ので、書き戻しでそこへ踏み込むと、これまで
+    /// 通っていた `compute_path_to_pose` が黙って失敗に変わる。penalty は加算で
+    /// あって通行止めではない (`action_cost_raw` が MAX_COST を返すのは遷移先が
+    /// 非 free のときだけ) ので起きないはずだが、退行するならここなので張っておく。
+    #[test]
+    fn compact_plan_still_succeeds_after_the_window_is_committed() {
+        let mut core = PlannerCore::new(build(64), cfg_compact());
+        let cancel = AtomicBool::new(false);
+        let goal = pose(2.5, 1.0, 0.0);
+        let start = pose(0.4, 1.0, 0.0);
+        let (before, _) = core.plan(start, goal, &cancel).expect("plan before");
+
+        let robot = pose(1.0, 1.0, 0.0);
+        core.set_window(robot);
+        let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.5] };
+        core.observe_scan(&scan, robot);
+        core.refine_passes(5);
+
+        let (after, s) = core.plan(start, goal, &cancel).expect("plan after commit");
+        assert!(!s.solved_now, "同じゴールなので解き直さないこと");
+        assert!(after.len() > 2, "経路が返ること (未到達扱いになっていない)");
+        assert_ne!(
+            before.len(),
+            after.len(),
+            "狭域が上げた値が広域のロールアウトに効いていること (経路が変わる)"
+        );
+    }
+
+    /// この変更の主張そのもの: penalty を入れたあとの compact が、`global_sweep` を
+    /// 切った密経路と**同じ**振る舞いになること。
+    ///
+    /// 上流セルの値が両者で一致するところまで見る (compact 側はパッチ経由・sink
+    /// 経由の 2 段を挟むので、揃わなければどこかで場が食い違っている)。
+    #[test]
+    fn compact_with_penalties_matches_dense_without_a_global_sweep() {
+        let goal = pose(2.5, 1.0, 0.0);
+        let robot = pose(1.0, 1.0, 0.0);
+        let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.5] };
+        let cancel = AtomicBool::new(false);
+
+        let mut dense = PlannerCore::new(build(64), cfg());
+        dense.prepare_goal(goal, &cancel).expect("dense solve");
+        dense.set_window(robot);
+        // 前進 1 ステップでヒット帯へ着地する上流セル (密経路のセル座標 = 全域座標)。
+        let (gix, giy, git) = {
+            let vi = dense.local().unwrap();
+            pose_to_cell(&vi.base, 1.2, 1.0, 0.0)
+        };
+        dense.observe_scan(&scan, robot);
+        dense.refine_passes(5);
+        let dense_value = {
+            let vi = dense.local().unwrap();
+            vi.base.states[vi.base.to_index(gix, giy, git) as usize].total_cost
+        };
+
+        let mut compact = PlannerCore::new(build(64), cfg_compact());
+        compact.prepare_goal(goal, &cancel).expect("compact solve");
+        compact.set_window(robot);
+        compact.observe_scan(&scan, robot);
+        compact.refine_passes(5);
+        let compact_value = {
+            let Some(CachedGoal { field: Field::Compact(f), .. }) = compact.cached.as_ref() else {
+                panic!("compact field expected");
+            };
+            f.sink.read(f.orig(gix, giy, git)).0
+        };
+
+        assert_eq!(
+            compact_value, dense_value,
+            "compact の sink が密の states と同じ値を持つこと (上流セル {gix},{giy},{git})"
+        );
+    }
+
     /// パッチを置き直しても、狭域が上げた値が戻らないこと。
     ///
     /// 値は sink から復元でき、それを裏付ける `local_penalty` は penalty 表から
