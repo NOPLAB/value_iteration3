@@ -184,7 +184,8 @@ fn read_params(node: &Node) -> Result<Params> {
 
     // 狭域が書いた local_penalty を全域へ伝播させる背景掃き (core::sweep_global)。
     // これを止めると、狭域が「通れない」と判断しても広域の経路は塞がった通路を
-    // 指し続ける (旧挙動)。密ソルバ専用 — compact には共有場が無い。
+    // 指し続ける (旧挙動)。密ソルバは全域 Gauss–Seidel、compact は sink の
+    // タイル修復で同じことをする (どちらも `core::sweep_global` の入口)。
     let global_sweep = p!("global_sweep", bool, true);
     // 1 回のロック取得で掃きに使う時間と、そのあとロックを手放して待つ時間。
     // 比がそのまま CPU の取り分になる (既定 20:60 = 1 コアの 25%)。追従ループは
@@ -828,9 +829,9 @@ fn main() -> Result<()> {
              Raise map_scale (halving the resolution quarters this), raise dense_limit_mb if the \
              machine really has the room, or switch to solver: frontier2d_sparse_compact \
              (+ compact_sink_dir), which keeps only {:.2} GB of finalized output and hydrates a \
-             small patch around the robot for following.\n\
-             Note that compact has no shared value field, so global_sweep (the local -> global \
-             feedback) does nothing there.",
+             small patch around the robot for following. The local -> global feedback \
+             (global_sweep) works there too — it repairs the sink tile by tile instead of \
+             sweeping a full `states` array.",
             states_gb,
             nstates,
             params.dense_limit_mb,
@@ -866,6 +867,7 @@ fn main() -> Result<()> {
         action_tolerance_cells,
         compact_sink_dir: sink_dir,
         vi_threads: params.vi_threads.max(0) as usize,
+        global_sweep: params.global_sweep,
     };
     let core = Arc::new(Mutex::new(PlannerCore::new(build, cfg)));
 
@@ -926,28 +928,24 @@ fn main() -> Result<()> {
     // 全域 Gauss–Seidel で掃き直して初めて、広域の経路が塞がった通路を避ける
     // ようになる (`core::sweep_global` の doc)。
     //
+    // compact 経路も同じ入口で回る。向こうは全域の `states` を持てないので、
+    // 1 呼び出しで sink のタイルを 1 枚だけ起こして掃いて書き戻す
+    // (`core::Repair`)。伝播にかかる時間は地図の大きさではなく変化が及ぶ範囲に
+    // 比例するので、最初の反応が遅くても掃き終わるまでの実測ログを見ること。
+    //
     // ロックの持ち方が肝。10 Hz の追従ループは同じ Mutex を `try_lock` で取り、
     // 3 tick 続けて取れないとロボットを止める。そこで 1 掃きを走り切らせず、
     // budget ms だけ掃いてロックを手放し、idle ms 待つ形にしてある
     // (既定 20:60 = 1 コアの 25%)。
-    if params.global_sweep && use_compact {
-        eprintln!(
-            "WARN: global_sweep is on but solver={} has no shared field to sweep (compact never \
-             builds `states`; the follow patch is discarded on every recenter). The local planner \
-             will avoid obstacles, but the global path will keep insisting on the blocked route. \
-             Use a dense solver (frontier2d_sparse) if the map fits — 19F at map_scale 2 measures \
-             655 MB.",
-            params.solver
-        );
-    }
-    if params.global_sweep && !use_compact {
+    if params.global_sweep {
         let core = Arc::clone(&core);
         let budget = Duration::from_millis(params.global_sweep_budget_ms.max(1) as u64);
         let idle = Duration::from_millis(params.global_sweep_idle_ms.max(0) as u64);
         std::thread::spawn(move || {
-            // 1 チャンクの粒度。budget の中で経過時間を見る刻みでもあるので、
-            // Pi4 (実測 1 掃き 7.9M セルで 8-11 秒 = 約 1M cells/s) で数 ms に
-            // なる大きさにしてある。
+            // 密経路の 1 チャンクの粒度。budget の中で経過時間を見る刻みでも
+            // あるので、Pi4 (実測 1 掃き 7.9M セルで 8-11 秒 = 約 1M cells/s) で
+            // 数 ms になる大きさにしてある。compact 経路はこの値を使わず、
+            // 1 呼び出し = タイル 1 枚 (これも数十 ms で頭打ち)。
             const CELLS_PER_STEP: usize = 5_000;
             let mut cur = SweepCursor::default();
             let mut sweep_start: Option<Instant> = None;

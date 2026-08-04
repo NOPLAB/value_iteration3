@@ -20,12 +20,17 @@ yield the lock so the 10Hz follow loop keeps running. Without it the robot
 avoids obstacles locally while compute_path_to_pose keeps returning a path
 through them.
 
-map_scale and the out-of-core (compact) solver are both supported, but a compact
-solve never allocates states -- the follow loop hydrates only a patch around the
-robot, and that patch is discarded on every recenter -- so there is no shared
-field to sweep and global_sweep does nothing under compact. Prefer a dense
-solver with map_scale sized to fit: dense costs 80 B/state (56 for states plus
-24 for sweep_orders) and dense_limit_mb refuses to start above the limit.
+map_scale and the out-of-core (compact) solver are both supported, and
+global_sweep works under both. A compact solve never allocates states, so the
+follow loop hydrates a patch around the robot from the sink and writes the
+window back every tick -- that makes the sink itself the shared field -- and the
+propagation repairs the sink one tile at a time (interior plus a frozen halo)
+instead of sweeping a full states array. Same update rule, so it settles on the
+same fixed point, and the work scales with the region the change actually
+reaches rather than with the map. Dense costs 80 B/state (56 for states plus 24
+for sweep_orders) and dense_limit_mb refuses to start above the limit; compact
+keeps 12 B/state in the sink plus one follow patch and one repair tile (a few MB
+together).
 compact_ram_limit_mb (default 512 MB) spills the sink to disk when
 compact_sink_dir is unset and the finalized output would not fit -- but the
 follow loop re-reads the sink on every patch recenter, so prefer pointing

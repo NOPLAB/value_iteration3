@@ -21,14 +21,18 @@
     whole shared field with Gauss-Seidel in the background, in chunks that yield
     the lock so the 10Hz follow loop keeps running.
 
-    map_scale and the out-of-core (compact) solver are both supported, but a
-    compact solve never allocates states -- the follow loop hydrates only a patch
-    around the robot from the sink, and that patch is discarded on every recenter.
-    So there is no shared field under compact and global_sweep does nothing;
-    prefer a dense solver with map_scale sized to fit (dense costs 80 B/state:
-    56 for states plus 24 for sweep_orders, and dense_limit_mb refuses to start
-    above the limit). compact_ram_limit_mb spills the compact sink to disk when
-    compact_sink_dir is unset and it would not fit in RAM.
+    map_scale and the out-of-core (compact) solver are both supported, and
+    global_sweep works under both. A compact solve never allocates states, so the
+    follow loop hydrates a patch around the robot from the sink and writes its
+    window back every tick -- the sink is the shared field -- and the propagation
+    repairs that sink one tile at a time (interior plus a frozen halo) instead of
+    sweeping a full states array. Same update rule, so the same fixed point, and
+    the work scales with the region the change reaches rather than with the map.
+    Dense costs 80 B/state (56 for states plus 24 for sweep_orders) and
+    dense_limit_mb refuses to start above the limit; compact keeps 12 B/state in
+    the sink plus a few MB of patch and tile. compact_ram_limit_mb spills the
+    compact sink to disk when compact_sink_dir is unset and it would not fit in
+    RAM.
   </description>
   <maintainer email="noplab90@gmail.com">nop</maintainer>
   <license>Apache-2.0</license>

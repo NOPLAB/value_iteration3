@@ -59,14 +59,31 @@
 //! 観測した penalty だけを別に覚える ([`PenaltyOverlay`], 1 B/セル)。密経路の
 //! `states.local_penalty` の代わりで、寿命も同じ (ゴールを解き直すと消える)。
 //!
-//! この 2 つで、compact は**「`global_sweep` を切った密経路」と同じ**ところまで
-//! 来る。残る差は 1 つだけ:
+//! ## compact の全域伝播はタイル修復で回す ([`Repair`])
 //!
-//! - **全域伝播 ([`PlannerCore::sweep_global`]) がまだ compact には無い。** 上がった
-//!   値は窓の周りに留まるので、広域の経路は「窓の中だけ迂回する」形になり、20 m 先
-//!   から降りてくるロールアウトが塞がった通路を選ぶこと自体は変わらない。密経路で
-//!   `global_sweep` を切ったときと同じ既知の穴で、`sweep_global` は compact では
-//!   いまも何もしない。
+//! 共有場ができても、上がった値を外へ広げなければ広域の経路は変わらない。密経路の
+//! [`PlannerCore::sweep_global`] は全域 Gauss–Seidel でそれをやるが、要求するのは
+//! 全域ぶんの `states` と `sweep_orders` (80 B/state) で、compact はまさにそれを
+//! 持てないから compact なので同じコードは使えない。
+//!
+//! 代わりに sink を**タイル単位**で起こして掃く。1 タイル = 更新する interior
+//! (既定 16 セル角) + 遷移が届く距離 `reach` の halo。halo を凍結境界にして
+//! interior だけを掃き、変わった列を sink へ返し、変化の外接矩形から `reach` セル
+//! 以内のタイルを待ち行列へ入れ直す。キューが空になったら収束 = 全域 Gauss–Seidel
+//! と同じ不動点。更新式は `value_iteration_at` そのままなので、狭域・広域・solve・
+//! 修復の 4 者が同一の更新式のままになる (vi_rs には手を入れない)。
+//!
+//! - **打ち切りではない。** 値が動かないタイルは 1 パスで抜けるだけで、動く範囲は
+//!   全部掃く。仕事量が地図の大きさではなく**実際に影響が及ぶ範囲**に比例する。
+//! - **メモリはタイル 1 枚ぶんだけ。** 0.25 m/cell・reach 2 で 20x20x60 = 1.9 MB
+//!   (追従パッチの 3.5 MB と合わせて 6 MB 弱)。
+//! - **最悪は全域 1 掃きぶん**。津田沼 (0.25 m/cell) で 3,700 タイル訪問 = 読み
+//!   1.3 GB / 書き 0.7 GB になる。暴走ガードとして訪問回数に上限を置いてある。
+//!
+//! 修復が追従パッチの footprint を書き換えたら、パッチを無効化して次の tick で
+//! 起こし直させる ([`PlannerCore::sweep_global`] の「パッチの無効化」)。パッチは
+//! sink の写しを凍結して持っているので、これをしないと修復とパッチが同じセルを
+//! 互いに上書きし合って**収束しない** (値は正しいまま、掃きが終わらなくなる)。
 //!
 //! `BuildParams` が vi_global_planner::core と重複しているのは意図的
 //! (クレート間依存を避けるため; vi_local_planner から引き継いだ規約)。
@@ -74,6 +91,7 @@
 //! このモジュールは vi_reference のみに依存し、ホストで `cargo test --lib`
 //! できる (分離クレート方式; リポジトリ CLAUDE.md 参照)。
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -148,6 +166,11 @@ pub struct PlanConfig {
     pub compact_sink_dir: SinkDir,
     /// compact 経路のワーカースレッド数 (0 = `default_threads()`)。
     pub vi_threads: usize,
+
+    // ── 狭域 → 広域の全域伝播 ──
+    /// 全域掃き ([`PlannerCore::sweep_global`]) を回すか。compact 経路では
+    /// これが false のとき修復タイル ([`Repair`], 数 MB) を確保しない。
+    pub global_sweep: bool,
 }
 
 impl PlanConfig {
@@ -315,6 +338,82 @@ impl PenaltyOverlay {
     }
 }
 
+/// 修復タイルの interior の 1 辺 [セル]。大きいほど 1 訪問あたりの halo の
+/// 割り増し (`(I+2h)²/I²`) が減って効率が上がり、代わりにタイル 1 枚のメモリと
+/// ロックを握る時間が増える。16 は 0.25 m/cell (halo 2) で
+/// 20x20x60 = 1.9 MB・ハイドレート 288 KB あたり。
+const REPAIR_INTERIOR_CELLS: i32 = 16;
+
+/// compact 経路の全域伝播 (タイル修復) の作業場。密経路では作らない。
+///
+/// 密経路の `sweep_global` は全域の `states` を Gauss–Seidel で掃くが、compact に
+/// あるのは 12 B/state の sink だけなので、地図をタイルに切って 1 枚ずつ起こしては
+/// 掃いて書き戻す。**ブロック Gauss–Seidel** なので、キューが空になったときの場は
+/// 全域掃きと同じ不動点になる (更新式は `value_iteration_at` そのまま)。
+///
+/// タイル = 更新する interior (`interior` セル角) + 凍結する halo (`halo` = 遷移が
+/// 届く距離 `reach`)。halo があるので interior のセルの遷移先はすべてタイル内に
+/// 収まり、外は読むだけで済む。
+///
+/// キューは FIFO。狭域の窓は毎 tick 自分のタイルを汚し得るので、LIFO にすると
+/// 外向きの伝播が窓に食われる。
+struct Repair {
+    /// タイル 1 枚ぶんの密な場。地図はハイドレートで丸ごと上書きするので、
+    /// ここで確定しているのは幾何と遷移表だけ。
+    vi: ValueIterator,
+    /// interior の 1 辺 [セル]。タイル格子の刻みでもある。
+    interior: i32,
+    /// 凍結境界の厚み [セル] = 遷移が届く最大セル数。
+    halo: i32,
+    /// タイル格子の大きさ。
+    tnx: i32,
+    tny: i32,
+    /// タイルが待ち行列に入っているか (二重投入よけ)。
+    queued: Vec<bool>,
+    queue: VecDeque<u32>,
+    /// いまの伝播で消費したタイル訪問数 (キューが空になるとリセット)。
+    visits: usize,
+    /// 訪問数の上限。超えたら諦めてキューを捨てる (暴走ガード。ここに掛かるのは
+    /// 想定外なので、掛かったら握り潰さずログに出す)。
+    visit_cap: usize,
+}
+
+impl Repair {
+    /// タイル番号 → interior のグローバルセル範囲 `(x0, x1, y0, y1)` (両端含む)。
+    fn interior_of(&self, t: u32, gnx: i32, gny: i32) -> (i32, i32, i32, i32) {
+        let (tx, ty) = ((t as i32) % self.tnx, (t as i32) / self.tnx);
+        let x0 = tx * self.interior;
+        let y0 = ty * self.interior;
+        (x0, (x0 + self.interior - 1).min(gnx - 1), y0, (y0 + self.interior - 1).min(gny - 1))
+    }
+
+    /// グローバル矩形 `(x0, x1, y0, y1)` から `halo` セル以内にある interior を
+    /// 持つタイルをすべて投入する。値が動いたセルの**上流**は必ずこの範囲にいる
+    /// (上流はチェビシェフ距離 `reach` = `halo` 以内) ので、これで取りこぼさない。
+    fn enqueue_around(&mut self, (x0, x1, y0, y1): (i32, i32, i32, i32)) {
+        let h = self.halo;
+        let tx0 = ((x0 - h).max(0) / self.interior).min(self.tnx - 1);
+        let tx1 = ((x1 + h).max(0) / self.interior).min(self.tnx - 1);
+        let ty0 = ((y0 - h).max(0) / self.interior).min(self.tny - 1);
+        let ty1 = ((y1 + h).max(0) / self.interior).min(self.tny - 1);
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                let t = (ty * self.tnx + tx) as u32;
+                if !self.queued[t as usize] {
+                    self.queued[t as usize] = true;
+                    self.queue.push_back(t);
+                }
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.queue.clear();
+        self.queued.fill(false);
+        self.visits = 0;
+    }
+}
+
 struct CachedGoal {
     goal_x: f64,
     goal_y: f64,
@@ -346,6 +445,8 @@ pub struct PlannerCore {
     /// 密経路の `states.local_penalty` に対応するので、寿命も同じ
     /// (ゴールを解き直すと `states` ごと作り直される = ここでは `clear`)。
     penalty: Option<PenaltyOverlay>,
+    /// compact 経路の全域伝播の作業場 (密経路と `global_sweep: false` では None)。
+    repair: Option<Repair>,
     /// 狭域が共有場を動かしたか。`refine_for` が Δ>0 を出すと立ち、全域掃きが
     /// Δ=0 で 1 周し終えると落ちる。全域掃きを回すかの唯一の判断材料
     /// (「狭域が通れないと言っている」を別途検出する必要はない — 通れないなら
@@ -463,6 +564,68 @@ fn new_patch(build: &BuildParams) -> Result<Patch, PlanError> {
     Ok(Patch { vi, half, reach, at: None })
 }
 
+/// compact 経路の修復タイルを 1 枚作る (ゴール非依存)。`reach` は [`new_patch`] が
+/// 遷移表から実測した値。
+///
+/// interior は `REPAIR_INTERIOR_CELLS` だが、**`reach` を下回らせない**。値が動いた
+/// セルの上流は `reach` セル以内にいるので、`interior >= reach` でないと
+/// [`Repair::enqueue_around`] の「変化の外接矩形 + halo に触れるタイル」だけでは
+/// 取りこぼす (静かに間違った場に落ち着く)。`new_patch` の凍結境界の検証と同じ類の罠。
+fn new_repair(build: &BuildParams, reach: i32) -> Result<Repair, PlanError> {
+    let halo = reach.max(1);
+    let interior = REPAIR_INTERIOR_CELLS.max(halo);
+    let side = interior + 2 * halo;
+
+    let mut vi = ValueIterator::new(build.actions.clone(), 1);
+    // 中身は hydrate_states が全部上書きするので、地図は全 free のダミーでよい
+    // (ここで確定するのは幾何と遷移表)。
+    let dummy = OccupancyGrid {
+        width: side,
+        height: side,
+        resolution: build.grid.resolution,
+        origin_x: 0.0,
+        origin_y: 0.0,
+        origin_quat: build.grid.origin_quat.clone(),
+        data: vec![0i8; (side as usize) * (side as usize)],
+    };
+    vi.set_map_with_occupancy_grid(
+        &dummy,
+        build.theta_cell_num,
+        build.safety_radius,
+        build.safety_radius_penalty,
+        build.goal_margin_radius,
+        build.goal_margin_theta,
+    );
+    // パッチと同じ幾何なので同じはずだが、halo が凍結境界として足りることは
+    // タイル自身の遷移表でも確かめる (1 セル足りないと interior の縁だけが
+    // MAX_COST を見て、値が静かにずれる)。
+    let tile_reach = transition_reach(&vi);
+    if tile_reach > halo {
+        return Err(PlanError::Patch(format!(
+            "repair tile halo {halo} cells is short of the transition reach {tile_reach}"
+        )));
+    }
+
+    let ceil_div = |n: i32| ((n + interior - 1) / interior).max(1);
+    let (tnx, tny) = (ceil_div(build.grid.width), ceil_div(build.grid.height));
+    let tiles = tnx as usize * tny as usize;
+    Ok(Repair {
+        vi,
+        interior,
+        halo,
+        tnx,
+        tny,
+        queued: vec![false; tiles],
+        queue: VecDeque::new(),
+        visits: 0,
+        // 1 タイルあたり平均 64 訪問 (= 128 パス) まで。1 訪問が 2 パスなので、
+        // これは「密経路が全域 Δ=0 まで 128 掃き必要」に相当する。64x64 の通路
+        // 地図で密が 72 掃き・compact が 1 タイルあたり 36 訪問だったので、
+        // 3 倍以上の余裕がある。ここは収束の見積もりではなく暴走ガード。
+        visit_cap: tiles.saturating_mul(64).saturating_add(256),
+    })
+}
+
 impl Patch {
     /// ロボットのグローバルセル `(gx, gy)` に対してパッチを置き直す必要があるか。
     /// 判定は寸法ではなく凍結境界の条件そのもの: ウィンドウ (±`local_ixy_range`) と
@@ -491,79 +654,174 @@ impl Patch {
         overlay: Option<&PenaltyOverlay>,
         p0: (i32, i32),
     ) {
-        let (gnx, gny, nt) = f.cell_num;
-        let res = f.resolution;
-        let side = 2 * self.half + 1;
-        let margin = (build.safety_radius / res).ceil() as i32;
-
         self.at = Some(p0);
-        let base = &mut self.vi.base;
-        base.map_origin_x = f.origin.0 + p0.0 as f64 * res;
-        base.map_origin_y = f.origin.1 + p0.1 as f64 * res;
-        base.map_origin_quat = f.origin_quat.clone();
-        // ゴールは sink 側の規約 (value == 0) で判定するので final_state の再計算は
-        // 要らないが、幾何の一貫性のために持たせておく。
-        base.goal_x = f.goal.0;
-        base.goal_y = f.goal.1;
-        base.goal_t = f.goal.2;
+        hydrate_states(&mut self.vi.base, f, build, overlay, p0);
+    }
 
-        for py in 0..side {
-            let gy = p0.1 + py;
-            for px in 0..side {
-                let gx = p0.0 + px;
-                let inside = gx >= 0 && gx < gnx && gy >= 0 && gy < gny;
-                // free / penalty は**グローバル座標・グローバル幅**で評価する。
-                // `State::from_occupancy` の margin ループは行跨ぎバグを持つので、
-                // パッチを切り出してから評価すると compact solve が見た値とズレる。
-                let proto = if inside {
-                    State::from_occupancy(
-                        gx,
-                        gy,
-                        0,
-                        &build.grid,
-                        margin,
-                        build.safety_radius_penalty,
-                        gnx,
-                    )
-                } else {
-                    // 地図外。`from_occupancy` の非 free 早期リターンと同じ形。
-                    State {
-                        total_cost: MAX_COST,
-                        penalty: PROB_BASE,
-                        local_penalty: 0,
-                        ix: 0,
-                        iy: 0,
-                        it: 0,
-                        free: false,
-                        final_state: false,
-                        optimal_action: None,
-                    }
-                };
-                let orig0 = if inside { Some(f.orig(gx, gy, 0)) } else { None };
-                let pen = overlay.map(|o| o.get(gx, gy)).unwrap_or(0);
-                for it in 0..nt {
-                    let (v, a) = match orig0 {
-                        Some(o) => f.sink.read(o + it as usize),
-                        None => (MAX_COST, -1),
-                    };
-                    let idx = base.to_index(px, py, it) as usize;
-                    let s = &mut base.states[idx];
-                    s.ix = px;
-                    s.iy = py;
-                    s.it = it;
-                    s.free = proto.free;
-                    s.penalty = proto.penalty;
-                    s.local_penalty = pen;
-                    s.total_cost = v;
-                    s.optimal_action = if a >= 0 { Some(a as usize) } else { None };
-                    // sink の規約: 未到達 = MAX_COST、ゴール圏 = 0 (`CompactPolicy::is_final`
-                    // と同じ判定)。`value_iteration_raw` は final_state を更新しないので、
-                    // ゴール圏はローカル精密化でも 0 に留まる。
-                    s.final_state = v == 0;
+    /// パッチが占めているグローバルセル範囲 `(x0, x1, y0, y1)`。未ハイドレートなら None。
+    fn footprint(&self) -> Option<(i32, i32, i32, i32)> {
+        let (p0x, p0y) = self.at?;
+        let side = 2 * self.half;
+        Some((p0x, p0x + side, p0y, p0y + side))
+    }
+}
+
+/// compact の場と静的地図から、左下がグローバルセル `p0` の密な矩形を起こす。
+/// 大きさは `base` の `cell_num_x/y` で決まる (追従パッチと修復タイルで共用)。
+///
+/// `overlay` からは観測済みの `local_penalty` を**矩形全体に**戻す。中だけでは
+/// 足りない: `action_cost` は遷移先の `local_penalty` を読むので、凍結境界側が 0 の
+/// ままだと縁の行動コストが sink の値と食い違う。
+fn hydrate_states(
+    base: &mut ValueIterator,
+    f: &CompactField,
+    build: &BuildParams,
+    overlay: Option<&PenaltyOverlay>,
+    p0: (i32, i32),
+) {
+    let (gnx, gny, nt) = f.cell_num;
+    let res = f.resolution;
+    let (sx, sy) = (base.cell_num_x, base.cell_num_y);
+    let margin = (build.safety_radius / res).ceil() as i32;
+
+    base.map_origin_x = f.origin.0 + p0.0 as f64 * res;
+    base.map_origin_y = f.origin.1 + p0.1 as f64 * res;
+    base.map_origin_quat = f.origin_quat.clone();
+    // ゴールは sink 側の規約 (value == 0) で判定するので final_state の再計算は
+    // 要らないが、幾何の一貫性のために持たせておく。
+    base.goal_x = f.goal.0;
+    base.goal_y = f.goal.1;
+    base.goal_t = f.goal.2;
+
+    for py in 0..sy {
+        let gy = p0.1 + py;
+        for px in 0..sx {
+            let gx = p0.0 + px;
+            let inside = gx >= 0 && gx < gnx && gy >= 0 && gy < gny;
+            // free / penalty は**グローバル座標・グローバル幅**で評価する。
+            // `State::from_occupancy` の margin ループは行跨ぎバグを持つので、
+            // 切り出してから評価すると compact solve が見た値とズレる。
+            let proto = if inside {
+                let pen = build.safety_radius_penalty;
+                State::from_occupancy(gx, gy, 0, &build.grid, margin, pen, gnx)
+            } else {
+                // 地図外。`from_occupancy` の非 free 早期リターンと同じ形。
+                State {
+                    total_cost: MAX_COST,
+                    penalty: PROB_BASE,
+                    local_penalty: 0,
+                    ix: 0,
+                    iy: 0,
+                    it: 0,
+                    free: false,
+                    final_state: false,
+                    optimal_action: None,
                 }
+            };
+            let orig0 = if inside { Some(f.orig(gx, gy, 0)) } else { None };
+            let pen = overlay.map(|o| o.get(gx, gy)).unwrap_or(0);
+            for it in 0..nt {
+                let (v, a) = match orig0 {
+                    Some(o) => f.sink.read(o + it as usize),
+                    None => (MAX_COST, -1),
+                };
+                let idx = base.to_index(px, py, it) as usize;
+                let s = &mut base.states[idx];
+                s.ix = px;
+                s.iy = py;
+                s.it = it;
+                s.free = proto.free;
+                s.penalty = proto.penalty;
+                s.local_penalty = pen;
+                s.total_cost = v;
+                s.optimal_action = if a >= 0 { Some(a as usize) } else { None };
+                // sink の規約: 未到達 = MAX_COST、ゴール圏 = 0 (`CompactPolicy::is_final`
+                // と同じ判定)。`value_iteration_raw` は final_state を更新しないので、
+                // ゴール圏はローカル精密化でも 0 に留まる。
+                s.final_state = v == 0;
             }
         }
     }
+}
+
+/// 起こした矩形の一部 (局所座標 `[x0..=x1] x [y0..=y1]`、左下が `p0`) を sink へ
+/// 書き戻す。**実際に変わった列だけ**書き、変わったセルのグローバル座標の外接矩形を
+/// 返す (何も変わっていなければ None)。
+///
+/// 変わっていない列を飛ばすのは mmap sink のためで、書けばそのままページの汚しに
+/// なる。落ち着いた窓は 1 ページも汚さない。
+fn commit_states(
+    f: &mut CompactField,
+    base: &ValueIterator,
+    p0: (i32, i32),
+    (x0, x1, y0, y1): (i32, i32, i32, i32),
+) -> Option<(i32, i32, i32, i32)> {
+    let (gnx, gny, nt) = f.cell_num;
+    let mut values = vec![0u64; nt as usize];
+    let mut actions = vec![-1i32; nt as usize];
+    let mut bbox: Option<(i32, i32, i32, i32)> = None;
+    for py in y0..=y1 {
+        let gy = p0.1 + py;
+        if gy < 0 || gy >= gny {
+            continue;
+        }
+        for px in x0..=x1 {
+            let gx = p0.0 + px;
+            if gx < 0 || gx >= gnx {
+                continue;
+            }
+            let orig = f.orig(gx, gy, 0);
+            let mut changed = false;
+            for it in 0..nt {
+                let s = &base.states[base.to_index(px, py, it) as usize];
+                // sink の action はインデックス (`hydrate_states` / `CompactPolicy` と
+                // 同じ規約。`Action::id` ではない)。
+                let a = s.optimal_action.map(|ai| ai as i32).unwrap_or(-1);
+                values[it as usize] = s.total_cost;
+                actions[it as usize] = a;
+                changed |= f.sink.read(orig + it as usize) != (s.total_cost, a);
+            }
+            if changed {
+                f.sink.write_column(orig, &values, &actions);
+                bbox = Some(match bbox {
+                    None => (gx, gx, gy, gy),
+                    Some((bx0, bx1, by0, by1)) => {
+                        (bx0.min(gx), bx1.max(gx), by0.min(gy), by1.max(gy))
+                    }
+                });
+            }
+        }
+    }
+    bbox
+}
+
+/// 局所座標の矩形 `[x0..=x1] x [y0..=y1]` を Gauss–Seidel で 1 パス掃き、Δ 合計を返す。
+/// 掃き向きは 4 通りから選ぶ (タイルは毎回起こし直すので `sweep_orders` のような
+/// 索引表は持たない — 掃き順は毎回この 2 つの bool で決める)。
+fn sweep_rect(
+    vi: &mut ValueIterator,
+    (x0, x1, y0, y1): (i32, i32, i32, i32),
+    nt: i32,
+    fwd_x: bool,
+    fwd_y: bool,
+) -> u64 {
+    let ys: Vec<i32> = if fwd_y { (y0..=y1).collect() } else { (y0..=y1).rev().collect() };
+    let xs: Vec<i32> = if fwd_x { (x0..=x1).collect() } else { (x0..=x1).rev().collect() };
+    let mut delta = 0u64;
+    for &iy in &ys {
+        for &ix in &xs {
+            for it in 0..nt {
+                let i = vi.to_index(ix, iy, it) as usize;
+                delta = delta.saturating_add(vi.value_iteration_at(i));
+            }
+        }
+    }
+    delta
+}
+
+/// 閉区間の矩形 `(x0, x1, y0, y1)` どうしが重なるか。
+fn rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    a.0 <= b.1 && b.0 <= a.1 && a.2 <= b.3 && b.2 <= a.3
 }
 
 /// compact 出力 sink を作る。`dir` 指定時はディスク mmap、無指定は RAM。
@@ -583,7 +841,10 @@ impl PlannerCore {
         let penalty = cfg
             .use_compact()
             .then(|| PenaltyOverlay::new(build.grid.width, build.grid.height));
-        Self { build, cfg, cached: None, patch: None, penalty, dirty: false }
+        // 修復タイルは遷移表の再計算が要るので、パッチと一緒に最初の solve で作る
+        // (`prepare_goal_with_progress`)。掃きスレッドの中で作ると、数秒かかる
+        // 再計算をロックの中でやることになる。
+        Self { build, cfg, cached: None, patch: None, penalty, repair: None, dirty: false }
     }
 
     /// キャッシュ中のゴールが `goal` と同一 (許容差内) か。追従スレッドが
@@ -672,13 +933,22 @@ impl PlannerCore {
             ov.clear();
         }
         // 解き直した直後は収束済み。前のゴールで積んだ「伝播させる仕事がある」印は
-        // 持ち越さない (持ち越すと最初の 1 掃きが必ず無駄に回る)。
+        // 持ち越さない (持ち越すと最初の 1 掃きが必ず無駄に回る)。待ち行列に残った
+        // タイルも同じで、前のゴールの場を修復しても意味がない。
         self.dirty = false;
+        if let Some(r) = self.repair.as_mut() {
+            r.clear();
+        }
 
         let field = if self.cfg.use_compact() {
-            // パッチは幾何だけで決まるので初回だけ作る (遷移表の再計算を避ける)。
+            // パッチも修復タイルも幾何だけで決まるので初回だけ作る
+            // (遷移表の再計算は 64^3 サブセルサンプリング x 行動 x θ で重い)。
             if self.patch.is_none() {
-                self.patch = Some(new_patch(&self.build)?);
+                let p = new_patch(&self.build)?;
+                if self.cfg.global_sweep && self.repair.is_none() {
+                    self.repair = Some(new_repair(&self.build, p.reach)?);
+                }
+                self.patch = Some(p);
             }
             self.solve_compact(&goal, goal_t_deg, &mut stats, cancel)?
         } else {
@@ -978,40 +1248,26 @@ impl PlannerCore {
     /// 実際に変わった列だけ書く。値が動かない tick のほうが多く、mmap sink では
     /// 書き込みがそのままページの汚しになるため (0.25 m/cell の窓 9x9x60 で
     /// 58 KB/tick、10 Hz なら 580 KB/s)。
+    ///
+    /// 書けた範囲は修復の待ち行列にも入れる。**ここが狭域 → 全域伝播の入口**で、
+    /// 「窓が動いた」以外に伝播の起点は無い。
     fn commit_window(&mut self) {
         let patch = self.patch.as_ref();
+        let repair = self.repair.as_mut();
         let Some(c) = self.cached.as_mut() else { return };
         let Field::Compact(f) = &mut c.field else { return };
         let Some(p) = patch else { return };
-        let Some((p0x, p0y)) = p.at else { return };
-        let (gnx, gny, nt) = f.cell_num;
-        let mut values = vec![0u64; nt as usize];
-        let mut actions = vec![-1i32; nt as usize];
-        for py in p.vi.local_iy_min..=p.vi.local_iy_max {
-            let gy = p0y + py;
-            if gy < 0 || gy >= gny {
-                continue;
-            }
-            for px in p.vi.local_ix_min..=p.vi.local_ix_max {
-                let gx = p0x + px;
-                if gx < 0 || gx >= gnx {
-                    continue;
-                }
-                let base = f.orig(gx, gy, 0);
-                let mut changed = false;
-                for it in 0..nt {
-                    let s = &p.vi.base.states[p.vi.base.to_index(px, py, it) as usize];
-                    // sink の action はインデックス (`hydrate` / `CompactPolicy` と同じ規約。
-                    // `Action::id` ではない)。
-                    let a = s.optimal_action.map(|ai| ai as i32).unwrap_or(-1);
-                    values[it as usize] = s.total_cost;
-                    actions[it as usize] = a;
-                    changed |= f.sink.read(base + it as usize) != (s.total_cost, a);
-                }
-                if changed {
-                    f.sink.write_column(base, &values, &actions);
-                }
-            }
+        let Some(p0) = p.at else { return };
+        let win = (
+            p.vi.local_ix_min,
+            p.vi.local_ix_max,
+            p.vi.local_iy_min,
+            p.vi.local_iy_max,
+        );
+        let Some(bbox) = commit_states(f, &p.vi.base, p0, win) else { return };
+        if let Some(r) = repair {
+            r.enqueue_around(bbox);
+            self.dirty = true;
         }
     }
 
@@ -1023,9 +1279,11 @@ impl PlannerCore {
         let t0 = Instant::now();
         loop {
             let (pass_delta, stopped) = self.refine_pass_until(|| t0.elapsed() >= budget);
-            if pass_delta > 0 {
-                // 狭域が共有場を動かした。全域掃きに伝播させる仕事があると印を付ける
-                // (`sweep_global`)。
+            // 狭域が共有場を動かした。全域掃きに伝播させる仕事があると印を付ける。
+            // compact は窓を書き戻して初めて共有場が動くので、印は `commit_window`
+            // が (書けた範囲を待ち行列へ入れるのと同時に) 立てる。ここで立てると、
+            // 書き戻す先が無い Δ でも掃きスレッドを起こしてしまう。
+            if pass_delta > 0 && !self.cfg.use_compact() {
                 self.dirty = true;
             }
             if stopped || pass_delta == 0 {
@@ -1078,18 +1336,22 @@ impl PlannerCore {
     /// ロックを手放す (`run_follow` は `try_lock` に 3 回続けて失敗するとロボットを
     /// 止める)。1 掃き終わるごとに掃き順を次へ回すので、伝播方向は偏らない。
     ///
-    /// # compact 経路では何もしない (まだ)
+    /// # compact 経路ではタイル 1 枚を修復する
     ///
-    /// `commit_window` と [`PenaltyOverlay`] で compact にも共有場 (= sink) は
-    /// できたが、**それを全域へ掃く手立てがまだ無い**。ここが要求するのは全域ぶんの
-    /// `states` と `sweep_orders` (80 B/state) で、compact はまさにそれを持てない
-    /// から compact なので、同じコードは使えない。sink をタイル単位で起こしては
-    /// 掃いて書き戻す形が要る (モジュール冒頭)。それまで compact は
-    /// 「`global_sweep` を切った密経路」と同じ = 窓の外へは広がらない。
+    /// compact に全域の `states` は無いので、[`Repair`] のタイルを 1 枚だけ処理して
+    /// 返る (`max_cells` と `cur` は使わない)。`done` は待ち行列が空になったとき。
+    /// 呼び出し規約は密経路と同じ — 呼び出し側は `done` か予算切れまで繰り返す。
+    ///
+    /// 1 呼び出しの仕事は「ハイドレート + 高々 2 パス + 書き戻し」で頭打ちなので、
+    /// ロックを握る時間は予算 + タイル 1 枚ぶんに収まる (0.25 m/cell で数十 ms、
+    /// 追従ループが `try_lock` に 3 回失敗する 300 ms には余裕がある)。
     pub fn sweep_global(&mut self, cur: &mut SweepCursor, max_cells: usize) -> (u64, bool) {
+        if self.cfg.use_compact() {
+            return self.repair_one_tile();
+        }
         let Some(c) = self.cached.as_mut() else { return (0, true) };
         let Field::Dense(vi) = &mut c.field else {
-            self.dirty = false; // compact を掃く実装がまだ無い
+            self.dirty = false;
             return (0, true);
         };
 
@@ -1125,6 +1387,93 @@ impl PlannerCore {
             self.dirty = false;
         }
         (delta, true)
+    }
+
+    /// compact 経路の全域伝播: 待ち行列の先頭のタイルを 1 枚だけ修復する。
+    /// 戻り値は `(このタイルの Δ 合計, 待ち行列が空になったか)`。
+    ///
+    /// halo を凍結して interior だけを掃くブロック Gauss–Seidel。1 訪問では
+    /// 落ち着き切らないことがあるが、変化があれば自分のタイルも
+    /// [`Repair::enqueue_around`] で入り直すので、キューが空 = どのタイルも
+    /// 自分の halo に対して Δ=0 = 全域 Gauss–Seidel と同じ不動点になる。
+    ///
+    /// ## パッチの無効化
+    ///
+    /// 追従パッチは sink の写しを凍結して持っている。修復がその footprint を
+    /// 書き換えたら `at = None` にして次の tick で起こし直させる。しないと、
+    /// パッチが古い凍結値から計算した値を `commit_window` が書き戻し → タイルが
+    /// また直し → …… と互いを上書きし続けて**キューが空にならない** (値は
+    /// どちらも正しいので、症状は「掃きが終わらない」だけ)。`commit_window` は
+    /// 毎 tick 走っているので、起こし直しで失われるものは無い。
+    fn repair_one_tile(&mut self) -> (u64, bool) {
+        let build = &self.build;
+        let overlay = self.penalty.as_ref();
+        let Some(r) = self.repair.as_mut() else {
+            self.dirty = false; // global_sweep: false なので作っていない
+            return (0, true);
+        };
+        let Some(c) = self.cached.as_mut() else {
+            r.clear();
+            self.dirty = false;
+            return (0, true);
+        };
+        let Field::Compact(f) = &mut c.field else {
+            self.dirty = false;
+            return (0, true);
+        };
+        let Some(t) = r.queue.pop_front() else {
+            r.visits = 0;
+            self.dirty = false;
+            return (0, true);
+        };
+        r.queued[t as usize] = false;
+        r.visits += 1;
+        if r.visits > r.visit_cap {
+            // ここに掛かるのは想定外 (ブロック GS は必ず止まる)。握り潰すと
+            // 「掃きが終わらない」としか見えないので、捨てたことを必ず出す。
+            eprintln!(
+                "vi_planner: tile repair gave up after {} visits with {} tiles still queued; \
+                 the global field may be stale until the next goal",
+                r.visits,
+                r.queue.len() + 1
+            );
+            r.clear();
+            self.dirty = false;
+            return (0, true);
+        }
+
+        let (gnx, gny, nt) = f.cell_num;
+        let (gx0, gx1, gy0, gy1) = r.interior_of(t, gnx, gny);
+        let p0 = (gx0 - r.halo, gy0 - r.halo);
+        hydrate_states(&mut r.vi, f, build, overlay, p0);
+
+        // interior のタイル局所座標。halo は読むだけ (凍結境界)。
+        let rect = (r.halo, r.halo + (gx1 - gx0), r.halo, r.halo + (gy1 - gy0));
+        // 掃き向きは訪問ごとに回して伝播方向を偏らせない (密経路が
+        // `sweep_orders` を順に使うのと同じ意図)。
+        let mut delta = sweep_rect(&mut r.vi, rect, nt, r.visits & 1 == 0, r.visits & 2 == 0);
+        if delta > 0 {
+            // 動いたタイルだけ 2 パス目を掃いてから返す。動かないタイル
+            // (= 伝播の波面の外) は 1 パスで抜ける — 仕事量が地図の大きさでは
+            // なく影響範囲に比例するのはここ。
+            let back = sweep_rect(&mut r.vi, rect, nt, r.visits & 1 != 0, r.visits & 2 != 0);
+            delta = delta.saturating_add(back);
+            if let Some(bbox) = commit_states(f, &r.vi, p0, rect) {
+                r.enqueue_around(bbox);
+                if let Some(p) = self.patch.as_mut() {
+                    if p.footprint().map(|fp| rects_overlap(fp, bbox)).unwrap_or(false) {
+                        p.at = None;
+                    }
+                }
+            }
+        }
+
+        let done = r.queue.is_empty();
+        if done {
+            r.visits = 0;
+            self.dirty = false;
+        }
+        (delta, done)
     }
 
     /// ウィンドウ 1 パス。`should_stop` は x 列ごとに観測し、途中打ち切り時は
@@ -1239,6 +1588,7 @@ mod tests {
             action_tolerance_cells: 4,
             compact_sink_dir: None,
             vi_threads: 1,
+            global_sweep: true,
         }
     }
 
@@ -2026,6 +2376,7 @@ mod tests {
             cached: core.cached.take(),
             patch: core.patch.take(),
             penalty: core.penalty.take(),
+            repair: core.repair.take(),
             dirty: false,
         };
         assert_eq!(strict_core.decide(on_obstacle), Decision::NoAction);
@@ -2036,6 +2387,7 @@ mod tests {
             cached: strict_core.cached,
             patch: strict_core.patch,
             penalty: strict_core.penalty,
+            repair: strict_core.repair,
             dirty: false,
         };
         assert!(matches!(relaxed_core.decide(on_obstacle), Decision::Action { .. }));
@@ -2258,19 +2610,179 @@ mod tests {
         assert_eq!(cur.order, 0, "一周したら戻ること");
     }
 
-    /// compact の共有場 (sink) を全域へ掃く実装はまだ無いので、全域掃きは何もせず
-    /// 印だけ落とすこと — 呼び出し側が空回りしないように。
+    /// 修復を待ち行列が空になるまで進める。戻り値は消費したタイル訪問数。
+    fn repair_until_settled(core: &mut PlannerCore, max_visits: usize) -> usize {
+        let mut cur = SweepCursor::default();
+        let mut visits = 0;
+        while core.is_dirty() && visits < max_visits {
+            core.sweep_global(&mut cur, usize::MAX);
+            visits += 1;
+        }
+        assert!(!core.is_dirty(), "{max_visits} 訪問では修復が終わらない");
+        visits
+    }
+
+    /// **タイル修復の本題。** compact の全域伝播が、密経路の全域掃きと**同じ**場に
+    /// 落ち着くこと。
+    ///
+    /// 通路を塞ぎ、ウィンドウ (±1m) の外にある西側のセルで比べる。ここは
+    /// `commit_window` が届かない場所なので、値が一致するのはタイル修復が伝播を
+    /// 担っているときだけ。両者とも Δ=0 まで回してから比べる (同じ Bellman 作用素の
+    /// 不動点は 1 つなので、掃き順が違っても同じ値になる)。
     #[test]
-    fn compact_has_no_global_sweep_yet() {
+    fn compact_global_propagation_matches_the_dense_global_sweep() {
+        let goal = pose(2.8, 1.25, 0.0);
+        let robot = pose(1.5, 1.25, 0.0);
+        let cancel = AtomicBool::new(false);
+        // 通路の断面を塞ぐスキャン (1 ビームでは ±2 セルしか立たないので向きを振る)。
+        let block = |core: &mut PlannerCore| {
+            core.set_window(robot);
+            for k in -3..=3 {
+                let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.55] };
+                core.observe_scan(&scan, pose(robot.x, robot.y, k as f64 * 0.12));
+            }
+            core.refine_for(Duration::from_secs(5));
+        };
+
+        let mut dense = PlannerCore::new(corridor(64, 20, 30), cfg());
+        dense.prepare_goal(goal, &cancel).expect("dense solve");
+        // ウィンドウは ±20 セル = 10..=50。西の観測点はその外に取る。
+        let west = {
+            let vi = dense.local().unwrap();
+            pose_to_cell(&vi.base, 0.3, 1.25, 0.0) // セル (6, 25)
+        };
+        let before = {
+            let vi = dense.local().unwrap();
+            vi.base.states[vi.base.to_index(west.0, west.1, west.2) as usize].total_cost
+        };
+        block(&mut dense);
+        let mut cur = SweepCursor::default();
+        let mut sweeps = 0;
+        while dense.is_dirty() && sweeps < 400 {
+            if dense.sweep_global(&mut cur, usize::MAX).1 {
+                sweeps += 1;
+            }
+        }
+        assert!(!dense.is_dirty(), "密経路が収束すること");
+        let dense_value = {
+            let vi = dense.local().unwrap();
+            vi.base.states[vi.base.to_index(west.0, west.1, west.2) as usize].total_cost
+        };
+        assert!(dense_value > before, "塞いだら西側の値は上がること");
+
+        let mut compact = PlannerCore::new(corridor(64, 20, 30), cfg_compact());
+        compact.prepare_goal(goal, &cancel).expect("compact solve");
+        block(&mut compact);
+        assert!(compact.is_dirty(), "窓を書き戻したら伝播の仕事が積まれること");
+        let visits = repair_until_settled(&mut compact, 8_000);
+        let compact_value = {
+            let Some(CachedGoal { field: Field::Compact(f), .. }) = compact.cached.as_ref() else {
+                panic!("compact field expected");
+            };
+            f.sink.read(f.orig(west.0, west.1, west.2)).0
+        };
+
+        assert_eq!(
+            compact_value, dense_value,
+            "ウィンドウの外 (セル {},{},{}) で密の全域掃きと同じ値になること \
+             (タイル訪問 {visits} 回 / 密は {sweeps} 掃き)",
+            west.0, west.1, west.2
+        );
+    }
+
+    /// 修復と追従パッチが互いを上書きし合って**終わらなくならない**こと。
+    ///
+    /// パッチは sink の写しを凍結して持っているので、修復がその footprint を
+    /// 書き換えたら無効化して起こし直させる必要がある。しないと「パッチが古い
+    /// 凍結値から計算 → `commit_window` が書き戻す → 修復がまた直す」で
+    /// `is_dirty` が永久に落ちない (値はどちらも正しいので、症状は掃きが
+    /// 終わらないことだけ = 気付きにくい)。
+    ///
+    /// 追従 1 tick と修復の空になるまでを交互に回し、数ラウンドで「追従 tick が
+    /// 何も動かさない」ところへ落ち着くのを見る。
+    #[test]
+    fn compact_repair_and_the_follow_patch_settle_together() {
+        let mut core = PlannerCore::new(corridor(64, 20, 30), cfg_compact());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(2.8, 1.25, 0.0), &cancel).expect("solve");
+
+        let robot = pose(1.5, 1.25, 0.0);
+        core.set_window(robot);
+        for k in -3..=3 {
+            let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.55] };
+            core.observe_scan(&scan, pose(robot.x, robot.y, k as f64 * 0.12));
+        }
+        core.refine_for(Duration::from_secs(5));
+
+        let mut rounds = 0;
+        let quiet = loop {
+            repair_until_settled(&mut core, 8_000);
+            // 追従 1 tick 相当 (置き直しが要ればここで起き直す)。
+            core.set_window(robot);
+            core.refine_for(Duration::from_secs(5));
+            rounds += 1;
+            if !core.is_dirty() {
+                break true;
+            }
+            if rounds >= 8 {
+                break false;
+            }
+        };
+        assert!(quiet, "追従 tick と修復が同じ不動点に落ち着くこと ({rounds} ラウンド回した)");
+    }
+
+    /// 修復タイルの halo が遷移の届く距離をちゃんと覆っていること、および
+    /// interior がそれを下回らないこと (下回ると `enqueue_around` が上流タイルを
+    /// 取りこぼし、静かに間違った場に落ち着く)。
+    #[test]
+    fn repair_tile_geometry_covers_the_transition_reach() {
+        let b = build(64);
+        let patch = new_patch(&b).expect("patch");
+        let r = new_repair(&b, patch.reach).expect("repair tile");
+        assert_eq!(r.halo, patch.reach.max(1), "halo は遷移到達距離そのもの");
+        assert!(r.halo >= transition_reach(&r.vi), "halo が凍結境界として足りること");
+        assert!(r.interior >= r.halo, "interior が halo を下回らないこと");
+        assert_eq!(r.vi.cell_num_x, r.interior + 2 * r.halo);
+        // タイル格子は地図を覆い切ること。
+        assert!(r.tnx * r.interior >= b.grid.width);
+        assert!(r.tny * r.interior >= b.grid.height);
+    }
+
+    /// ゴールを解き直したら待ち行列も空にすること (前のゴールの場を修復しても
+    /// 意味がない。密経路の `dirty` を落とすのと同じ寿命)。
+    #[test]
+    fn resolving_a_new_goal_clears_the_repair_queue() {
         let mut core = PlannerCore::new(build(64), cfg_compact());
         let cancel = AtomicBool::new(false);
-        core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).expect("solve");
-        core.dirty = true;
+        core.prepare_goal(pose(2.5, 1.0, 0.0), &cancel).expect("solve");
 
+        let robot = pose(1.0, 1.0, 0.0);
+        core.set_window(robot);
+        let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.5] };
+        core.observe_scan(&scan, robot);
+        core.refine_passes(5);
+        assert!(!core.repair.as_ref().unwrap().queue.is_empty(), "伝播の仕事が積まれること");
+
+        core.prepare_goal(pose(0.5, 2.5, 0.0), &cancel).expect("re-solve");
+        assert!(core.repair.as_ref().unwrap().queue.is_empty());
+        assert!(!core.is_dirty());
+    }
+
+    /// `global_sweep: false` なら修復タイル (数 MB) を確保しないこと。
+    #[test]
+    fn repair_tile_is_not_allocated_when_the_sweep_is_off() {
+        let mut cfg = cfg_compact();
+        cfg.global_sweep = false;
+        let mut core = PlannerCore::new(build(64), cfg);
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).expect("solve");
+        assert!(core.repair.is_none());
+
+        // 掃きを呼んでも何もせず、印だけ落として返ること (呼び出し側が空回りしない)。
+        core.dirty = true;
         let mut cur = SweepCursor::default();
-        let (delta, done) = core.sweep_global(&mut cur, usize::MAX);
-        assert_eq!((delta, done), (0, true));
-        assert!(!core.is_dirty(), "掃く場が無いなら印は落とすこと");
+        assert_eq!(core.sweep_global(&mut cur, usize::MAX), (0, true));
+        assert!(!core.is_dirty());
     }
 
     /// ゴールを解き直したら印は持ち越さないこと (最初の 1 掃きが無駄に回らない)。
