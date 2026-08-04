@@ -373,6 +373,10 @@ struct Repair {
     queue: VecDeque<u32>,
     /// いまの伝播で消費したタイル訪問数 (キューが空になるとリセット)。
     visits: usize,
+    /// 直近の伝播 1 回ぶんの訪問数 (`visits` をリセットする前に写す)。掃きに
+    /// 実際どれだけ働いたかを呼び出し側がログに出すためだけの値 — compact 側の
+    /// 「1 掃き」は地図の大きさでは決まらないので、経過時間だけでは読めない。
+    last_visits: usize,
     /// 訪問数の上限。超えたら諦めてキューを捨てる (暴走ガード。ここに掛かるのは
     /// 想定外なので、掛かったら握り潰さずログに出す)。
     visit_cap: usize,
@@ -407,10 +411,16 @@ impl Repair {
         }
     }
 
+    /// 伝播 1 回ぶんの終わり。訪問数はログ用に写してから畳む。
+    fn settle(&mut self) {
+        self.last_visits = self.visits;
+        self.visits = 0;
+    }
+
     fn clear(&mut self) {
         self.queue.clear();
         self.queued.fill(false);
-        self.visits = 0;
+        self.settle();
     }
 }
 
@@ -567,10 +577,11 @@ fn new_patch(build: &BuildParams) -> Result<Patch, PlanError> {
 /// compact 経路の修復タイルを 1 枚作る (ゴール非依存)。`reach` は [`new_patch`] が
 /// 遷移表から実測した値。
 ///
-/// interior は `REPAIR_INTERIOR_CELLS` だが、**`reach` を下回らせない**。値が動いた
-/// セルの上流は `reach` セル以内にいるので、`interior >= reach` でないと
-/// [`Repair::enqueue_around`] の「変化の外接矩形 + halo に触れるタイル」だけでは
-/// 取りこぼす (静かに間違った場に落ち着く)。`new_patch` の凍結境界の検証と同じ類の罠。
+/// interior は `REPAIR_INTERIOR_CELLS` だが `reach` を下回らせない。取りこぼしの
+/// 心配は無い ([`Repair::enqueue_around`] はセル単位で `halo` ぶん広げてから
+/// タイルに割るので、interior の大きさに依らず上流を覆う)。halo より薄い interior は
+/// ハイドレートした `(interior + 2*halo)²` のうち更新するのが 1/9 未満になって
+/// 割に合わないだけ。
 fn new_repair(build: &BuildParams, reach: i32) -> Result<Repair, PlanError> {
     let halo = reach.max(1);
     let interior = REPAIR_INTERIOR_CELLS.max(halo);
@@ -618,6 +629,7 @@ fn new_repair(build: &BuildParams, reach: i32) -> Result<Repair, PlanError> {
         queued: vec![false; tiles],
         queue: VecDeque::new(),
         visits: 0,
+        last_visits: 0,
         // 1 タイルあたり平均 64 訪問 (= 128 パス) まで。1 訪問が 2 パスなので、
         // これは「密経路が全域 Δ=0 まで 128 掃き必要」に相当する。64x64 の通路
         // 地図で密が 72 掃き・compact が 1 タイルあたり 36 訪問だったので、
@@ -1312,6 +1324,15 @@ impl PlannerCore {
         self.dirty
     }
 
+    /// compact 経路: 直近の伝播 1 回で処理したタイル数 (密経路では None)。
+    ///
+    /// compact の「1 掃き」は地図の大きさで決まらず、変化が及んだ範囲で決まる。
+    /// 経過時間だけ出しても速いのか仕事が少なかったのか読めないので、ログには
+    /// これを添えること。
+    pub fn sweep_tiles(&self) -> Option<usize> {
+        self.repair.as_ref().map(|r| r.last_visits)
+    }
+
     /// 共有価値関数を全域で最大 `max_cells` セルぶん掃き進める (Gauss–Seidel)。
     /// 戻り値は `(このチャンクの Δ 合計, 1 掃きを終えたか)`。
     ///
@@ -1405,6 +1426,14 @@ impl PlannerCore {
     /// また直し → …… と互いを上書きし続けて**キューが空にならない** (値は
     /// どちらも正しいので、症状は「掃きが終わらない」だけ)。`commit_window` は
     /// 毎 tick 走っているので、起こし直しで失われるものは無い。
+    ///
+    /// 判定は footprint 全体との重なりで、狭域の窓の中まで含む (保守側)。**代償は
+    /// セル解像度で効く**: パッチの一辺は `2*(2*win + reach + 2) + 1` セルなので、
+    /// 0.25 m/cell なら 27 角 = 4.4 万状態でも、0.10 m/cell では 53 角 = 16.9 万状態
+    /// (13.4 MB) になり、起こし直しが 10 Hz の `set_window` の中で走る。波面が
+    /// ロボットの近くを通るあいだこれが続くので、細かい地図では tick の実測を
+    /// 見ること (窓の外だけに絞るのは、窓の中を patch と修復のどちらが持つかを
+    /// 決め直すことになるので、測ってからにする)。
     fn repair_one_tile(&mut self) -> (u64, bool) {
         let build = &self.build;
         let overlay = self.penalty.as_ref();
@@ -1422,7 +1451,7 @@ impl PlannerCore {
             return (0, true);
         };
         let Some(t) = r.queue.pop_front() else {
-            r.visits = 0;
+            r.settle();
             self.dirty = false;
             return (0, true);
         };
@@ -1470,7 +1499,7 @@ impl PlannerCore {
 
         let done = r.queue.is_empty();
         if done {
-            r.visits = 0;
+            r.settle();
             self.dirty = false;
         }
         (delta, done)
@@ -2731,9 +2760,9 @@ mod tests {
         assert!(quiet, "追従 tick と修復が同じ不動点に落ち着くこと ({rounds} ラウンド回した)");
     }
 
-    /// 修復タイルの halo が遷移の届く距離をちゃんと覆っていること、および
-    /// interior がそれを下回らないこと (下回ると `enqueue_around` が上流タイルを
-    /// 取りこぼし、静かに間違った場に落ち着く)。
+    /// 修復タイルの halo が遷移の届く距離をちゃんと覆っていること (足りないと
+    /// interior の縁だけが MAX_COST を見て値が静かにずれる)、および halo に対して
+    /// 割の合う interior になっていること。
     #[test]
     fn repair_tile_geometry_covers_the_transition_reach() {
         let b = build(64);

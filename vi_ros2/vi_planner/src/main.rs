@@ -969,13 +969,22 @@ fn main() -> Result<()> {
                     loop {
                         let (_, done) = c.sweep_global(&mut cur, CELLS_PER_STEP);
                         if done {
-                            // 全域 1 掃きに実際かかった時間 (idle を含む実時間 =
+                            // 伝播 1 回に実際かかった時間 (idle を含む実時間 =
                             // 狭域の判断が広域に届くまでの遅れそのもの)。budget/idle を
                             // 実測から詰められるよう必ず出す。`still_dirty=false` なら
                             // 新しい不動点に達したので、次の狭域の書き込みまで止まる。
+                            //
+                            // compact は 1 回の伝播で掃く量が地図の大きさで決まらない
+                            // (変化が及んだ範囲で決まる) ので、経過時間だけでは速いのか
+                            // 仕事が少なかったのか読めない。タイル数を必ず添える。
+                            let work = match c.sweep_tiles() {
+                                Some(n) => format!(", {n} tiles"),
+                                None => String::new(),
+                            };
                             eprintln!(
-                                "vi_planner: global sweep done in {:.1}s (still_dirty={})",
+                                "vi_planner: global sweep done in {:.1}s{} (still_dirty={})",
                                 started.elapsed().as_secs_f64(),
+                                work,
                                 c.is_dirty()
                             );
                             sweep_start = None;
