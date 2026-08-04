@@ -15,8 +15,8 @@
 //!   2. パラメータ宣言・検証 (行動集合と θ 数は起動パラメータがそのまま効く)
 //!   3. `VI_THREADS` 設定 (vi_threads > 0 のとき)
 //!   4. /map 受信 (transient_local, 初回メッセージまでブロック)
-//!   5. PlannerCore 構築 (静的地図前提)
-//!   6. pose / scan 購読 + cmd_vel パブリッシャ + 2 つの action サーバ配線
+//!   5. PlannerCore 構築 (静的地図前提) + 先読みワーカー (`waypoint_prefetch`)
+//!   6. pose / scan / waypoints 購読 + cmd_vel パブリッシャ + 2 つの action サーバ配線
 //!   7. executor.spin()
 //!
 //! ## ロック規律 (重要)
@@ -30,6 +30,9 @@
 //!     実際に solve するのは広域側の 1 回だけになる。
 //!   - 追従の制御ループは **tick ごとに取得・解放**する。10Hz・予算 40ms なので、
 //!     1Hz のロールアウトは tick の隙間に入る。
+//!   - 先読みワーカー (`waypoint_prefetch`) は**この Mutex を一度も取らない**。
+//!     自分の予備の核を別に持っていて、解けた場だけを受け渡す
+//!     (`core::Prefetcher`)。握らせると、無くしたはずの停止がそのまま戻る。
 //!
 //! ## ゴール世代チェック
 //!
@@ -42,7 +45,7 @@
 //! イメージがビルドする版 — に合わせている (vi_node / vi_global_planner と同一)。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -60,7 +63,7 @@ use vi_reference::OccupancyGrid as ViOccupancyGrid;
 
 use vi_planner::core::{
     value_grid_of, BuildParams, Decision, PlanConfig, PlanError, PlanStats, PlannerCore,
-    SweepCursor,
+    Prefetcher, SweepCursor,
 };
 
 use rclrs::*;
@@ -124,6 +127,10 @@ struct Params {
     global_sweep: bool,
     global_sweep_budget_ms: i64,
     global_sweep_idle_ms: i64,
+    // ── ウェイポイントの先読み ──
+    waypoint_prefetch: bool,
+    waypoint_topic: String,
+    waypoint_prefetch_threads: i64,
     // ── 可視化 ──
     publish_value_function: bool,
     value_publish_interval_ms: i64,
@@ -193,6 +200,23 @@ fn read_params(node: &Node) -> Result<Params> {
     // budget を伸ばすときは idle も一緒に伸ばすこと。
     let global_sweep_budget_ms = p!("global_sweep_budget_ms", i64, 20);
     let global_sweep_idle_ms = p!("global_sweep_idle_ms", i64, 60);
+
+    // 次のウェイポイントの価値関数を、いまの点へ走っている間に解いておく
+    // (core::Prefetcher)。巡回では点が変わるたびに solve が丸ごと 1 回走り、その間
+    // 機体が止まる (19F で 29 秒、津田沼 compact で 87 秒) — それを走行時間に隠す。
+    // **既定は false**: 価値関数が同時に 2 つ生きるので、密ならメモリが、compact
+    // なら sink のディスクが最大 2 倍 + 採用待ちの 1 つぶん要る。効くのは
+    // waypoint_topic に並びを出すもの (daifuku_waypoint_manager) がいるときだけで、
+    // 並びが無ければ立ち上がっていても何も解かない。
+    let waypoint_prefetch = p!("waypoint_prefetch", bool, false);
+    // 先読み対象の並び (nav_msgs/Path)。transient_local で購読するので、後から
+    // 起動しても latch されている並びを拾える。
+    let waypoint_topic = p!("waypoint_topic", Arc<str>, "waypoints".into()).to_string();
+    // 先読みの solve に使うスレッド数。追従は 10Hz・予算 40ms/tick で回っているので
+    // 既定 1 に絞ってある。**効くのは compact 経路だけ** — 密の frontier2d_sparse は
+    // スレッド数を環境変数 VI_THREADS から読む (プロセスで 1 つ) ので、先読みだけを
+    // 絞ることができない。
+    let waypoint_prefetch_threads = p!("waypoint_prefetch_threads", i64, 1);
 
     let publish_value_function = p!("publish_value_function", bool, true);
     // solve の途中経過の配信間隔。0 は「完了時のみ」。追従中の再配信は掃き
@@ -270,6 +294,9 @@ fn read_params(node: &Node) -> Result<Params> {
         global_sweep,
         global_sweep_budget_ms,
         global_sweep_idle_ms,
+        waypoint_prefetch,
+        waypoint_topic,
+        waypoint_prefetch_threads,
         publish_value_function,
         value_publish_interval_ms,
         cost_drawing_threshold,
@@ -589,7 +616,8 @@ fn run_follow(
             Ok(stats) => {
                 if stats.solved_now {
                     eprintln!(
-                        "vi_planner: value function solved in {:.2}s (iters={}) [follow_path]",
+                        "vi_planner: value function {} in {:.2}s (iters={}) [follow_path]",
+                        if stats.adopted { "adopted from prefetch" } else { "solved" },
                         t0.elapsed().as_secs_f64(),
                         stats.iters
                     );
@@ -804,6 +832,9 @@ fn main() -> Result<()> {
     // 56 B/state だけで見積もると 4 割以上足りない。compact は確定出力 12 B/state だけ。
     let states_gb = nstates as f64 * 80.0 / 1e9;
     let sink_gb = nstates as f64 * 12.0 / 1e9;
+    // 先読みは価値関数を 2 本持つ (走っている点のと、次の点の)。密ならメモリ、
+    // compact ならディスクがそのぶん要る。見積もりは常に 2 倍で語ること。
+    let fields = if params.waypoint_prefetch { 2.0 } else { 1.0 };
     eprintln!(
         "vi_planner: planner grid {}x{} @{:.3}m (map_scale={}, downsample={}) x{} theta \
          = {} states{}",
@@ -823,12 +854,26 @@ fn main() -> Result<()> {
     // sink の置き場と、そこを選んだ理由の 1 行はこの中で出る (明示指定 →
     // compact_ram_limit_mb による自動退避 → RAM)。密ソルバなら None。
     let sink_dir = compact_sink_dir(&params, solver, nstates);
+    if params.waypoint_prefetch {
+        // 生きる場はちょうど 2 つ (走行中のと、次の) で頭打ちになる。新しい場を
+        // 確保する前に必ず古いほうを手放しているため — 走行中の核は solve の前に
+        // `cached = None`、先読みは注文を受ける前に採用待ちを捨てる。
+        eprintln!(
+            "vi_planner: waypoint prefetch on ({} threads) — {} for {:.2} GB \
+             (2 x {:.2} GB: the goal being driven to, and the next one)",
+            params.waypoint_prefetch_threads.max(1),
+            if use_compact { "budget the sink directory" } else { "budget RAM" },
+            if use_compact { sink_gb * 2.0 } else { states_gb * 2.0 },
+            if use_compact { sink_gb } else { states_gb },
+        );
+    }
     // 密の見積もりが限度を超えたら**起動を止める**。ここまで来れば地図の実寸が
     // 分かっているので、launch 側の代理判定 (map_scale > 1 なら密を禁止) より正確。
     // 黙って確保して OOM killer に落とされるより、理由を出して止めるほうがよい。
-    if !use_compact && states_gb * 1000.0 > params.dense_limit_mb.max(0) as f64 {
+    // 先読みを入れると場が 2 本になるので、限度と突き合わせるのも 2 本ぶん。
+    if !use_compact && states_gb * fields * 1000.0 > params.dense_limit_mb.max(0) as f64 {
         return Err(anyhow!(
-            "the dense value function needs {:.2} GB (states + sweep_orders) for {} states, over \
+            "the dense value function needs {:.2} GB (states + sweep_orders) for {} states{}, over \
              dense_limit_mb={}.\n\
              Raise map_scale (halving the resolution quarters this), raise dense_limit_mb if the \
              machine really has the room, or switch to solver: frontier2d_sparse_compact \
@@ -836,8 +881,13 @@ fn main() -> Result<()> {
              small patch around the robot for following. The local -> global feedback \
              (global_sweep) works there too — it repairs the sink tile by tile instead of \
              sweeping a full `states` array.",
-            states_gb,
+            states_gb * fields,
             nstates,
+            if params.waypoint_prefetch {
+                " x2 value functions (waypoint_prefetch: true)"
+            } else {
+                ""
+            },
             params.dense_limit_mb,
             sink_gb
         ));
@@ -870,10 +920,36 @@ fn main() -> Result<()> {
         path_spacing: params.path_spacing,
         action_tolerance_cells,
         compact_sink_dir: sink_dir,
+        // 先読みを入れると場が 2 つ同時に生きるので、compact の確定出力は solve
+        // ごとに使い捨てのディレクトリ (<compact_sink_dir>/gen<N>) へ分ける。
+        // 固定ファイル名のままだと後から解くほうが先の場のファイルを truncate で
+        // 潰す (mmap したまま長さが変わる = ゼロを読むか SIGBUS)。カウンタは
+        // 先読み側の核と共有すること。
+        compact_sink_gen: params.waypoint_prefetch.then(|| Arc::new(AtomicU64::new(0))),
         vi_threads: params.vi_threads.max(0) as usize,
         global_sweep: params.global_sweep,
     };
-    let core = Arc::new(Mutex::new(PlannerCore::new(build, cfg)));
+
+    // 5b. ウェイポイントの先読み (waypoint_prefetch)。予備の核を 1 つ専用スレッドに
+    //     持たせ、いまの点へ走っている間に次の点を解かせる。走行中の核のロックは
+    //     取らないので、追従ループ (10Hz / try_lock) の邪魔はしない。
+    let prefetch = params.waypoint_prefetch.then(|| {
+        let cfg = PlanConfig {
+            // 先読みの場に狭域の書き込みは無い = 伝播させる仕事が無いので、
+            // 修復タイル (数 MB + 遷移表の再計算) を作らせない。
+            global_sweep: false,
+            // 追従の 40ms/tick を削らないよう既定 1 に絞る (compact のみ有効。
+            // 密は VI_THREADS がプロセスで 1 つなので分けられない)。
+            vi_threads: params.waypoint_prefetch_threads.max(1) as usize,
+            ..cfg.clone()
+        };
+        Prefetcher::spawn(build.clone(), cfg)
+    });
+    let mut core = PlannerCore::new(build, cfg);
+    if let Some(pf) = prefetch.clone() {
+        core = core.with_prefetch(pf);
+    }
+    let core = Arc::new(Mutex::new(core));
 
     // 6a. 自己位置トピック購読 (tf2 代替)。
     let latest_pose: Arc<Mutex<Option<PoseView>>> = Arc::new(Mutex::new(None));
@@ -901,6 +977,40 @@ fn main() -> Result<()> {
             q.push(vi_scan_from(&msg));
         },
     )?;
+
+    // 6b-2. 先読み対象の並び (nav_msgs/Path)。daifuku_waypoint_manager が
+    //       waypoint を編集するたび latch して出す。**受け取っただけでは何も
+    //       解かない** — 注文が出るのは走り出して最初のゴールが確定してから
+    //       (core::Prefetcher::note_goal) で、そうしないと起動と同時に 1 点目の
+    //       solve が走って nav2 の lifecycle 立ち上げと CPU を奪い合う。
+    let _waypoints_sub = match prefetch.clone() {
+        None => None,
+        Some(pf) => {
+            let frame = params.global_frame.clone();
+            Some(node.create_subscription::<nav_msgs::msg::Path, _>(
+                params.waypoint_topic.as_str().reliable().transient_local().keep_last(1),
+                move |msg: nav_msgs::msg::Path| {
+                    // フレームが違う並びで先読みすると、座標だけがそれらしく
+                    // 入って一致判定に永久に掛からない (先読みが黙って効かなく
+                    // なるだけなので、必ず出す)。
+                    if !msg.header.frame_id.is_empty() && msg.header.frame_id != frame {
+                        eprintln!(
+                            "WARN: vi_planner: ignoring {} waypoints in frame {:?} \
+                             (this planner works in {:?})",
+                            msg.poses.len(),
+                            msg.header.frame_id,
+                            frame
+                        );
+                        return;
+                    }
+                    let wps: Vec<PoseView> =
+                        msg.poses.iter().map(|p| pose_view_from(&p.pose)).collect();
+                    eprintln!("vi_planner: {} waypoints available for prefetch", wps.len());
+                    pf.set_waypoints(wps);
+                },
+            )?)
+        }
+    };
 
     // 6c. cmd_vel パブリッシャ (Nav2 構成では launch 側で cmd_vel_nav に
     //     リマップし velocity_smoother を経由させる)。
@@ -1153,11 +1263,15 @@ fn main() -> Result<()> {
                         Ok(Ok((poses, stats))) => {
                             let dt = t0.elapsed();
                             eprintln!(
-                                "vi_planner: path with {} poses in {:.2}s (solved_now={}, iters={})",
+                                "vi_planner: path with {} poses in {:.2}s \
+                                 (solved_now={}, iters={}{})",
                                 stats.poses,
                                 dt.as_secs_f64(),
                                 stats.solved_now,
-                                stats.iters
+                                stats.iters,
+                                // 先読みが効いた回。solve を丸ごと飛ばしたので、
+                                // ここが出ている間は点の切り替わりで機体が止まらない。
+                                if stats.adopted { ", prefetched" } else { "" }
                             );
                             let stamp = node_clock.now().to_sec_nanosec().unwrap_or((0, 0));
                             let mut result =
@@ -1303,8 +1417,14 @@ fn main() -> Result<()> {
     )?;
 
     eprintln!(
-        "vi_planner: ready (solver={}, actions=compute_path_to_pose + follow_path, {}Hz)",
-        params.solver, params.control_frequency
+        "vi_planner: ready (solver={}, actions=compute_path_to_pose + follow_path, {}Hz{})",
+        params.solver,
+        params.control_frequency,
+        if params.waypoint_prefetch {
+            format!(", prefetching from {}", params.waypoint_topic)
+        } else {
+            String::new()
+        }
     );
 
     // 7. Spin.

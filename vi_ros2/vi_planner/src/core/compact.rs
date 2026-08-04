@@ -63,7 +63,7 @@
 //! 見ること) は [`super`] の doc にまとめてある。
 
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use vi_reference::bridge::PoseView;
 use vi_reference::msg::{OccupancyGrid, Quaternion};
@@ -76,7 +76,7 @@ use vi_reference::state::State;
 use vi_reference::value_iterator::ValueIterator;
 use vi_reference::{Action, ValueIteratorLocal};
 
-use super::{BuildParams, Field, PlanError, PlannerCore, SinkDir, SolveStats};
+use super::{BuildParams, Field, PlanError, PlannerCore, SinkDir, SinkGen, SolveStats};
 
 /// `ValueIteratorLocal::set_map_with_occupancy_grid` が固定で入れるローカル
 /// ウィンドウ半径 [m]。パッチの寸法を決めるのに先に知る必要があるので写しを持つ
@@ -590,12 +590,45 @@ fn rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
 }
 
 /// compact 出力 sink を作る。`dir` 指定時はディスク mmap、無指定は RAM。
-fn make_sink(nstates: usize, dir: &SinkDir) -> Result<Box<dyn CompactSink + Send>, PlanError> {
-    match dir {
-        Some(dir) => crate::sink::MmapSink::new(dir, nstates)
-            .map(|s| Box::new(s) as Box<dyn CompactSink + Send>)
-            .map_err(|e| PlanError::Sink(e.to_string())),
-        None => Ok(Box::new(RamSink::new(nstates))),
+///
+/// `gen` があるときは `dir` 直下ではなく `dir/gen<N>` に置き、その場を捨てた
+/// ときにディレクトリごと消す ([`crate::sink::MmapSink::new_owned`])。**先読み
+/// ([`super::Prefetcher`]) を入れると場が同時に 2 つ以上生きる**ので、固定
+/// ファイル名のままだと後から解くほうが `truncate` で先の場のファイルを潰す
+/// (mmap したまま長さが変わるので、読めばゼロか SIGBUS)。カウンタは先読み側の
+/// 核と共有していて、どの solve も自分だけのディレクトリを取る。
+///
+/// 先読みを使わないときは `gen` が None で、置き場は従来どおり `dir` 直下。
+fn make_sink(
+    nstates: usize,
+    dir: &SinkDir,
+    gen: &SinkGen,
+) -> Result<Box<dyn CompactSink + Send>, PlanError> {
+    let Some(dir) = dir else { return Ok(Box::new(RamSink::new(nstates))) };
+    let boxed = |s| Box::new(s) as Box<dyn CompactSink + Send>;
+    let Some(counter) = gen else {
+        return crate::sink::MmapSink::new(dir, nstates)
+            .map(boxed)
+            .map_err(|e| PlanError::Sink(e.to_string()));
+    };
+    let n = counter.fetch_add(1, Ordering::Relaxed);
+    if n == 0 {
+        // 前回の実行が落ちて残した世代を片付ける。この時点で世代を持っている
+        // 場はまだ 1 つも無いので、生きている sink を消す心配はない。
+        remove_stale_generations(dir);
+    }
+    crate::sink::MmapSink::new_owned(&dir.join(format!("gen{n}")), nstates)
+        .map(boxed)
+        .map_err(|e| PlanError::Sink(e.to_string()))
+}
+
+/// `dir` の下に残っている `gen*` を消す (失敗は無視 — 消せなくても解ける)。
+fn remove_stale_generations(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        if e.file_name().to_string_lossy().starts_with("gen") {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
     }
 }
 
@@ -620,7 +653,8 @@ impl PlannerCore {
         let g = &self.build.grid;
         let nt = self.build.theta_cell_num;
         let nstates = g.width as usize * g.height as usize * nt as usize;
-        let mut sink = make_sink(nstates, &self.cfg.compact_sink_dir)?;
+        let mut sink =
+            make_sink(nstates, &self.cfg.compact_sink_dir, &self.cfg.compact_sink_gen)?;
         let nthreads =
             if self.cfg.vi_threads > 0 { self.cfg.vi_threads } else { default_threads() };
 

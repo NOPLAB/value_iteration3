@@ -19,6 +19,8 @@
 //!   solve・ロールアウト・窓の精密化・全域掃きはすべてここにある。
 //! - [`compact`] — アウトオブコア経路だけの機構 (sink・追従パッチ・penalty 表・
 //!   タイル修復)。`PlannerCore` の compact 側メソッドもそちらに置いてある。
+//! - [`prefetch`] — 次のウェイポイントを走行中に解いておく先読み ([`Prefetcher`])。
+//!   付けるかどうかは任意で、付けなければ以下は何も変わらない。
 //! - `core/tests.rs` — 両経路をまたぐテスト。
 //!
 //! # 狭域 → 広域のフィードバック ([`PlannerCore::sweep_global`])
@@ -71,10 +73,12 @@
 //! できる (分離クレート方式; リポジトリ CLAUDE.md 参照)。
 
 mod compact;
+mod prefetch;
 #[cfg(test)]
 mod tests;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ndarray::Array2;
@@ -89,6 +93,7 @@ use vi_reference::value_iterator::ValueIterator;
 use vi_reference::{Action, ValueIteratorLocal};
 
 use compact::{new_patch, new_repair, CompactField, Patch, PenaltyOverlay, Repair};
+pub use prefetch::Prefetcher;
 
 /// ゴールごとの ValueIterator 構築入力 (地図は起動時に一度だけ取り込む)。
 /// vi_global_planner::core::BuildParams と同型 — クレート間依存を避けるための
@@ -108,6 +113,14 @@ pub struct BuildParams {
 /// `Some(dir)` = そのディレクトリ上の mmap ファイル。必要量は
 /// `nx·ny·theta_cell_num × 12 B` なので、小メモリ機ではディスクに逃がす。
 pub type SinkDir = Option<std::path::PathBuf>;
+
+/// compact 出力を solve ごとに使い捨てのディレクトリ (`<dir>/gen<N>`) へ置くための
+/// 世代カウンタ。`None` = 従来どおり `compact_sink_dir` 直下の固定ファイル名。
+///
+/// 先読み ([`Prefetcher`]) を使うときは**必須**で、しかも先読み側の核と**同じ
+/// カウンタを共有すること**。場が 2 つ同時に生きるので、固定ファイル名のままだと
+/// 後から解くほうが先の場のファイルを `truncate` で潰す。
+pub type SinkGen = Option<Arc<AtomicU64>>;
 
 /// 計画・追従の設定。前半は solve とキャッシュ、後半は用途別
 /// (`plan_*` = 広域ロールアウト / `decide` = 狭域追従)。
@@ -137,6 +150,8 @@ pub struct PlanConfig {
     // ── アウトオブコア (compact) 経路 ──
     /// 確定出力の置き場。`solver` が `frontier2d_sparse_compact` のときだけ参照する。
     pub compact_sink_dir: SinkDir,
+    /// solve ごとに使い捨てのディレクトリを切るか (先読みを使うときは必須)。
+    pub compact_sink_gen: SinkGen,
     /// compact 経路のワーカースレッド数 (0 = `default_threads()`)。
     pub vi_threads: usize,
 
@@ -156,10 +171,15 @@ impl PlanConfig {
 /// solve 単体の統計 (ログ用)。
 #[derive(Clone, Copy, Debug)]
 pub struct SolveStats {
-    /// この呼び出しで solve を実行したか (false = キャッシュヒット)。
+    /// この呼び出しでゴールの価値関数が新しく載ったか (false = キャッシュヒット)。
+    /// 先読みから受け取ったときも true — 場が入れ替わったのは同じなので。
     pub solved_now: bool,
-    /// 実行した solve イテレーション数 (キャッシュヒット時 0)。
+    /// 実行した solve イテレーション数 (キャッシュヒットと先読み採用では 0 —
+    /// 解いたのは先読みワーカーなので、この呼び出しの仕事ではない)。
     pub iters: u32,
+    /// 先読み ([`Prefetcher`]) が用意しておいた場を受け取ったか。この呼び出しは
+    /// solve していない = 走り出しまでの待ちが無かった、という意味。
+    pub adopted: bool,
 }
 
 /// 1 回の plan の統計 (ログ/Feedback 用)。
@@ -167,6 +187,7 @@ pub struct SolveStats {
 pub struct PlanStats {
     pub solved_now: bool,
     pub iters: u32,
+    pub adopted: bool,
     pub poses: usize,
 }
 
@@ -254,12 +275,26 @@ pub struct PlannerCore {
     /// (「狭域が通れないと言っている」を別途検出する必要はない — 通れないなら
     /// 必ず値が動くので、これがその信号そのものになる)。
     dirty: bool,
+    /// 次のウェイポイントの先読み ([`Prefetcher`])。`None` = 先読みなし
+    /// (`waypoint_prefetch: false`) で、そのときこの核の挙動は従来と同じ。
+    prefetch: Option<Prefetcher>,
+    /// 追従の道具 (パッチ・penalty 表・修復タイル) を持たず solve だけをする核か。
+    /// 先読みワーカーが抱える予備の核がこれ ([`PlannerCore::new_solve_only`])。
+    solve_only: bool,
 }
 
 /// 円環上の角度差 (度、0..=180)。
 fn circ_deg_diff(a: i32, b: i32) -> i32 {
     let d = (a - b).rem_euclid(360);
     d.min(360 - d)
+}
+
+/// 2 つのゴール `(x, y, θ[deg])` を「同じ」とみなせるか。キャッシュの再利用判定と
+/// 先読み ([`Prefetcher`]) の照合が同じ規則を使うためにここに 1 つだけ置く
+/// (別々にすると、先読みが用意した場を採用できないゴールが静かに生まれる)。
+fn goal_matches(a: (f64, f64, i32), b: (f64, f64, i32), tol_xy: f64, tol_deg: f64) -> bool {
+    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt() <= tol_xy
+        && circ_deg_diff(a.2, b.2) as f64 <= tol_deg
 }
 
 /// `(ix, iy, it)` に方策があれば Decision::Action を返す (読み取り専用)。
@@ -313,7 +348,32 @@ impl PlannerCore {
         // 修復タイルは遷移表の再計算が要るので、パッチと一緒に最初の solve で作る
         // (`prepare_goal_with_progress`)。掃きスレッドの中で作ると、数秒かかる
         // 再計算をロックの中でやることになる。
-        Self { build, cfg, cached: None, patch: None, penalty, repair: None, dirty: false }
+        Self {
+            build,
+            cfg,
+            cached: None,
+            patch: None,
+            penalty,
+            repair: None,
+            dirty: false,
+            prefetch: None,
+            solve_only: false,
+        }
+    }
+
+    /// 先読み ([`Prefetcher`]) を付ける。付けると `prepare_goal_*` が 2 つのことを
+    /// するようになる: ゴールの場が先読みで用意できていれば solve を飛ばして
+    /// 受け取り、ゴールが確定するたびに**並びの次の点**を先読みへ注文する。
+    /// 付けなければ (既定) この核の挙動は従来のまま。
+    pub fn with_prefetch(mut self, prefetch: Prefetcher) -> Self {
+        self.prefetch = Some(prefetch);
+        self
+    }
+
+    /// 先読みワーカーが抱える予備の核。追従はしないので、パッチも penalty 表も
+    /// 修復タイルも作らない (作ると遷移表の再計算ぶんだけ最初の先読みが遅くなる)。
+    fn new_solve_only(build: BuildParams, cfg: PlanConfig) -> Self {
+        Self { solve_only: true, penalty: None, ..Self::new(build, cfg) }
     }
 
     /// キャッシュ中のゴールが `goal` と同一 (許容差内) か。追従スレッドが
@@ -325,9 +385,12 @@ impl PlannerCore {
 
     fn cache_matches(&self, goal: &PoseView, goal_t_deg: i32) -> bool {
         let Some(c) = self.cached.as_ref() else { return false };
-        let d2 = (c.goal_x - goal.x).powi(2) + (c.goal_y - goal.y).powi(2);
-        d2.sqrt() <= self.cfg.goal_tolerance_xy
-            && circ_deg_diff(c.goal_t_deg, goal_t_deg) as f64 <= self.cfg.goal_tolerance_deg
+        goal_matches(
+            (c.goal_x, c.goal_y, c.goal_t_deg),
+            (goal.x, goal.y, goal_t_deg),
+            self.cfg.goal_tolerance_xy,
+            self.cfg.goal_tolerance_deg,
+        )
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -381,6 +444,11 @@ impl PlannerCore {
     /// `prepare_goal` と同じだが、`solve_chunk` ごとの write_back 後に `on_chunk`
     /// を呼ぶ (途中経過の value_function 可視化用)。キャッシュヒット時は呼ばれない。
     /// compact 経路は 1 回で走り切るので `on_chunk` は呼ばれない。
+    ///
+    /// 先読み ([`Prefetcher`]) が付いていれば、solve の前にそちらを見る。用意が
+    /// できていれば受け取って solve を飛ばし (`stats.adopted`)、まだ解いている
+    /// 最中なら終わるまで待つ。どちらにせよ最後に**並びの次の点**を注文するので、
+    /// 巡回中は「いまのゴールへ走っている間に次のゴールが解けている」状態になる。
     pub fn prepare_goal_with_progress(
         &mut self,
         goal: PoseView,
@@ -388,9 +456,13 @@ impl PlannerCore {
         on_chunk: &mut dyn FnMut(&ValueIterator),
     ) -> Result<SolveStats, PlanError> {
         let goal_t_deg = yaw_to_goal_theta_deg(goal.yaw_rad);
-        let mut stats = SolveStats { solved_now: false, iters: 0 };
+        let mut stats = SolveStats { solved_now: false, iters: 0, adopted: false };
 
         if self.cache_matches(&goal, goal_t_deg) {
+            // ここも注文の入口。BT は追従中も 1Hz で計画を投げ直すので、最初の
+            // 1 回で注文できていなくても (並びがまだ届いていない等) 次の tick で
+            // 拾える。同じ点の注文は 2 回目以降 no-op。
+            self.request_next(goal);
             return Ok(stats);
         }
 
@@ -411,24 +483,49 @@ impl PlannerCore {
             r.clear();
         }
 
-        let field = if self.cfg.use_compact() {
-            // パッチも修復タイルも幾何だけで決まるので初回だけ作る
-            // (遷移表の再計算は 64^3 サブセルサンプリング x 行動 x θ で重い)。
-            if self.patch.is_none() {
-                let p = new_patch(&self.build)?;
-                if self.cfg.global_sweep && self.repair.is_none() {
-                    self.repair = Some(new_repair(&self.build, p.reach)?);
-                }
-                self.patch = Some(p);
+        // パッチも修復タイルも幾何だけで決まるので初回だけ作る (遷移表の再計算は
+        // 64^3 サブセルサンプリング x 行動 x θ で重い)。**solve の外に出してある**
+        // のは、先読みから受け取る経路が solve を通らないため — 巡回の 1 点目から
+        // 受け取ると、ここが solve の中にあると追従の道具が無いまま走り出す。
+        if self.cfg.use_compact() && !self.solve_only && self.patch.is_none() {
+            let p = new_patch(&self.build)?;
+            if self.cfg.global_sweep && self.repair.is_none() {
+                self.repair = Some(new_repair(&self.build, p.reach)?);
             }
-            self.solve_compact(&goal, goal_t_deg, &mut stats, cancel)?
-        } else {
-            self.solve_dense(&goal, goal_t_deg, &mut stats, cancel, on_chunk)?
+            self.patch = Some(p);
+        }
+
+        let adopted = match self.prefetch.as_ref() {
+            Some(pf) => pf.adopt(goal, goal_t_deg, cancel),
+            None => None,
+        };
+        let cached = match adopted {
+            Some(c) => {
+                stats.adopted = true;
+                c
+            }
+            None => {
+                let field = if self.cfg.use_compact() {
+                    self.solve_compact(&goal, goal_t_deg, &mut stats, cancel)?
+                } else {
+                    self.solve_dense(&goal, goal_t_deg, &mut stats, cancel, on_chunk)?
+                };
+                CachedGoal { goal_x: goal.x, goal_y: goal.y, goal_t_deg, field }
+            }
         };
 
         stats.solved_now = true;
-        self.cached = Some(CachedGoal { goal_x: goal.x, goal_y: goal.y, goal_t_deg, field });
+        self.cached = Some(cached);
+        self.request_next(goal);
         Ok(stats)
+    }
+
+    /// 先読みへ「いまのゴールはこれ」と伝える (並びの次の点の注文がここで出る)。
+    /// 先読みが付いていなければ何もしない。
+    fn request_next(&self, goal: PoseView) {
+        if let Some(pf) = self.prefetch.as_ref() {
+            pf.note_goal(goal);
+        }
     }
 
     /// 密経路: `ValueIterator::states` を確保し、`solve_chunk` ごとに cancel を観測しながら解く。
@@ -531,7 +628,12 @@ impl PlannerCore {
         };
         Ok((
             poses.clone(),
-            PlanStats { solved_now: s.solved_now, iters: s.iters, poses: poses.len() },
+            PlanStats {
+                solved_now: s.solved_now,
+                iters: s.iters,
+                adopted: s.adopted,
+                poses: poses.len(),
+            },
         ))
     }
 

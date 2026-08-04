@@ -51,6 +51,7 @@ fn cfg() -> PlanConfig {
         path_spacing: RES,
         action_tolerance_cells: 4,
         compact_sink_dir: None,
+        compact_sink_gen: None,
         vi_threads: 1,
         global_sweep: true,
     }
@@ -842,6 +843,8 @@ fn decide_borrows_action_from_neighbors() {
         penalty: core.penalty.take(),
         repair: core.repair.take(),
         dirty: false,
+        prefetch: None,
+        solve_only: false,
     };
     assert_eq!(strict_core.decide(on_obstacle), Decision::NoAction);
     // tolerance 4 (0.2m) なら近傍の行動を借りられる。
@@ -853,6 +856,8 @@ fn decide_borrows_action_from_neighbors() {
         penalty: strict_core.penalty,
         repair: strict_core.repair,
         dirty: false,
+        prefetch: None,
+        solve_only: false,
     };
     assert!(matches!(relaxed_core.decide(on_obstacle), Decision::Action { .. }));
 }
@@ -1330,4 +1335,172 @@ fn resolving_a_new_goal_clears_the_pending_propagation() {
     core.dirty = true;
     core.prepare_goal(pose(0.5, 0.5, 0.0), &cancel).expect("re-solve");
     assert!(!core.is_dirty());
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ウェイポイントの先読み (core::prefetch)
+//
+// ワーカーは別スレッドで走るが、`adopt` が「解き終わるまで待つ」ので待ち合わせは
+// 要らない (sleep で同期するテストにはしない)。
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// 先読みの本題: 2 点目の solve が**走行中に済んでいる**こと。
+/// 巡回で点が変わるたびに止まっていた solve 1 回ぶんがこれで消える。
+#[test]
+fn the_next_waypoint_is_adopted_without_solving_again() {
+    let wps = vec![pose(1.0, 1.0, 0.0), pose(2.0, 2.0, 0.0)];
+    let pf = Prefetcher::spawn(build(64), cfg());
+    pf.set_waypoints(wps.clone());
+    let mut core = PlannerCore::new(build(64), cfg()).with_prefetch(pf);
+    let cancel = AtomicBool::new(false);
+
+    // 1 点目。先読みはまだ何も持っていないので自分で解く。解き終わった時点で
+    // 2 点目が注文される。
+    let s1 = core.prepare_goal(wps[0], &cancel).expect("solve the first waypoint");
+    assert!(s1.solved_now && s1.iters > 0 && !s1.adopted);
+
+    // 2 点目。先読みワーカーが解いた場をそのまま受け取る (この呼び出しは
+    // 1 イテレーションも回さない)。
+    let s2 = core.prepare_goal(wps[1], &cancel).expect("adopt the second waypoint");
+    assert!(s2.adopted, "2 点目は先読みから受け取ること");
+    assert_eq!(s2.iters, 0, "solve は先読みワーカーが済ませているはず");
+    assert!(s2.solved_now, "場が入れ替わったのはキャッシュヒットではない");
+    assert!(core.is_cached_goal(wps[1]));
+}
+
+/// 受け取った場が「自分で解いた場」と同じに扱われること。とくに compact の
+/// 追従パッチは solve の中ではなく外で作るようにしてあるので、**1 点目から
+/// 受け取っても**追従できる (パッチが無いと decide は NoAction しか返さない)。
+#[test]
+fn a_goal_adopted_as_the_first_one_can_still_be_followed() {
+    let wps = vec![pose(1.0, 1.0, 0.0), pose(2.0, 2.0, 0.0)];
+    let pf = Prefetcher::spawn(build(64), cfg_compact());
+    pf.set_waypoints(wps.clone());
+    let cancel = AtomicBool::new(false);
+
+    // 注文だけさせる核 (ここでは 1 点目を解く)。
+    let mut warm = PlannerCore::new(build(64), cfg_compact()).with_prefetch(pf.clone());
+    warm.prepare_goal(wps[0], &cancel).expect("solve the first waypoint");
+
+    // まっさらな核が 2 点目を受け取る = solve を一度も通らない。
+    let mut fresh = PlannerCore::new(build(64), cfg_compact()).with_prefetch(pf);
+    let s = fresh.prepare_goal(wps[1], &cancel).expect("adopt");
+    assert!(s.adopted);
+    assert!(fresh.patch.is_some(), "solve を通らなくても追従パッチは要る");
+    assert!(fresh.repair.is_some(), "全域伝播の作業場も同じ");
+    assert!(!fresh.is_dirty());
+
+    let start = pose(1.0, 1.0, 0.0);
+    fresh.set_window(start);
+    assert!(
+        matches!(fresh.decide(start), Decision::Action { .. }),
+        "受け取った場の上で方策が読めること"
+    );
+}
+
+/// 並びに無いゴールが来たら、先読みを待たずに自分で解くこと (待つと、巡回の
+/// 途中に単発ゴールを 1 つ挟んだだけで先読み 1 回ぶん止まる)。
+#[test]
+fn a_goal_outside_the_list_is_solved_without_waiting_for_the_prefetch() {
+    let wps = vec![pose(1.0, 1.0, 0.0), pose(2.0, 2.0, 0.0)];
+    let pf = Prefetcher::spawn(build(64), cfg());
+    pf.set_waypoints(wps.clone());
+    let mut core = PlannerCore::new(build(64), cfg()).with_prefetch(pf);
+    let cancel = AtomicBool::new(false);
+    core.prepare_goal(wps[0], &cancel).expect("solve the first waypoint");
+
+    // 2 点目を先読みしている最中に、並びに無いゴールが来る。
+    let elsewhere = pose(0.5, 2.5, 0.0);
+    let s = core.prepare_goal(elsewhere, &cancel).expect("solve");
+    assert!(!s.adopted, "別ゴールの先読みを受け取ってはいけない");
+    assert!(s.iters > 0, "自分で解くこと");
+    assert!(core.is_cached_goal(elsewhere));
+}
+
+/// 巡回中の「いまの点」を計画し直しても、次の点の先読みは走り続けること。
+///
+/// BT は追従中も 1Hz で `compute_path_to_pose` を投げ直し、復帰行動でも同じ点を
+/// 計画し直す。ここで先読みが取り消されると、次の点に着いたときに solve が丸ごと
+/// 1 回走る = この機能が消したはずの停止がそのまま戻る。取り消しが起きないのは
+/// 同じ点ならキャッシュヒットで `adopt` まで来ないからで、`adopt` の doc に書いた
+/// 「進行中の先読みは常にキャッシュ中のゴールの次」という対応がその根拠。
+#[test]
+fn replanning_the_current_goal_leaves_the_prefetch_running() {
+    let wps = vec![pose(1.0, 1.0, 0.0), pose(2.0, 2.0, 0.0)];
+    let pf = Prefetcher::spawn(build(64), cfg());
+    pf.set_waypoints(wps.clone());
+    let mut core = PlannerCore::new(build(64), cfg()).with_prefetch(pf.clone());
+    let cancel = AtomicBool::new(false);
+    core.prepare_goal(wps[0], &cancel).expect("solve the first waypoint");
+
+    // BT のリプラン相当。キャッシュヒットなので solve もしない。
+    let again = core.prepare_goal(wps[0], &cancel).expect("replan");
+    assert!(!again.solved_now && !again.adopted);
+
+    // 2 点目の先読みは生きたまま (注文中か、もう解けているか)。
+    let alive = pf.pending().is_some()
+        || core.prepare_goal(wps[1], &cancel).expect("adopt").adopted;
+    assert!(alive, "いまの点を計画し直しただけで次の点の先読みを捨ててはいけない");
+}
+
+/// 最後の点まで来たら注文しない (並びの外を勝手に解かない)。
+#[test]
+fn the_last_waypoint_does_not_queue_another_prefetch() {
+    let wps = vec![pose(1.0, 1.0, 0.0)];
+    let pf = Prefetcher::spawn(build(64), cfg());
+    pf.set_waypoints(wps.clone());
+    let mut core = PlannerCore::new(build(64), cfg()).with_prefetch(pf.clone());
+    let cancel = AtomicBool::new(false);
+    core.prepare_goal(wps[0], &cancel).expect("solve");
+    assert!(pf.pending().is_none(), "最後の点の次は無い");
+}
+
+/// 先読みは価値関数を 2 つ同時に生かす。compact の確定出力は solve ごとに
+/// 別ディレクトリへ置くこと — 固定ファイル名のままだと、後から解くほうが
+/// `truncate` で先の場のファイルを潰す (mmap 中に長さが変わる)。
+#[test]
+fn two_live_compact_fields_never_share_a_sink_directory() {
+    let dir = std::env::temp_dir().join("vi_planner_sink_gen_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    let gen = Arc::new(AtomicU64::new(0));
+    let cfg_gen = || PlanConfig {
+        compact_sink_dir: Some(dir.clone()),
+        compact_sink_gen: Some(Arc::clone(&gen)),
+        ..cfg_compact()
+    };
+    let cancel = AtomicBool::new(false);
+
+    let mut a = PlannerCore::new(build(48), cfg_gen());
+    a.prepare_goal(pose(1.0, 1.0, 0.0), &cancel).expect("solve a");
+    let before = a.value_grid(60).expect("grid a");
+
+    // 2 本目。ここで a の sink を潰すようだと、先読みは使いものにならない。
+    let mut b = PlannerCore::new(build(48), cfg_gen());
+    b.prepare_goal(pose(2.0, 0.5, 0.0), &cancel).expect("solve b");
+
+    assert_eq!(before.data, a.value_grid(60).expect("grid a again").data, "a の場が無傷であること");
+    let gens = std::fs::read_dir(&dir)
+        .expect("sink dir")
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("gen"))
+        .count();
+    assert_eq!(gens, 2, "solve ごとに 1 つ");
+
+    drop(a);
+    drop(b);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `main.rs` は核を `Arc<Mutex<PlannerCore>>` にしてスレッドへ配る。**その形は
+/// ホストでは組めない** (rclrs が colcon 経由でしかリンクしない) ので、必要な
+/// 境界だけここで固定する。先読みを足したときに壊れるならこのテストで落ちる。
+#[test]
+fn the_core_and_the_prefetcher_cross_threads() {
+    fn send<T: Send>() {}
+    fn send_sync<T: Send + Sync>() {}
+    // `Mutex<T>: Sync` は `T: Send` で足りる。核そのものは Sync ではない
+    // (sink が `dyn CompactSink + Send` なので) — 共有はロック越しだけ。
+    send::<PlannerCore>();
+    // 先読みの取っ手は核の中に入ったまま別スレッドへ渡るので、両方が要る。
+    send_sync::<Prefetcher>();
 }
