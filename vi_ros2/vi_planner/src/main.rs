@@ -195,6 +195,8 @@ fn read_params(node: &Node) -> Result<Params> {
     let global_sweep_idle_ms = p!("global_sweep_idle_ms", i64, 60);
 
     let publish_value_function = p!("publish_value_function", bool, true);
+    // solve の途中経過の配信間隔。0 は「完了時のみ」。追従中の再配信は掃き
+    // スレッドが 2 秒ごとに出すので、ここを 0 にすると追従中は出なくなる。
     let value_publish_interval_ms = p!("value_publish_interval_ms", i64, 500);
     let cost_drawing_threshold = p!("cost_drawing_threshold", i64, 60);
     let window_cost_drawing_threshold = p!("window_cost_drawing_threshold", i64, 60);
@@ -494,7 +496,9 @@ fn ros_grid_from(
 /// スライス (価値関数は 1 本しかないので、旧 vi_local_planner の
 /// `local_value_function` に相当するトピックは無い)。
 struct Viz {
-    /// θ=0 全域スライス (solve の途中経過 + 完了時)。
+    /// θ=0 全域スライス (solve の途中経過 + 完了時 + 追従中の伝播の進み具合)。
+    /// 追従中に出しているのは掃きスレッドで、`global_sweep: false` だと
+    /// solve した瞬間のまま固まる。
     vf_pub: Publisher<nav_msgs::msg::OccupancyGrid>,
     /// ローカルウィンドウの現在方位スライス (追従中、スキャン penalty 込み)。
     win_pub: Publisher<nav_msgs::msg::OccupancyGrid>,
@@ -933,12 +937,18 @@ fn main() -> Result<()> {
     // (`core::Repair`)。伝播にかかる時間は地図の大きさではなく変化が及ぶ範囲に
     // 比例するので、最初の反応が遅くても掃き終わるまでの実測ログを見ること。
     //
+    // **`value_function` の再配信もこのスレッドが持つ**。追従中は solve が
+    // 走らないので、ここで出さないと全域スライスは solve した瞬間のまま固まり、
+    // 伝播が効いていても画面では何も起きない (追従ループが出すのは ±1m の窓だけ
+    // で、窓は機体と一緒に動くので離れると固まったままの全域が下から見える)。
+    //
     // ロックの持ち方が肝。10 Hz の追従ループは同じ Mutex を `try_lock` で取り、
     // 3 tick 続けて取れないとロボットを止める。そこで 1 掃きを走り切らせず、
     // budget ms だけ掃いてロックを手放し、idle ms 待つ形にしてある
     // (既定 20:60 = 1 コアの 25%)。
     if params.global_sweep {
         let core = Arc::clone(&core);
+        let viz = viz.clone();
         let budget = Duration::from_millis(params.global_sweep_budget_ms.max(1) as u64);
         let idle = Duration::from_millis(params.global_sweep_idle_ms.max(0) as u64);
         std::thread::spawn(move || {
@@ -947,9 +957,25 @@ fn main() -> Result<()> {
             // 数 ms になる大きさにしてある。compact 経路はこの値を使わず、
             // 1 呼び出し = タイル 1 枚 (これも数十 ms で頭打ち)。
             const CELLS_PER_STEP: usize = 5_000;
+            // 伝播が続いている間の報告間隔。**走行中は待ち行列がまず空にならない**
+            // ので (壁が窓に入っていれば `set_local_cost` が毎 tick penalty を塗り
+            // 直す)、下の「done」の行はほとんど出ない。掃きが動いているかを見る
+            // 手掛かりはこの間隔で出る進捗のほうになる。
+            //
+            // 価値関数の再配信もここに乗せる。追従中は solve が走らないので、
+            // ここで出さないと `value_function` は solve した瞬間のまま固まり、
+            // **伝播が効いていても画面では何も起きない** (追従ループが出すのは
+            // ±1m の窓だけ)。全域 1 枚は 19F (scale 2) で 13 万セル、津田沼
+            // (scale 5) で 94 万セル読むので、10 Hz の追従ループには置けない。
+            // 作るのはロックの中なので、この間隔の tick だけ追従ループが try_lock に
+            // 失敗し得る (2 秒に 1 回なので 3 tick 連続にはならず、機体は止まらない)。
+            const REPORT_EVERY: Duration = Duration::from_secs(2);
             let mut cur = SweepCursor::default();
             let mut sweep_start: Option<Instant> = None;
+            let mut last_report = Instant::now();
             loop {
+                // ロックの中で作って、外で配信する (可視化 1 枚は 100 万セル級)。
+                let mut grid = None;
                 {
                     let mut c = match core.lock() {
                         Ok(g) => g,
@@ -966,8 +992,19 @@ fn main() -> Result<()> {
                     }
                     let t0 = Instant::now();
                     let started = *sweep_start.get_or_insert(t0);
+                    let mut done = false;
                     loop {
-                        let (_, done) = c.sweep_global(&mut cur, CELLS_PER_STEP);
+                        if c.sweep_global(&mut cur, CELLS_PER_STEP).1 {
+                            done = true;
+                            break;
+                        }
+                        if t0.elapsed() >= budget {
+                            break;
+                        }
+                    }
+
+                    if done || last_report.elapsed() >= REPORT_EVERY {
+                        last_report = Instant::now();
                         if done {
                             // 伝播 1 回に実際かかった時間 (idle を含む実時間 =
                             // 狭域の判断が広域に届くまでの遅れそのもの)。budget/idle を
@@ -988,12 +1025,24 @@ fn main() -> Result<()> {
                                 c.is_dirty()
                             );
                             sweep_start = None;
-                            break;
+                        } else if let Some((visits, queued)) = c.repair_progress() {
+                            eprintln!(
+                                "vi_planner: tile repair running for {:.1}s \
+                                 ({visits} visits, {queued} tiles queued)",
+                                started.elapsed().as_secs_f64()
+                            );
                         }
-                        if t0.elapsed() >= budget {
-                            break;
+                        // `interval: 0` は「solve 完了時のみ」なので、途中の
+                        // 再配信はしない (伝播 1 回の完了は完了として出す)。
+                        if let Some(v) = viz.as_ref() {
+                            if done || !v.interval.is_zero() {
+                                grid = c.value_grid(v.threshold_steps);
+                            }
                         }
                     }
+                }
+                if let (Some(v), Some(g)) = (viz.as_ref(), grid) {
+                    let _ = v.vf_pub.publish(ros_grid_from(&g, &v.frame_id, v.stamp()));
                 }
                 std::thread::sleep(idle);
             }

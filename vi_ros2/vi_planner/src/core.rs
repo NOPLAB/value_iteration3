@@ -85,6 +85,18 @@
 //! sink の写しを凍結して持っているので、これをしないと修復とパッチが同じセルを
 //! 互いに上書きし合って**収束しない** (値は正しいまま、掃きが終わらなくなる)。
 //!
+//! ### 効いているかを見るときに引っかかる 2 つ
+//!
+//! - **塞ぎ方で桁が変わる。** `set_local_cost` が置くのは壁ではなくコストなので、
+//!   通路の一部だけを塞いでも脇を抜けられれば遠方の値はほぼ動かない (幅 2m の
+//!   通路を幅 0.4m 塞いで +0.75 ステップ = `cost_drawing_threshold: 60` の色 1 段)。
+//!   幅いっぱい塞げば桁が変わる (実測 13 → 38 ステップ、12 秒相当で収束。
+//!   [`tests::a_full_width_block_raises_the_value_far_outside_the_window`])。
+//! - **走行中は待ち行列がまず空にならない。** 壁が窓 (±1m) に入っていれば
+//!   `set_local_cost` が毎 tick penalty を塗り直すので、次の伝播が積まれ続ける
+//!   (実測 1000 tick 中 987 tick が dirty)。「1 回終わった」ログを待っても出ない
+//!   ので、[`PlannerCore::repair_progress`] のほうを見ること。
+//!
 //! `BuildParams` が vi_global_planner::core と重複しているのは意図的
 //! (クレート間依存を避けるため; vi_local_planner から引き継いだ規約)。
 //!
@@ -1331,6 +1343,19 @@ impl PlannerCore {
     /// これを添えること。
     pub fn sweep_tiles(&self) -> Option<usize> {
         self.repair.as_ref().map(|r| r.last_visits)
+    }
+
+    /// compact 経路: 進行中の伝播の進み具合 `(これまでの訪問数, 残りタイル数)`。
+    /// 伝播していないときと密経路では None。
+    ///
+    /// **走行中は待ち行列がまず空にならない**。壁が窓 (±1m) に入っていれば
+    /// `set_local_cost` が毎 tick penalty を塗り直すので `commit_window` が動き、
+    /// 次の伝播を積む (実測: 壁が窓の中にある通路を 100 秒走って、待ち行列が
+    /// 空だったのは 1000 tick 中 13 回だけ)。つまり `sweep_tiles` の「1 回終わった」
+    /// ログはほぼ出ない — 掃きが動いているかはこちらで見ること。
+    pub fn repair_progress(&self) -> Option<(usize, usize)> {
+        let r = self.repair.as_ref()?;
+        (!r.queue.is_empty()).then_some((r.visits, r.queue.len()))
     }
 
     /// 共有価値関数を全域で最大 `max_cells` セルぶん掃き進める (Gauss–Seidel)。
@@ -2716,6 +2741,78 @@ mod tests {
             "ウィンドウの外 (セル {},{},{}) で密の全域掃きと同じ値になること \
              (タイル訪問 {visits} 回 / 密は {sweeps} 掃き)",
             west.0, west.1, west.2
+        );
+    }
+
+    /// 通路を**幅いっぱい**に塞いだら、遠方 (窓の外) の値がその分だけ上がること。
+    ///
+    /// 上のパリティ試験は「compact が密と同じ不動点に落ちる」ことしか見ていない。
+    /// 実機で確かめたいのはその手前の「不動点が実用的な量だけ動く」ほうなので、
+    /// 追従 1 tick + 修復数枚を交互に回す (掃きスレッドの duty そのもの) 形で
+    /// 遠方の値を追う。実測 13 → 38 ステップ、119 ラウンド (= 12 秒相当) /
+    /// タイル訪問 358 回で落ち着く。
+    ///
+    /// **塞ぎ方で桁が変わる**。通路の一部だけを塞ぐと迂回できてしまい遠方の値は
+    /// ほとんど動かない (別測定: 幅 2m の通路を幅 0.4m だけ塞いで +0.75 ステップ
+    /// = `cost_drawing_threshold: 60` の色 1 段ぶん)。効いていないように見えても
+    /// たいていはこれで、伝播の不具合ではない。
+    #[test]
+    fn a_full_width_block_raises_the_value_far_outside_the_window() {
+        const N: i32 = 100;
+        let mut core = PlannerCore::new(corridor(N, 30, 50), cfg_compact());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(4.5, 2.0, 0.0), &cancel).expect("solve");
+
+        let robot = pose(3.0, 2.0, 0.0);
+        // 遠方の観測点はロボットの 2.5m 西 = 窓 (±1m = ±20 セル) の 30 セル外。
+        let (fx, fy) = (10i32, 40i32);
+        let read = |core: &PlannerCore| {
+            let Some(CachedGoal { field: Field::Compact(f), .. }) = core.cached.as_ref() else {
+                panic!("compact field expected");
+            };
+            f.sink.read(f.orig(fx, fy, 0)).0
+        };
+        let before = read(&core);
+
+        // x = 3.55 の縦線を通路幅いっぱいに塗る。
+        let inc = 0.05;
+        let a0 = -0.9;
+        let ranges: Vec<f64> = (0..37).map(|i| 0.55 / (a0 + inc * i as f64).cos()).collect();
+        let scan = LaserScan { angle_min: a0, angle_increment: inc, ranges };
+
+        let mut cur = SweepCursor::default();
+        let mut visits = 0usize;
+        let mut settled = None;
+        for round in 0..300 {
+            core.set_window(robot);
+            core.observe_scan(&scan, robot);
+            core.refine_for(Duration::from_secs(5));
+            // 掃きスレッドの 1 周期ぶん (budget 20ms / idle 60ms で数枚)。
+            for _ in 0..3 {
+                if !core.is_dirty() {
+                    break;
+                }
+                core.sweep_global(&mut cur, usize::MAX);
+                visits += 1;
+            }
+            if !core.is_dirty() {
+                settled = Some(round);
+                break;
+            }
+        }
+        let after = read(&core);
+        let steps = |v: u64| v / 262144;
+        assert!(
+            settled.is_some(),
+            "300 ラウンド (= 30 秒相当) で伝播が落ち着くこと (訪問 {visits} 回)"
+        );
+        // 塞ぎの penalty (2048 ステップ) を丸ごと払うわけではない — 帯の縁を
+        // かすめる経路が残るので、その差額ぶんだけ上がる。
+        assert!(
+            steps(after) >= steps(before) + 10,
+            "遠方の値が実用的な量だけ上がること ({} -> {} ステップ、{settled:?} ラウンド / 訪問 {visits} 回)",
+            steps(before),
+            steps(after),
         );
     }
 
