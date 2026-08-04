@@ -20,8 +20,48 @@
 //! - [`compact`] — アウトオブコア経路だけの機構 (sink・追従パッチ・penalty 表・
 //!   タイル修復)。`PlannerCore` の compact 側メソッドもそちらに置いてある。
 //! - [`prefetch`] — 次のウェイポイントを走行中に解いておく先読み ([`Prefetcher`])。
-//!   付けるかどうかは任意で、付けなければ以下は何も変わらない。
+//!   付けるかどうかは任意で、付けなければ以下は何も変わらない。走り出しまでの
+//!   待ちを消すという狙いは [`PlanConfig::early_start`] と同じだが、あちらが
+//!   「解く量を減らす」のに対しこちらは「解く時刻を早める」ので、併用できる。
 //! - `core/tests.rs` — 両経路をまたぐテスト。
+//!
+//! # 走り出しの短縮 ([`PlanConfig::early_start`], 既定 false)
+//!
+//! solve はゴールごとに 1 回で、その間**機体は止まっている** (19F で 29 秒、
+//! 津田沼 compact で 87 秒)。ここで解いているのは地図の全域ぶんの価値関数だが、
+//! 走り出すのに要るのは**いまの姿勢からゴールまでの経路**だけなので、それが
+//! 引けた時点で止めてしまえる。判定はロールアウトそのもの ([`reaches_goal`]) で、
+//! 密は `solve_chunk` の切れ目ごと、compact は波の finalize ごとに試す。
+//!
+//! 止めた場でよい理由は経路の側にある。compact の finalize は値の昇順に進むので
+//! sink に載っている列は**最後まで解いたときと同じ値**で、未確定の列が
+//! `MAX_COST` のまま残っているだけ。密は値が上から単調に下がるので途中の場は
+//! 常に Bellman の上界 = 貪欲降下は必ず値を下げながらゴールに着く (循環しない)
+//! — ただし**最短とは限らない**。
+//!
+//! 残りは `global_sweep: true` なら走りながら詰まる。**起点の作り方だけが 2 経路で
+//! 違う**: 密は打ち切った時点で `dirty` を立てて全域掃きに渡す (立てるものが他に
+//! ないため)。compact のタイル修復は変化した範囲から広げる形なので `dirty` を
+//! 立てても待ち行列が空で空振りするが、追従が始まれば窓が未確定域 (機体の後ろは
+//! まだ `MAX_COST`) をまたいで値が動き、`commit_window` がそれを sink へ返して
+//! タイルを積む — つまり**1 tick 遅れで同じ状態になる**。
+//!
+//! 承知しておくこと 3 つ:
+//!
+//! - **経路の外は未確定。** 機体が経路から外れると方策が引けない位置に入り得る。
+//!   そのときは打ち切った場を捨てて解き直すので ([`PlannerCore::discard_truncated`])、
+//!   **待ちは合計で長くなる** (打ち切りぶん + 最後まで)。
+//! - **キャッシュヒットは solve に入らない。** 逃げ道を持たずに打ち切った場を
+//!   載せたままにすると、BT が 1Hz で投げ直しても同じ場で同じ失敗を繰り返す。
+//!   `plan_*` の中の解き直しと `discard_truncated` はそのための道。
+//! - **compact では効かない地図がある。** finalize は値バンド
+//!   (`COUPLE_SAFETY(4) · 遷移到達セル数 · 最大 penalty`) 単位でしか進まないので、
+//!   地図の値域が丸ごと 1 バンドに収まると波 2 つで解き終わり、打ち切る隙がない。
+//!   **エラーも警告も出ず、ただ何も短くならない**。バンドは 0.1 m/cell・
+//!   `safety_radius_penalty: 30` で 4·4·31 ≒ 500 ステップ ≒ 150 m ぶんの値域なので、
+//!   建物 1 フロア程度の地図はまず 1 バンドに収まる (解像度が粗いほどバンドは
+//!   狭くなるので、`map_scale` を上げた広域地図のほうが効きやすい)。効いたかは
+//!   `SolveStats::truncated` — ログの "cut short" / ", truncated" で見る。
 //!
 //! # 狭域 → 広域のフィードバック ([`PlannerCore::sweep_global`])
 //!
@@ -86,7 +126,8 @@ use ndarray::Array2;
 use vi_reference::bridge::{value_slice_to_occupancy, yaw_to_goal_theta_deg, PoseView};
 use vi_reference::msg::{LaserScan, OccupancyGrid};
 use vi_reference::planner::{
-    densify, optimal_action_at, pose_to_cell, rollout_path_on, PathPose, RolloutStatus,
+    densify, optimal_action_at, pose_to_cell, rollout_path_on, PathPose, PolicyView, Rollout,
+    RolloutStatus,
 };
 use vi_reference::solvers::{solve, U64Solver};
 use vi_reference::value_iterator::ValueIterator;
@@ -159,6 +200,14 @@ pub struct PlanConfig {
     /// 全域掃き ([`PlannerCore::sweep_global`]) を回すか。compact 経路では
     /// これが false のとき修復タイル ([`compact::Repair`], 数 MB) を確保しない。
     pub global_sweep: bool,
+
+    // ── 走り出しの短縮 ──
+    /// **機体の現在地からゴールまで方策が繋がった時点で solve を打ち切る**か
+    /// (`false` = 従来どおり収束まで解く)。判定と代償は
+    /// [`PlannerCore::prepare_goal_with_progress`] の「早期打ち切り」を参照。
+    /// 打ち切りには起点が要るので、`from: None` で呼ばれた solve は
+    /// これが true でも最後まで解く。
+    pub early_start: bool,
 }
 
 impl PlanConfig {
@@ -180,6 +229,11 @@ pub struct SolveStats {
     /// 先読み ([`Prefetcher`]) が用意しておいた場を受け取ったか。この呼び出しは
     /// solve していない = 走り出しまでの待ちが無かった、という意味。
     pub adopted: bool,
+    /// いま載っている場が**収束前に打ち切ったもの**か (`early_start`)。ゴールまでの
+    /// 経路は繋がっているが、そこから外れた領域は未確定 (compact なら sink が
+    /// `MAX_COST` のまま、密なら値が上振れしたまま)。キャッシュヒットのときも
+    /// 載っている場の状態を映す。
+    pub truncated: bool,
 }
 
 /// 1 回の plan の統計 (ログ/Feedback 用)。
@@ -188,6 +242,7 @@ pub struct PlanStats {
     pub solved_now: bool,
     pub iters: u32,
     pub adopted: bool,
+    pub truncated: bool,
     pub poses: usize,
 }
 
@@ -242,6 +297,11 @@ struct CachedGoal {
     goal_y: f64,
     goal_t_deg: i32,
     field: Field,
+    /// 収束前に打ち切った場か ([`PlanConfig::early_start`])。**捨てて解き直す判断に
+    /// 要る**: 打ち切った場でロールアウトが通らなかったとき、この印が無いと
+    /// 同じキャッシュを何度でも返して同じ失敗を繰り返す (BT の 1Hz リプランは
+    /// キャッシュヒットなので solve に入らない = 自然には直らない)。
+    truncated: bool,
 }
 
 /// 全域掃き ([`PlannerCore::sweep_global`]) の再開位置。10 Hz の追従ループと同じ
@@ -295,6 +355,22 @@ fn circ_deg_diff(a: i32, b: i32) -> i32 {
 fn goal_matches(a: (f64, f64, i32), b: (f64, f64, i32), tol_xy: f64, tol_deg: f64) -> bool {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt() <= tol_xy
         && circ_deg_diff(a.2, b.2) as f64 <= tol_deg
+}
+
+/// `from` からゴール圏まで、いまの場の方策だけで辿り着けるか。早期打ち切り
+/// ([`PlanConfig::early_start`]) の判定はこれ 1 つで、密経路と compact 経路が同じ
+/// 規則を使う (どちらも [`rollout_path_on`] = `plan` が実際に返す経路の作り方そのもの
+/// なので、「打ち切ったのに `plan` が失敗する」がこの判定を通った場では起きない)。
+fn reaches_goal(p: &dyn PolicyView, cfg: &PlanConfig, from: PoseView) -> bool {
+    rollout_path_on(
+        p,
+        from.x,
+        from.y,
+        from.yaw_rad,
+        cfg.max_rollout_steps,
+        cfg.start_tolerance_cells,
+    )
+    .reached_goal()
 }
 
 /// `(ix, iy, it)` に方策があれば Decision::Action を返す (読み取り専用)。
@@ -438,7 +514,7 @@ impl PlannerCore {
         goal: PoseView,
         cancel: &AtomicBool,
     ) -> Result<SolveStats, PlanError> {
-        self.prepare_goal_with_progress(goal, cancel, &mut |_| {})
+        self.prepare_goal_with_progress(goal, None, cancel, &mut |_| {})
     }
 
     /// `prepare_goal` と同じだが、`solve_chunk` ごとの write_back 後に `on_chunk`
@@ -449,20 +525,44 @@ impl PlannerCore {
     /// できていれば受け取って solve を飛ばし (`stats.adopted`)、まだ解いている
     /// 最中なら終わるまで待つ。どちらにせよ最後に**並びの次の点**を注文するので、
     /// 巡回中は「いまのゴールへ走っている間に次のゴールが解けている」状態になる。
+    ///
+    /// # 早期打ち切り (`early_start`)
+    ///
+    /// `from` は**機体のいまの姿勢**。[`PlanConfig::early_start`] が true でこれが
+    /// 与えられていると、solve を収束まで回さず「`from` からゴールまで方策が
+    /// 繋がった」時点で止める。判定はロールアウトそのもの — 途中の場の上で
+    /// [`rollout_path_on`] を試し、ゴール圏に着いたら打ち切る。「値がロボットの
+    /// 近くまで来たか」を距離や値で近似せず、**使う経路が引けたかを直接見る**
+    /// (近似だと、経路上の 1 セルだけ未確定で `plan` が失敗する形の外し方をする)。
+    ///
+    /// 止めた場でよい理由は経路の側にある。compact 経路の finalize は値の昇順に
+    /// 進むので、sink に載っている列は**最後まで解いたときと同じ値** (未確定の列が
+    /// `MAX_COST` のまま残っているだけ)。密経路は値が上から単調に下がるので、途中の
+    /// 場は常に Bellman の上界 = 貪欲降下は必ず値を下げながらゴールに着く (循環しない)
+    /// — ただし**最短とは限らない**。密で打ち切った場は `global_sweep: true` なら
+    /// 走りながら全域掃きが最後まで詰める。
+    ///
+    /// 代償は「ゴールまでの経路の外は未確定」であること。機体が経路から外れると
+    /// 未確定領域に入り得るので、`plan` のロールアウトが通らなかったときは
+    /// [`PlannerCore::discard_truncated`] で捨てて解き直す道を必ず残しておくこと
+    /// (キャッシュヒットは solve に入らないので、放っておくと同じ失敗が続く)。
     pub fn prepare_goal_with_progress(
         &mut self,
         goal: PoseView,
+        from: Option<PoseView>,
         cancel: &AtomicBool,
         on_chunk: &mut dyn FnMut(&ValueIterator),
     ) -> Result<SolveStats, PlanError> {
         let goal_t_deg = yaw_to_goal_theta_deg(goal.yaw_rad);
-        let mut stats = SolveStats { solved_now: false, iters: 0, adopted: false };
+        let mut stats =
+            SolveStats { solved_now: false, iters: 0, adopted: false, truncated: false };
 
         if self.cache_matches(&goal, goal_t_deg) {
             // ここも注文の入口。BT は追従中も 1Hz で計画を投げ直すので、最初の
             // 1 回で注文できていなくても (並びがまだ届いていない等) 次の tick で
             // 拾える。同じ点の注文は 2 回目以降 no-op。
             self.request_next(goal);
+            stats.truncated = self.cached.as_ref().is_some_and(|c| c.truncated);
             return Ok(stats);
         }
 
@@ -499,6 +599,12 @@ impl PlannerCore {
             Some(pf) => pf.adopt(goal, goal_t_deg, cancel),
             None => None,
         };
+        // 打ち切りの起点。`early_start` でも起点が無ければ打ち切らない (先読みの
+        // ワーカーがここを通る道でもある — あちらは `prepare_goal` 経由で
+        // `from: None`。次の点を解いている間に機体は動くので、いまの姿勢を起点に
+        // 打ち切った場は着いた頃には使えない)。
+        let from = self.cfg.early_start.then_some(from).flatten();
+
         let cached = match adopted {
             Some(c) => {
                 stats.adopted = true;
@@ -506,18 +612,51 @@ impl PlannerCore {
             }
             None => {
                 let field = if self.cfg.use_compact() {
-                    self.solve_compact(&goal, goal_t_deg, &mut stats, cancel)?
+                    self.solve_compact(&goal, goal_t_deg, from, &mut stats, cancel)?
                 } else {
-                    self.solve_dense(&goal, goal_t_deg, &mut stats, cancel, on_chunk)?
+                    self.solve_dense(&goal, goal_t_deg, from, &mut stats, cancel, on_chunk)?
                 };
-                CachedGoal { goal_x: goal.x, goal_y: goal.y, goal_t_deg, field }
+                CachedGoal {
+                    goal_x: goal.x,
+                    goal_y: goal.y,
+                    goal_t_deg,
+                    field,
+                    truncated: stats.truncated,
+                }
             }
         };
 
         stats.solved_now = true;
+        // 打ち切った密の場は、走りながら全域掃きが最後まで詰める。掃きを回すかの
+        // 判断材料は `dirty` 1 つなので、ここで立てるだけでよい。
+        //
+        // compact で立てないのは、あちらの伝播が「変化した範囲」から広げる形だから。
+        // 立てても待ち行列が空で 1 回空振りするだけで、実際の起点は追従が始まって
+        // 最初の `commit_window` (窓が未確定域をまたいで値が動く) になる。
+        if stats.truncated && !self.cfg.use_compact() {
+            self.dirty = true;
+        }
         self.cached = Some(cached);
         self.request_next(goal);
         Ok(stats)
+    }
+
+    /// 打ち切った (収束前に止めた) 場を捨てる。捨てたら true、収束済みの場や
+    /// キャッシュ無しなら false。
+    ///
+    /// **これが `early_start` の唯一の逃げ道**。打ち切った場でロールアウトが
+    /// 通らない / 方策が引けないとき、キャッシュが載ったままだと BT が何度
+    /// 投げ直しても `prepare_goal_*` はキャッシュヒットで返って同じ失敗を繰り返す。
+    /// 捨てておけば次の要求が最後まで解き直す (`from` を渡さなければ打ち切らない)。
+    pub fn discard_truncated(&mut self) -> bool {
+        if !self.cached.as_ref().is_some_and(|c| c.truncated) {
+            return false;
+        }
+        self.cached = None;
+        if let Some(p) = self.patch.as_mut() {
+            p.at = None; // 打ち切った場から起こしたパッチで走らせない
+        }
+        true
     }
 
     /// 先読みへ「いまのゴールはこれ」と伝える (並びの次の点の注文がここで出る)。
@@ -529,10 +668,13 @@ impl PlannerCore {
     }
 
     /// 密経路: `ValueIterator::states` を確保し、`solve_chunk` ごとに cancel を観測しながら解く。
+    /// `from` があるときは、そこからゴールまで方策が繋がった時点で打ち切る
+    /// (`stats.truncated`)。観測の刻みは cancel と同じ `solve_chunk`。
     fn solve_dense(
         &self,
         goal: &PoseView,
         goal_t_deg: i32,
+        from: Option<PoseView>,
         stats: &mut SolveStats,
         cancel: &AtomicBool,
         on_chunk: &mut dyn FnMut(&ValueIterator),
@@ -564,6 +706,15 @@ impl PlannerCore {
             if s.converged {
                 break true;
             }
+            // 早期打ち切り。チャンクの切れ目で場を読めるのは、`frontier2d_sparse` が
+            // 収束していなくても毎回 argmin パスを回して `states` へ値と方策を
+            // 書き戻すため (打ち切りで `optimal_action` が空のまま、にはならない)。
+            if let Some(from) = from {
+                if reaches_goal(&vi.base, &self.cfg, from) {
+                    stats.truncated = true;
+                    break true;
+                }
+            }
         };
         if !converged {
             return Err(PlanError::NotConverged);
@@ -587,6 +738,11 @@ impl PlannerCore {
     }
 
     /// `plan` の途中経過コールバック付き版 (`prepare_goal_with_progress` と同じ規約)。
+    ///
+    /// `start` は早期打ち切り (`early_start`) の起点でもある。打ち切った場で
+    /// ロールアウトが通らなかったときは**その場で捨てて解き直す** — 失敗を
+    /// そのまま返すと、キャッシュに載ったままの場を BT が何度でも引き直して
+    /// 同じ失敗を繰り返す。
     pub fn plan_with_progress(
         &mut self,
         start: PoseView,
@@ -594,30 +750,21 @@ impl PlannerCore {
         cancel: &AtomicBool,
         on_chunk: &mut dyn FnMut(&ValueIterator),
     ) -> Result<(Vec<PathPose>, PlanStats), PlanError> {
-        let s = self.prepare_goal_with_progress(goal, cancel, on_chunk)?;
+        let mut s = self.prepare_goal_with_progress(goal, Some(start), cancel, on_chunk)?;
 
-        let cached = self.cached.as_ref().expect("cache filled above");
-        // 密経路は追従で注入された local_penalty 込みの値を読む。compact 経路は
-        // sink を読む。sink には狭域が `commit_window` で返した値も入っている
-        // ので、こちらも動的障害物込みの値になる (モジュール冒頭)。
-        let r = match &cached.field {
-            Field::Dense(vi) => rollout_path_on(
-                &vi.base,
-                start.x,
-                start.y,
-                start.yaw_rad,
-                self.cfg.max_rollout_steps,
-                self.cfg.start_tolerance_cells,
-            ),
-            Field::Compact(f) => rollout_path_on(
-                &f.policy(),
-                start.x,
-                start.y,
-                start.yaw_rad,
-                self.cfg.max_rollout_steps,
-                self.cfg.start_tolerance_cells,
-            ),
-        };
+        let mut r = self.rollout(start);
+        if !r.reached_goal() && self.discard_truncated() {
+            eprintln!(
+                "vi_planner: the truncated value function (early_start) does not roll out from \
+                 ({:.2}, {:.2}): {:?} — solving this goal to convergence instead",
+                start.x, start.y, r.status
+            );
+            // 起点を渡さない = 今度は打ち切らない。先読みが次の点を解いている
+            // 最中ならここで取り消されて注文し直しになる (走っている間に解き直す
+            // 時間はあるので、失う仕事より繰り返す失敗のほうが高い)。
+            s = self.prepare_goal_with_progress(goal, None, cancel, on_chunk)?;
+            r = self.rollout(start);
+        }
         if !r.reached_goal() {
             return Err(PlanError::Rollout(r.status));
         }
@@ -632,9 +779,35 @@ impl PlannerCore {
                 solved_now: s.solved_now,
                 iters: s.iters,
                 adopted: s.adopted,
+                truncated: s.truncated,
                 poses: poses.len(),
             },
         ))
+    }
+
+    /// いま載っている場の貪欲ロールアウト。ゴール未設定なら `NoAction`。
+    ///
+    /// 密経路は追従で注入された local_penalty 込みの値を読む。compact 経路は
+    /// sink を読む。sink には狭域が `commit_window` で返した値も入っているので、
+    /// こちらも動的障害物込みの値になる (モジュール冒頭)。
+    fn rollout(&self, start: PoseView) -> Rollout {
+        let Some(cached) = self.cached.as_ref() else {
+            return Rollout { poses: Vec::new(), status: RolloutStatus::NoAction };
+        };
+        let go = |p: &dyn PolicyView| {
+            rollout_path_on(
+                p,
+                start.x,
+                start.y,
+                start.yaw_rad,
+                self.cfg.max_rollout_steps,
+                self.cfg.start_tolerance_cells,
+            )
+        };
+        match &cached.field {
+            Field::Dense(vi) => go(&vi.base),
+            Field::Compact(f) => go(&f.policy()),
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────

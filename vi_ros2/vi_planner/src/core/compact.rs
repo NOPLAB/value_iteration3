@@ -70,7 +70,7 @@ use vi_reference::msg::{OccupancyGrid, Quaternion};
 use vi_reference::params::{MAX_COST, PROB_BASE};
 use vi_reference::planner::CompactPolicy;
 use vi_reference::solvers::frontier2d_sparse_compact::{
-    default_threads, solve_compact_mapped, CompactSink, RamSink,
+    default_threads, solve_compact_mapped_stopping, CompactSink, RamSink,
 };
 use vi_reference::state::State;
 use vi_reference::value_iterator::ValueIterator;
@@ -643,10 +643,18 @@ impl PlannerCore {
     /// compact (アウトオブコア) 経路: `states` を作らず地図とゴールから直接解き、
     /// 確定出力を sink に置く。solve は 1 回で走り切るので `solve_chunk` は使わず、
     /// `cancel` は `solve_compact_mapped` 内のラウンド境界で観測される。
+    ///
+    /// `from` があるときは早期打ち切り ([`super::PlanConfig::early_start`])。波の
+    /// finalize が終わるたびに sink の上でロールアウトを試し、ゴールまで繋がったら
+    /// そこで止める。**そこで止めた sink はそのまま使える** — finalize は値の昇順に
+    /// 進むので、載っている列は最後まで解いたときと同じ値で、未 finalize の列が
+    /// `MAX_COST` のまま残っているだけ。したがって「経路が引けた」= その経路上の
+    /// 列は全部確定済み、になる。
     pub(super) fn solve_compact(
         &self,
         goal: &PoseView,
         goal_t_deg: i32,
+        from: Option<PoseView>,
         stats: &mut SolveStats,
         cancel: &AtomicBool,
     ) -> Result<Field, PlanError> {
@@ -658,7 +666,23 @@ impl PlannerCore {
         let nthreads =
             if self.cfg.vi_threads > 0 { self.cfg.vi_threads } else { default_threads() };
 
-        let s = solve_compact_mapped(
+        let (cfg, actions) = (&self.cfg, self.build.actions.clone());
+        let cell_num = (g.width, g.height, nt);
+        let goal_xyt = (goal.x, goal.y, goal_t_deg);
+        let mut stop = |s: &dyn CompactSink| -> bool {
+            let Some(from) = from else { return false };
+            let p = CompactPolicy::new(
+                s,
+                &actions,
+                cell_num,
+                g.resolution,
+                (g.origin_x, g.origin_y),
+                goal_xyt,
+            );
+            super::reaches_goal(&p, cfg, from)
+        };
+
+        let s = solve_compact_mapped_stopping(
             self.build.actions.clone(),
             1,
             g,
@@ -675,12 +699,14 @@ impl PlannerCore {
             sink.as_mut(),
             nthreads,
             cancel,
+            &mut stop,
         );
         stats.iters = s.iters;
+        stats.truncated = s.stopped;
         if s.cancelled {
             return Err(PlanError::Cancelled);
         }
-        if !s.converged {
+        if !s.converged && !s.stopped {
             return Err(PlanError::NotConverged);
         }
         Ok(Field::Compact(Box::new(CompactField {

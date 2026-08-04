@@ -54,6 +54,7 @@ fn cfg() -> PlanConfig {
         compact_sink_gen: None,
         vi_threads: 1,
         global_sweep: true,
+        early_start: false,
     }
 }
 
@@ -426,7 +427,7 @@ fn progress_callback_fires_only_when_solving() {
     assert!(calls > 0);
 
     let mut calls_cached = 0usize;
-    core.prepare_goal_with_progress(goal, &cancel, &mut |_| calls_cached += 1)
+    core.prepare_goal_with_progress(goal, None, &cancel, &mut |_| calls_cached += 1)
         .expect("follow");
     assert_eq!(calls_cached, 0);
 }
@@ -1503,4 +1504,164 @@ fn the_core_and_the_prefetcher_cross_threads() {
     send::<PlannerCore>();
     // 先読みの取っ手は核の中に入ったまま別スレッドへ渡るので、両方が要る。
     send_sync::<Prefetcher>();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 走り出しの短縮 (core::PlanConfig::early_start)
+//
+// 判定は密経路も compact 経路も同じ (`reaches_goal` = plan が返す経路の作り方
+// そのもの) なので、両者で見るのは「打ち切ったか」ではなく**打ち切った場が
+// 使えるか**にしてある。
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn cfg_early() -> PlanConfig {
+    PlanConfig { early_start: true, ..cfg() }
+}
+
+/// 密経路の本題: 起点からゴールまで方策が繋がった時点で solve が止まり、
+/// **その場のまま**経路が引けて追従もできること。
+#[test]
+fn early_start_cuts_the_dense_solve_once_the_path_exists() {
+    let goal = pose(0.5, 0.5, 0.0);
+    let start = pose(1.5, 1.5, 0.0);
+    let cancel = AtomicBool::new(false);
+
+    let mut full = PlannerCore::new(build(64), cfg());
+    let (_, sf) = full.plan(start, goal, &cancel).expect("full plan");
+    assert!(!sf.truncated);
+
+    let mut early = PlannerCore::new(build(64), cfg_early());
+    let (path, se) = early.plan(start, goal, &cancel).expect("early plan");
+    assert!(se.truncated, "起点まで繋がった時点で止まること");
+    assert!(se.iters < sf.iters, "打ち切ったぶん短いこと: {} vs {}", se.iters, sf.iters);
+    assert!(path.len() > 2);
+
+    // 打ち切った場でも追従の判断が下せる (方策は収束前でも書き戻されている)。
+    early.set_window(start);
+    assert!(matches!(early.decide(start), Decision::Action { .. }));
+}
+
+/// 打ち切った密の場には「まだ伝播させる仕事がある」印を付ける。走りながら
+/// 全域掃きが最後まで詰めるための唯一の判断材料がこれ (`global_sweep: true`)。
+#[test]
+fn a_truncated_dense_field_is_left_dirty_for_the_global_sweep() {
+    let cancel = AtomicBool::new(false);
+    let mut core = PlannerCore::new(build(64), cfg_early());
+    let s = core
+        .plan(pose(1.5, 1.5, 0.0), pose(0.5, 0.5, 0.0), &cancel)
+        .expect("plan")
+        .1;
+    assert!(s.truncated);
+    assert!(core.is_dirty(), "打ち切った場は掃きに渡すこと");
+
+    // 収束まで解いた場は逆に印を持たない (最初の 1 掃きが無駄に回る)。
+    let mut done = PlannerCore::new(build(64), cfg());
+    done.plan(pose(1.5, 1.5, 0.0), pose(0.5, 0.5, 0.0), &cancel).expect("plan");
+    assert!(!done.is_dirty());
+}
+
+/// compact 経路: 打ち切った sink には経路に要る列だけが載り、遠くは未確定
+/// (`MAX_COST`) のまま。**それでも載っている値は最後まで解いたときと同じ** —
+/// finalize が値の昇順に進むので、確定した列は以後動かない。
+///
+/// 地図が小さいと値域が丸ごと 1 バンドに収まって波が 2 つで終わる (= 打ち切る
+/// 隙が無い) ので、ここだけ広めの地図を使う。
+#[test]
+fn early_start_cuts_the_compact_solve_and_leaves_the_far_side_unfinalized() {
+    let goal = pose(1.0, 1.0, 0.0);
+    let start = pose(4.0, 4.0, 0.0);
+    let cancel = AtomicBool::new(false);
+
+    let mut core = PlannerCore::new(build(256), cfg_early_compact());
+    let (path, s) = core.plan(start, goal, &cancel).expect("early plan");
+    assert!(s.truncated, "波が残っているうちに止まること");
+    assert!(path.len() > 2);
+
+    // 起点まわりは確定済み、地図の反対の隅はまだ。**この 2 つは走り出す前に見る** —
+    // 走り出すと窓の書き戻し (`commit_window`) とタイル修復が未確定域を埋めていく。
+    let far = pose(12.0, 12.0, 0.0);
+    assert!(compact_value_at(&core, start) < MAX_COST, "起点は確定していること");
+    assert_eq!(compact_value_at(&core, far), MAX_COST, "遠くは未確定のままのはず");
+
+    // **本題**: 打ち切った場のままゴール圏まで走り切れること (既定の solver は
+    // compact なので、実機で通るのはこの経路)。窓は毎 tick 未確定域と確定域の
+    // 境目をまたぐので、そこで NoAction になるならここで落ちる。
+    let (mut x, mut y, mut yaw) = (start.x, start.y, start.yaw_rad);
+    for _ in 0..2000 {
+        let p = pose(x, y, yaw);
+        core.set_window(p);
+        core.refine_passes(1);
+        match core.decide(p) {
+            Decision::Goal => {
+                assert!(core.goal_distance(x, y).unwrap() <= 0.3);
+                return;
+            }
+            Decision::Action { fw, rot_deg, .. } => {
+                x += fw * yaw.cos();
+                y += fw * yaw.sin();
+                yaw += rot_deg.to_radians();
+            }
+            Decision::NoAction => panic!("no action at ({x:.2}, {y:.2}) on the truncated field"),
+        }
+    }
+    panic!("did not reach the goal in 2000 steps");
+}
+
+fn cfg_early_compact() -> PlanConfig {
+    PlanConfig { early_start: true, ..cfg_compact() }
+}
+
+/// compact の場の `(x, y, θ=0)` の値。未確定の列は `MAX_COST` を返す。
+fn compact_value_at(core: &PlannerCore, p: PoseView) -> u64 {
+    let Some(CachedGoal { field: Field::Compact(f), .. }) = core.cached.as_ref() else {
+        panic!("compact field expected");
+    };
+    let ix = ((p.x - f.origin.0) / f.resolution).floor() as i32;
+    let iy = ((p.y - f.origin.1) / f.resolution).floor() as i32;
+    f.sink.read(f.orig(ix, iy, 0)).0
+}
+
+/// 起点を渡さない solve は `early_start` でも最後まで解く。先読みのワーカーが
+/// 通るのがこの道で、打ち切った場を渡されると困る (次の点に着く頃には機体は
+/// 起点にいない)。
+#[test]
+fn a_solve_without_an_anchor_is_never_cut_short() {
+    let cancel = AtomicBool::new(false);
+    let mut core = PlannerCore::new(build(64), cfg_early());
+    let s = core.prepare_goal(pose(0.5, 0.5, 0.0), &cancel).expect("solve");
+    assert!(s.solved_now && !s.truncated);
+}
+
+/// 打ち切りの唯一の逃げ道: 経路の外の未確定領域から計画を頼まれたら、
+/// **キャッシュを捨てて解き直す**。返しっぱなしにすると BT が投げ直しても
+/// キャッシュヒットで同じ失敗を繰り返す。
+#[test]
+fn a_truncated_field_that_cannot_be_rolled_out_is_solved_again() {
+    let goal = pose(0.3, 0.3, 0.0);
+    let cancel = AtomicBool::new(false);
+    // 打ち切りを観測するのはチャンクの切れ目なので、刻みを 1 にして「起点に
+    // 届いた直後」で止める (既定の 16 だと、その 1 チャンクのあいだに波が
+    // 地図の反対側まで行ってしまって未確定領域が残らない)。
+    let mut core = PlannerCore::new(build(96), PlanConfig { solve_chunk: 1, ..cfg_early() });
+
+    let s1 = core.plan(pose(0.9, 0.9, 0.0), goal, &cancel).expect("plan near").1;
+    assert!(s1.truncated);
+
+    // 打ち切った時点では届いていない、ゴールからもっと遠い起点。
+    let (path, s2) = core.plan(pose(4.5, 4.5, 0.0), goal, &cancel).expect("plan far");
+    assert!(s2.solved_now, "キャッシュを捨てて解き直すこと");
+    assert!(!s2.truncated, "解き直しは打ち切らない");
+    assert!(path.len() > 2);
+    assert!(!core.discard_truncated(), "解き直した場に打ち切りの印は残らない");
+}
+
+/// 収束済みの場は捨てない (`discard_truncated` は打ち切った場だけの逃げ道)。
+#[test]
+fn discard_truncated_leaves_a_converged_field_alone() {
+    let goal = pose(2.0, 2.0, 0.0);
+    let cancel = AtomicBool::new(false);
+    let mut core = PlannerCore::new(build(64), cfg());
+    core.prepare_goal(goal, &cancel).expect("solve");
+    assert!(!core.discard_truncated());
+    assert!(core.is_cached_goal(goal), "捨てられていないこと");
 }

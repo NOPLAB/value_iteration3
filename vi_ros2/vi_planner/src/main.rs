@@ -131,6 +131,8 @@ struct Params {
     waypoint_prefetch: bool,
     waypoint_topic: String,
     waypoint_prefetch_threads: i64,
+    // ── 走り出しの短縮 ──
+    early_start: bool,
     // ── 可視化 ──
     publish_value_function: bool,
     value_publish_interval_ms: i64,
@@ -218,6 +220,14 @@ fn read_params(node: &Node) -> Result<Params> {
     // 絞ることができない。
     let waypoint_prefetch_threads = p!("waypoint_prefetch_threads", i64, 1);
 
+    // 機体の現在地からゴールまで方策が繋がった時点で solve を打ち切って走り出す
+    // (core::PlanConfig::early_start)。**既定は false**: 経路の外は未確定のままに
+    // なるので、機体が経路から外れると解き直しが要る (そのときは打ち切った場を
+    // 捨ててから最後まで解くので、待ちは合計で長くなる)。先読み
+    // (waypoint_prefetch) と違い追加のメモリは要らず、両者は併用できる
+    // — 先読みで用意した場は打ち切らないので、受け取れた点では関係しない。
+    let early_start = p!("early_start", bool, false);
+
     let publish_value_function = p!("publish_value_function", bool, true);
     // solve の途中経過の配信間隔。0 は「完了時のみ」。追従中の再配信は掃き
     // スレッドが 2 秒ごとに出すので、ここを 0 にすると追従中は出なくなる。
@@ -297,6 +307,7 @@ fn read_params(node: &Node) -> Result<Params> {
         waypoint_prefetch,
         waypoint_topic,
         waypoint_prefetch_threads,
+        early_start,
         publish_value_function,
         value_publish_interval_ms,
         cost_drawing_threshold,
@@ -604,7 +615,11 @@ fn run_follow(
 
         let t0 = Instant::now();
         let mut last_viz: Option<Instant> = None;
-        let prepared = core.prepare_goal_with_progress(goal, cancel, &mut |vi| {
+        // 早期打ち切り (early_start) の起点。solve のあいだ機体は止まっているので、
+        // ここで読んだ姿勢は走り出すときの姿勢そのもの。まだ pose が来ていなければ
+        // 打ち切らずに最後まで解く (下の制御ループはどのみち pose を待つ)。
+        let from = *latest_pose.lock().unwrap();
+        let prepared = core.prepare_goal_with_progress(goal, from, cancel, &mut |vi| {
             let Some(v) = viz else { return };
             if !v.due(&mut last_viz) {
                 return;
@@ -616,10 +631,17 @@ fn run_follow(
             Ok(stats) => {
                 if stats.solved_now {
                     eprintln!(
-                        "vi_planner: value function {} in {:.2}s (iters={}) [follow_path]",
+                        "vi_planner: value function {} in {:.2}s (iters={}){} [follow_path]",
                         if stats.adopted { "adopted from prefetch" } else { "solved" },
                         t0.elapsed().as_secs_f64(),
-                        stats.iters
+                        stats.iters,
+                        // 打ち切った回。ゴールまでの経路は繋がっているが、そこから
+                        // 外れた領域は未確定 (early_start)。
+                        if stats.truncated {
+                            ", cut short at the first path to the goal"
+                        } else {
+                            ""
+                        }
                     );
                     // 収束後の最終状態を必ず 1 回配信する。
                     if let Some(v) = viz {
@@ -635,6 +657,9 @@ fn run_follow(
     } // ここでロックを解放 — 以降は tick ごとに取り直す。
 
     // ── 2. 制御ループ ──
+    // tick の中では取得した guard が `core` を隠すので、guard を手放したあとに
+    // 本体へ触るための別名を先に取っておく。
+    let shared = core;
     let mut failure_ticks = 0u32;
     // ロックを連続で取れなかった tick 数 (下の try_lock を参照)。
     let mut busy_ticks = 0u32;
@@ -764,6 +789,18 @@ fn run_follow(
 
         if failure_ticks >= tuning.failure_ticks_limit {
             stop_cmd(cmd_pub);
+            // 打ち切った場 (early_start) だったなら捨てる。方策が引けないのは
+            // 「経路の外の未確定領域に入った」形で起き得るが、キャッシュを
+            // 残したままだと BT が投げ直すたびに同じ場で同じ失敗を繰り返す
+            // (prepare_goal はキャッシュヒットで solve に入らない)。捨てておけば
+            // 次の要求が最後まで解き直す。収束済みの場なら何もしない。
+            if shared.lock().unwrap_or_else(|p| p.into_inner()).discard_truncated() {
+                eprintln!(
+                    "vi_planner: dropped the truncated value function (early_start) after \
+                     {failure_ticks} ticks without an action; the next request solves it \
+                     to convergence"
+                );
+            }
             return Outcome::Failed("no applicable action for too long".into());
         }
         if let Some(rest) = tuning.period.checked_sub(tick_start.elapsed()) {
@@ -928,7 +965,20 @@ fn main() -> Result<()> {
         compact_sink_gen: params.waypoint_prefetch.then(|| Arc::new(AtomicU64::new(0))),
         vi_threads: params.vi_threads.max(0) as usize,
         global_sweep: params.global_sweep,
+        early_start: params.early_start,
     };
+    if params.early_start {
+        eprintln!(
+            "vi_planner: early start on — a solve stops as soon as the policy reaches the goal \
+             from the robot; everything off that path {}",
+            if params.global_sweep {
+                "is filled in while driving (dense: the global sweep; compact: the tile repair \
+                 the follow loop seeds every time it writes its window back)"
+            } else {
+                "stays as it was cut — global_sweep is off, so nothing fills it in"
+            }
+        );
+    }
 
     // 5b. ウェイポイントの先読み (waypoint_prefetch)。予備の核を 1 つ専用スレッドに
     //     持たせ、いまの点へ走っている間に次の点を解かせる。走行中の核のロックは
@@ -941,6 +991,10 @@ fn main() -> Result<()> {
             // 追従の 40ms/tick を削らないよう既定 1 に絞る (compact のみ有効。
             // 密は VI_THREADS がプロセスで 1 つなので分けられない)。
             vi_threads: params.waypoint_prefetch_threads.max(1) as usize,
+            // 先読みは最後まで解く。打ち切りの起点は「いまの機体の姿勢」だが、
+            // 次の点に着く頃には機体はそこにいない (打ち切った場は使えない)。
+            // ワーカーは起点を渡さないので実際には二重の歯止め。
+            early_start: false,
             ..cfg.clone()
         };
         Prefetcher::spawn(build.clone(), cfg)
@@ -1264,14 +1318,17 @@ fn main() -> Result<()> {
                             let dt = t0.elapsed();
                             eprintln!(
                                 "vi_planner: path with {} poses in {:.2}s \
-                                 (solved_now={}, iters={}{})",
+                                 (solved_now={}, iters={}{}{})",
                                 stats.poses,
                                 dt.as_secs_f64(),
                                 stats.solved_now,
                                 stats.iters,
                                 // 先読みが効いた回。solve を丸ごと飛ばしたので、
                                 // ここが出ている間は点の切り替わりで機体が止まらない。
-                                if stats.adopted { ", prefetched" } else { "" }
+                                if stats.adopted { ", prefetched" } else { "" },
+                                // 打ち切った場で答えた回 (early_start)。経路の外は
+                                // 未確定なので、機体が外れると解き直しが要る。
+                                if stats.truncated { ", truncated" } else { "" }
                             );
                             let stamp = node_clock.now().to_sec_nanosec().unwrap_or((0, 0));
                             let mut result =

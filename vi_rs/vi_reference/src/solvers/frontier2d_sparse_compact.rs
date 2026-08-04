@@ -781,6 +781,12 @@ pub struct CompactStats {
     /// `converged == false` の内訳: `cancel` フラグで中断されたなら true、
     /// `max_iter` 打ち切りなら false。中断時の `sink` の内容は未完成なので使えない。
     pub cancelled: bool,
+    /// `converged == false` のもう 1 つの内訳: `stop` コールバックが打ち切ったなら true
+    /// （`solve_compact_mapped_stopping` を使ったときだけ立つ）。**`cancelled` と違い
+    /// `sink` はそのまま使える** — 書いてあるのは finalize 済みの列だけで、それらは
+    /// 定義から v* 到達済み＝収束解と bit-exact に同じ値。未 finalize の列が
+    /// `(MAX_COST, -1)` のまま残っているだけ。
+    pub stopped: bool,
     /// final 化された eval_ok セル数。
     pub finalized: u64,
     /// 到達可能（eval_ok かつ `cp != UNREACHED`）セル数。
@@ -1067,7 +1073,17 @@ pub(crate) fn solve_compact_into_nthreads(
     // states を源にバンドスキャンを回す（src の借用は core 内で完結し、write_back と競合しない）。
     let mut stats = {
         let src = SliceSource::new(&vi.states, g.nx, g.nt);
-        solve_compact_core(&g, mt, &src, max_iter, band_override, sink, nthreads, &never)
+        solve_compact_core(
+            &g,
+            mt,
+            &src,
+            max_iter,
+            band_override,
+            sink,
+            nthreads,
+            &never,
+            &mut |_| false,
+        )
     };
     write_back_sink(vi, &g, sink);
     // slice 経路は states があるので reachable を厳密にカウント（mapped 経路は core 内の finalized）。
@@ -1088,6 +1104,10 @@ pub(crate) fn solve_compact_into_nthreads(
 /// cancelled=true` で即座に戻る（`sink` の内容は未完成なので破棄すること）。中断を使わない
 /// 呼び出し側は `&AtomicBool::new(false)` を渡す。ROS プランナがゴール変更でプリエンプトする
 /// ために必要（solve は巨大マップで数十秒〜数分ブロックする）。
+///
+/// **途中まで解けた出力を使いたい**（走り出しを早める等）なら
+/// [`solve_compact_mapped_stopping`] のほう。`cancel` で止めた `sink` は使えないが、
+/// あちらで止めた `sink` は使える。
 #[allow(clippy::too_many_arguments)]
 pub fn solve_compact_mapped(
     actions: Vec<Action>,
@@ -1107,6 +1127,57 @@ pub fn solve_compact_mapped(
     nthreads: usize,
     cancel: &AtomicBool,
 ) -> CompactStats {
+    solve_compact_mapped_stopping(
+        actions,
+        thread_num,
+        map,
+        theta_cell_num,
+        safety_radius,
+        safety_radius_penalty,
+        goal_margin_radius,
+        goal_margin_theta,
+        goal_x,
+        goal_y,
+        goal_t,
+        max_iter,
+        band_override,
+        sink,
+        nthreads,
+        cancel,
+        &mut |_| false,
+    )
+}
+
+/// `solve_compact_mapped` の**途中打ち切り**版。`stop` は波の finalize が終わるたびに、
+/// その時点の `sink`（= finalize 済みの確定出力）を添えて呼ばれ、`true` を返すとそこで
+/// 解くのをやめて `converged=false, stopped=true` で戻る。
+///
+/// `cancel` による中断と違い、**このとき `sink` はそのまま使える**。finalize は値の
+/// 昇順で進み、finalize 済みの列は v* 到達済み（以後不変）だからで、書いてある値は
+/// 最後まで解いたときと bit-exact に同じ。未 finalize の列が `(MAX_COST, -1)` のまま
+/// 残っているだけになる。「ロボットの現在地からゴールまで方策が繋がったらそこで
+/// 止めて走り出す」のような使い方のための入口で、`stop` の中で `sink` を読んで
+/// 判定する（値の閾値でも、ロールアウトが通るかでもよい）。
+#[allow(clippy::too_many_arguments)]
+pub fn solve_compact_mapped_stopping(
+    actions: Vec<Action>,
+    thread_num: i32,
+    map: &OccupancyGrid,
+    theta_cell_num: i32,
+    safety_radius: f64,
+    safety_radius_penalty: f64,
+    goal_margin_radius: f64,
+    goal_margin_theta: i32,
+    goal_x: f64,
+    goal_y: f64,
+    goal_t: i32,
+    max_iter: u32,
+    band_override: Option<u64>,
+    sink: &mut dyn CompactSink,
+    nthreads: usize,
+    cancel: &AtomicBool,
+    stop: &mut dyn FnMut(&dyn CompactSink) -> bool,
+) -> CompactStats {
     let mut vi = ValueIterator::new(actions, thread_num);
     // geometry + transitions のみ（states / sweep_orders は作らない = O(total) 確保なし）。
     vi.set_map_geometry_no_states(map, theta_cell_num, goal_margin_radius, goal_margin_theta);
@@ -1115,7 +1186,7 @@ pub fn solve_compact_mapped(
     let g = Geom::build(&vi);
     let mt = displacement(&vi).2;
     let src = MapSource::build(map, &vi, safety_radius, safety_radius_penalty);
-    solve_compact_core(&g, mt, &src, max_iter, band_override, sink, nthreads, cancel)
+    solve_compact_core(&g, mt, &src, max_iter, band_override, sink, nthreads, cancel, stop)
 }
 
 /// 既定スレッド数（環境変数 `VI_THREADS` 上書き可）。`solve_compact_mapped` にスレッド数を渡すための
@@ -1147,6 +1218,11 @@ pub fn mapped_goal_cell_count(
 
 /// バンドスキャン本体（源 `src` 非依存）。`slice`/`mapped` 両入口が共有する。出力は `sink` に確定し、
 /// write_back はしない（呼び出し側の責務）。`reachable` は finalized 数で近似（slice 入口が上書きする）。
+///
+/// `stop` は**波の finalize が終わるたび**に呼ばれ、`true` を返すとそこで打ち切る
+/// （`converged=false, stopped=true`）。渡されるのはその時点の `sink` = finalize 済みの
+/// 確定出力だけなので、呼び出し側は「もう十分か」を出力そのもので判定できる。使わない
+/// 呼び出し側は `&mut |_| false` を渡す。
 #[allow(clippy::too_many_arguments)]
 fn solve_compact_core(
     g: &Geom,
@@ -1157,6 +1233,7 @@ fn solve_compact_core(
     sink: &mut dyn CompactSink,
     nthreads: usize,
     cancel: &AtomicBool,
+    stop: &mut dyn FnMut(&dyn CompactSink) -> bool,
 ) -> CompactStats {
     let (nx, ny) = (g.nx, g.ny);
     let (dx, dy) = (g.mx as u32, g.my as u32);
@@ -1211,6 +1288,7 @@ fn solve_compact_core(
     });
 
     let mut t = band;
+    let mut stopped = false;
     let converged = 'outer: loop {
         // ── 波: バンド [.., t) を収束。relax は隣接（未到達含む）を発見、伝播は in-band 列のみ。
         //    nthreads==1 は直列 G-S、>=2 は並列 async G-S × θマスク疎評価。max_iter 到達なら
@@ -1285,6 +1363,15 @@ fn solve_compact_core(
             break true;
         }
 
+        // ── 打ち切り判定: ここまでの確定出力で足りるか呼び出し側に訊く ──
+        // 全部解けたかどうかの判定 (直上) の**後**に置く。最後の波で解き切ったなら
+        // `stopped` ではなく `converged` を返したい（打ち切りは「まだ残っているのに
+        // 止めた」ときだけの状態）。
+        if stop(&*sink) {
+            stopped = true;
+            break 'outer false;
+        }
+
         // T を次バンドへ進め、deferred（live かつ col_min < 新 T）を膨張して再活性。
         t = t.saturating_add(band);
         let mut react = Bitboard2D::new(nx as u32, ny as u32);
@@ -1311,8 +1398,10 @@ fn solve_compact_core(
         iters,
         updates: total_updates,
         converged,
-        // 非収束の内訳: cancel が立っていれば中断、そうでなければ max_iter 打ち切り。
-        cancelled: !converged && cancel.load(Ordering::Relaxed),
+        // 非収束の内訳: stop が打ち切ったならそれ、cancel が立っていれば中断、
+        // どちらでもなければ max_iter 打ち切り。
+        cancelled: !converged && !stopped && cancel.load(Ordering::Relaxed),
+        stopped,
         finalized,
         // 収束時は finalized == 到達可能 eval セル数。slice 入口は states から厳密値で上書きする。
         reachable: finalized,
