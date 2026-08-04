@@ -46,14 +46,27 @@
 //! 成り立つ条件は「ウィンドウ内のセルの遷移先がパッチ内に収まる」ことで、
 //! これは遷移表の実測値で起動時に検証する ([`transition_reach`])。
 //!
-//! compact 経路には密経路と 2 点だけ差異がある (どちらも意図的):
+//! ## compact でも sink が共有場になる (書き戻し + penalty 表)
 //!
-//! 1. `plan_*` のロールアウトは sink (静的地図の解) を読む。密経路では追従中に
-//!    注入されたスキャン由来の `local_penalty` 込みの値を読むので、動的障害物が
-//!    経路にも反映されていた。compact ではされない (走行はパッチ側の方策に従うので
-//!    避けること自体はできる)。
-//! 2. パッチを置き直すとその周期のローカル精密化は捨てられる (密経路は全域 `states`
-//!    に書くので残る)。スキャンは毎 tick 注入されるので次の tick で復元される。
+//! パッチだけで回すと、狭域の成果はパッチの外へ出られない。sink は全域ぶんの配列
+//! なので、**狭域が動かした窓を毎 tick sink へ書き戻す** ([`PlannerCore::commit_window`])
+//! と、密経路の `states` と同じ意味で共有場になる。広域のロールアウトは sink を
+//! 読むので、そこで見えるようになる。
+//!
+//! ただし sink は `(value, action)` の 12 B/state しか持たない。値を書き戻しても
+//! **その値を正当化する `local_penalty` がどこにも残らない**ので、次にその区画を
+//! 起こし直すと penalty 0 で価値反復が回り、上げた値が静かに元へ戻る。そこで
+//! 観測した penalty だけを別に覚える ([`PenaltyOverlay`], 1 B/セル)。密経路の
+//! `states.local_penalty` の代わりで、寿命も同じ (ゴールを解き直すと消える)。
+//!
+//! この 2 つで、compact は**「`global_sweep` を切った密経路」と同じ**ところまで
+//! 来る。残る差は 1 つだけ:
+//!
+//! - **全域伝播 ([`PlannerCore::sweep_global`]) がまだ compact には無い。** 上がった
+//!   値は窓の周りに留まるので、広域の経路は「窓の中だけ迂回する」形になり、20 m 先
+//!   から降りてくるロールアウトが塞がった通路を選ぶこと自体は変わらない。密経路で
+//!   `global_sweep` を切ったときと同じ既知の穴で、`sweep_global` は compact では
+//!   いまも何もしない。
 //!
 //! `BuildParams` が vi_global_planner::core と重複しているのは意図的
 //! (クレート間依存を避けるため; vi_local_planner から引き継いだ規約)。
@@ -255,6 +268,53 @@ struct Patch {
     at: Option<(i32, i32)>,
 }
 
+/// compact 経路で観測した `local_penalty` の全域表 (密経路では作らない)。
+///
+/// sink は `(value, action)` しか持たないので、書き戻した値を裏付ける penalty が
+/// 残らない。これが密経路の `states.local_penalty` の代わりで、パッチを起こし直す
+/// たびに [`Patch::hydrate`] が窓の外の分もここから復元する。無いと、置き直した
+/// 直後の価値反復が penalty 0 で回って上げた値を戻してしまう。
+///
+/// **1 セル 1 バイトで正確に持てる。** `set_local_cost` が書くのは
+/// `2048 << PROB_BASE_BIT` (= 2^29) か、それを 2 で割り続けた値だけなので常に
+/// 2 の冪で、指数だけ持てば足りる。しかも θ 方向に一様 (同じ (ix,iy) の全 θ へ
+/// 同じ値を書く) なので 2D でよい。この 2 つは `vi_reference::local` の
+/// `set_local_cost` の実装そのもので、崩れたらこの表は近似に落ちる。
+struct PenaltyOverlay {
+    /// 指数 + 1。0 = penalty 無し、`e` = 値 `1 << (e - 1)`。
+    exp: Vec<u8>,
+    nx: i32,
+    ny: i32,
+}
+
+impl PenaltyOverlay {
+    fn new(nx: i32, ny: i32) -> Self {
+        Self { exp: vec![0u8; nx as usize * ny as usize], nx, ny }
+    }
+
+    fn idx(&self, ix: i32, iy: i32) -> Option<usize> {
+        (ix >= 0 && ix < self.nx && iy >= 0 && iy < self.ny)
+            .then(|| iy as usize * self.nx as usize + ix as usize)
+    }
+
+    fn get(&self, ix: i32, iy: i32) -> u64 {
+        match self.idx(ix, iy).map(|i| self.exp[i]) {
+            Some(0) | None => 0,
+            Some(e) => 1u64 << (e - 1),
+        }
+    }
+
+    /// 2 の冪でない値が来たら**切り下げ**て記録する (上の理由で実際には来ない)。
+    fn set(&mut self, ix: i32, iy: i32, v: u64) {
+        let Some(i) = self.idx(ix, iy) else { return };
+        self.exp[i] = if v == 0 { 0 } else { (64 - v.leading_zeros()) as u8 };
+    }
+
+    fn clear(&mut self) {
+        self.exp.fill(0);
+    }
+}
+
 struct CachedGoal {
     goal_x: f64,
     goal_y: f64,
@@ -282,6 +342,10 @@ pub struct PlannerCore {
     /// compact 経路の追従用パッチ (ゴール非依存なのでキャッシュの外に置く)。
     /// 密経路では使わない。
     patch: Option<Patch>,
+    /// compact 経路で観測した `local_penalty` の全域表 (密経路では None)。
+    /// 密経路の `states.local_penalty` に対応するので、寿命も同じ
+    /// (ゴールを解き直すと `states` ごと作り直される = ここでは `clear`)。
+    penalty: Option<PenaltyOverlay>,
     /// 狭域が共有場を動かしたか。`refine_for` が Δ>0 を出すと立ち、全域掃きが
     /// Δ=0 で 1 周し終えると落ちる。全域掃きを回すかの唯一の判断材料
     /// (「狭域が通れないと言っている」を別途検出する必要はない — 通れないなら
@@ -416,7 +480,17 @@ impl Patch {
     /// compact の場と静的地図からパッチの `states` を起こす。
     /// `p0` はパッチ左下のグローバルセル座標 (地図外へ食い込んでよい — その分は
     /// 占有セル扱いになり、`action_cost` が MAX_COST を返す = 元の地図外判定と同じ)。
-    fn hydrate(&mut self, f: &CompactField, build: &BuildParams, p0: (i32, i32)) {
+    ///
+    /// `overlay` からは観測済みの `local_penalty` を**パッチ全体に**戻す。窓の中
+    /// だけでは足りない: `action_cost` は遷移先の `local_penalty` を読むので、
+    /// 凍結境界側が 0 のままだと窓の縁の行動コストが sink の値と食い違う。
+    fn hydrate(
+        &mut self,
+        f: &CompactField,
+        build: &BuildParams,
+        overlay: Option<&PenaltyOverlay>,
+        p0: (i32, i32),
+    ) {
         let (gnx, gny, nt) = f.cell_num;
         let res = f.resolution;
         let side = 2 * self.half + 1;
@@ -466,6 +540,7 @@ impl Patch {
                     }
                 };
                 let orig0 = if inside { Some(f.orig(gx, gy, 0)) } else { None };
+                let pen = overlay.map(|o| o.get(gx, gy)).unwrap_or(0);
                 for it in 0..nt {
                     let (v, a) = match orig0 {
                         Some(o) => f.sink.read(o + it as usize),
@@ -478,7 +553,7 @@ impl Patch {
                     s.it = it;
                     s.free = proto.free;
                     s.penalty = proto.penalty;
-                    s.local_penalty = 0;
+                    s.local_penalty = pen;
                     s.total_cost = v;
                     s.optimal_action = if a >= 0 { Some(a as usize) } else { None };
                     // sink の規約: 未到達 = MAX_COST、ゴール圏 = 0 (`CompactPolicy::is_final`
@@ -503,7 +578,12 @@ fn make_sink(nstates: usize, dir: &SinkDir) -> Result<Box<dyn CompactSink + Send
 
 impl PlannerCore {
     pub fn new(build: BuildParams, cfg: PlanConfig) -> Self {
-        Self { build, cfg, cached: None, patch: None, dirty: false }
+        // penalty 表は compact だけ (密は states がそのまま持つ)。1 B/セルなので
+        // 津田沼の 0.25 m/cell (1177x800) でも 0.9 MB。
+        let penalty = cfg
+            .use_compact()
+            .then(|| PenaltyOverlay::new(build.grid.width, build.grid.height));
+        Self { build, cfg, cached: None, patch: None, penalty, dirty: false }
     }
 
     /// キャッシュ中のゴールが `goal` と同一 (許容差内) か。追従スレッドが
@@ -585,6 +665,11 @@ impl PlannerCore {
         self.cached = None; // 旧キャッシュ (数 GB になり得る) を先に解放
         if let Some(p) = self.patch.as_mut() {
             p.at = None; // 別ゴールの値が残ったパッチで走らせない
+        }
+        // 密経路は `states` を作り直すので local_penalty がここで消える。compact の
+        // penalty 表も同じ寿命にそろえる (「消したければゴールを取り直す」の実体)。
+        if let Some(ov) = self.penalty.as_mut() {
+            ov.clear();
         }
         // 解き直した直後は収束済み。前のゴールで積んだ「伝播させる仕事がある」印は
         // 持ち越さない (持ち越すと最初の 1 掃きが必ず無駄に回る)。
@@ -728,7 +813,8 @@ impl PlannerCore {
 
         let cached = self.cached.as_ref().expect("cache filled above");
         // 密経路は追従で注入された local_penalty 込みの値を読む。compact 経路は
-        // sink (静的地図の解) を読む — モジュール冒頭の差異 1。
+        // sink を読む。sink には狭域が `commit_window` で返した値も入っている
+        // ので、こちらも動的障害物込みの値になる (モジュール冒頭)。
         let r = match &cached.field {
             Field::Dense(vi) => rollout_path_on(
                 &vi.base,
@@ -835,11 +921,13 @@ impl PlannerCore {
 
     /// ローカルウィンドウをロボット位置中心へ移動 (本家 `setLocalWindow`)。
     /// compact 経路では、必要ならその前にパッチを置き直して compact の場から
-    /// 起こし直す (置き直した周期のローカル精密化は捨てられる — 冒頭の差異 2)。
+    /// 起こし直す。前の位置での成果は `commit_window` が毎 tick sink へ返して
+    /// あるので、置き直しで失われるものは無い。
     pub fn set_window(&mut self, pose: PoseView) {
-        // build / cached / patch は別フィールドなので分割して借りられる。
+        // build / cached / patch / penalty は別フィールドなので分割して借りられる。
         let build = &self.build;
         let patch = &mut self.patch;
+        let overlay = self.penalty.as_ref();
         let Some(c) = self.cached.as_mut() else { return };
         match &mut c.field {
             Field::Dense(vi) => vi.set_local_window(pose.x, pose.y),
@@ -849,7 +937,7 @@ impl PlannerCore {
                 let gx = ((pose.x - f.origin.0) / res).floor() as i32;
                 let gy = ((pose.y - f.origin.1) / res).floor() as i32;
                 if p.needs_recenter(gx, gy) {
-                    p.hydrate(f, build, (gx - p.half, gy - p.half));
+                    p.hydrate(f, build, overlay, (gx - p.half, gy - p.half));
                 }
                 p.vi.set_local_window(pose.x, pose.y);
             }
@@ -861,6 +949,69 @@ impl PlannerCore {
     pub fn observe_scan(&mut self, scan: &LaserScan, pose: PoseView) {
         if let Some(vi) = self.local_mut() {
             vi.set_local_cost(scan, pose.x, pose.y, pose.yaw_rad);
+        }
+        self.harvest_penalties();
+    }
+
+    /// compact 経路: いま窓に入っている `local_penalty` を全域表へ写す
+    /// (`set_local_cost` はヒット帯へ書くのも減衰させるのも窓の中だけなので、
+    /// 変化はすべてこの範囲に収まる)。密経路では何もしない。
+    fn harvest_penalties(&mut self) {
+        let (Some(p), Some(ov)) = (self.patch.as_ref(), self.penalty.as_mut()) else { return };
+        let Some((p0x, p0y)) = p.at else { return };
+        let vi = &p.vi;
+        for py in vi.local_iy_min..=vi.local_iy_max {
+            for px in vi.local_ix_min..=vi.local_ix_max {
+                let idx = vi.base.to_index(px, py, 0) as usize;
+                ov.set(p0x + px, p0y + py, vi.base.states[idx].local_penalty);
+            }
+        }
+    }
+
+    /// compact 経路: 狭域が動かした窓の `(value, policy)` を sink へ書き戻す。
+    ///
+    /// **これが compact 版の「共有場」の実体**。sink は全域ぶんの配列なので、
+    /// 書き戻せば広域のロールアウト (`plan_*` は sink を読む) からも、次に同じ
+    /// 区画を起こし直したパッチからも見える。書き戻すのは窓の中だけ — パッチの
+    /// 外周は凍結境界で、そもそも更新していない。
+    ///
+    /// 実際に変わった列だけ書く。値が動かない tick のほうが多く、mmap sink では
+    /// 書き込みがそのままページの汚しになるため (0.25 m/cell の窓 9x9x60 で
+    /// 58 KB/tick、10 Hz なら 580 KB/s)。
+    fn commit_window(&mut self) {
+        let patch = self.patch.as_ref();
+        let Some(c) = self.cached.as_mut() else { return };
+        let Field::Compact(f) = &mut c.field else { return };
+        let Some(p) = patch else { return };
+        let Some((p0x, p0y)) = p.at else { return };
+        let (gnx, gny, nt) = f.cell_num;
+        let mut values = vec![0u64; nt as usize];
+        let mut actions = vec![-1i32; nt as usize];
+        for py in p.vi.local_iy_min..=p.vi.local_iy_max {
+            let gy = p0y + py;
+            if gy < 0 || gy >= gny {
+                continue;
+            }
+            for px in p.vi.local_ix_min..=p.vi.local_ix_max {
+                let gx = p0x + px;
+                if gx < 0 || gx >= gnx {
+                    continue;
+                }
+                let base = f.orig(gx, gy, 0);
+                let mut changed = false;
+                for it in 0..nt {
+                    let s = &p.vi.base.states[p.vi.base.to_index(px, py, it) as usize];
+                    // sink の action はインデックス (`hydrate` / `CompactPolicy` と同じ規約。
+                    // `Action::id` ではない)。
+                    let a = s.optimal_action.map(|ai| ai as i32).unwrap_or(-1);
+                    values[it as usize] = s.total_cost;
+                    actions[it as usize] = a;
+                    changed |= f.sink.read(base + it as usize) != (s.total_cost, a);
+                }
+                if changed {
+                    f.sink.write_column(base, &values, &actions);
+                }
+            }
         }
     }
 
@@ -878,6 +1029,9 @@ impl PlannerCore {
                 self.dirty = true;
             }
             if stopped || pass_delta == 0 {
+                // compact 経路は窓を sink へ返して初めて共有場になる。予算切れでも
+                // 返す (次の tick で続きから精密化する)。密経路では何もしない。
+                self.commit_window();
                 return pass_delta;
             }
         }
@@ -888,6 +1042,7 @@ impl PlannerCore {
         for _ in 0..n {
             let _ = self.refine_pass_until(|| false);
         }
+        self.commit_window();
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -923,15 +1078,18 @@ impl PlannerCore {
     /// ロックを手放す (`run_follow` は `try_lock` に 3 回続けて失敗するとロボットを
     /// 止める)。1 掃き終わるごとに掃き順を次へ回すので、伝播方向は偏らない。
     ///
-    /// # compact 経路では何もしない
+    /// # compact 経路では何もしない (まだ)
     ///
-    /// compact は `states` を作らないので共有場が無い (確定出力の sink は
-    /// 読み出し用で、狭域はそこから起こしたパッチの上で回り、置き直しで捨てられる
-    /// — モジュール冒頭の差異 1・2)。この機能を使うには密ソルバが要る。
+    /// `commit_window` と [`PenaltyOverlay`] で compact にも共有場 (= sink) は
+    /// できたが、**それを全域へ掃く手立てがまだ無い**。ここが要求するのは全域ぶんの
+    /// `states` と `sweep_orders` (80 B/state) で、compact はまさにそれを持てない
+    /// から compact なので、同じコードは使えない。sink をタイル単位で起こしては
+    /// 掃いて書き戻す形が要る (モジュール冒頭)。それまで compact は
+    /// 「`global_sweep` を切った密経路」と同じ = 窓の外へは広がらない。
     pub fn sweep_global(&mut self, cur: &mut SweepCursor, max_cells: usize) -> (u64, bool) {
         let Some(c) = self.cached.as_mut() else { return (0, true) };
         let Field::Dense(vi) = &mut c.field else {
-            self.dirty = false; // compact には伝播させる場が無い
+            self.dirty = false; // compact を掃く実装がまだ無い
             return (0, true);
         };
 
@@ -1577,6 +1735,181 @@ mod tests {
         assert!(after > before, "upstream value must rise: before={before}, after={after}");
     }
 
+    /// penalty 表が `set_local_cost` の書く値を**丸めずに**持てること
+    /// (1 B/セルで足りる根拠 = 2 の冪しか来ない)。
+    #[test]
+    fn penalty_overlay_is_exact_for_every_value_set_local_cost_writes() {
+        let mut ov = PenaltyOverlay::new(4, 3);
+        assert_eq!(ov.get(0, 0), 0, "初期値は penalty 無し");
+
+        // set_local_cost が書くのは 2048<<PROB_BASE_BIT と、その半減列だけ。
+        let mut v = 2048u64 << PROB_BASE_BIT;
+        let mut seen = 0;
+        while v > 0 {
+            ov.set(1, 2, v);
+            assert_eq!(ov.get(1, 2), v, "{v} を丸めずに持てること");
+            v /= 2;
+            seen += 1;
+        }
+        assert_eq!(seen, 30, "2^29 から 1 まで 30 段");
+
+        ov.set(1, 2, 0);
+        assert_eq!(ov.get(1, 2), 0);
+        // 表の外は 0 (パッチは地図外へ食い込む)。
+        ov.set(-1, 0, 1 << 20);
+        ov.set(4, 0, 1 << 20);
+        assert_eq!((ov.get(-1, 0), ov.get(4, 0), ov.get(0, 3)), (0, 0, 0));
+
+        ov.set(0, 0, 1 << 20);
+        ov.clear();
+        assert_eq!(ov.get(0, 0), 0, "ゴールを取り直したら消えること");
+    }
+
+    /// compact 経路の狭域の成果が **sink に載る** こと = 広域と場を共有すること。
+    /// 密経路の `states` に相当する共有場が compact でも成立している、の実体。
+    #[test]
+    fn compact_local_refinement_reaches_the_shared_sink() {
+        let mut core = PlannerCore::new(build(64), cfg_compact());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(2.5, 1.0, 0.0), &cancel).expect("solve");
+
+        let robot = pose(1.0, 1.0, 0.0);
+        core.set_window(robot);
+        // 前進 1 ステップでヒット帯へ着地する上流セル (dense 版と同じ取り方)。
+        let (uix, uiy, uit) = {
+            let vi = core.local().unwrap();
+            pose_to_cell(&vi.base, 1.2, 1.0, 0.0)
+        };
+        let (p0x, p0y) = core.patch.as_ref().unwrap().at.unwrap();
+        let (gx, gy) = (p0x + uix, p0y + uiy);
+        let sink_of = |core: &PlannerCore| {
+            let Some(CachedGoal { field: Field::Compact(f), .. }) = core.cached.as_ref() else {
+                panic!("compact field expected");
+            };
+            f.sink.read(f.orig(gx, gy, uit))
+        };
+        let before = sink_of(&core);
+
+        let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.5] };
+        core.observe_scan(&scan, robot);
+        core.refine_passes(5);
+
+        let after = sink_of(&core);
+        assert!(
+            after.0 > before.0,
+            "狭域が上げた値が sink に返っていること: before={before:?}, after={after:?}"
+        );
+    }
+
+    /// パッチを置き直しても、狭域が上げた値が戻らないこと。
+    ///
+    /// 値は sink から復元でき、それを裏付ける `local_penalty` は penalty 表から
+    /// 復元できる。**表が無いと**、起こし直した直後の価値反復が penalty 0 で回って
+    /// 値を静かに元へ戻す (だからこの 2 つはセット)。
+    #[test]
+    fn compact_penalty_survives_a_patch_recenter() {
+        let mut core = PlannerCore::new(build(64), cfg_compact());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(2.5, 1.0, 0.0), &cancel).expect("solve");
+
+        let robot = pose(1.0, 1.0, 0.0);
+        core.set_window(robot);
+        let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.5] };
+        core.observe_scan(&scan, robot);
+        core.refine_passes(5);
+
+        // ヒット帯 (1.5, 1.0) のグローバルセルと、そこに載った penalty。
+        let (hgx, hgy) = {
+            let p = core.patch.as_ref().unwrap();
+            let (p0x, p0y) = p.at.unwrap();
+            let (hx, hy, _) = pose_to_cell(&p.vi.base, 1.5, 1.0, 0.0);
+            (p0x + hx, p0y + hy)
+        };
+        assert_eq!(
+            core.penalty.as_ref().unwrap().get(hgx, hgy),
+            2048u64 << PROB_BASE_BIT,
+            "ヒット帯の penalty が表に載ること"
+        );
+        let raised = {
+            let Some(CachedGoal { field: Field::Compact(f), .. }) = core.cached.as_ref() else {
+                panic!("compact field expected");
+            };
+            f.sink.read(f.orig(hgx, hgy, 0)).0
+        };
+
+        // 遠くへ動かしてパッチを置き直させ、戻ってくる。
+        let away = pose(1.0, 2.6, 0.0);
+        core.set_window(away);
+        let moved = core.patch.as_ref().unwrap().at;
+        core.set_window(robot);
+        assert_ne!(moved, core.patch.as_ref().unwrap().at, "パッチが置き直されていること");
+
+        let p = core.patch.as_ref().unwrap();
+        let (p0x, p0y) = p.at.unwrap();
+        let idx = p.vi.base.to_index(hgx - p0x, hgy - p0y, 0) as usize;
+        let s = &p.vi.base.states[idx];
+        assert_eq!(s.local_penalty, 2048u64 << PROB_BASE_BIT, "penalty が復元されること");
+        assert_eq!(s.total_cost, raised, "sink から上がった値のまま起きること");
+
+        // 起こし直した場でもう一度回しても値は戻らない (penalty が効いているため)。
+        core.refine_passes(3);
+        let p = core.patch.as_ref().unwrap();
+        let after = &p.vi.base.states[p.vi.base.to_index(hgx - p0x, hgy - p0y, 0) as usize];
+        assert!(after.total_cost >= raised, "penalty 抜きで解き直されていないこと");
+    }
+
+    /// 狭域が何もしていない tick では sink を書かないこと (mmap sink のページを
+    /// 無駄に汚さない)。
+    #[test]
+    fn compact_commit_writes_nothing_when_the_window_is_settled() {
+        /// 書き込み回数を数える sink。
+        struct CountingSink {
+            inner: RamSink,
+            writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl CompactSink for CountingSink {
+            fn write_column(&mut self, base: usize, values: &[u64], actions: &[i32]) {
+                self.writes.fetch_add(1, Ordering::Relaxed);
+                self.inner.write_column(base, values, actions);
+            }
+            fn read(&self, orig: usize) -> (u64, i32) {
+                self.inner.read(orig)
+            }
+        }
+
+        let mut core = PlannerCore::new(build(64), cfg_compact());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).expect("solve");
+
+        // solve 済みの sink を数える sink で包み直す。
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let Some(CachedGoal { field: Field::Compact(f), .. }) = core.cached.as_mut() else {
+                panic!("compact field expected");
+            };
+            let (nx, ny, nt) = f.cell_num;
+            let n = nx as usize * ny as usize * nt as usize;
+            let mut inner = RamSink::new(n);
+            for orig in 0..n {
+                let (v, a) = f.sink.read(orig);
+                inner.write_column(orig, &[v], &[a]);
+            }
+            f.sink = Box::new(CountingSink { inner, writes: writes.clone() });
+        }
+
+        let robot = pose(1.0, 1.0, 0.0);
+        core.set_window(robot);
+        core.refine_passes(2); // 均す
+        writes.store(0, Ordering::Relaxed);
+        core.refine_passes(2); // 何も動かないはず
+        assert_eq!(writes.load(Ordering::Relaxed), 0, "収束済みの窓では書かないこと");
+
+        let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.5] };
+        core.observe_scan(&scan, robot);
+        core.refine_passes(2);
+        assert!(writes.load(Ordering::Relaxed) > 0, "動いたぶんは書くこと");
+    }
+
     /// 障害物・ペナルティ変化の無いウィンドウは 1 パスで Δ=0 になり、
     /// refine_for が予算を使い切らず早期リターンすること。
     #[test]
@@ -1616,6 +1949,7 @@ mod tests {
             cfg: strict,
             cached: core.cached.take(),
             patch: core.patch.take(),
+            penalty: core.penalty.take(),
             dirty: false,
         };
         assert_eq!(strict_core.decide(on_obstacle), Decision::NoAction);
@@ -1625,6 +1959,7 @@ mod tests {
             cfg: cfg(),
             cached: strict_core.cached,
             patch: strict_core.patch,
+            penalty: strict_core.penalty,
             dirty: false,
         };
         assert!(matches!(relaxed_core.decide(on_obstacle), Decision::Action { .. }));
@@ -1847,10 +2182,10 @@ mod tests {
         assert_eq!(cur.order, 0, "一周したら戻ること");
     }
 
-    /// compact 経路には共有場が無い (states を作らない) ので、全域掃きは何もせず
+    /// compact の共有場 (sink) を全域へ掃く実装はまだ無いので、全域掃きは何もせず
     /// 印だけ落とすこと — 呼び出し側が空回りしないように。
     #[test]
-    fn compact_has_no_shared_field_to_sweep() {
+    fn compact_has_no_global_sweep_yet() {
         let mut core = PlannerCore::new(build(64), cfg_compact());
         let cancel = AtomicBool::new(false);
         core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).expect("solve");
