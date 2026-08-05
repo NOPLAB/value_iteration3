@@ -1,5 +1,7 @@
 //! vi_planner entry point — Nav2 の planner_server と controller_server を
-//! **1 ノードで同時に**置き換える全 Rust ノード。
+//! **1 ノードで同時に**置き換える全 Rust ノード。`standalone: true` にすると
+//! さらに bt_navigator と waypoint_follower も置き換え、**Nav2 のノードを 1 つも
+//! 立てずに**自律移動する (下の「スタンドアロン」を参照)。
 //!
 //! `compute_path_to_pose` (nav2_msgs) と `follow_path` (nav2_msgs) の両方を
 //! 提供し、どちらも同じ `PlannerCore` = 同じ価値関数を読む。従来の
@@ -10,13 +12,45 @@
 //! 畳み、経路はその価値関数の貪欲ロールアウト、追従は同じ価値関数の
 //! ±1m ウィンドウ精密化として扱う。
 //!
+//! ## スタンドアロン (`standalone: true`)
+//!
+//! `navigate_to_pose` と `follow_waypoints` を**このノード自身が**提供する。
+//! bt_navigator / behavior_server / waypoint_follower / smoother_server と、
+//! それらを起こす lifecycle_manager が要らなくなる。アクション型は nav2_msgs の
+//! ままなので、RViz の `Nav2 Goal` も daifuku の各パネルも配線を変えずに動く。
+//!
+//! Nav2 の BT を挟まなくなることで消える制約が 4 つある。どれも「VI の場は
+//! 走りながら良くなる」のに BT がゴール単位で諦めていたことに由来する:
+//!
+//!   * **1 Hz のリプランが消える。** BT は `ComputePathToPose` を毎秒呼び、
+//!     キャッシュヒットでもロールアウト + densify を**ロックの中で**回していた。
+//!     10 Hz の追従ループは同じ Mutex を `try_lock` するので、これは毎秒の
+//!     取り合いだった。ここではロールアウトはゴールにつき 1 回で、しかも
+//!     `plan` トピックへの表示専用。
+//!   * **ロールアウトの失敗でゴールが死ななくなる。** `LoopDetected` は
+//!     「貪欲降下が振動した」であって「方策が無い」ではない。追従は方策を
+//!     1 手ずつ引くので、経路が引けなくても走れることがある。BT 構成では
+//!     `ComputePathToPose` の失敗がそのままゴールの失敗だった。
+//!   * **リカバリが実際に効く。** BT の `Spin` / `BackUp` は
+//!     `local_costmap/costmap_raw` を待つので、コストマップを持たないこの構成
+//!     では**必ず失敗**し、動くのは `Wait` だけだった。その `Wait` も
+//!     follow_path が走っていない間は `observe_scan` も `refine_for` も呼ばない
+//!     ので、「待てば通れる」の唯一の仕組み ([`set_local_cost`] の penalty 半減)
+//!     が進まない。ここでは投げ直しの前に [`run_settle`] が**止まったまま場を
+//!     更新する**。
+//!   * **先読みが黙って効かない経路が無くなる。** `waypoint_prefetch` は順路を
+//!     `waypoint_topic` から拾うしか手が無く、そこへ出すものがいない構成では
+//!     警告も出ずに何もしなかった。`follow_waypoints` を自分で持つと、順路は
+//!     ゴールと同じ経路で入ってくる。
+//!
 //! Boot order (vi_global_planner と同型):
 //!   1. `Context::default_from_env` + basic executor + node 作成
 //!   2. パラメータ宣言・検証 (行動集合と θ 数は起動パラメータがそのまま効く)
 //!   3. `VI_THREADS` 設定 (vi_threads > 0 のとき)
 //!   4. /map 受信 (transient_local, 初回メッセージまでブロック)
 //!   5. PlannerCore 構築 (静的地図前提) + 先読みワーカー (`waypoint_prefetch`)
-//!   6. pose / scan / waypoints 購読 + cmd_vel パブリッシャ + 2 つの action サーバ配線
+//!   6. pose / scan / waypoints 購読 + cmd_vel パブリッシャ + action サーバ配線
+//!      (常に 2 つ、`standalone` ならさらに 2 つ)
 //!   7. executor.spin()
 //!
 //! ## ロック規律 (重要)
@@ -123,6 +157,12 @@ struct Params {
     refine_budget_ms: i64,
     action_tolerance: f64,
     no_action_timeout_sec: f64,
+    // ── スタンドアロン (navigate_to_pose / follow_waypoints) ──
+    standalone: bool,
+    goal_retry_limit: i64,
+    goal_retry_settle_sec: f64,
+    waypoint_stop_on_failure: bool,
+    waypoint_pause_sec: f64,
     // ── 狭域 → 広域のフィードバック (全域掃き) ──
     global_sweep: bool,
     global_sweep_budget_ms: i64,
@@ -190,6 +230,26 @@ fn read_params(node: &Node) -> Result<Params> {
     let refine_budget_ms = p!("refine_budget_ms", i64, 40);
     let action_tolerance = p!("action_tolerance", f64, 0.2);
     let no_action_timeout_sec = p!("no_action_timeout_sec", f64, 3.0);
+
+    // navigate_to_pose と follow_waypoints をこのノード自身が提供する
+    // (= bt_navigator / behavior_server / waypoint_follower を立てない)。
+    // **既定は false**: Nav2 構成でこれを立てると navigate_to_pose のサーバが
+    // bt_navigator と 2 つになり、クライアントは先に見つけたほうへ繋ぐ
+    // (どちらに繋がったかはログにも出ない)。立てるのは launch の責任。
+    let standalone = p!("standalone", bool, false);
+    // 追従が失敗したときにゴールを投げ直す上限 (負で無制限)。BT の
+    // `RecoveryNode number_of_retries` の置き換えだが、あちらと違って
+    // **投げ直しの合間に場が実際に動く** (下の goal_retry_settle_sec)。
+    let goal_retry_limit = p!("goal_retry_limit", i64, 3);
+    // 投げ直す前に、止まったままスキャンを取り込んで場を精密化する時間。
+    // 0 で即座に投げ直す (それだと同じ場で同じ失敗を繰り返しやすい)。
+    let goal_retry_settle_sec = p!("goal_retry_settle_sec", f64, 3.0);
+    // follow_waypoints: 1 点失敗したら残りを諦めるか。false なら次の点へ進み、
+    // 飛ばした番号を result.missed_waypoints で返す (nav2_waypoint_follower と同義)。
+    let waypoint_stop_on_failure = p!("stop_on_failure", bool, false);
+    // 1 点に着いてから次の点へ向かうまでの待ち (nav2_waypoint_follower の
+    // waypoint_pause_duration [ms] に相当。こちらは秒)。
+    let waypoint_pause_sec = p!("waypoint_pause_sec", f64, 0.2);
 
     // 狭域が書いた local_penalty を全域へ伝播させる背景掃き (core::sweep_global)。
     // これを止めると、狭域が「通れない」と判断しても広域の経路は塞がった通路を
@@ -301,6 +361,11 @@ fn read_params(node: &Node) -> Result<Params> {
         refine_budget_ms,
         action_tolerance,
         no_action_timeout_sec,
+        standalone,
+        goal_retry_limit,
+        goal_retry_settle_sec,
+        waypoint_stop_on_failure,
+        waypoint_pause_sec,
         global_sweep,
         global_sweep_budget_ms,
         global_sweep_idle_ms,
@@ -587,22 +652,57 @@ enum Outcome {
     Failed(String),
 }
 
+/// 追従の 1 tick の様子。アクションごとに Feedback の形が違うので、追従ループ
+/// 自体はメッセージ型を知らずにこれを渡す (`follow_path` は距離と速度だけ、
+/// `navigate_to_pose` は姿勢と経過時間も要る)。
+struct FollowProgress {
+    pose: PoseView,
+    /// ゴールまでの XY 距離。ゴール未設定なら None。
+    distance_remaining: Option<f64>,
+    /// この tick に出した前進速度 [m/s] (止めた tick は 0)。
+    speed: f32,
+}
+
+/// 表示専用の経路パブリッシャ (`plan`)。Nav2 構成ではこれを出すのは
+/// planner_server (= `compute_path_to_pose` の側) で、RViz の Path 表示や
+/// `daifuku_rqt` が見ているのはそのトピック。スタンドアロンでは
+/// `navigate_to_pose` が誰も `compute_path_to_pose` を呼ばないので、
+/// ここから出さないと**画面に経路が 1 本も出ない**。
+///
+/// あくまで表示専用で、ロールアウトが失敗しても走行には影響しない
+/// (追従は経路ではなく方策を 1 手ずつ引く)。
+struct PlanPub {
+    path_pub: Publisher<nav_msgs::msg::Path>,
+    clock: Clock,
+    frame_id: String,
+}
+
+/// 追従ループが触る ROS 側の口。ゴールごとに変わらないものをまとめてある。
+/// 全フィールドが参照か Copy なので、分配束縛のために Copy にしてある。
+#[derive(Clone, Copy)]
+struct FollowCtx<'a> {
+    core: &'a Mutex<PlannerCore>,
+    latest_pose: &'a Mutex<Option<PoseView>>,
+    scan_queue: &'a Mutex<Vec<ViLaserScan>>,
+    cmd_pub: &'a Publisher<geometry_msgs::msg::Twist>,
+    /// 表示専用の経路。None なら出さない (`follow_path` 構成では BT 側の
+    /// `compute_path_to_pose` が出すので不要)。
+    plan_pub: Option<&'a PlanPub>,
+    viz: Option<&'a Viz>,
+    tuning: FollowTuning,
+}
+
 /// 1 ゴールぶんの追従ループ。
 ///
 /// solve 中だけロックを保持し、制御ループは **tick ごとに取得・解放**する
 /// (compute_path_to_pose を待たせないため; ファイル冒頭のロック規律を参照)。
-#[allow(clippy::too_many_arguments)]
 fn run_follow(
-    core: &Mutex<PlannerCore>,
+    ctx: &FollowCtx,
     goal: PoseView,
     cancel: &AtomicBool,
-    latest_pose: &Mutex<Option<PoseView>>,
-    scan_queue: &Mutex<Vec<ViLaserScan>>,
-    cmd_pub: &Publisher<geometry_msgs::msg::Twist>,
-    feedback: &FeedbackPublisher<nav2_msgs::action::FollowPath>,
-    tuning: FollowTuning,
-    viz: Option<&Viz>,
+    report: &dyn Fn(&FollowProgress),
 ) -> Outcome {
+    let FollowCtx { core, latest_pose, scan_queue, cmd_pub, plan_pub, viz, tuning } = *ctx;
     // ── 1. 価値関数の用意 (広域側が既に解いていれば何もしない) ──
     {
         let mut core = core.lock().unwrap();
@@ -631,7 +731,9 @@ fn run_follow(
             Ok(stats) => {
                 if stats.solved_now {
                     eprintln!(
-                        "vi_planner: value function {} in {:.2}s (iters={}){} [follow_path]",
+                        // 「追従が用意した場」の意 (広域の plan が解いたぶんと区別する)。
+                        // standalone では follow_path ではなく navigate_to_pose の下。
+                        "vi_planner: value function {} in {:.2}s (iters={}){} [following]",
                         if stats.adopted { "adopted from prefetch" } else { "solved" },
                         t0.elapsed().as_secs_f64(),
                         stats.iters,
@@ -653,6 +755,31 @@ fn run_follow(
             }
             Err(PlanError::Cancelled) => return Outcome::Preempted,
             Err(e) => return Outcome::Failed(e.to_string()),
+        }
+
+        // 表示用の経路を 1 本だけ出す (スタンドアロンのみ)。場は既に載っている
+        // ので、ここは solve ではなくロールアウト 1 回。
+        //
+        // **失敗しても走行には影響させない。** ロールアウトは貪欲降下なので、
+        // 値の起伏が 1 手の進捗より大きい地形で振動して `LoopDetected` になる
+        // ことがある (HINT を出す条件そのもの)。追従は方策を 1 手ずつ引くだけ
+        // なので、経路が引けなくても走れる。BT 構成ではこの失敗が
+        // `ComputePathToPose` の失敗 = ゴールの失敗だった。
+        if let Some(pp) = plan_pub {
+            let from = *latest_pose.lock().unwrap();
+            if let Some(from) = from {
+                match core.plan(from, goal, cancel) {
+                    Ok((poses, _)) => {
+                        let stamp = pp.clock.now().to_sec_nanosec().unwrap_or((0, 0));
+                        let _ =
+                            pp.path_pub.publish(poses_to_path(&poses, &pp.frame_id, stamp));
+                    }
+                    Err(e) => eprintln!(
+                        "WARN: vi_planner: no path to draw ({e}) — following anyway \
+                         (the policy is followed one action at a time, not the path)"
+                    ),
+                }
+            }
         }
     } // ここでロックを解放 — 以降は tick ごとに取り直す。
 
@@ -782,10 +909,7 @@ fn run_follow(
             }
         }
 
-        let _ = feedback.publish(nav2_msgs::action::FollowPath_Feedback {
-            distance_to_goal: dist.unwrap_or(f64::NAN) as f32,
-            speed,
-        });
+        report(&FollowProgress { pose, distance_remaining: dist, speed });
 
         if failure_ticks >= tuning.failure_ticks_limit {
             stop_cmd(cmd_pub);
@@ -805,6 +929,162 @@ fn run_follow(
         }
         if let Some(rest) = tuning.period.checked_sub(tick_start.elapsed()) {
             std::thread::sleep(rest);
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Standalone goal runner (bt_navigator / behavior_server の置き換え)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// 巡回 (`follow_waypoints`) の終わり方。飛ばした点そのものは別に返す。
+enum TourOutcome {
+    /// 最後の点まで回った (途中で失敗した点があっても、進み続けたならこれ)。
+    Done,
+    /// `stop_on_failure: true` で 1 点目の失敗のところで止めた。
+    Stopped,
+    /// 新しいゴールか cancel で止まった。
+    Preempted,
+}
+
+/// `NavigateToPose` の Feedback を 1 tick ぶん作る。
+///
+/// `builtin_interfaces` を直接 use せずに済むよう、既定値から組み立てて
+/// フィールドに代入する形にしてある (Duration の型名を書かなくてよい)。
+fn nav_feedback(
+    p: &FollowProgress,
+    frame_id: &str,
+    clock: &Clock,
+    started: Instant,
+    retries: u64,
+) -> nav2_msgs::action::NavigateToPose_Feedback {
+    let mut fb = nav2_msgs::action::NavigateToPose_Feedback::default();
+    let (sec, nanosec) = clock.now().to_sec_nanosec().unwrap_or((0, 0));
+    fb.current_pose.header.frame_id = frame_id.into();
+    fb.current_pose.header.stamp.sec = sec;
+    fb.current_pose.header.stamp.nanosec = nanosec;
+    fb.current_pose.pose.position.x = p.pose.x;
+    fb.current_pose.pose.position.y = p.pose.y;
+    fb.current_pose.pose.orientation.z = (p.pose.yaw_rad / 2.0).sin();
+    fb.current_pose.pose.orientation.w = (p.pose.yaw_rad / 2.0).cos();
+    let elapsed = started.elapsed();
+    fb.navigation_time.sec = elapsed.as_secs() as i32;
+    fb.navigation_time.nanosec = elapsed.subsec_nanos();
+    // 投げ直した回数。BT 構成の「リカバリを何回回したか」と同じ枠に入れる
+    // (RViz と daifuku_rqt がこの数字を出す)。
+    fb.number_of_recoveries = retries.min(i16::MAX as u64) as i16;
+    fb.distance_remaining = p.distance_remaining.unwrap_or(f64::NAN) as f32;
+    // estimated_time_remaining は出さない (VI の値は秒だが、それは行動 1 手 =
+    // 1 秒という模型の中の秒で、実時間ではない。埋めると嘘になる)。
+    fb
+}
+
+/// 投げ直しのチューニング (`standalone` のときだけ効く)。
+#[derive(Clone, Copy)]
+struct RetryTuning {
+    /// 追従が失敗したときに投げ直す上限。負で無制限。
+    limit: i64,
+    /// 投げ直す前に、その場で場を落ち着かせる時間。0 で即座に投げ直す。
+    settle: Duration,
+}
+
+/// 止まったまま場を更新し続ける「待ち」。投げ直しの前に挟む。
+///
+/// **Nav2 の BT の `Wait` はこれができない。** あちらが待っている間は
+/// `follow_path` が走っていないので `observe_scan` も `refine_for` も呼ばれず、
+/// つまり `set_local_cost` の penalty 半減 — 一度«通れない»と塗った場所が
+/// «やっぱり通れる»に戻る唯一の経路 — が 1 段も進まない。待ち時間を延ばしても
+/// 場が同じままなら、投げ直しは同じ失敗を同じ場所で繰り返すだけになる
+/// (2026-08-04 の実機で `no_action_timeout_sec` を 15 秒へ延ばして確認: 粘らず、
+/// 1 点飛ばすまでが 2 分に伸びただけだった)。
+///
+/// ここでは 0 速度を出しながら制御ループと同じ更新 (窓の移動 → スキャン注入 →
+/// 精密化) を回す。ロックの持ち方も制御ループと同じ `try_lock` で、掃きスレッド
+/// からも先読みからも取り上げない。
+///
+/// 戻り値は「最後まで待てたか」。false は cancel された。
+fn run_settle(ctx: &FollowCtx, cancel: &AtomicBool, dur: Duration) -> bool {
+    let FollowCtx { core, latest_pose, scan_queue, cmd_pub, tuning, .. } = *ctx;
+    let deadline = Instant::now() + dur;
+    while Instant::now() < deadline {
+        let tick_start = Instant::now();
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        stop_cmd(cmd_pub);
+
+        let pose = *latest_pose.lock().unwrap();
+        if let Some(pose) = pose {
+            let guard = match core.try_lock() {
+                Ok(g) => Some(g),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+                Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            };
+            if let Some(mut c) = guard {
+                let scans = std::mem::take(&mut *scan_queue.lock().unwrap());
+                c.set_window(pose);
+                for scan in &scans {
+                    c.observe_scan(scan, pose);
+                }
+                c.refine_for(tuning.refine_budget);
+            }
+        }
+
+        if let Some(rest) = tuning.period.checked_sub(tick_start.elapsed()) {
+            std::thread::sleep(rest);
+        }
+    }
+    true
+}
+
+/// スタンドアロンの 1 ゴール = `navigate_to_pose` の中身。
+///
+/// [`run_follow`] を「失敗したら場を落ち着かせて投げ直す」で包んだだけだが、
+/// これが Nav2 の BT (`RecoveryNode` + `RoundRobin` の Spin / Wait / BackUp) の
+/// 置き換えになっている。BT との違いは 2 つ:
+///
+///   * リカバリが**必ず動く**。`Spin` / `BackUp` は `local_costmap/costmap_raw`
+///     を待つが、VI 構成にコストマップは無いので必ず失敗していた。
+///   * 待つ間に**場が動く** ([`run_settle`])。BT の `Wait` は止まるだけだった。
+///
+/// `retries` は Feedback の `number_of_recoveries` 用に外から覗くための共有カウンタ。
+fn run_goal(
+    ctx: &FollowCtx,
+    goal: PoseView,
+    cancel: &AtomicBool,
+    retry: RetryTuning,
+    retries: &AtomicU64,
+    report: &dyn Fn(&FollowProgress),
+) -> Outcome {
+    retries.store(0, Ordering::Relaxed);
+    loop {
+        match run_follow(ctx, goal, cancel, report) {
+            Outcome::Failed(reason) => {
+                let done = retries.load(Ordering::Relaxed);
+                if retry.limit >= 0 && done as i64 >= retry.limit {
+                    return Outcome::Failed(format!("{reason} (after {done} retries)"));
+                }
+                retries.store(done + 1, Ordering::Relaxed);
+                eprintln!(
+                    "vi_planner: follow failed ({reason}); settling for {:.1}s, then retry {}{}",
+                    retry.settle.as_secs_f64(),
+                    done + 1,
+                    if retry.limit >= 0 {
+                        format!("/{}", retry.limit)
+                    } else {
+                        String::new()
+                    }
+                );
+                if !retry.settle.is_zero() && !run_settle(ctx, cancel, retry.settle) {
+                    stop_cmd(ctx.cmd_pub);
+                    return Outcome::Preempted;
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    stop_cmd(ctx.cmd_pub);
+                    return Outcome::Preempted;
+                }
+            }
+            other => return other,
         }
     }
 }
@@ -1224,6 +1504,35 @@ fn main() -> Result<()> {
     // ロールアウト固着時のヒント表示用 (safety_radius_penalty [秒/セル], safety_radius [m])。
     let params_hint = (params.safety_radius_penalty, params.safety_radius);
 
+    // 制御ループのチューニング。追従を回すサーバが 3 つ (follow_path /
+    // navigate_to_pose / follow_waypoints) あるので、サーバの配線より先に作る。
+    let period = Duration::from_secs_f64(1.0 / params.control_frequency);
+    let tuning = FollowTuning {
+        period,
+        refine_budget: Duration::from_millis(params.refine_budget_ms.max(0) as u64),
+        failure_ticks_limit: (params.no_action_timeout_sec.max(0.0) * params.control_frequency)
+            .ceil()
+            .max(1.0) as u32,
+    };
+    let retry = RetryTuning {
+        limit: params.goal_retry_limit,
+        settle: Duration::from_secs_f64(params.goal_retry_settle_sec.max(0.0)),
+    };
+
+    // スタンドアロンでは `compute_path_to_pose` を誰も呼ばないので、表示用の経路は
+    // 追従側が出す。Nav2 構成では planner_server (ここでは compute_path_to_pose の
+    // 成功) が出すトピックなので、そちらでは立てない。
+    let plan_pub: Option<Arc<PlanPub>> = params
+        .standalone
+        .then(|| -> Result<Arc<PlanPub>> {
+            Ok(Arc::new(PlanPub {
+                path_pub: node.create_publisher::<nav_msgs::msg::Path>("plan".keep_last(1))?,
+                clock: node.get_clock(),
+                frame_id: params.global_frame.clone(),
+            }))
+        })
+        .transpose()?;
+
     // 6e. compute_path_to_pose action サーバ (planner_server の置き換え)。
     let _plan_server = {
         let core = Arc::clone(&core);
@@ -1372,16 +1681,282 @@ fn main() -> Result<()> {
         )?
     };
 
-    // 6f. follow_path action サーバ (controller_server の置き換え)。
-    let period = Duration::from_secs_f64(1.0 / params.control_frequency);
-    let tuning = FollowTuning {
-        period,
-        refine_budget: Duration::from_millis(params.refine_budget_ms.max(0) as u64),
-        failure_ticks_limit: (params.no_action_timeout_sec.max(0.0) * params.control_frequency)
-            .ceil()
-            .max(1.0) as u32,
+    // 6f. navigate_to_pose action サーバ (bt_navigator + behavior_server の置き換え)。
+    //     **standalone のときだけ立てる** — Nav2 構成で立てると bt_navigator と
+    //     2 つになり、クライアントは先に見つけたほうへ繋ぐ (どちらに繋がったかは
+    //     どこにも出ないので、症状は「ときどき挙動が違う」になる)。
+    let _nav_to_pose_server = if !params.standalone {
+        None
+    } else {
+        let core = Arc::clone(&core);
+        let latest_pose = Arc::clone(&latest_pose);
+        let scan_queue = Arc::clone(&scan_queue);
+        let cmd_pub = cmd_pub.clone();
+        let follow_cancel = Arc::clone(&follow_cancel);
+        let viz = viz.clone();
+        let plan_pub = plan_pub.clone();
+        let frame_id = frame_id.clone();
+        let node_clock = node_clock.clone();
+
+        Some(node.create_action_server::<nav2_msgs::action::NavigateToPose, _>(
+            "navigate_to_pose",
+            move |requested_goal: RequestedGoal<nav2_msgs::action::NavigateToPose>| {
+                let core = Arc::clone(&core);
+                let latest_pose = Arc::clone(&latest_pose);
+                let scan_queue = Arc::clone(&scan_queue);
+                let cmd_pub = cmd_pub.clone();
+                let follow_cancel = Arc::clone(&follow_cancel);
+                let viz = viz.clone();
+                let plan_pub = plan_pub.clone();
+                let frame_id = frame_id.clone();
+                let node_clock = node_clock.clone();
+
+                async move {
+                    // ── プリエンプト: 前の追従を止め、自分の cancel を登録 ──
+                    // スロットは follow_path と共有する。3 つのサーバは同じ 1 台を
+                    // 走らせるので、どれが来ても前のものは止まらなければならない。
+                    let my_cancel = Arc::new(AtomicBool::new(false));
+                    {
+                        let mut slot = follow_cancel.lock().unwrap();
+                        if let Some(prev) = slot.take() {
+                            prev.store(true, Ordering::SeqCst);
+                        }
+                        *slot = Some(Arc::clone(&my_cancel));
+                    }
+
+                    let accepted = requested_goal.accept();
+                    let goal = pose_view_from(&accepted.goal().pose.pose);
+                    let executing = accepted.execute();
+                    eprintln!("vi_planner: navigate to ({:.2}, {:.2})", goal.x, goal.y);
+
+                    let feedback = executing.feedback_publisher();
+                    let (done_tx, done_rx) = futures::channel::oneshot::channel::<Outcome>();
+                    let cancel_t = Arc::clone(&my_cancel);
+                    std::thread::spawn(move || {
+                        let ctx = FollowCtx {
+                            core: &core,
+                            latest_pose: &latest_pose,
+                            scan_queue: &scan_queue,
+                            cmd_pub: &cmd_pub,
+                            plan_pub: plan_pub.as_deref(),
+                            viz: viz.as_deref(),
+                            tuning,
+                        };
+                        let retries = AtomicU64::new(0);
+                        let t0 = Instant::now();
+                        let outcome =
+                            run_goal(&ctx, goal, &cancel_t, retry, &retries, &|p| {
+                                let _ = feedback.publish(nav_feedback(
+                                    p,
+                                    &frame_id,
+                                    &node_clock,
+                                    t0,
+                                    retries.load(Ordering::Relaxed),
+                                ));
+                            });
+                        let _ = done_tx.send(outcome);
+                    });
+
+                    let mut done_rx = done_rx;
+                    match executing.until_cancel_requested(&mut done_rx).await {
+                        Ok(Ok(Outcome::Reached)) => {
+                            eprintln!("vi_planner: goal reached");
+                            executing.succeeded_with(
+                                nav2_msgs::action::NavigateToPose_Result::default(),
+                            )
+                        }
+                        Ok(Ok(Outcome::Preempted)) => {
+                            eprintln!("vi_planner: preempted by a newer goal");
+                            executing.aborted_with(
+                                nav2_msgs::action::NavigateToPose_Result::default(),
+                            )
+                        }
+                        Ok(Ok(Outcome::Failed(reason))) => {
+                            eprintln!("ERROR: vi_planner: {reason}");
+                            executing.aborted_with(
+                                nav2_msgs::action::NavigateToPose_Result::default(),
+                            )
+                        }
+                        Ok(Err(_)) => executing
+                            .aborted_with(nav2_msgs::action::NavigateToPose_Result::default()),
+                        Err(rest) => {
+                            my_cancel.store(true, Ordering::SeqCst);
+                            let cancelling = executing.begin_cancelling();
+                            let _ = rest.await;
+                            eprintln!("vi_planner: cancelled by client");
+                            cancelling.cancelled_with(
+                                nav2_msgs::action::NavigateToPose_Result::default(),
+                            )
+                        }
+                    }
+                }
+            },
+        )?)
     };
 
+    // 6g. follow_waypoints action サーバ (nav2_waypoint_follower の置き換え)。
+    //     **順路は配列の順**に回る (距離で並べ替えたりはしない。nav2 側も同じ)。
+    //
+    //     ここで順路を丸ごと受け取れることには、単に 1 ノード減る以上の意味がある:
+    //     先読み (`waypoint_prefetch`) は「次の点」を知る手立てが
+    //     `waypoint_topic` の latch しか無く、そこへ出すものがいない構成では
+    //     **エラーも警告も出ないまま何も解かなかった**。ゴールと同じ経路で
+    //     順路が入るので、その穴が塞がる。
+    let _follow_waypoints_server = if !params.standalone {
+        None
+    } else {
+        let core = Arc::clone(&core);
+        let latest_pose = Arc::clone(&latest_pose);
+        let scan_queue = Arc::clone(&scan_queue);
+        let cmd_pub = cmd_pub.clone();
+        let follow_cancel = Arc::clone(&follow_cancel);
+        let viz = viz.clone();
+        let plan_pub = plan_pub.clone();
+        let prefetch = prefetch.clone();
+        let stop_on_failure = params.waypoint_stop_on_failure;
+        let pause = Duration::from_secs_f64(params.waypoint_pause_sec.max(0.0));
+
+        Some(node.create_action_server::<nav2_msgs::action::FollowWaypoints, _>(
+            "follow_waypoints",
+            move |requested_goal: RequestedGoal<nav2_msgs::action::FollowWaypoints>| {
+                let core = Arc::clone(&core);
+                let latest_pose = Arc::clone(&latest_pose);
+                let scan_queue = Arc::clone(&scan_queue);
+                let cmd_pub = cmd_pub.clone();
+                let follow_cancel = Arc::clone(&follow_cancel);
+                let viz = viz.clone();
+                let plan_pub = plan_pub.clone();
+                let prefetch = prefetch.clone();
+
+                async move {
+                    let my_cancel = Arc::new(AtomicBool::new(false));
+                    {
+                        let mut slot = follow_cancel.lock().unwrap();
+                        if let Some(prev) = slot.take() {
+                            prev.store(true, Ordering::SeqCst);
+                        }
+                        *slot = Some(Arc::clone(&my_cancel));
+                    }
+
+                    let accepted = requested_goal.accept();
+                    let goals: Vec<PoseView> =
+                        accepted.goal().poses.iter().map(|p| pose_view_from(&p.pose)).collect();
+                    let executing = accepted.execute();
+
+                    if goals.is_empty() {
+                        eprintln!("ERROR: vi_planner: follow_waypoints goal has no poses");
+                        return executing
+                            .aborted_with(nav2_msgs::action::FollowWaypoints_Result::default());
+                    }
+                    eprintln!("vi_planner: waypoint tour of {} poses", goals.len());
+                    // 先読みへ順路をそのまま渡す (トピック経由と同じ受け口)。
+                    if let Some(pf) = prefetch.as_ref() {
+                        pf.set_waypoints(goals.clone());
+                    }
+
+                    let feedback = executing.feedback_publisher();
+                    let (done_tx, done_rx) =
+                        futures::channel::oneshot::channel::<(TourOutcome, Vec<i32>)>();
+                    let cancel_t = Arc::clone(&my_cancel);
+                    std::thread::spawn(move || {
+                        let ctx = FollowCtx {
+                            core: &core,
+                            latest_pose: &latest_pose,
+                            scan_queue: &scan_queue,
+                            cmd_pub: &cmd_pub,
+                            plan_pub: plan_pub.as_deref(),
+                            viz: viz.as_deref(),
+                            tuning,
+                        };
+                        let retries = AtomicU64::new(0);
+                        let mut missed: Vec<i32> = Vec::new();
+                        let mut outcome = TourOutcome::Done;
+                        for (i, goal) in goals.iter().enumerate() {
+                            let mut fb =
+                                nav2_msgs::action::FollowWaypoints_Feedback::default();
+                            fb.current_waypoint = i as u32;
+                            let _ = feedback.publish(fb);
+                            eprintln!(
+                                "vi_planner: waypoint {}/{} -> ({:.2}, {:.2})",
+                                i + 1,
+                                goals.len(),
+                                goal.x,
+                                goal.y
+                            );
+                            match run_goal(&ctx, *goal, &cancel_t, retry, &retries, &|_| {}) {
+                                Outcome::Reached => {}
+                                Outcome::Preempted => {
+                                    outcome = TourOutcome::Preempted;
+                                    break;
+                                }
+                                Outcome::Failed(reason) => {
+                                    eprintln!(
+                                        "ERROR: vi_planner: waypoint {} failed: {reason}",
+                                        i + 1
+                                    );
+                                    missed.push(i as i32);
+                                    if stop_on_failure {
+                                        outcome = TourOutcome::Stopped;
+                                        break;
+                                    }
+                                }
+                            }
+                            // 次の点へ向かうまでの間 (`waypoint_pause_sec`)。単に
+                            // 待つのではなく場を更新し続ける (run_settle)。
+                            if !pause.is_zero() && !run_settle(&ctx, &cancel_t, pause) {
+                                outcome = TourOutcome::Preempted;
+                                break;
+                            }
+                        }
+                        stop_cmd(&cmd_pub);
+                        let _ = done_tx.send((outcome, missed));
+                    });
+
+                    let mut done_rx = done_rx;
+                    match executing.until_cancel_requested(&mut done_rx).await {
+                        Ok(Ok((outcome, missed))) => {
+                            let mut result =
+                                nav2_msgs::action::FollowWaypoints_Result::default();
+                            result.missed_waypoints = missed;
+                            match outcome {
+                                TourOutcome::Done => {
+                                    eprintln!(
+                                        "vi_planner: tour finished ({} missed)",
+                                        result.missed_waypoints.len()
+                                    );
+                                    executing.succeeded_with(result)
+                                }
+                                TourOutcome::Stopped => {
+                                    eprintln!(
+                                        "ERROR: vi_planner: tour stopped at the first failure \
+                                         (stop_on_failure: true)"
+                                    );
+                                    executing.aborted_with(result)
+                                }
+                                TourOutcome::Preempted => {
+                                    eprintln!("vi_planner: tour preempted");
+                                    executing.aborted_with(result)
+                                }
+                            }
+                        }
+                        Ok(Err(_)) => executing
+                            .aborted_with(nav2_msgs::action::FollowWaypoints_Result::default()),
+                        Err(rest) => {
+                            my_cancel.store(true, Ordering::SeqCst);
+                            let cancelling = executing.begin_cancelling();
+                            let _ = rest.await;
+                            eprintln!("vi_planner: tour cancelled by client");
+                            cancelling.cancelled_with(
+                                nav2_msgs::action::FollowWaypoints_Result::default(),
+                            )
+                        }
+                    }
+                }
+            },
+        )?)
+    };
+
+    // 6h. follow_path action サーバ (controller_server の置き換え)。
     let _follow_server = node.create_action_server::<nav2_msgs::action::FollowPath, _>(
         "follow_path",
         move |requested_goal: RequestedGoal<nav2_msgs::action::FollowPath>| {
@@ -1427,17 +2002,24 @@ fn main() -> Result<()> {
                 let cmd_pub_t = cmd_pub.clone();
                 let viz_t = viz.clone();
                 std::thread::spawn(move || {
-                    let outcome = run_follow(
-                        &core_t,
-                        goal,
-                        &cancel_t,
-                        &latest_pose_t,
-                        &scan_queue_t,
-                        &cmd_pub_t,
-                        &feedback,
+                    let ctx = FollowCtx {
+                        core: &core_t,
+                        latest_pose: &latest_pose_t,
+                        scan_queue: &scan_queue_t,
+                        cmd_pub: &cmd_pub_t,
+                        // Nav2 構成で `plan` を出すのは compute_path_to_pose の側。
+                        plan_pub: None,
+                        viz: viz_t.as_deref(),
                         tuning,
-                        viz_t.as_deref(),
-                    );
+                    };
+                    // BT 構成では投げ直しは BT (RecoveryNode) の仕事なので、
+                    // ここは 1 回きり (run_goal を通さない)。
+                    let outcome = run_follow(&ctx, goal, &cancel_t, &|p| {
+                        let _ = feedback.publish(nav2_msgs::action::FollowPath_Feedback {
+                            distance_to_goal: p.distance_remaining.unwrap_or(f64::NAN) as f32,
+                            speed: p.speed,
+                        });
+                    });
                     let _ = done_tx.send(outcome);
                 });
 
@@ -1474,15 +2056,38 @@ fn main() -> Result<()> {
     )?;
 
     eprintln!(
-        "vi_planner: ready (solver={}, actions=compute_path_to_pose + follow_path, {}Hz{})",
+        "vi_planner: ready (solver={}, actions=compute_path_to_pose + follow_path{}, {}Hz{})",
         params.solver,
+        if params.standalone {
+            " + navigate_to_pose + follow_waypoints (standalone: no Nav2 nodes)"
+        } else {
+            ""
+        },
         params.control_frequency,
         if params.waypoint_prefetch {
-            format!(", prefetching from {}", params.waypoint_topic)
+            // スタンドアロンでは follow_waypoints のゴールがそのまま順路になるので、
+            // トピックは「もう 1 つの入口」でしかない。
+            if params.standalone {
+                format!(", prefetching from the tour (or {})", params.waypoint_topic)
+            } else {
+                format!(", prefetching from {}", params.waypoint_topic)
+            }
         } else {
             String::new()
         }
     );
+    if params.standalone {
+        eprintln!(
+            "vi_planner: standalone retries a failed goal {} (settling {:.1}s between tries, \
+             during which scans keep updating the value function — a Nav2 BT Wait cannot)",
+            if params.goal_retry_limit < 0 {
+                "without limit".to_string()
+            } else {
+                format!("up to {} times", params.goal_retry_limit)
+            },
+            params.goal_retry_settle_sec
+        );
+    }
 
     // 7. Spin.
     executor.spin(SpinOptions::default()).first_error()?;
