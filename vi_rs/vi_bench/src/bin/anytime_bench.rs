@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 
-use vi_bench::fixtures::canonical_actions;
+use vi_bench::params::canonical_actions;
 use vi_bench::pgm::{self, Occupancy, PgmMap};
 use vi_reference::params::PROB_BASE;
 use vi_reference::planner::{rollout_path, RolloutStatus};
