@@ -19,6 +19,7 @@ pub mod frontier2d;
 pub mod frontier2d_pad;
 pub mod frontier2d_par;
 pub mod frontier2d_fused;
+pub mod compact_zip;
 pub mod frontier2d_sparse;
 pub mod frontier2d_sparse_compact;
 pub mod frontier2d_par_unsafe;
