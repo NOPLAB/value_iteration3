@@ -96,7 +96,7 @@ use vi_reference::Action;
 use vi_reference::OccupancyGrid as ViOccupancyGrid;
 
 use vi_planner::core::{
-    value_grid_of, BuildParams, Decision, PlanConfig, PlanError, PlanStats, PlannerCore,
+    value_grid_on, BuildParams, Decision, PlanConfig, PlanError, PlanStats, PlannerCore,
     Prefetcher, SweepCursor,
 };
 
@@ -724,7 +724,7 @@ fn run_follow(
             if !v.due(&mut last_viz) {
                 return;
             }
-            let g = value_grid_of(vi, v.threshold_steps);
+            let g = value_grid_on(vi, v.threshold_steps);
             let _ = v.vf_pub.publish(ros_grid_from(&g, &v.frame_id, v.stamp()));
         });
         match prepared {
@@ -1605,7 +1605,7 @@ fn main() -> Result<()> {
                                 if !v.due(&mut last_viz) {
                                     return;
                                 }
-                                let g = value_grid_of(vi, v.threshold_steps);
+                                let g = value_grid_on(vi, v.threshold_steps);
                                 let _ =
                                     v.vf_pub.publish(ros_grid_from(&g, &frame_t, v.stamp()));
                             });

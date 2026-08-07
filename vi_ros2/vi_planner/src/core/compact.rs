@@ -69,14 +69,17 @@ use vi_reference::bridge::PoseView;
 use vi_reference::msg::{OccupancyGrid, Quaternion};
 use vi_reference::params::{MAX_COST, PROB_BASE};
 use vi_reference::planner::CompactPolicy;
+use vi_reference::planner::PolicyView;
 use vi_reference::solvers::frontier2d_sparse_compact::{
-    default_threads, solve_compact_mapped_stopping, CompactSink, RamSink,
+    default_threads, solve_compact_mapped_observed, CompactSink, RamSink,
 };
 use vi_reference::state::State;
 use vi_reference::value_iterator::ValueIterator;
 use vi_reference::{Action, ValueIteratorLocal};
 
-use super::{BuildParams, Field, PlanError, PlannerCore, SinkDir, SinkGen, SolveStats};
+use super::{
+    BuildParams, Field, PlanError, PlannerCore, SinkDir, SinkGen, SolveDirector, SolveStats,
+};
 
 /// `ValueIteratorLocal::set_map_with_occupancy_grid` が固定で入れるローカル
 /// ウィンドウ半径 [m]。パッチの寸法を決めるのに先に知る必要があるので写しを持つ
@@ -104,6 +107,7 @@ impl CompactField {
             self.origin,
             self.goal,
         )
+        .with_origin_quat(self.origin_quat.clone())
     }
 
     /// グローバルセル `(ix,iy,it)` の sink 索引 (usize 演算; 広域地図で i32 が溢れる)。
@@ -641,12 +645,12 @@ fn remove_stale_generations(dir: &std::path::Path) {
 
 impl PlannerCore {
     /// compact (アウトオブコア) 経路: `states` を作らず地図とゴールから直接解き、
-    /// 確定出力を sink に置く。solve は 1 回で走り切るので `solve_chunk` は使わず、
-    /// `cancel` は `solve_compact_mapped` 内のラウンド境界で観測される。
+    /// 確定出力を sink に置く。進行制御は密経路と同じ [`SolveDirector`] 1 つ —
+    /// 境界はバンド finalize ごとで、そこで cancel 観測・途中経過 (`on_chunk`、sink
+    /// ビューの `&dyn PolicyView`)・早期打ち切り ([`super::PlanConfig::early_start`])
+    /// が行われる (`cancel` はソルバ内部のラウンド境界でも従来どおり観測される)。
     ///
-    /// `from` があるときは早期打ち切り ([`super::PlanConfig::early_start`])。波の
-    /// finalize が終わるたびに sink の上でロールアウトを試し、ゴールまで繋がったら
-    /// そこで止める。**そこで止めた sink はそのまま使える** — finalize は値の昇順に
+    /// 早期打ち切りで**止めた sink はそのまま使える** — finalize は値の昇順に
     /// 進むので、載っている列は最後まで解いたときと同じ値で、未 finalize の列が
     /// `MAX_COST` のまま残っているだけ。したがって「経路が引けた」= その経路上の
     /// 列は全部確定済み、になる。
@@ -657,6 +661,7 @@ impl PlannerCore {
         from: Option<PoseView>,
         stats: &mut SolveStats,
         cancel: &AtomicBool,
+        on_chunk: &mut dyn FnMut(&dyn PolicyView),
     ) -> Result<Field, PlanError> {
         let g = &self.build.grid;
         let nt = self.build.theta_cell_num;
@@ -666,23 +671,9 @@ impl PlannerCore {
         let nthreads =
             if self.cfg.vi_threads > 0 { self.cfg.vi_threads } else { default_threads() };
 
-        let (cfg, actions) = (&self.cfg, self.build.actions.clone());
-        let cell_num = (g.width, g.height, nt);
-        let goal_xyt = (goal.x, goal.y, goal_t_deg);
-        let mut stop = |s: &dyn CompactSink| -> bool {
-            let Some(from) = from else { return false };
-            let p = CompactPolicy::new(
-                s,
-                &actions,
-                cell_num,
-                g.resolution,
-                (g.origin_x, g.origin_y),
-                goal_xyt,
-            );
-            super::reaches_goal(&p, cfg, from)
-        };
-
-        let s = solve_compact_mapped_stopping(
+        let mut director =
+            SolveDirector { cfg: &self.cfg, cancel, from, on_progress: on_chunk };
+        let s = solve_compact_mapped_observed(
             self.build.actions.clone(),
             1,
             g,
@@ -699,7 +690,7 @@ impl PlannerCore {
             sink.as_mut(),
             nthreads,
             cancel,
-            &mut stop,
+            &mut director,
         );
         stats.iters = s.iters;
         stats.truncated = s.stopped;

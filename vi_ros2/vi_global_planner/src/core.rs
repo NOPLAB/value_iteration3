@@ -20,9 +20,11 @@ use vi_reference::planner::{
     densify, rollout_path_on, CompactPolicy, PathPose, PolicyView, Rollout, RolloutStatus,
 };
 use vi_reference::solvers::frontier2d_sparse_compact::{
-    default_threads, solve_compact_mapped, CompactSink, RamSink,
+    default_threads, solve_compact_mapped_observed, CompactSink, RamSink,
 };
-use vi_reference::solvers::{solve, U64Solver};
+use vi_reference::solvers::{
+    solve_observed, SolveFlow, SolveObserver, SolveProbe, U64Solver,
+};
 use vi_reference::{Action, ValueIterator};
 
 /// 巨大マップ用アウトオブコア経路の出力先。`None` = RAM (`RamSink`)、`Some(dir)` = その
@@ -73,7 +75,7 @@ impl PlanConfig {
     /// 他のソルバは `ValueIterator::states` (56 B × nx·ny·nθ) を密に確保するので、
     /// 津田沼のような広域地図では確保だけで数十 GB になり起動不能。
     pub fn use_compact(&self) -> bool {
-        matches!(self.solver, U64Solver::Frontier2DSparseCompact { .. })
+        self.solver.caps().out_of_core
     }
 }
 
@@ -138,6 +140,29 @@ impl CompactField {
             self.origin,
             self.goal,
         )
+    }
+}
+
+/// solve の進行制御 ([`SolveObserver`] 実装)。境界 (密: `solve_chunk` 反復ごと /
+/// compact: バンド finalize ごと) で cancel を観測し、途中経過を `on_progress` へ流す。
+/// 旧実装の手書きチャンクループの置き換え (vi_planner::core の SolveDirector と同型 —
+/// クレート間依存を避ける意図的な重複)。
+struct SolveDirector<'a> {
+    interval: u32,
+    cancel: &'a AtomicBool,
+    on_progress: &'a mut dyn FnMut(&dyn PolicyView),
+}
+
+impl SolveObserver for SolveDirector<'_> {
+    fn interval(&self) -> u32 {
+        self.interval.max(1)
+    }
+    fn boundary(&mut self, probe: &mut dyn SolveProbe) -> SolveFlow {
+        if self.cancel.load(Ordering::Relaxed) {
+            return SolveFlow::Cancel;
+        }
+        (self.on_progress)(probe.policy());
+        SolveFlow::Continue
     }
 }
 
@@ -218,15 +243,16 @@ impl PlannerCore {
         self.plan_with_progress(start, goal, cancel, &mut |_| {})
     }
 
-    /// `plan` と同じだが、solve 中に `solve_chunk` ごとの write_back 後
-    /// `on_chunk` を呼ぶ (途中経過の value_function 可視化用)。
+    /// `plan` と同じだが、solve の境界 (密: `solve_chunk` 反復ごと / compact: バンド
+    /// finalize ごと) に `on_chunk` を呼ぶ (途中経過の value_function 可視化用 —
+    /// [`value_slice_on`] がそのまま受け取れる `&dyn PolicyView` を渡す)。
     /// キャッシュヒット時 (solve なし) は呼ばれない。
     pub fn plan_with_progress(
         &mut self,
         start: PoseView,
         goal: PoseView,
         cancel: &AtomicBool,
-        on_chunk: &mut dyn FnMut(&ValueIterator),
+        on_chunk: &mut dyn FnMut(&dyn PolicyView),
     ) -> Result<(Vec<PathPose>, PlanStats), PlanError> {
         let goal_t_deg = yaw_to_goal_theta_deg(goal.yaw_rad);
 
@@ -235,7 +261,7 @@ impl PlannerCore {
         if !self.cache_matches(&goal, goal_t_deg) {
             self.cached = None; // 旧キャッシュ (数 GB になり得る) を先に解放
             let field = if self.cfg.use_compact() {
-                self.solve_compact(&goal, goal_t_deg, cancel, &mut stats)?
+                self.solve_compact(&goal, goal_t_deg, cancel, &mut stats, on_chunk)?
             } else {
                 self.solve_dense(&goal, goal_t_deg, cancel, &mut stats, on_chunk)?
             };
@@ -272,15 +298,21 @@ impl PlannerCore {
         )
     }
 
-    /// 密経路: `ValueIterator::states` を確保し、`solve_chunk` ごとに cancel を観測しながら解く。
+    /// 密経路: `ValueIterator::states` を確保し、[`solve_observed`] + [`SolveDirector`]
+    /// で解く。cancel の観測と途中経過は solve 内部の境界 (`solve_chunk` 反復ごと) で
+    /// 行われる — 旧実装のチャンク再入 (毎チャンクの再ビルド + 全セル write_back) は
+    /// もう無い。
     fn solve_dense(
         &self,
         goal: &PoseView,
         goal_t_deg: i32,
         cancel: &AtomicBool,
         stats: &mut PlanStats,
-        on_chunk: &mut dyn FnMut(&ValueIterator),
+        on_chunk: &mut dyn FnMut(&dyn PolicyView),
     ) -> Result<SolvedField, PlanError> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PlanError::Cancelled);
+        }
         let mut vi = ValueIterator::new(self.build.actions.clone(), 1);
         vi.set_map_with_occupancy_grid(
             &self.build.grid,
@@ -292,38 +324,33 @@ impl PlannerCore {
         );
         vi.set_goal(goal.x, goal.y, goal_t_deg);
 
-        let mut remaining = self.cfg.max_solve_iter;
-        let converged = loop {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(PlanError::Cancelled);
-            }
-            if remaining == 0 {
-                break false;
-            }
-            let chunk = remaining.min(self.cfg.solve_chunk.max(1));
-            let s = solve(&mut vi, self.cfg.solver, chunk);
-            stats.iters = stats.iters.saturating_add(s.iters);
-            remaining -= chunk;
-            on_chunk(&vi);
-            if s.converged {
-                break true;
-            }
+        let mut director = SolveDirector {
+            interval: self.cfg.solve_chunk,
+            cancel,
+            on_progress: on_chunk,
         };
-        if !converged {
+        let out = solve_observed(&mut vi, self.cfg.solver, self.cfg.max_solve_iter, &mut director);
+        stats.iters = out.iters;
+        if out.cancelled {
+            return Err(PlanError::Cancelled);
+        }
+        if !out.converged {
             return Err(PlanError::NotConverged);
         }
         Ok(SolvedField::Dense(Box::new(vi)))
     }
 
     /// compact (アウトオブコア) 経路: `states` を作らず地図とゴールから直接解き、確定出力を
-    /// sink に置く。solve は 1 回で走り切るので `solve_chunk` は使わず、`cancel` は
-    /// `solve_compact_mapped` 内のラウンド境界で観測される (途中経過の on_chunk は無い)。
+    /// sink に置く。境界はバンド finalize ごとで、そこで `on_chunk` (sink ビューの
+    /// `&dyn PolicyView`) も呼ばれる (`cancel` はソルバ内部のラウンド境界でも従来
+    /// どおり観測される)。
     fn solve_compact(
         &self,
         goal: &PoseView,
         goal_t_deg: i32,
         cancel: &AtomicBool,
         stats: &mut PlanStats,
+        on_chunk: &mut dyn FnMut(&dyn PolicyView),
     ) -> Result<SolvedField, PlanError> {
         let g = &self.build.grid;
         let nt = self.build.theta_cell_num;
@@ -331,7 +358,12 @@ impl PlannerCore {
         let mut sink = make_sink(nstates, &self.cfg.compact_sink_dir)?;
         let nthreads = if self.cfg.vi_threads > 0 { self.cfg.vi_threads } else { default_threads() };
 
-        let s = solve_compact_mapped(
+        let mut director = SolveDirector {
+            interval: self.cfg.solve_chunk,
+            cancel,
+            on_progress: on_chunk,
+        };
+        let s = solve_compact_mapped_observed(
             self.build.actions.clone(),
             1,
             g,
@@ -348,6 +380,7 @@ impl PlannerCore {
             sink.as_mut(),
             nthreads,
             cancel,
+            &mut director,
         );
         stats.iters = s.iters;
         if s.cancelled {
@@ -367,24 +400,30 @@ impl PlannerCore {
     }
 }
 
-/// 密な `ValueIterator` の θ=0 スライスを取り出す (solve 途中経過の配信にも使う)。
-pub fn value_slice_from_vi(vi: &ValueIterator) -> ValueSlice {
-    let (nx, ny) = (vi.cell_num_x, vi.cell_num_y);
+/// 場の θ=0 スライスを取り出す (solve 途中経過の配信にも使う)。ビューは
+/// [`PolicyView`] なので密 (`&ValueIterator`) も compact (sink ビュー) も同じ実装。
+pub fn value_slice_on(p: &dyn PolicyView) -> ValueSlice {
+    let (nx, ny, _) = p.cell_num();
     let mut values = vec![MAX_COST; nx as usize * ny as usize];
     for iy in 0..ny {
         for ix in 0..nx {
-            values[iy as usize * nx as usize + ix as usize] =
-                vi.states[vi.to_index(ix, iy, 0) as usize].total_cost;
+            values[iy as usize * nx as usize + ix as usize] = p.value_at(ix, iy, 0);
         }
     }
+    let (ox, oy) = p.map_origin();
     ValueSlice {
         width: nx,
         height: ny,
-        resolution: vi.xy_resolution,
-        origin_x: vi.map_origin_x,
-        origin_y: vi.map_origin_y,
+        resolution: p.xy_resolution(),
+        origin_x: ox,
+        origin_y: oy,
         values,
     }
+}
+
+/// `value_slice_on` の `&ValueIterator` 版 (後方互換の別名)。
+pub fn value_slice_from_vi(vi: &ValueIterator) -> ValueSlice {
+    value_slice_on(vi)
 }
 
 /// compact 出力 sink を作る。`dir` 指定時はディスク mmap、無指定は RAM。
@@ -558,7 +597,7 @@ mod tests {
         let mut calls = 0usize;
         core.plan_with_progress(pose(0.6, 0.6, 0.0), goal, &cancel, &mut |vi| {
             calls += 1;
-            assert!(vi.cell_num_x > 0);
+            assert!(vi.cell_num().0 > 0);
         })
         .expect("first plan");
         assert!(calls > 0);

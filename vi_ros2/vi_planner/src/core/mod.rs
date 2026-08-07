@@ -129,7 +129,7 @@ use vi_reference::planner::{
     densify, optimal_action_at, pose_to_cell, rollout_path_on, PathPose, PolicyView, Rollout,
     RolloutStatus,
 };
-use vi_reference::solvers::{solve, U64Solver};
+use vi_reference::solvers::{solve_observed, SolveFlow, SolveObserver, SolveProbe, U64Solver};
 use vi_reference::value_iterator::ValueIterator;
 use vi_reference::{Action, ValueIteratorLocal};
 
@@ -211,9 +211,11 @@ pub struct PlanConfig {
 }
 
 impl PlanConfig {
-    /// アウトオブコア (`states` を作らない) 経路を使うか。
+    /// アウトオブコア (`states` を作らない) 経路を使うか (ソルバの能力宣言
+    /// [`vi_reference::solvers::SolverCaps::out_of_core`] を読む — ソルバ名の
+    /// ハードコードはしない)。
     pub fn use_compact(&self) -> bool {
-        matches!(self.solver, U64Solver::Frontier2DSparseCompact { .. })
+        self.solver.caps().out_of_core
     }
 }
 
@@ -373,6 +375,42 @@ fn reaches_goal(p: &dyn PolicyView, cfg: &PlanConfig, from: PoseView) -> bool {
     .reached_goal()
 }
 
+/// solve の進行制御 ([`SolveObserver`] 実装)。密・compact の両経路がこれ 1 つを使う —
+/// 旧実装の「密: 手書きチャンクループ / compact: stop クロージャ」の置き換え。
+/// 境界 (ソルバの自然な粒度: 密系はラウンド/スイープ × `solve_chunk`、compact は
+/// バンド finalize) ごとに呼ばれ、
+///   1. cancel (プリエンプト) を観測し、
+///   2. 途中経過を `on_progress` へ流し (probe の場は要求時にだけ具現化される)、
+///   3. `from` があれば早期打ち切り ([`PlanConfig::early_start`]) を判定する。
+/// 判定は [`reaches_goal`] そのもの = `plan` が実際に返す経路の作り方なので、密でも
+/// compact でも「打ち切ったのに `plan` が失敗する」形の外し方をしない。
+struct SolveDirector<'a> {
+    cfg: &'a PlanConfig,
+    cancel: &'a AtomicBool,
+    /// 早期打ち切りの起点 (None = 打ち切らない)。
+    from: Option<PoseView>,
+    on_progress: &'a mut dyn FnMut(&dyn PolicyView),
+}
+
+impl SolveObserver for SolveDirector<'_> {
+    fn interval(&self) -> u32 {
+        self.cfg.solve_chunk.max(1)
+    }
+    fn boundary(&mut self, probe: &mut dyn SolveProbe) -> SolveFlow {
+        if self.cancel.load(Ordering::Relaxed) {
+            return SolveFlow::Cancel;
+        }
+        let p = probe.policy();
+        (self.on_progress)(p);
+        if let Some(from) = self.from {
+            if reaches_goal(p, self.cfg, from) {
+                return SolveFlow::Stop;
+            }
+        }
+        SolveFlow::Continue
+    }
+}
+
 /// `(ix, iy, it)` に方策があれば Decision::Action を返す (読み取り専用)。
 fn action_at(vi: &ValueIterator, ix: i32, iy: i32, it: i32) -> Option<Decision> {
     let id = optimal_action_at(vi, ix, iy, it);
@@ -391,27 +429,32 @@ fn is_final(vi: &ValueIterator, ix: i32, iy: i32, it: i32) -> bool {
         && vi.states[vi.to_index(ix, iy, it) as usize].final_state
 }
 
-/// solve 済み ValueIterator の θ=0 全域スライスを可視化用 OccupancyGrid に描画する
-/// (0..=100、未到達 -1)。solve 中の途中経過 (`*_with_progress` のコールバック) からも
-/// 呼べるよう自由関数にしてある。
-pub fn value_grid_of(vi: &ValueIterator, threshold_steps: u64) -> OccupancyGrid {
-    let (nx, ny) = (vi.cell_num_x, vi.cell_num_y);
+/// solve 済み場の θ=0 全域スライスを可視化用 OccupancyGrid に描画する (0..=100、
+/// 未到達 -1)。ビューは [`PolicyView`] — 密 (`&ValueIterator`) も compact (sink ビュー)
+/// も同じ実装で描く。solve 中の途中経過 (`*_with_progress` のコールバック) からも呼べる。
+pub fn value_grid_on(p: &dyn PolicyView, threshold_steps: u64) -> OccupancyGrid {
+    let (nx, ny, _) = p.cell_num();
     let mut slice = Array2::<u64>::zeros((ny as usize, nx as usize));
     for iy in 0..ny {
         for ix in 0..nx {
-            slice[[iy as usize, ix as usize]] =
-                vi.states[vi.to_index(ix, iy, 0) as usize].total_cost;
+            slice[[iy as usize, ix as usize]] = p.value_at(ix, iy, 0);
         }
     }
+    let (ox, oy) = p.map_origin();
     OccupancyGrid {
         width: nx,
         height: ny,
-        resolution: vi.xy_resolution,
-        origin_x: vi.map_origin_x,
-        origin_y: vi.map_origin_y,
-        origin_quat: vi.map_origin_quat.clone(),
+        resolution: p.xy_resolution(),
+        origin_x: ox,
+        origin_y: oy,
+        origin_quat: p.map_origin_quat(),
         data: value_slice_to_occupancy(&slice, threshold_steps),
     }
+}
+
+/// `value_grid_on` の `&ValueIterator` 版 (後方互換の別名)。
+pub fn value_grid_of(vi: &ValueIterator, threshold_steps: u64) -> OccupancyGrid {
+    value_grid_on(vi, threshold_steps)
 }
 
 impl PlannerCore {
@@ -517,9 +560,10 @@ impl PlannerCore {
         self.prepare_goal_with_progress(goal, None, cancel, &mut |_| {})
     }
 
-    /// `prepare_goal` と同じだが、`solve_chunk` ごとの write_back 後に `on_chunk`
-    /// を呼ぶ (途中経過の value_function 可視化用)。キャッシュヒット時は呼ばれない。
-    /// compact 経路は 1 回で走り切るので `on_chunk` は呼ばれない。
+    /// `prepare_goal` と同じだが、solve の境界 (密: `solve_chunk` 反復ごと /
+    /// compact: バンド finalize ごと) に `on_chunk` を呼ぶ (途中経過の value_function
+    /// 可視化用 — [`value_grid_on`] がそのまま受け取れる `&dyn PolicyView` を渡す)。
+    /// キャッシュヒット時は呼ばれない。
     ///
     /// 先読み ([`Prefetcher`]) が付いていれば、solve の前にそちらを見る。用意が
     /// できていれば受け取って solve を飛ばし (`stats.adopted`)、まだ解いている
@@ -551,7 +595,7 @@ impl PlannerCore {
         goal: PoseView,
         from: Option<PoseView>,
         cancel: &AtomicBool,
-        on_chunk: &mut dyn FnMut(&ValueIterator),
+        on_chunk: &mut dyn FnMut(&dyn PolicyView),
     ) -> Result<SolveStats, PlanError> {
         let goal_t_deg = yaw_to_goal_theta_deg(goal.yaw_rad);
         let mut stats =
@@ -612,7 +656,7 @@ impl PlannerCore {
             }
             None => {
                 let field = if self.cfg.use_compact() {
-                    self.solve_compact(&goal, goal_t_deg, from, &mut stats, cancel)?
+                    self.solve_compact(&goal, goal_t_deg, from, &mut stats, cancel, on_chunk)?
                 } else {
                     self.solve_dense(&goal, goal_t_deg, from, &mut stats, cancel, on_chunk)?
                 };
@@ -667,9 +711,12 @@ impl PlannerCore {
         }
     }
 
-    /// 密経路: `ValueIterator::states` を確保し、`solve_chunk` ごとに cancel を観測しながら解く。
-    /// `from` があるときは、そこからゴールまで方策が繋がった時点で打ち切る
-    /// (`stats.truncated`)。観測の刻みは cancel と同じ `solve_chunk`。
+    /// 密経路: `ValueIterator::states` を確保し、[`solve_observed`] + [`SolveDirector`]
+    /// で解く。cancel の観測・途中経過・早期打ち切り (`from` があるとき) はすべて
+    /// solve 内部の境界 (`solve_chunk` 反復ごと) で行われる — 旧実装のチャンク再入
+    /// (毎チャンクの再ビルド + 全セル write_back) はもう無い。境界で場を読めることは
+    /// ソルバ側の契約 (`SolveProbe::policy`) で、全 `U64Solver` が conformance テストで
+    /// これをゲートされている。
     fn solve_dense(
         &self,
         goal: &PoseView,
@@ -677,8 +724,11 @@ impl PlannerCore {
         from: Option<PoseView>,
         stats: &mut SolveStats,
         cancel: &AtomicBool,
-        on_chunk: &mut dyn FnMut(&ValueIterator),
+        on_chunk: &mut dyn FnMut(&dyn PolicyView),
     ) -> Result<Field, PlanError> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PlanError::Cancelled);
+        }
         let mut vi = ValueIteratorLocal::new(self.build.actions.clone(), 1);
         vi.set_map_with_occupancy_grid(
             &self.build.grid,
@@ -690,33 +740,16 @@ impl PlannerCore {
         );
         vi.base.set_goal(goal.x, goal.y, goal_t_deg);
 
-        let mut remaining = self.cfg.max_solve_iter;
-        let converged = loop {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(PlanError::Cancelled);
-            }
-            if remaining == 0 {
-                break false;
-            }
-            let chunk = remaining.min(self.cfg.solve_chunk.max(1));
-            let s = solve(&mut vi.base, self.cfg.solver, chunk);
-            stats.iters = stats.iters.saturating_add(s.iters);
-            remaining -= chunk;
-            on_chunk(&vi.base);
-            if s.converged {
-                break true;
-            }
-            // 早期打ち切り。チャンクの切れ目で場を読めるのは、`frontier2d_sparse` が
-            // 収束していなくても毎回 argmin パスを回して `states` へ値と方策を
-            // 書き戻すため (打ち切りで `optimal_action` が空のまま、にはならない)。
-            if let Some(from) = from {
-                if reaches_goal(&vi.base, &self.cfg, from) {
-                    stats.truncated = true;
-                    break true;
-                }
-            }
-        };
-        if !converged {
+        let mut director =
+            SolveDirector { cfg: &self.cfg, cancel, from, on_progress: on_chunk };
+        let out =
+            solve_observed(&mut vi.base, self.cfg.solver, self.cfg.max_solve_iter, &mut director);
+        stats.iters = out.iters;
+        stats.truncated = out.stopped;
+        if out.cancelled {
+            return Err(PlanError::Cancelled);
+        }
+        if !out.converged && !out.stopped {
             return Err(PlanError::NotConverged);
         }
         Ok(Field::Dense(Box::new(vi)))
@@ -748,7 +781,7 @@ impl PlannerCore {
         start: PoseView,
         goal: PoseView,
         cancel: &AtomicBool,
-        on_chunk: &mut dyn FnMut(&ValueIterator),
+        on_chunk: &mut dyn FnMut(&dyn PolicyView),
     ) -> Result<(Vec<PathPose>, PlanStats), PlanError> {
         let mut s = self.prepare_goal_with_progress(goal, Some(start), cancel, on_chunk)?;
 
@@ -826,24 +859,8 @@ impl PlannerCore {
     /// (`publish_value_function: false` を推奨)。
     pub fn value_grid(&self, threshold_steps: u64) -> Option<OccupancyGrid> {
         match &self.cached.as_ref()?.field {
-            Field::Dense(vi) => Some(value_grid_of(&vi.base, threshold_steps)),
-            Field::Compact(f) => {
-                let (nx, ny) = (f.cell_num.0, f.cell_num.1);
-                let slice = Array2::from_shape_vec(
-                    (ny as usize, nx as usize),
-                    f.policy().value_slice_theta0(),
-                )
-                .ok()?;
-                Some(OccupancyGrid {
-                    width: nx,
-                    height: ny,
-                    resolution: f.resolution,
-                    origin_x: f.origin.0,
-                    origin_y: f.origin.1,
-                    origin_quat: f.origin_quat.clone(),
-                    data: value_slice_to_occupancy(&slice, threshold_steps),
-                })
-            }
+            Field::Dense(vi) => Some(value_grid_on(&vi.base, threshold_steps)),
+            Field::Compact(f) => Some(value_grid_on(&f.policy(), threshold_steps)),
         }
     }
 

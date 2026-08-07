@@ -421,7 +421,7 @@ fn progress_callback_fires_only_when_solving() {
     let mut calls = 0usize;
     core.plan_with_progress(pose(0.6, 0.6, 0.0), goal, &cancel, &mut |vi| {
         calls += 1;
-        assert!(vi.cell_num_x > 0);
+        assert!(vi.cell_num().0 > 0);
     })
     .expect("first plan");
     assert!(calls > 0);

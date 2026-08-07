@@ -43,7 +43,7 @@ use vi_reference::Action;
 use vi_reference::OccupancyGrid as ViOccupancyGrid;
 
 use vi_global_planner::core::{
-    value_slice_from_vi, BuildParams, PlanConfig, PlannerCore, ValueSlice,
+    value_slice_on, BuildParams, PlanConfig, PlannerCore, ValueSlice,
 };
 
 use rclrs::*;
@@ -575,7 +575,7 @@ fn main() -> Result<()> {
                         }
                         let stamp = clock_thread.now().to_sec_nanosec().unwrap_or((0, 0));
                         let _ = pub_.publish(value_function_grid(
-                            &value_slice_from_vi(vi),
+                            &value_slice_on(vi),
                             threshold_steps,
                             &frame_thread,
                             stamp,
