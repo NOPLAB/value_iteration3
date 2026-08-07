@@ -31,10 +31,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::params::MAX_COST;
+use crate::solvers::observe::{
+    MaterializeProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
+};
 use crate::value_iterator::ValueIterator;
 
 use super::frontier2d_pad::{action_cost_pad, Padded};
-use super::frontier2d_par::{final_policy, n_threads};
+use super::frontier2d_par::{final_policy, final_policy_hot, n_threads};
 use super::{async_gs_engine, seed_frontier_2d};
 
 // AtomicU64 は u64 と同一のメモリ表現を持つ (std ドキュメント保証) — `Vec<[u64; 2]>` を
@@ -49,7 +52,11 @@ const _: () = assert!(
 ///
 /// 並列骨格 (永続スレッド + バリア×2 + work-stealing + リーダーの次フロンティア再構築) は
 /// [`super::async_gs_engine`] が担い、ここでは pad モデル固有の per-cell 評価だけを与える。
-pub fn frontier2d_par_unsafe_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+pub fn frontier2d_par_unsafe_solve_observed(
+    vi: &mut ValueIterator,
+    max_iter: u32,
+    obs: &mut dyn SolveObserver,
+) -> SolveOutcome {
     let mut m = Padded::build(vi);
     let (nx, ny, nt) = (m.nx, m.ny, m.nt);
     let (dx, dy) = (m.mx as u32, m.my as u32);
@@ -64,6 +71,7 @@ pub fn frontier2d_par_unsafe_solve(vi: &mut ValueIterator, max_iter: u32) -> (u3
         unsafe { std::slice::from_raw_parts(hot.as_mut_ptr().cast::<[AtomicU64; 2]>(), n_pad) };
 
     let cand_list: Vec<(u32, u32)> = seed_frontier_2d(vi).dilate(dx, dy).enumerate().collect();
+    let interval = obs.interval();
     let m_ref = &m;
 
     // per-cell 評価 (pad モデル): 全 θ を Bellman 更新し、(減少した θ があるか, 減少 θ 層数) を返す。
@@ -94,74 +102,35 @@ pub fn frontier2d_par_unsafe_solve(vi: &mut ValueIterator, max_iter: u32) -> (u3
         (cell_changed, ups)
     };
 
-    let (iters, total_updates, converged) =
-        async_gs_engine(nx, ny, dx, dy, nthreads, max_iter, cand_list, eval);
+    let out = {
+        // 境界はエンジンのリーダー相 (全ワーカーがバリアで静止) から呼ばれるので、
+        // hot_atomic の Relaxed 読みで一貫したスナップショットが取れる。
+        let mut boundary = |iters: u32, updates: u64| -> SolveFlow {
+            let mut mat = |vi: &mut ValueIterator| {
+                let opt = final_policy_hot(m_ref, hot_atomic, nthreads);
+                m_ref.write_back_hot(vi, hot_atomic, Some(&opt));
+            };
+            let mut probe = MaterializeProbe::new(vi, &mut mat, iters, updates);
+            obs.boundary(&mut probe)
+        };
+        async_gs_engine(
+            nx, ny, dx, dy, nthreads, max_iter, cand_list, eval, interval, &mut boundary,
+        )
+    };
 
-    // hot を Padded へ戻し、収束値から optimal_action を確定して書き戻す。
+    // hot を Padded へ戻す。中断 (cancel) 時は場を保証しない契約なので書き戻さない。
     m.hot = hot;
+    if out.cancelled {
+        return out;
+    }
+    // 現在値から optimal_action を確定して書き戻す (Stop 時も観測可能な場を残す)。
     let opt = final_policy(&m, nthreads);
     m.write_back(vi, Some(&opt));
 
-    (iters, total_updates, converged)
+    out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::frontier2d_par_unsafe_solve;
-    use crate::solvers::test_support::{assert_parity, parity_standard_maps};
-
-    #[test]
-    fn parity_standard_maps_frontier2d_par_unsafe() {
-        parity_standard_maps(|vi| frontier2d_par_unsafe_solve(vi, 2000));
-    }
-
-    /// より大きい空マップ: 複数行バンドにまたがる候補で cross-thread 非同期パスを刺激する。
-    /// 非同期更新でも一意固定点へ収束するので reference と bit-exact のはず。
-    #[test]
-    fn parity_larger_empty_frontier2d_par_unsafe() {
-        assert_parity(32, 24, vec![0i8; 32 * 24], |vi| {
-            frontier2d_par_unsafe_solve(vi, 2000)
-        });
-    }
-
-    /// 安全 Jacobi 版 (`frontier2d_par`) との wall-clock 比較（手動計測用、CI 非実行）。
-    /// `VI_THREADS` でスレッド数を掃引可能。release 推奨:
-    /// `cargo test -p vi_reference --release bench_unsafe_vs_par -- --ignored --nocapture`
-    #[test]
-    #[ignore = "wall-clock benchmark; run manually in release"]
-    fn bench_unsafe_vs_par() {
-        use crate::solvers::frontier2d_par::frontier2d_par_solve;
-        use crate::solvers::test_support::make_vi;
-        use std::time::Instant;
-
-        let (w, h) = (400, 400);
-        let occ = vec![0i8; (w * h) as usize];
-
-        let mut a = make_vi(w, h, occ.clone());
-        let t = Instant::now();
-        let (pi, pu, pc) = frontier2d_par_solve(&mut a, 100_000);
-        let par_ms = t.elapsed().as_secs_f64() * 1e3;
-
-        let mut b = make_vi(w, h, occ);
-        let t = Instant::now();
-        let (ui, uu, uc) = frontier2d_par_unsafe_solve(&mut b, 100_000);
-        let uns_ms = t.elapsed().as_secs_f64() * 1e3;
-
-        // 到達可能セルの収束値が一致することも併せて確認。
-        let mut mism = 0u64;
-        for i in 0..a.states.len() {
-            if a.states[i].total_cost < crate::solvers::REACH_THRESH
-                && a.states[i].total_cost != b.states[i].total_cost
-            {
-                mism += 1;
-            }
-        }
-
-        let threads = std::env::var("VI_THREADS").unwrap_or_else(|_| "auto".into());
-        println!("\n=== {w}x{h} empty, threads={threads} ===");
-        println!("  par   (safe Jacobi): iters={pi:6} updates={pu:10} {par_ms:8.1} ms conv={pc}");
-        println!("  unsafe (async G-S) : iters={ui:6} updates={uu:10} {uns_ms:8.1} ms conv={uc}");
-        println!("  speedup = {:.2}x   value-mismatch(reachable) = {mism}", par_ms / uns_ms);
-        assert_eq!(mism, 0, "収束値は安全版と一致するはず");
-    }
+/// 従来 API (observer なし)。`(iters, updates, converged)`。
+pub fn frontier2d_par_unsafe_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+    frontier2d_par_unsafe_solve_observed(vi, max_iter, &mut NullObserver).tuple()
 }

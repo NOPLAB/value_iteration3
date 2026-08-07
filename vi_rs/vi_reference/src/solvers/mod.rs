@@ -3,7 +3,7 @@
 //! セルの収束値は Reference (全走査) = 本家と bit-exact。
 //! 設計: `docs/superpowers/specs/2026-06-09-vi-u64-fast-solvers-design.md`
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Barrier;
 
 use crate::params::MAX_COST;
@@ -15,6 +15,8 @@ pub(crate) use crate::bitboard::{Bitboard2D, Bitboard3D};
 
 pub mod block;
 pub mod coarse_theta;
+#[cfg(test)]
+mod conformance;
 pub mod frontier2d;
 pub mod frontier2d_pad;
 pub mod frontier2d_par;
@@ -27,6 +29,8 @@ pub mod frontier2d_soa;
 #[cfg(test)]
 mod measure;
 pub mod frontier3d;
+pub mod observe;
+pub mod original;
 pub mod pyramid;
 pub mod stack;
 pub mod stream;
@@ -34,6 +38,9 @@ pub mod tau;
 pub mod topk;
 pub mod priority;
 pub mod prio_lc;
+
+pub use observe::{NullObserver, SolveFlow, SolveObserver, SolveOutcome, SolveProbe};
+use observe::{BoundaryPacer, InPlaceProbe};
 
 /// dilation 変位 `(mx, my, mt)` を `actions` の全遷移から算出する。`dit` は絶対 θ なので、
 /// 各 (action, source theta `t`) について循環距離 `min(|dit-t|, nt-|dit-t|)` を取り `mt` とする。
@@ -84,14 +91,21 @@ pub(crate) fn seed_frontier_2d(vi: &ValueIterator) -> Bitboard2D {
 /// `update` は候補セル `(ix,iy,it)` を評価し、値を下げた（=次フロンティアへ伝播すべき）なら
 /// `true` を返す。ドライバは `true` のセルだけを次フロンティアに入れ、`updates` を 1 加算する
 /// （この「更新 ⟺ 伝播」は全 frontier3d 系ソルバで成り立つ不変条件）。
-/// `(iters, updates, converged)` を返す（`converged` はフロンティアが空になったか）。
-pub(crate) fn frontier3d_driver<F>(vi: &mut ValueIterator, max_iter: u32, mut update: F) -> (u32, u64, bool)
+///
+/// ラウンド境界ごとに `obs.boundary` を呼ぶ (in-place なので観測は無料)。
+pub(crate) fn frontier3d_driver<F>(
+    vi: &mut ValueIterator,
+    max_iter: u32,
+    obs: &mut dyn SolveObserver,
+    mut update: F,
+) -> SolveOutcome
 where
     F: FnMut(&mut ValueIterator, u32, u32, u32) -> bool,
 {
     let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
     let (mx, my, mt) = displacement(vi);
     let (dx, dy, dt) = (mx as u32, my as u32, mt as u32);
+    let mut pacer = BoundaryPacer::new(obs);
     let mut frontier = seed_frontier(vi);
     let mut updates: u64 = 0;
     let mut iters: u32 = 0;
@@ -106,31 +120,47 @@ where
             }
         }
         frontier = new_frontier;
+        if frontier.popcount() > 0 && pacer.due(iters as u64) {
+            let mut probe = InPlaceProbe { vi, iters, updates };
+            match obs.boundary(&mut probe) {
+                SolveFlow::Continue => {}
+                SolveFlow::Stop => return SolveOutcome::stopped(iters, updates),
+                SolveFlow::Cancel => return SolveOutcome::cancelled(iters, updates),
+            }
+        }
     }
-    (iters, updates, frontier.popcount() == 0)
+    SolveOutcome::running(iters, updates, frontier.popcount() == 0)
 }
 
 /// 2D フロンティア反復の共通ドライバ。frontier2d / soa / pad が共有する「seed →
 /// (空間膨張 → 候補 (ix,iy) ごとに全 θ 層を再評価 → 更新があれば次フロンティアへ) を収束まで」
 /// の骨格をまとめる。差分は候補セルごとの処理 `cell(ix, iy)` のみ。
 ///
-/// `cell` は候補セル `(ix,iy)` の全 θ 層を再評価し、**減少した θ 層の数**を返す（0 なら不変）。
+/// `M::cell` は候補セル `(ix,iy)` の全 θ 層を再評価し、**減少した θ 層の数**を返す（0 なら不変）。
 /// ドライバは戻り値が 1 以上のセルだけを次フロンティアに入れ、その数を `updates` に加算する。
-/// per-cell が読む状態 (vi / SoA 配列 / Padded) は呼び出し側がクロージャに閉じ込めるため、
-/// ドライバ自身は `vi` を借用しない（seed / displacement は呼び出し側が事前計算して渡す）。
-/// `(iters, updates, converged)` を返す。
-pub(crate) fn frontier2d_driver<F>(
+/// per-cell が読む状態 (vi / SoA 配列 / Padded) はモデル側が持ち、ドライバ自身は `vi` を
+/// 借用しない（seed / displacement は呼び出し側が事前計算して渡す）。
+///
+/// 境界プローブの具現化はモデルが知っている (in-place は無料、SoA/Pad は要求時 write_back)
+/// ので、境界呼び出しは `M::boundary` へ委譲する。cell と boundary が同じ内部状態を可変借用
+/// するため、クロージャ 2 つではなく 1 オブジェクト 2 メソッドにしてある。
+pub(crate) trait Frontier2DSweep {
+    fn cell(&mut self, ix: u32, iy: u32) -> u64;
+    fn boundary(&mut self, obs: &mut dyn SolveObserver, iters: u32, updates: u64) -> SolveFlow;
+}
+
+/// 2D フロンティア反復の共通ドライバ本体。ラウンド境界ごとに `model.boundary` を呼ぶ。
+pub(crate) fn frontier2d_driver<M: Frontier2DSweep>(
     nx: i32,
     ny: i32,
     seed: Bitboard2D,
     dx: u32,
     dy: u32,
     max_iter: u32,
-    mut cell: F,
-) -> (u32, u64, bool)
-where
-    F: FnMut(u32, u32) -> u64,
-{
+    obs: &mut dyn SolveObserver,
+    model: &mut M,
+) -> SolveOutcome {
+    let mut pacer = BoundaryPacer::new(obs);
     let mut frontier = seed;
     let mut updates: u64 = 0;
     let mut iters: u32 = 0;
@@ -139,15 +169,22 @@ where
         let candidates = frontier.dilate(dx, dy);
         let mut new_frontier = Bitboard2D::new(nx as u32, ny as u32);
         for (ix, iy) in candidates.enumerate() {
-            let u = cell(ix, iy);
+            let u = model.cell(ix, iy);
             if u > 0 {
                 updates += u;
                 new_frontier.set(ix, iy);
             }
         }
         frontier = new_frontier;
+        if frontier.popcount() > 0 && pacer.due(iters as u64) {
+            match model.boundary(obs, iters, updates) {
+                SolveFlow::Continue => {}
+                SolveFlow::Stop => return SolveOutcome::stopped(iters, updates),
+                SolveFlow::Cancel => return SolveOutcome::cancelled(iters, updates),
+            }
+        }
     }
-    (iters, updates, frontier.popcount() == 0)
+    SolveOutcome::running(iters, updates, frontier.popcount() == 0)
 }
 
 /// 収束後の最終 argmin パス（並列・読み取り専用）の共通実装。frontier2d_par /
@@ -263,7 +300,9 @@ pub(crate) fn async_gs_engine<F>(
     max_iter: u32,
     mut cand_list: Vec<(u32, u32)>,
     eval: F,
-) -> (u32, u64, bool)
+    obs_interval: u32,
+    boundary: &mut dyn FnMut(u32, u64) -> SolveFlow,
+) -> SolveOutcome
 where
     F: Fn(i32, i32) -> (bool, u64) + Sync,
 {
@@ -275,106 +314,139 @@ where
 
     let barrier = Barrier::new(nthreads);
     let done = AtomicBool::new(false);
-    let iters_out = AtomicU32::new(0);
-    let converged_out = AtomicBool::new(false);
     // work-stealing カーソル: 候補リストを BLOCK 件単位で fetch_add により動的分配する。
     let cursor = AtomicUsize::new(0);
+    // 境界プローブが読む「これまでの更新総数」。各スレッドが自ラウンド分を B1 前に足す。
+    let updates_total = AtomicU64::new(0);
     let eval = &eval;
 
-    let total_updates: u64 = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..nthreads)
-            .map(|w| {
-                let barrier = &barrier;
-                let done = &done;
-                let iters_out = &iters_out;
-                let converged_out = &converged_out;
-                let cursor = &cursor;
-                scope.spawn(move || -> u64 {
-                    // `GsShared` 全体を再束縛してクロージャに「構造体まるごと」をキャプチャさせる
-                    // (Rust 2021 のフィールド分割キャプチャだと生ポインタ単体が捕まり Send にならない)。
-                    #[allow(clippy::redundant_locals)]
-                    let shared = shared;
-                    let mut my_updates: u64 = 0;
-                    let mut iter_count: u32 = 0;
-                    loop {
-                        // ── compute (並列・in-place 非同期書き込み) ──
-                        // SAFETY (cand): リーダーの差し替えは B1〜B2 間のみ、ここは B2 後の compute 相
-                        // — バリアの happens-before で可視・無競合。
-                        let cand = unsafe { &*shared.cand };
-                        let n = cand.len();
-                        // SAFETY: ワーカー w は changed[w] だけを触る（他スレッドと排他）。
-                        let my_changed = unsafe { &mut *shared.changed.add(w) };
-                        my_changed.clear();
+    /// compute 相 1 ラウンド分 (work stealing で候補を claim して評価)。ラウンドの
+    /// 自スレッド更新数を返す。
+    /// SAFETY: バリアで相分離された compute 相 (B2 後〜B1 前) からのみ呼ぶこと —
+    /// cand はリーダーの差し替え (B1〜B2 間) と競合せず、changed[w] は w だけが触る。
+    unsafe fn compute_phase<F: Fn(i32, i32) -> (bool, u64)>(
+        shared: GsShared,
+        cursor: &AtomicUsize,
+        eval: &F,
+        w: usize,
+    ) -> u64 {
+        let cand = unsafe { &*shared.cand };
+        let n = cand.len();
+        let my_changed = unsafe { &mut *shared.changed.add(w) };
+        my_changed.clear();
+        let mut ups_round = 0u64;
+        // work stealing: BLOCK 件の連続ブロックを fetch_add で claim する。
+        // 各ブロックの claim は一意なので「セルの書き手は 1 スレッド」が保たれる。
+        const BLOCK: usize = 16;
+        loop {
+            let s = cursor.fetch_add(BLOCK, Ordering::Relaxed);
+            if s >= n {
+                break;
+            }
+            let e = (s + BLOCK).min(n);
+            for &(ixu, iyu) in &cand[s..e] {
+                let (cell_changed, ups) = eval(ixu as i32, iyu as i32);
+                ups_round += ups;
+                if cell_changed {
+                    my_changed.push((ixu, iyu));
+                }
+            }
+        }
+        ups_round
+    }
 
-                        // work stealing: BLOCK 件の連続ブロックを fetch_add で claim する。
-                        // 各ブロックの claim は一意なので「セルの書き手は 1 スレッド」が保たれる。
-                        const BLOCK: usize = 16;
-                        loop {
-                            let s = cursor.fetch_add(BLOCK, Ordering::Relaxed);
-                            if s >= n {
-                                break;
-                            }
-                            let e = (s + BLOCK).min(n);
-                            for &(ixu, iyu) in &cand[s..e] {
-                                let (cell_changed, ups) = eval(ixu as i32, iyu as i32);
-                                my_updates += ups;
-                                if cell_changed {
-                                    my_changed.push((ixu, iyu));
-                                }
-                            }
-                        }
-
-                        barrier.wait(); // B1: 全 hot/changed 書き込みが可視。
-
-                        // ── リーダー直列: changed → 次フロンティア再構築 / 終了判定 ──
-                        if w == 0 {
-                            iter_count += 1;
-                            let mut any = false;
-                            let mut nf = Bitboard2D::new(nx as u32, ny as u32);
-                            for i in 0..nthreads {
-                                // SAFETY: B1 後、各 changed[i] への書きは完了し可視。
-                                let cl = unsafe { &*shared.changed.add(i) };
-                                if !cl.is_empty() {
-                                    any = true;
-                                }
-                                for &(ixu, iyu) in cl {
-                                    nf.set(ixu, iyu);
-                                }
-                            }
-                            if any && iter_count < max_iter {
-                                let mut next: Vec<(u32, u32)> =
-                                    nf.dilate(dx, dy).enumerate().collect();
-                                // 対称 Gauss-Seidel 風: 走査方向をラウンドごとに反転。
-                                if iter_count % 2 == 1 {
-                                    next.reverse();
-                                }
-                                // SAFETY: 他ワーカーは B1〜B2 間 cand を読まない。
-                                unsafe {
-                                    *shared.cand = next;
-                                }
-                                cursor.store(0, Ordering::Relaxed);
-                            } else {
-                                iters_out.store(iter_count, Ordering::Relaxed);
-                                converged_out.store(!any, Ordering::Relaxed);
-                                done.store(true, Ordering::Relaxed);
-                            }
-                        }
-
-                        barrier.wait(); // B2: リーダーの cand 差し替え / done が可視。
-                        if done.load(Ordering::Relaxed) {
-                            break;
-                        }
+    std::thread::scope(|scope| {
+        // ワーカー (w=1..nthreads)。compute とバリアだけを回す。
+        for w in 1..nthreads {
+            let barrier = &barrier;
+            let done = &done;
+            let cursor = &cursor;
+            let updates_total = &updates_total;
+            scope.spawn(move || {
+                // `GsShared` 全体を再束縛してクロージャに「構造体まるごと」をキャプチャさせる
+                // (Rust 2021 のフィールド分割キャプチャだと生ポインタ単体が捕まり Send にならない)。
+                #[allow(clippy::redundant_locals)]
+                let shared = shared;
+                loop {
+                    // SAFETY: compute 相 (B2 後〜B1 前)。
+                    let ups = unsafe { compute_phase(shared, cursor, eval, w) };
+                    if ups > 0 {
+                        updates_total.fetch_add(ups, Ordering::Relaxed);
                     }
-                    my_updates
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).sum()
-    });
+                    barrier.wait(); // B1: 全 hot/changed 書き込みが可視。
+                    barrier.wait(); // B2: リーダーの cand 差し替え / done が可視。
+                    if done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            });
+        }
 
-    let iters = iters_out.load(Ordering::Relaxed);
-    let converged = converged_out.load(Ordering::Relaxed);
-    (iters, total_updates, converged)
+        // リーダー (w=0) は**呼び出しスレッドでインライン実行**する。boundary フックは
+        // ここから呼ばれるので、observer は Send である必要がない。
+        let interval = obs_interval.max(1) as u64;
+        let mut next_boundary: u64 = interval;
+        let mut iter_count: u32 = 0;
+        let mut outcome: Option<SolveOutcome> = None;
+        loop {
+            // SAFETY: compute 相 (B2 後〜B1 前)。
+            let ups = unsafe { compute_phase(shared, &cursor, eval, 0) };
+            if ups > 0 {
+                updates_total.fetch_add(ups, Ordering::Relaxed);
+            }
+            barrier.wait(); // B1: 全 hot/changed 書き込みが可視。
+
+            // ── リーダー直列: changed → 次フロンティア再構築 / 境界 / 終了判定 ──
+            // ここでは全ワーカーが B2 で待機している (compute 書き込みは静止) ので、
+            // boundary の具現化 (write_back / argmin) は共有配列を安全に読める。
+            iter_count += 1;
+            let mut any = false;
+            let mut nf = Bitboard2D::new(nx as u32, ny as u32);
+            for i in 0..nthreads {
+                // SAFETY: B1 後、各 changed[i] への書きは完了し可視。
+                let cl = unsafe { &*shared.changed.add(i) };
+                if !cl.is_empty() {
+                    any = true;
+                }
+                for &(ixu, iyu) in cl {
+                    nf.set(ixu, iyu);
+                }
+            }
+            let updates_now = updates_total.load(Ordering::Relaxed);
+            let mut flow = SolveFlow::Continue;
+            if any && iter_count < max_iter && iter_count as u64 >= next_boundary {
+                next_boundary = (iter_count as u64).saturating_add(interval);
+                flow = boundary(iter_count, updates_now);
+            }
+            if any && iter_count < max_iter && flow == SolveFlow::Continue {
+                let mut next: Vec<(u32, u32)> = nf.dilate(dx, dy).enumerate().collect();
+                // 対称 Gauss-Seidel 風: 走査方向をラウンドごとに反転。
+                if iter_count % 2 == 1 {
+                    next.reverse();
+                }
+                // SAFETY: 他ワーカーは B1〜B2 間 cand を読まない。
+                unsafe {
+                    *shared.cand = next;
+                }
+                cursor.store(0, Ordering::Relaxed);
+            } else {
+                outcome = Some(match flow {
+                    SolveFlow::Stop => SolveOutcome::stopped(iter_count, updates_now),
+                    SolveFlow::Cancel => SolveOutcome::cancelled(iter_count, updates_now),
+                    SolveFlow::Continue => {
+                        SolveOutcome::running(iter_count, updates_now, !any)
+                    }
+                });
+                done.store(true, Ordering::Relaxed);
+            }
+
+            barrier.wait(); // B2: リーダーの cand 差し替え / done が可視。
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        outcome.expect("engine loop sets outcome before exiting")
+    })
 }
 
 /// 到達可能とみなす total_cost 上限（compare.py の value>=1e6 境界と整合）。
@@ -441,65 +513,147 @@ pub struct U64SolveStats {
     pub converged: bool,
 }
 
-/// Reference は全走査を strict 固定点（到達可能セルが不変）まで回す。
-pub(crate) fn reference_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    let mut prev: Vec<u64> = vi.states.iter().map(|s| s.total_cost).collect();
-    let mut iters = 0u32;
-    let converged = loop {
-        vi.value_iteration_worker(1, 0);
-        iters += 1;
-        let mut changed = false;
-        for (i, s) in vi.states.iter().enumerate() {
-            if s.total_cost < REACH_THRESH && s.total_cost != prev[i] {
-                changed = true;
-            }
-            prev[i] = s.total_cost;
-        }
-        if !changed {
-            break true;
-        }
-        if iters >= max_iter {
-            break false;
-        }
-    };
-    (iters, 0, converged)
+/// 途中で打ち切った場 (Stop / max_iter 到達) の性質。early_start の健全性議論と
+/// conformance テストの期待切り替えに使う。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Partiality {
+    /// 途中の場は全セル V ≥ v* の単調上界 (MAX_COST から妥当な Bellman 更新のみで降下)。
+    /// その場の上の貪欲降下は自分の値を厳密に下げながら進むので循環しない
+    /// (最短とは限らない)。
+    UpperBound,
+    /// 確定済みセルは v* に bit-exact、未確定セルは `(MAX_COST, 方策なし)`
+    /// (compact: finalize は値の昇順に進むため)。
+    ExactPrefix,
+    /// 近似オペレータ (outcome 枝刈りなど) のため上の不変条件を保証しない。
+    /// 境界観測・cancel・stop は使えるが、途中の場の性質には頼らないこと。
+    Heuristic,
 }
 
-/// セット済み `ValueIterator` を指定ソルバで収束まで解く。
+/// ソルバの能力宣言。プランナ側のハードコード
+/// (`matches!(solver, Frontier2DSparseCompact {..})` など) をここへ集約する。
+#[derive(Clone, Copy, Debug)]
+pub struct SolverCaps {
+    /// 収束値・方策が本家 (Reference 固定点) と bit-exact か。false は近似ソルバ
+    /// (実パラメタ付き tau/topk、settle-once の prio_ls)。
+    pub exact: bool,
+    /// 途中で打ち切った場の性質。
+    pub partial: Partiality,
+    /// `states` を確保しないアウトオブコア経路か (出力は `CompactSink`)。
+    pub out_of_core: bool,
+    /// マルチスレッド (`VI_THREADS`) を使うか。
+    pub parallel: bool,
+}
+
+impl U64Solver {
+    /// このソルバ (パラメタ込み) の能力。
+    pub fn caps(&self) -> SolverCaps {
+        use U64Solver::*;
+        let exact = match *self {
+            // tau>0: 改善が tau 以下の更新を捨てる → 値は上界のまま止まる (非 exact)。
+            Frontier3DTau { tau } => tau == 0,
+            // k が全 outcome 数以上なら枝刈りなしで exact。全 outcome 数は地図・行動に
+            // 依存して分からないので、保証できるのは「枝刈りが起き得ない」u32::MAX のみ。
+            Frontier3DTopK { k } => k == u32::MAX,
+            // settle-once (Dijkstra 流) は確率遷移では早すぎる確定があり得る → 近似。
+            PriorityLabelSetting => false,
+            // coarse_theta は refine が完全収束するので step に依らず exact。
+            _ => true,
+        };
+        let partial = match *self {
+            Frontier2DSparseCompact { .. } => Partiality::ExactPrefix,
+            // 枝刈りは期待コストを下げる方向にも外し得る → 上界不変条件なし。
+            Frontier3DTopK { k } if k != u32::MAX => Partiality::Heuristic,
+            _ => Partiality::UpperBound,
+        };
+        SolverCaps {
+            exact,
+            partial,
+            out_of_core: matches!(self, Frontier2DSparseCompact { .. }),
+            parallel: matches!(
+                self,
+                Frontier2DPar
+                    | Frontier2DParUnsafe
+                    | Frontier2DFused
+                    | Frontier2DSparse
+                    | Frontier2DSparseCompact { .. }
+            ),
+        }
+    }
+}
+
+/// セット済み `ValueIterator` を指定ソルバで収束まで解く (従来 API)。
+/// `solve_observed` の [`NullObserver`] ラッパ。
 pub fn solve(vi: &mut ValueIterator, solver: U64Solver, max_iter: u32) -> U64SolveStats {
-    let (iters, updates, converged) = match solver {
-        U64Solver::Reference => reference_solve(vi, max_iter),
-        U64Solver::Frontier3D => frontier3d::frontier3d_solve(vi, max_iter),
-        U64Solver::Frontier2D => frontier2d::frontier2d_solve(vi, max_iter),
-        U64Solver::Frontier2DSoA => frontier2d_soa::frontier2d_soa_solve(vi, max_iter),
-        U64Solver::Frontier2DPad => frontier2d_pad::frontier2d_pad_solve(vi, max_iter),
-        U64Solver::Frontier2DPar => frontier2d_par::frontier2d_par_solve(vi, max_iter),
-        U64Solver::Frontier2DFused => frontier2d_fused::frontier2d_fused_solve(vi, max_iter),
-        U64Solver::Frontier2DSparse => frontier2d_sparse::frontier2d_sparse_solve(vi, max_iter),
+    let o = solve_observed(vi, solver, max_iter, &mut NullObserver);
+    U64SolveStats { iters: o.iters, updates: o.updates, converged: o.converged }
+}
+
+/// セット済み `ValueIterator` を指定ソルバで解き、進行を `obs` に観測させる。
+/// 各ソルバは自然な境界 (ラウンド / スイープ / ブロックパス / バンド finalize /
+/// 一定 pop 数) ごとに [`SolveObserver::boundary`] を呼ぶ。詳細は [`observe`]。
+pub fn solve_observed(
+    vi: &mut ValueIterator,
+    solver: U64Solver,
+    max_iter: u32,
+    obs: &mut dyn SolveObserver,
+) -> SolveOutcome {
+    match solver {
+        U64Solver::Reference => original::original_solve_observed(vi, max_iter, obs),
+        U64Solver::Frontier3D => frontier3d::frontier3d_solve_observed(vi, max_iter, obs),
+        U64Solver::Frontier2D => frontier2d::frontier2d_solve_observed(vi, max_iter, obs),
+        U64Solver::Frontier2DSoA => {
+            frontier2d_soa::frontier2d_soa_solve_observed(vi, max_iter, obs)
+        }
+        U64Solver::Frontier2DPad => {
+            frontier2d_pad::frontier2d_pad_solve_observed(vi, max_iter, obs)
+        }
+        U64Solver::Frontier2DPar => {
+            frontier2d_par::frontier2d_par_solve_observed(vi, max_iter, obs)
+        }
+        U64Solver::Frontier2DFused => {
+            frontier2d_fused::frontier2d_fused_solve_observed(vi, max_iter, obs)
+        }
+        U64Solver::Frontier2DSparse => {
+            frontier2d_sparse::frontier2d_sparse_solve_observed(vi, max_iter, obs)
+        }
         U64Solver::Frontier2DSparseCompact { band } => {
-            let s = frontier2d_sparse_compact::solve_compact(
+            let s = frontier2d_sparse_compact::solve_compact_observed(
                 vi,
                 max_iter,
                 if band == 0 { None } else { Some(band) },
+                obs,
             );
-            (s.iters, s.updates, s.converged)
+            SolveOutcome {
+                iters: s.iters,
+                updates: s.updates,
+                converged: s.converged,
+                stopped: s.stopped,
+                cancelled: s.cancelled,
+            }
         }
         U64Solver::Frontier2DParUnsafe => {
-            frontier2d_par_unsafe::frontier2d_par_unsafe_solve(vi, max_iter)
+            frontier2d_par_unsafe::frontier2d_par_unsafe_solve_observed(vi, max_iter, obs)
         }
-        U64Solver::FrontierStack => stack::frontier_stack_solve(vi, max_iter),
-        U64Solver::BlockRefine => block::block_refine_solve(vi, max_iter),
-        U64Solver::PyramidSweep => pyramid::pyramid_sweep_solve(vi, max_iter),
-        U64Solver::Frontier3DTau { tau } => tau::frontier3d_tau_solve(vi, tau, max_iter),
-        U64Solver::Frontier3DTopK { k } => topk::frontier3d_topk_solve(vi, k, max_iter),
+        U64Solver::FrontierStack => stack::frontier_stack_solve_observed(vi, max_iter, obs),
+        U64Solver::BlockRefine => block::block_refine_solve_observed(vi, max_iter, obs),
+        U64Solver::PyramidSweep => pyramid::pyramid_sweep_solve_observed(vi, max_iter, obs),
+        U64Solver::Frontier3DTau { tau } => {
+            tau::frontier3d_tau_solve_observed(vi, tau, max_iter, obs)
+        }
+        U64Solver::Frontier3DTopK { k } => {
+            topk::frontier3d_topk_solve_observed(vi, k, max_iter, obs)
+        }
         U64Solver::Frontier3DCoarseTheta { step } => {
-            coarse_theta::frontier3d_coarse_theta_solve(vi, step, max_iter)
+            coarse_theta::frontier3d_coarse_theta_solve_observed(vi, step, max_iter, obs)
         }
-        U64Solver::StreamMimic => stream::stream_mimic_solve(vi, max_iter),
-        U64Solver::PriorityLabelSetting => priority::prio_ls_solve(vi, max_iter),
-        U64Solver::PriorityLabelCorrecting => prio_lc::prio_lc_solve(vi, max_iter),
-    };
-    U64SolveStats { iters, updates, converged }
+        U64Solver::StreamMimic => stream::stream_mimic_solve_observed(vi, max_iter, obs),
+        U64Solver::PriorityLabelSetting => {
+            priority::priority_solve_observed(vi, max_iter, true, obs)
+        }
+        U64Solver::PriorityLabelCorrecting => {
+            priority::priority_solve_observed(vi, max_iter, false, obs)
+        }
+    }
 }
 
 /// フロンティア/ブロック系ソルバの parity テスト共有ヘルパ。

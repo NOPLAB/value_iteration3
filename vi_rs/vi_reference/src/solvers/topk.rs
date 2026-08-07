@@ -5,6 +5,7 @@
 
 use crate::params::MAX_COST;
 use crate::solvers::frontier3d_driver;
+use crate::solvers::observe::{NullObserver, SolveObserver, SolveOutcome};
 use crate::value_iterator::{action_cost_raw, to_index_raw, ValueIterator};
 use crate::{Action, State};
 
@@ -58,9 +59,14 @@ fn action_cost_topk(
     cost / psum
 }
 
-/// セット済み `ValueIterator` を Frontier3DTopK で収束まで解く。`(iters, updates, converged)`。
-pub fn frontier3d_topk_solve(vi: &mut ValueIterator, k: u32, max_iter: u32) -> (u32, u64, bool) {
-    frontier3d_driver(vi, max_iter, |vi, ix, iy, it| {
+/// セット済み `ValueIterator` を Frontier3DTopK で収束まで解く。
+pub fn frontier3d_topk_solve_observed(
+    vi: &mut ValueIterator,
+    k: u32,
+    max_iter: u32,
+    obs: &mut dyn SolveObserver,
+) -> SolveOutcome {
+    frontier3d_driver(vi, max_iter, obs, |vi, ix, iy, it| {
         let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
         let idx = vi.to_index(ix as i32, iy as i32, it as i32) as usize;
         if !vi.states[idx].free || vi.states[idx].final_state {
@@ -87,14 +93,7 @@ pub fn frontier3d_topk_solve(vi: &mut ValueIterator, k: u32, max_iter: u32) -> (
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::frontier3d_topk_solve;
-    use crate::solvers::test_support::parity_standard_maps;
-
-    #[test]
-    fn topk_full_parity_standard_maps() {
-        // k=u32::MAX → 枝刈り無し → Frontier3D 等価 → Reference と bit-exact。
-        parity_standard_maps(|vi| frontier3d_topk_solve(vi, u32::MAX, 2000));
-    }
+/// 従来 API (observer なし)。`(iters, updates, converged)`。
+pub fn frontier3d_topk_solve(vi: &mut ValueIterator, k: u32, max_iter: u32) -> (u32, u64, bool) {
+    frontier3d_topk_solve_observed(vi, k, max_iter, &mut NullObserver).tuple()
 }

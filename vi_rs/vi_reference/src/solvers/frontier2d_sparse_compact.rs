@@ -28,6 +28,8 @@ use crate::value_iterator::ValueIterator;
 use super::frontier2d_fused::{action_cost_fused, CpCells, Geom, UNREACHED};
 use super::frontier2d_par::n_threads;
 use super::{displacement, Bitboard2D};
+use crate::planner::{CompactPolicy, PolicyView};
+use crate::solvers::observe::{SolveFlow, SolveObserver, SolveProbe};
 
 /// compact が per-state に読む情報の抽象源。O(total) の `states` 配列を常駐させる `SliceSource` と、
 /// マップから 2D の free/penalty（θ 非依存）＋ ゴール近傍の final 集合だけを保持する `MapSource` を
@@ -285,12 +287,20 @@ const BLOCK_ROWS: usize = 8;
 const COUPLE_SAFETY: u64 = 4;
 
 /// 1 ブロック分の cp/pen/eval/fin。退避時に `BlockStore` 側で `None` に落として解放する。
+///
+/// メモリレイアウト: `cp` だけが per-cell（8 B）。`pen` は θ 非依存（`StateSource::pen` が
+/// (ix,iy) にしか依らない）ので**列単位** 1 本（per-cell 換算 8/nt B）、`eval`/`fin` は列単位の
+/// θ ビットマスク（`nt ≤ 64` 前提、per-cell 換算 2/nt B）。旧レイアウト（pen per-cell 8 B +
+/// bool 2 B）の 18 B/cell から ~8.4 B/cell へ半減する。ブロック境界は `chunk = BLOCK_ROWS ·
+/// row_stride` で `row_stride % nt == 0` なので列がブロックを跨ぐことはない。
 struct Block {
     cp: Vec<u64>,
+    /// 列 (=`off/nt`) ごとのペナルティ（θ 非依存）。
     pen: Vec<u64>,
-    eval: Vec<bool>,
-    /// final 化済みか。構造的 final（`!eval_ok`）は構築時 true。
-    fin: Vec<bool>,
+    /// 列ごとの eval_ok θ ビットマスク。
+    eval: Vec<u64>,
+    /// 列ごとの final 化済み θ ビットマスク。構造的 final（`!eval_ok`）は構築時 1。
+    fin: Vec<u64>,
 }
 
 /// 行ブロック化＋遅延確保＋退避するストア。
@@ -369,43 +379,48 @@ impl BlockStore {
 
     /// ブロック `b` を `src` から遅延構築する（既に確保済み/退避済みなら no-op）。`Fused::build_direct`
     /// と同一規約: `pen = penalty +ʷ local_penalty`、`cp = pen`（final セル= seed value 0、`0+ʷpen`）
-    /// さもなくば UNREACHED、`eval = free && !final`、構造的 `fin = !eval`。
+    /// さもなくば UNREACHED、`eval = free && !final`、構造的 `fin = !eval`。free/pen は θ 非依存
+    /// なので src への問い合わせは列ごと 1 回で済む（旧実装は per-cell に 60 回引いていた）。
     fn ensure_block(&mut self, b: usize, src: &dyn StateSource) {
         if self.blocks[b].is_some() || self.evicted[b] {
             return;
         }
         let start = b * self.chunk;
         let len = self.chunk.min(self.n_pad - start);
-        let mut cp = vec![UNREACHED; len];
-        let mut pen = vec![0u64; len];
-        let mut eval = vec![false; len];
-        let mut fin = vec![true; len]; // パディング/非 eval は構造的 final。
         let (nt, nx, ny, mx, my) = (self.nt, self.nx, self.ny, self.mx, self.my);
-        for (o, (cpc, (penc, (evc, finc)))) in cp
-            .iter_mut()
-            .zip(pen.iter_mut().zip(eval.iter_mut().zip(fin.iter_mut())))
-            .enumerate()
-        {
-            let pad_idx = start + o;
-            let iy_pad = pad_idx / self.row_stride;
-            let rem = pad_idx % self.row_stride;
-            let ix_pad = rem / nt as usize;
-            let it = rem % nt as usize;
+        let ntu = nt as usize;
+        debug_assert_eq!(len % ntu, 0, "ブロックは列境界に揃うはず");
+        let ncols = len / ntu;
+        let mut cp = vec![UNREACHED; len];
+        let mut pen = vec![0u64; ncols];
+        let mut eval = vec![0u64; ncols];
+        let mut fin = vec![u64::MAX; ncols]; // パディング/非 eval は構造的 final。
+        for c in 0..ncols {
+            let pad_base = start + c * ntu;
+            let iy_pad = pad_base / self.row_stride;
+            let ix_pad = (pad_base % self.row_stride) / ntu;
             let ix = ix_pad as i32 - mx;
             let iy = iy_pad as i32 - my;
-            if ix >= 0 && ix < nx && iy >= 0 && iy < ny {
-                let free = src.free(ix, iy);
-                let p = src.pen(ix, iy);
-                *penc = p;
-                let is_final = free && src.is_final(ix, iy, it as i32);
-                let is_eval = free && !is_final;
-                *evc = is_eval;
-                *finc = !is_eval;
-                // seed: final セルは total_cost=0 → cp = 0 +ʷ p = p。非 final free は UNREACHED。
-                if is_final {
-                    *cpc = p;
+            if ix < 0 || ix >= nx || iy < 0 || iy >= ny {
+                continue;
+            }
+            let free = src.free(ix, iy);
+            let p = src.pen(ix, iy);
+            pen[c] = p;
+            if !free {
+                continue; // eval=0 / fin=全1（構造的 final）のまま。
+            }
+            let mut ev = 0u64;
+            for it in 0..nt {
+                if src.is_final(ix, iy, it) {
+                    // seed: final セルは total_cost=0 → cp = 0 +ʷ p = p。
+                    cp[c * ntu + it as usize] = p;
+                } else {
+                    ev |= 1u64 << it;
                 }
             }
+            eval[c] = ev;
+            fin[c] = !ev;
         }
         self.blocks[b] = Some(Block { cp, pen, eval, fin });
     }
@@ -413,13 +428,17 @@ impl BlockStore {
     #[inline(always)]
     fn pen(&self, i: usize) -> u64 {
         let b = i / self.chunk;
-        self.blocks[b].as_ref().expect("block not allocated").pen[i - b * self.chunk]
+        let off = i - b * self.chunk;
+        self.blocks[b].as_ref().expect("block not allocated").pen[off / self.nt as usize]
     }
 
     #[inline(always)]
     fn eval_ok(&self, i: usize) -> bool {
         let b = i / self.chunk;
-        self.blocks[b].as_ref().expect("block not allocated").eval[i - b * self.chunk]
+        let off = i - b * self.chunk;
+        let ntu = self.nt as usize;
+        let blk = self.blocks[b].as_ref().expect("block not allocated");
+        (blk.eval[off / ntu] >> (off % ntu)) & 1 == 1
     }
 
     #[inline(always)]
@@ -433,11 +452,12 @@ impl BlockStore {
     fn set_final(&mut self, i: usize) {
         let b = i / self.chunk;
         let off = i - b * self.chunk;
+        let ntu = self.nt as usize;
+        let (c, bit) = (off / ntu, off % ntu);
         let blk = self.blocks[b].as_mut().expect("block not allocated");
-        if !blk.fin[off] {
-            blk.fin[off] = true;
-            let is_eval = blk.eval[off];
-            if is_eval {
+        if (blk.fin[c] >> bit) & 1 == 0 {
+            blk.fin[c] |= 1u64 << bit;
+            if (blk.eval[c] >> bit) & 1 == 1 {
                 self.n_final[b] += 1;
             }
         }
@@ -464,10 +484,20 @@ impl BlockStore {
         self.blocks.iter().filter(|b| b.is_some()).count()
     }
 
+    /// 常駐ブロックのヒープ実測バイト数（cp + pen + eval + fin）。peak RAM 指標用。
+    fn resident_bytes(&self) -> u64 {
+        self.blocks
+            .iter()
+            .flatten()
+            .map(|blk| 8 * (blk.cp.len() + blk.pen.len() + blk.eval.len() + blk.fin.len()) as u64)
+            .sum()
+    }
+
     /// 並列非同期 G-S 用に、確保済みブロックの cp/pen/eval の生ポインタ表を作る（未確保は null）。
     /// 返り値の `AtomicCpView` は当該ラウンド中（ブロックの確保/退避が起きない間）のみ有効。cp は
-    /// `AtomicU64` として in-place 原子書き込みし、pen/eval は読み取り専用。`Block::cp` は同ラウンド
-    /// 中に再確保（move）されないので生ポインタは安定（`Vec<u64>` と `AtomicU64` は同一表現）。
+    /// `AtomicU64` として in-place 原子書き込みし、pen/eval は読み取り専用（列単位配列）。
+    /// `Block::cp` は同ラウンド中に再確保（move）されないので生ポインタは安定（`Vec<u64>` と
+    /// `AtomicU64` は同一表現）。
     fn atomic_view(&mut self) -> AtomicCpView {
         let nb = self.blocks.len();
         let mut cp = Vec::with_capacity(nb);
@@ -487,7 +517,7 @@ impl BlockStore {
                 }
             }
         }
-        AtomicCpView { cp, pen, eval, chunk: self.chunk }
+        AtomicCpView { cp, pen, eval, chunk: self.chunk, nt: self.nt as usize }
     }
 }
 
@@ -507,9 +537,12 @@ const _: () = assert!(
 /// `frontier2d_fused` の `&[AtomicU64]` ビューと同じ健全性が成り立つ（固定点は単調降下で一意）。
 struct AtomicCpView {
     cp: Vec<*mut AtomicU64>,
+    /// 列単位（index `off/nt`）のペナルティ配列。
     pen: Vec<*const u64>,
-    eval: Vec<*const bool>,
+    /// 列単位の eval_ok θ ビットマスク配列。
+    eval: Vec<*const u64>,
     chunk: usize,
+    nt: usize,
 }
 
 // SAFETY: 全アクセスは原子（cp）または読み取り専用（pen/eval）で、列ごと単一書き手の規律を守る。
@@ -526,12 +559,14 @@ impl AtomicCpView {
     #[inline(always)]
     fn pen(&self, i: usize) -> u64 {
         let b = i / self.chunk;
-        unsafe { *self.pen[b].add(i - b * self.chunk) }
+        let off = i - b * self.chunk;
+        unsafe { *self.pen[b].add(off / self.nt) }
     }
     #[inline(always)]
     fn eval_ok(&self, i: usize) -> bool {
         let b = i / self.chunk;
-        unsafe { *self.eval[b].add(i - b * self.chunk) }
+        let off = i - b * self.chunk;
+        unsafe { ((*self.eval[b].add(off / self.nt)) >> (off % self.nt)) & 1 == 1 }
     }
 }
 
@@ -799,6 +834,9 @@ pub struct CompactStats {
     pub freed_blocks: u64,
     /// 常駐ブロック数（確保済み・未退避）のピーク。遅延確保＋退避が peak RAM を抑える指標。
     pub peak_resident_blocks: u64,
+    /// 常駐ブロックのヒープ実測バイト数（cp/pen/eval/fin）のピーク。ブロック数と違い
+    /// レイアウト（per-cell/列単位）の違いが数字に出るので、RAM 削減の比較はこちらで行う。
+    pub peak_resident_block_bytes: u64,
     /// 総ブロック数。
     pub total_blocks: u64,
 }
@@ -1095,6 +1133,156 @@ pub(crate) fn solve_compact_into_nthreads(
     stats
 }
 
+/// compact の境界プローブ: finalize 済み sink を [`CompactPolicy`] として観測する。
+/// finalize は値の昇順に進むので、見える列は最後まで解いたときと bit-exact に同じ
+/// (`Partiality::ExactPrefix`)。`iters` は境界呼び出し回数 (バンド finalize 回数)。
+/// `updates` は core が境界へ運ばないため 0 (best effort)。
+struct CompactProbe<'a> {
+    policy: CompactPolicy<'a>,
+    iters: u32,
+}
+
+impl SolveProbe for CompactProbe<'_> {
+    fn iters(&self) -> u32 {
+        self.iters
+    }
+    fn updates(&self) -> u64 {
+        0
+    }
+    fn policy(&mut self) -> &dyn PolicyView {
+        &self.policy
+    }
+}
+
+/// `solve_compact` の observer 付き版 (`U64Solver::Frontier2DSparseCompact` の
+/// `solve_observed` 経路)。既存の `stop`/`cancel` フックを [`SolveObserver`] へアダプトする:
+/// 境界はバンド finalize ごと (compact の自然な粒度で、`interval` ヒントより粗い)。
+/// observer が `Cancel` を返したら core を止め、`cancelled=true` を返す
+/// (このとき sink / states は未完成なので write_back しない)。`Stop` は sink がそのまま
+/// 使えるので、確定分を states へ書き戻して返す。
+pub fn solve_compact_observed(
+    vi: &mut ValueIterator,
+    max_iter: u32,
+    band_override: Option<u64>,
+    obs: &mut dyn SolveObserver,
+) -> CompactStats {
+    let mut sink = RamSink::new(vi.states.len());
+    let g = Geom::build(vi);
+    let mt = displacement(vi).2;
+    let obs_cancel = AtomicBool::new(false);
+    let mut stats = {
+        let src = SliceSource::new(&vi.states, g.nx, g.nt);
+        let cell_num = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
+        let res = vi.xy_resolution;
+        let origin = (vi.map_origin_x, vi.map_origin_y);
+        let goal = (vi.goal_x, vi.goal_y, vi.goal_t);
+        let actions = &vi.actions;
+        let mut boundaries = 0u32;
+        let mut stop = |sink: &dyn CompactSink| -> bool {
+            boundaries += 1;
+            let mut probe = CompactProbe {
+                policy: CompactPolicy::new(sink, actions, cell_num, res, origin, goal),
+                iters: boundaries,
+            };
+            match obs.boundary(&mut probe) {
+                SolveFlow::Continue => false,
+                SolveFlow::Stop => true,
+                SolveFlow::Cancel => {
+                    obs_cancel.store(true, Ordering::Relaxed);
+                    true
+                }
+            }
+        };
+        let never = AtomicBool::new(false);
+        solve_compact_core(
+            &g,
+            mt,
+            &src,
+            max_iter,
+            band_override,
+            &mut sink,
+            n_threads(),
+            &never,
+            &mut stop,
+        )
+    };
+    if obs_cancel.load(Ordering::Relaxed) {
+        stats.cancelled = true;
+        stats.stopped = false;
+        return stats; // sink は未完成 — states には書き戻さない (場は破棄扱い)。
+    }
+    write_back_sink(vi, &g, &sink);
+    stats.reachable = vi
+        .states
+        .iter()
+        .filter(|s| s.free && !s.final_state && s.total_cost < MAX_COST)
+        .count() as u64;
+    stats
+}
+
+/// `solve_compact_mapped_stopping` の observer 付き版 (vi_planner の統一入口)。
+/// `cancel` (外部プリエンプトフラグ、バンド内ラウンド境界で観測) はそのまま生かし、
+/// observer の `Cancel` はバンド finalize 境界で `cancelled=true` に写す。
+#[allow(clippy::too_many_arguments)]
+pub fn solve_compact_mapped_observed(
+    actions: Vec<Action>,
+    thread_num: i32,
+    map: &OccupancyGrid,
+    theta_cell_num: i32,
+    safety_radius: f64,
+    safety_radius_penalty: f64,
+    goal_margin_radius: f64,
+    goal_margin_theta: i32,
+    goal_x: f64,
+    goal_y: f64,
+    goal_t: i32,
+    max_iter: u32,
+    band_override: Option<u64>,
+    sink: &mut dyn CompactSink,
+    nthreads: usize,
+    cancel: &AtomicBool,
+    obs: &mut dyn SolveObserver,
+) -> CompactStats {
+    let mut vi = ValueIterator::new(actions, thread_num);
+    vi.set_map_geometry_no_states(map, theta_cell_num, goal_margin_radius, goal_margin_theta);
+    vi.set_goal(goal_x, goal_y, goal_t);
+    let g = Geom::build(&vi);
+    let mt = displacement(&vi).2;
+    let src = MapSource::build(map, &vi, safety_radius, safety_radius_penalty);
+    let obs_cancel = AtomicBool::new(false);
+    let mut stats = {
+        let cell_num = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
+        let res = vi.xy_resolution;
+        let origin = (vi.map_origin_x, vi.map_origin_y);
+        let goal = (vi.goal_x, vi.goal_y, vi.goal_t);
+        let actions = &vi.actions;
+        let mut boundaries = 0u32;
+        let mut stop = |sink: &dyn CompactSink| -> bool {
+            boundaries += 1;
+            let mut probe = CompactProbe {
+                policy: CompactPolicy::new(sink, actions, cell_num, res, origin, goal),
+                iters: boundaries,
+            };
+            match obs.boundary(&mut probe) {
+                SolveFlow::Continue => false,
+                SolveFlow::Stop => true,
+                SolveFlow::Cancel => {
+                    obs_cancel.store(true, Ordering::Relaxed);
+                    true
+                }
+            }
+        };
+        solve_compact_core(
+            &g, mt, &src, max_iter, band_override, sink, nthreads, cancel, &mut stop,
+        )
+    };
+    if obs_cancel.load(Ordering::Relaxed) {
+        stats.cancelled = true;
+        stats.stopped = false;
+    }
+    stats
+}
+
 /// マップ + ゴールから **states を構築せず**ブロックタイル・アウトオブコアで解く（メモリ床を O(nx·ny)
 /// に下げる）。`vi.states`（O(total)）を一切確保せず、geometry/transitions だけ持つ `ValueIterator`
 /// を作り `MapSource` を源にする。出力は `sink`（ディスク mmap 推奨）に確定し、write_back はしない
@@ -1258,6 +1446,7 @@ fn solve_compact_core(
     let mut finalized = 0u64;
     let mut peak_resident_cols = 0u64;
     let mut peak_resident_blocks = 0u64;
+    let mut peak_resident_block_bytes = 0u64;
     let mut freed_blocks = 0u64;
 
     // 初期フロンティア（ゴール列を依存窓で膨張）。seed は src.for_each_seed（ゴール局所）から作る。
@@ -1356,6 +1545,7 @@ fn solve_compact_core(
         }
 
         peak_resident_blocks = peak_resident_blocks.max(store.resident_blocks() as u64);
+        peak_resident_block_bytes = peak_resident_block_bytes.max(store.resident_bytes());
         peak_resident_cols = peak_resident_cols.max(live.len() as u64);
 
         // ── 終了判定: 到達済み非 final 列（= live）が残っていない ──
@@ -1409,6 +1599,7 @@ fn solve_compact_core(
         reachable_cols,
         freed_blocks,
         peak_resident_blocks,
+        peak_resident_block_bytes,
         total_blocks,
     }
 }

@@ -26,6 +26,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::params::{MAX_COST, PROB_BASE_BIT};
+use crate::solvers::observe::{
+    MaterializeProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
+};
 use crate::value_iterator::ValueIterator;
 
 use super::frontier2d_pad::build_precomp;
@@ -184,6 +187,18 @@ pub(crate) fn write_back_fused(
     f: &Fused,
     opt: &[Option<usize>],
 ) {
+    write_back_fused_on(vi, g, f.cp.as_slice(), &f.pen, opt)
+}
+
+/// `write_back_fused` の cp 分離版。fused/sparse の境界プローブは cp を atomic ビューの
+/// まま (ワーカーがバリアで静止した相で) 具現化するため、cp/pen を外から渡す。
+pub(crate) fn write_back_fused_on<C: CpCells + ?Sized + Sync>(
+    vi: &mut ValueIterator,
+    g: &Geom,
+    cp: &C,
+    pen: &[u64],
+    opt: &[Option<usize>],
+) {
     let (nx, nt) = (g.nx, g.nt);
     let row_st = (nx * nt) as usize;
     let nthreads = n_threads();
@@ -197,10 +212,11 @@ pub(crate) fn write_back_fused(
                     let orig = base + k;
                     let pad_idx =
                         (s.it as i64 + g.pad_col(s.ix, s.iy)) as usize;
-                    s.total_cost = if f.cp[pad_idx] == UNREACHED {
+                    let v = cp.get(pad_idx);
+                    s.total_cost = if v == UNREACHED {
                         MAX_COST
                     } else {
-                        f.cp[pad_idx].wrapping_sub(f.pen[pad_idx])
+                        v.wrapping_sub(pen[pad_idx])
                     };
                     s.optimal_action = opt[orig];
                 }
@@ -218,6 +234,17 @@ pub(crate) fn final_policy_fused(
     nthreads: usize,
     skip_unreached: bool,
 ) -> Vec<Option<usize>> {
+    final_policy_fused_on(g, f.cp.as_slice(), &f.eval_ok, nthreads, skip_unreached)
+}
+
+/// `final_policy_fused` の cp 分離版 (境界プローブ用、`write_back_fused_on` と同じ理由)。
+pub(crate) fn final_policy_fused_on<C: CpCells + ?Sized + Sync>(
+    g: &Geom,
+    cp: &C,
+    eval_ok: &[bool],
+    nthreads: usize,
+    skip_unreached: bool,
+) -> Vec<Option<usize>> {
     super::final_policy_parallel(
         g.nx,
         g.ny,
@@ -227,8 +254,8 @@ pub(crate) fn final_policy_fused(
         g.row_stride,
         &g.precomp,
         nthreads,
-        |pad_idx| !f.eval_ok[pad_idx] || (skip_unreached && f.cp[pad_idx] == UNREACHED),
-        |buckets, pad_col| action_cost_fused(f.cp.as_slice(), buckets, pad_col),
+        |pad_idx| !eval_ok[pad_idx] || (skip_unreached && cp.get(pad_idx) == UNREACHED),
+        |buckets, pad_col| action_cost_fused(cp, buckets, pad_col),
     )
 }
 
@@ -237,7 +264,11 @@ pub(crate) fn final_policy_fused(
 ///
 /// 並列骨格は [`super::async_gs_engine`] が担い、ここでは cp 融合モデル固有の per-cell 評価
 /// (`before = cp − pen` 復元、`action_cost_fused`、`cp ← min_cost + pen`) だけを与える。
-pub fn frontier2d_fused_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+pub fn frontier2d_fused_solve_observed(
+    vi: &mut ValueIterator,
+    max_iter: u32,
+    obs: &mut dyn SolveObserver,
+) -> SolveOutcome {
     let g = Geom::build(vi);
     let (nx, ny, nt) = (g.nx, g.ny, g.nt);
     let (dx, dy) = (g.mx as u32, g.my as u32);
@@ -254,6 +285,7 @@ pub fn frontier2d_fused_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u6
     let g_ref = &g;
 
     let cand_list: Vec<(u32, u32)> = seed_frontier_2d(vi).dilate(dx, dy).enumerate().collect();
+    let interval = obs.interval();
 
     // per-cell 評価 (cp 融合モデル): 自セルは単一書き手なので最新値。before = cp − pen で復元。
     let eval = |ix: i32, iy: i32| -> (bool, u64) {
@@ -288,29 +320,34 @@ pub fn frontier2d_fused_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u6
         (cell_changed, ups)
     };
 
-    let (iters, total_updates, converged) =
-        async_gs_engine(nx, ny, dx, dy, nthreads, max_iter, cand_list, eval);
+    let out = {
+        // 境界はエンジンのリーダー相 (全ワーカーがバリアで静止) から呼ばれるので、
+        // cp_atomic の Relaxed 読みで一貫したスナップショットが取れる。
+        let mut boundary = |iters: u32, updates: u64| -> SolveFlow {
+            let mut mat = |vi: &mut ValueIterator| {
+                let opt = final_policy_fused_on(g_ref, cp_atomic, eval_ref, nthreads, false);
+                write_back_fused_on(vi, g_ref, cp_atomic, pen_ref, &opt);
+            };
+            let mut probe = MaterializeProbe::new(vi, &mut mat, iters, updates);
+            obs.boundary(&mut probe)
+        };
+        async_gs_engine(
+            nx, ny, dx, dy, nthreads, max_iter, cand_list, eval, interval, &mut boundary,
+        )
+    };
 
-    // 方策は cp から最終 argmin、書き戻しは行バンド並列。
-    let opt = final_policy_fused(&g, &f, nthreads, converged);
+    if out.cancelled {
+        // 中断: 場は保証しない契約なので書き戻しをスキップして即戻る。
+        return out;
+    }
+    // 方策は cp から最終 argmin、書き戻しは行バンド並列 (Stop 時も観測可能な場を残す)。
+    let opt = final_policy_fused(&g, &f, nthreads, out.converged);
     write_back_fused(vi, &g, &f, &opt);
 
-    (iters, total_updates, converged)
+    out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::frontier2d_fused_solve;
-    use crate::solvers::test_support::{assert_parity, parity_standard_maps};
-
-    #[test]
-    fn parity_standard_maps_frontier2d_fused() {
-        parity_standard_maps(|vi| frontier2d_fused_solve(vi, 2000));
-    }
-
-    /// 複数行バンドにまたがる候補で cross-thread 非同期パス + cp 復元を刺激する。
-    #[test]
-    fn parity_larger_empty_frontier2d_fused() {
-        assert_parity(32, 24, vec![0i8; 32 * 24], |vi| frontier2d_fused_solve(vi, 2000));
-    }
+/// 従来 API (observer なし)。`(iters, updates, converged)`。
+pub fn frontier2d_fused_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+    frontier2d_fused_solve_observed(vi, max_iter, &mut NullObserver).tuple()
 }

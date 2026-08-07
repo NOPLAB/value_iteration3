@@ -6,24 +6,26 @@
 //! Bellman 更新の部分集合なので値は固定点以上に留まり、refine が真の固定点へ収束する → 本家と
 //! bit-exact（u16 版の refine 上限による近似と異なり、ここでは完全収束させる）。
 
-use crate::solvers::{frontier3d::frontier3d_solve, frontier3d_driver};
+use crate::solvers::observe::{NullObserver, SolveObserver, SolveOutcome};
+use crate::solvers::{frontier3d::frontier3d_solve_observed, frontier3d_driver};
 use crate::value_iterator::{value_iteration_raw, ValueIterator};
 
 const COARSE_BUDGET: u32 = 64; // coarse pass の反復上限
 
-/// セット済み `ValueIterator` を Frontier3DCoarseTheta で収束まで解く。`(iters, updates, converged)`。
-pub fn frontier3d_coarse_theta_solve(
+/// セット済み `ValueIterator` を Frontier3DCoarseTheta で収束まで解く。
+pub fn frontier3d_coarse_theta_solve_observed(
     vi: &mut ValueIterator,
     step: u32,
     max_iter: u32,
-) -> (u32, u64, bool) {
+    obs: &mut dyn SolveObserver,
+) -> SolveOutcome {
     if step <= 1 {
-        return frontier3d_solve(vi, max_iter);
+        return frontier3d_solve_observed(vi, max_iter, obs);
     }
     let step_i = step as i32;
 
     // ── coarse pass: θ%step==0 のセルのみ更新（値を上から下げる事前伝播） ──
-    let (citers, cupd, _) = frontier3d_driver(vi, COARSE_BUDGET, |vi, ix, iy, it| {
+    let coarse = frontier3d_driver(vi, COARSE_BUDGET, obs, |vi, ix, iy, it| {
         if (it as i32) % step_i != 0 {
             return false; // 粗い θ のみ更新
         }
@@ -33,20 +35,31 @@ pub fn frontier3d_coarse_theta_solve(
         value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt);
         vi.states[idx].total_cost < before
     });
+    if coarse.stopped || coarse.cancelled {
+        return coarse;
+    }
 
     // ── refine: 全 θ を Frontier3D で収束まで（上からの収束 → 本家と bit-exact） ──
-    let (riters, rupd, conv) = frontier3d_solve(vi, max_iter.saturating_sub(citers));
-    (citers + riters, cupd + rupd, conv)
+    // observer から見た iters/updates が coarse pass から単調に続くようオフセットを重ねる。
+    let mut off = crate::solvers::observe::OffsetObserver {
+        inner: obs,
+        iters_offset: coarse.iters,
+        updates_offset: coarse.updates,
+    };
+    let refine =
+        frontier3d_solve_observed(vi, max_iter.saturating_sub(coarse.iters), &mut off);
+    SolveOutcome {
+        iters: coarse.iters + refine.iters,
+        updates: coarse.updates + refine.updates,
+        ..refine
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::frontier3d_coarse_theta_solve;
-    use crate::solvers::test_support::parity_standard_maps;
-
-    #[test]
-    fn coarse_theta_parity_standard_maps() {
-        // step>1 でも refine が完全収束するので Reference と bit-exact。
-        parity_standard_maps(|vi| frontier3d_coarse_theta_solve(vi, 4, 2000));
-    }
+/// 従来 API (observer なし)。`(iters, updates, converged)`。
+pub fn frontier3d_coarse_theta_solve(
+    vi: &mut ValueIterator,
+    step: u32,
+    max_iter: u32,
+) -> (u32, u64, bool) {
+    frontier3d_coarse_theta_solve_observed(vi, step, max_iter, &mut NullObserver).tuple()
 }

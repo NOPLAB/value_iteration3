@@ -82,6 +82,16 @@ pub trait PolicyView {
     fn action_index(&self, ix: i32, iy: i32, it: i32) -> Option<usize>;
     /// 行動 index → `(delta_fw[m], delta_rot[deg])`。
     fn action_delta(&self, ai: usize) -> (f64, f64);
+    /// `(ix,iy,it)` の値 (`total_cost`)。範囲外・未到達は `MAX_COST`。solve 途中の
+    /// 観測 (value_function 可視化・上界不変条件の検証) が同じビューで値も読めるように
+    /// するための口。
+    fn value_at(&self, ix: i32, iy: i32, it: i32) -> u64;
+    /// 地図原点の姿勢 (可視化グリッド生成用)。既定は単位クォータニオン —
+    /// 回転付き地図を扱うビューは override すること (`ValueIterator` は地図から、
+    /// `CompactPolicy` は `with_origin_quat` で与える)。
+    fn map_origin_quat(&self) -> crate::msg::Quaternion {
+        crate::msg::Quaternion::default()
+    }
 
     /// 本家 `t_resolution_ = 360/cell_num_t_`（整数除算後に f64 化）。
     fn t_resolution(&self) -> f64 {
@@ -129,6 +139,15 @@ impl PolicyView for ValueIterator {
         let a = &self.actions[ai];
         (a.delta_fw, a.delta_rot)
     }
+    fn value_at(&self, ix: i32, iy: i32, it: i32) -> u64 {
+        if !PolicyView::in_map_area(self, ix, iy) || it < 0 || it >= self.cell_num_t {
+            return MAX_COST;
+        }
+        self.states[self.to_index(ix, iy, it) as usize].total_cost
+    }
+    fn map_origin_quat(&self) -> crate::msg::Quaternion {
+        self.map_origin_quat.clone()
+    }
 }
 
 /// `solve_compact_mapped` が確定した `CompactSink` を方策ビューとして読む。
@@ -153,6 +172,9 @@ pub struct CompactPolicy<'a> {
     goal_x: f64,
     goal_y: f64,
     goal_t: i32,
+    /// 地図原点の姿勢 (可視化用)。`new` では単位クォータニオン、
+    /// 回転付き地図は [`CompactPolicy::with_origin_quat`] で与える。
+    origin_quat: crate::msg::Quaternion,
 }
 
 impl<'a> CompactPolicy<'a> {
@@ -177,7 +199,14 @@ impl<'a> CompactPolicy<'a> {
             goal_x: goal.0,
             goal_y: goal.1,
             goal_t: goal.2,
+            origin_quat: crate::msg::Quaternion::default(),
         }
+    }
+
+    /// 地図原点の姿勢を与える (可視化グリッド生成用)。
+    pub fn with_origin_quat(mut self, q: crate::msg::Quaternion) -> Self {
+        self.origin_quat = q;
+        self
     }
 
     /// orig 索引 (usize 演算。巨大マップで i32 が溢れるため)。
@@ -236,6 +265,12 @@ impl PolicyView for CompactPolicy<'_> {
     fn action_delta(&self, ai: usize) -> (f64, f64) {
         let a = &self.actions[ai];
         (a.delta_fw, a.delta_rot)
+    }
+    fn value_at(&self, ix: i32, iy: i32, it: i32) -> u64 {
+        self.read(ix, iy, it).0
+    }
+    fn map_origin_quat(&self) -> crate::msg::Quaternion {
+        self.origin_quat.clone()
     }
 }
 

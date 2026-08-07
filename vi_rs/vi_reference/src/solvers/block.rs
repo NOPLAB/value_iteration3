@@ -3,6 +3,9 @@
 //! 全 θ を `value_iteration_raw` で更新）。threshold=0 で Reference = 本家と bit-exact。
 
 use crate::params::MAX_COST;
+use crate::solvers::observe::{
+    BoundaryPacer, InPlaceProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
+};
 use crate::value_iterator::{value_iteration_raw, ValueIterator};
 
 const BLOCK: i32 = 8; // ブロック幅・高さ (refine.rs 既定)
@@ -37,9 +40,18 @@ fn update_block(
     (updates, changed)
 }
 
-/// セット済み `ValueIterator` を BlockRefine で収束まで解く。`(iters, updates, converged)` を返す。
+/// セット済み `ValueIterator` を BlockRefine で収束まで解く。
+pub fn block_refine_solve_observed(
+    vi: &mut ValueIterator,
+    max_iter: u32,
+    obs: &mut dyn SolveObserver,
+) -> SolveOutcome {
+    block_refine_sized(vi, BLOCK, LOCAL_SWEEPS, max_iter, obs)
+}
+
+/// 従来 API (observer なし)。`(iters, updates, converged)`。
 pub fn block_refine_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    block_refine_sized(vi, BLOCK, LOCAL_SWEEPS, max_iter)
+    block_refine_solve_observed(vi, max_iter, &mut NullObserver).tuple()
 }
 
 /// ブロックサイズ・inner sweep 数を指定した BlockRefine 一回分。PyramidSweep が
@@ -50,7 +62,9 @@ pub(crate) fn block_refine_sized(
     block: i32,
     local_sweeps: u32,
     max_iter: u32,
-) -> (u32, u64, bool) {
+    obs: &mut dyn SolveObserver,
+) -> SolveOutcome {
+    let mut pacer = BoundaryPacer::new(obs);
     let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
     // i32::div_ceil は unstable なので手動 (nx,ny,mx,my は非負)。
     let ceil_div = |a: i32, b: i32| (a + b - 1) / b;
@@ -140,17 +154,14 @@ pub(crate) fn block_refine_sized(
         if !any_changed {
             break true;
         }
+        if pacer.due(iters as u64) {
+            let mut probe = InPlaceProbe { vi, iters, updates };
+            match obs.boundary(&mut probe) {
+                SolveFlow::Continue => {}
+                SolveFlow::Stop => return SolveOutcome::stopped(iters, updates),
+                SolveFlow::Cancel => return SolveOutcome::cancelled(iters, updates),
+            }
+        }
     };
-    (iters, updates, converged)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::block_refine_solve;
-    use crate::solvers::test_support::parity_standard_maps;
-
-    #[test]
-    fn parity_standard_maps_block_refine() {
-        parity_standard_maps(|vi| block_refine_solve(vi, 2000));
-    }
+    SolveOutcome::running(iters, updates, converged)
 }

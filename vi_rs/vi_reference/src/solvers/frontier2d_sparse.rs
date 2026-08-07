@@ -20,7 +20,7 @@
 //! 初回ラウンドのみマスク未育成のため全 θ を評価する (上位集合なので無害)。
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Barrier;
 use std::time::{Duration, Instant};
 
@@ -28,7 +28,11 @@ use crate::params::{MAX_COST, PROB_BASE};
 use crate::value_iterator::ValueIterator;
 
 use super::frontier2d_fused::{
-    action_cost_fused, final_policy_fused, write_back_fused, Fused, Geom, UNREACHED,
+    action_cost_fused, final_policy_fused, final_policy_fused_on, write_back_fused,
+    write_back_fused_on, Fused, Geom, UNREACHED,
+};
+use crate::solvers::observe::{
+    MaterializeProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
 };
 use super::frontier2d_par::n_threads;
 use super::{displacement, seed_frontier_2d, Bitboard2D};
@@ -141,8 +145,16 @@ unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
 /// セット済み `ValueIterator` を θ疎評価 + penalty 融合 + 非同期 G-S 並列で解く。
-/// `(iters, updates, converged)`。到達可能セルの収束値・方策は本家と bit-exact。
-pub fn frontier2d_sparse_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+/// 到達可能セルの収束値・方策は本家と bit-exact。
+///
+/// リーダー (w=0) は**呼び出しスレッドでインライン実行**し、ラウンド境界ごとに
+/// `obs.boundary` を呼ぶ (Snapshotter がやっていたリーダー相での介入の一般化)。
+/// 境界の具現化は全ワーカーがバリアで静止した相なので cp の Relaxed 読みで一貫する。
+pub fn frontier2d_sparse_solve_observed(
+    vi: &mut ValueIterator,
+    max_iter: u32,
+    obs: &mut dyn SolveObserver,
+) -> SolveOutcome {
     let g = Geom::build(vi);
     let (nx, ny, nt) = (g.nx, g.ny, g.nt);
     assert!(nt <= 64, "θマスクは u64 前提 (nt={nt})");
@@ -158,8 +170,8 @@ pub fn frontier2d_sparse_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u
     // 直接ダンプ)。巨大マップ (例 tsukuba 0.15m = 4417×2367×60 ≈ 627M states ≈ 35 GB) では
     // states を抱えたままだと cp/pen と合わせ RAM を超えるため、初期フロンティアの
     // 種付け (seed_frontier_2d) 直後に解放する (フラグだけここで読む)。
-    // 解放すると末尾の write_back / policy は不能になるので、両方スキップする
-    // (動画は snapshot 出力で完結し、収束値は cp/pen 側に保持される)。
+    // 解放すると末尾の write_back / policy も境界プローブの具現化も不能になるので、
+    // どちらもスキップする (動画は snapshot 出力で完結し、収束値は cp/pen 側に保持される)。
     let drop_states = std::env::var("VI_SNAP_DROP_STATES")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -199,216 +211,266 @@ pub fn frontier2d_sparse_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u
 
     let barrier = Barrier::new(nthreads);
     let done = AtomicBool::new(false);
-    let iters_out = AtomicU32::new(0);
-    let converged_out = AtomicBool::new(false);
     let cursor = AtomicUsize::new(0);
+    // 境界プローブが読む「これまでの更新総数」。各スレッドが自ラウンド分を B1 前に足す。
+    let updates_total = AtomicU64::new(0);
     let g_ref = &g;
     let mask_ref: &[AtomicU64] = &mask_arr;
+    let interval = obs.interval().max(1) as u64;
+
+    // compute 相 1 ラウンド分 (θマスク gather + 疎評価)。changed[w] に (x, y, θマスク) を積み、
+    // 自ラウンド更新数を返す。全キャプチャは共有参照なので全スレッドで共有できる。
+    // SAFETY: バリアで相分離された compute 相からのみ呼ぶこと。
+    let compute_phase = |w: usize, first: bool| -> u64 {
+        // `Shared` 全体を再束縛してクロージャに「構造体まるごと」をキャプチャさせる
+        // (Rust 2021 のフィールド分割キャプチャだと生ポインタ単体が捕まり Sync にならない)。
+        #[allow(clippy::redundant_locals)]
+        let shared = shared;
+        // SAFETY (cand): リーダーの差し替えは B1〜B2 間のみ、ここは B2 後の compute 相。
+        let cand = unsafe { &*shared.cand };
+        let n = cand.len();
+        // SAFETY: ワーカー w は changed[w] だけを触る（他スレッドと排他）。
+        let my_changed = unsafe { &mut *shared.changed.add(w) };
+        my_changed.clear();
+        let mut my_updates = 0u64;
+
+        const BLOCK: usize = 16;
+        loop {
+            let s = cursor.fetch_add(BLOCK, Ordering::Relaxed);
+            if s >= n {
+                break;
+            }
+            let e = (s + BLOCK).min(n);
+            for j in s..e {
+                let (ixu, iyu) = cand[j];
+                let (ix, iy) = (ixu as i32, iyu as i32);
+
+                // 次セルのアクション先カラムを先読み (ヒントのみ、意味論不変)。
+                #[cfg(target_arch = "x86_64")]
+                if j + 1 < e {
+                    let (nix, niy) = cand[j + 1];
+                    let ncol = g_ref.pad_col(nix as i32, niy as i32);
+                    let base = cp_atomic.as_ptr();
+                    for per_theta in g_ref.precomp.iter() {
+                        for itq in [0usize, 16, 32, 48] {
+                            if let Some(&(off, _)) =
+                                per_theta[itq.min(nt as usize - 1)].first()
+                            {
+                                // SAFETY: prefetch はメモリを読まないヒント命令。
+                                unsafe {
+                                    std::arch::x86_64::_mm_prefetch::<
+                                        { std::arch::x86_64::_MM_HINT_T1 },
+                                    >(
+                                        base.add((ncol + off) as usize) as *const i8,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── θ マスク gather: 窓内の前ラウンド変化マスクを OR ──
+                let eval_mask = if first {
+                    full_mask // 初回はマスク未育成 → 全 θ (保守的)
+                } else {
+                    let mut acc = 0u64;
+                    for dy2 in -my..=my {
+                        let row = midx(ix - mx, iy + dy2);
+                        for k in 0..(2 * mx + 1) as usize {
+                            acc |= mask_ref[row + k].load(Ordering::Relaxed);
+                        }
+                    }
+                    if acc == 0 {
+                        continue; // 依存入力に変化なし
+                    }
+                    rot_dilate(acc, mt, nt)
+                };
+
+                let pad_col = g_ref.pad_col(ix, iy);
+                let mut cmask: u64 = 0;
+                let mut bits = eval_mask;
+                while bits != 0 {
+                    let it = bits.trailing_zeros() as i32;
+                    bits &= bits - 1;
+                    let pad_idx = (pad_col + it as i64) as usize;
+                    if !eval_ref[pad_idx] {
+                        continue;
+                    }
+                    let cp_self = cp_atomic[pad_idx].load(Ordering::Relaxed);
+                    let pen_self = pen_ref[pad_idx];
+                    let before = if cp_self == UNREACHED {
+                        MAX_COST
+                    } else {
+                        cp_self.wrapping_sub(pen_self)
+                    };
+                    let mut min_cost = MAX_COST;
+                    for per_theta in g_ref.precomp.iter() {
+                        let c = action_cost_fused(
+                            cp_atomic,
+                            &per_theta[it as usize],
+                            pad_col,
+                        );
+                        if c < min_cost {
+                            min_cost = c;
+                        }
+                    }
+                    if min_cost < before {
+                        // claim したブロック内のセル = 単一書き手。
+                        cp_atomic[pad_idx].store(
+                            min_cost.wrapping_add(pen_self),
+                            Ordering::Relaxed,
+                        );
+                        my_updates += 1;
+                        cmask |= 1u64 << it;
+                    }
+                }
+                if cmask != 0 {
+                    my_changed.push((ixu, iyu, cmask));
+                }
+            }
+        }
+        my_updates
+    };
+    let compute_phase = &compute_phase;
 
     // スナップショット計時はここから (Geom/Fused::build_direct・seed_frontier_2d を除外した
     // 純スイープ時間)。巨大マップでは build_direct が支配的になり得るが、本家 ROS1 の
     // snapshotWorker もセットアップを除外して計測する (README「vi_rs と同条件」) ので合わせる。
     let t_solve0 = Instant::now();
-    let total_updates: u64 = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..nthreads)
-            .map(|w| {
-                let barrier = &barrier;
-                let done = &done;
-                let iters_out = &iters_out;
-                let converged_out = &converged_out;
-                let cursor = &cursor;
-                scope.spawn(move || -> u64 {
-                    #[allow(clippy::redundant_locals)]
-                    let shared = shared;
-                    let mut my_updates: u64 = 0;
-                    let mut iter_count: u32 = 0;
-                    // リーダー専用: 前ラウンドに mask_arr へ書いたセル (ゼロ化用)。
-                    let mut prev_cells: Vec<(u32, u32)> = Vec::new();
-                    // リーダー専用: 可視化スナップショット (env 未設定なら None)。
-                    let mut snap = if w == 0 { Snapshotter::from_env(t_solve0) } else { None };
-                    loop {
-                        // ── compute (並列・in-place 非同期書き込み) ──
-                        let cand = unsafe { &*shared.cand };
-                        let n = cand.len();
-                        // SAFETY: ワーカー w は changed[w] だけを触る（他スレッドと排他）。
-                        let my_changed = unsafe { &mut *shared.changed.add(w) };
-                        my_changed.clear();
-                        let first = iter_count == 0;
-
-                        const BLOCK: usize = 16;
-                        loop {
-                            let s = cursor.fetch_add(BLOCK, Ordering::Relaxed);
-                            if s >= n {
-                                break;
-                            }
-                            let e = (s + BLOCK).min(n);
-                            for j in s..e {
-                                let (ixu, iyu) = cand[j];
-                                let (ix, iy) = (ixu as i32, iyu as i32);
-
-                                // 次セルのアクション先カラムを先読み (ヒントのみ、意味論不変)。
-                                #[cfg(target_arch = "x86_64")]
-                                if j + 1 < e {
-                                    let (nix, niy) = cand[j + 1];
-                                    let ncol = g_ref.pad_col(nix as i32, niy as i32);
-                                    let base = cp_atomic.as_ptr();
-                                    for per_theta in g_ref.precomp.iter() {
-                                        for itq in [0usize, 16, 32, 48] {
-                                            if let Some(&(off, _)) =
-                                                per_theta[itq.min(nt as usize - 1)].first()
-                                            {
-                                                // SAFETY: prefetch はメモリを読まないヒント命令。
-                                                unsafe {
-                                                    std::arch::x86_64::_mm_prefetch::<
-                                                        { std::arch::x86_64::_MM_HINT_T1 },
-                                                    >(
-                                                        base.add((ncol + off) as usize)
-                                                            as *const i8,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // ── θ マスク gather: 窓内の前ラウンド変化マスクを OR ──
-                                let eval_mask = if first {
-                                    full_mask // 初回はマスク未育成 → 全 θ (保守的)
-                                } else {
-                                    let mut acc = 0u64;
-                                    for dy2 in -my..=my {
-                                        let row = midx(ix - mx, iy + dy2);
-                                        for k in 0..(2 * mx + 1) as usize {
-                                            acc |= mask_ref[row + k].load(Ordering::Relaxed);
-                                        }
-                                    }
-                                    if acc == 0 {
-                                        continue; // 依存入力に変化なし
-                                    }
-                                    rot_dilate(acc, mt, nt)
-                                };
-
-                                let pad_col = g_ref.pad_col(ix, iy);
-                                let mut cmask: u64 = 0;
-                                let mut bits = eval_mask;
-                                while bits != 0 {
-                                    let it = bits.trailing_zeros() as i32;
-                                    bits &= bits - 1;
-                                    let pad_idx = (pad_col + it as i64) as usize;
-                                    if !eval_ref[pad_idx] {
-                                        continue;
-                                    }
-                                    let cp_self = cp_atomic[pad_idx].load(Ordering::Relaxed);
-                                    let pen_self = pen_ref[pad_idx];
-                                    let before = if cp_self == UNREACHED {
-                                        MAX_COST
-                                    } else {
-                                        cp_self.wrapping_sub(pen_self)
-                                    };
-                                    let mut min_cost = MAX_COST;
-                                    for per_theta in g_ref.precomp.iter() {
-                                        let c = action_cost_fused(
-                                            cp_atomic,
-                                            &per_theta[it as usize],
-                                            pad_col,
-                                        );
-                                        if c < min_cost {
-                                            min_cost = c;
-                                        }
-                                    }
-                                    if min_cost < before {
-                                        // claim したブロック内のセル = 単一書き手。
-                                        cp_atomic[pad_idx].store(
-                                            min_cost.wrapping_add(pen_self),
-                                            Ordering::Relaxed,
-                                        );
-                                        my_updates += 1;
-                                        cmask |= 1u64 << it;
-                                    }
-                                }
-                                if cmask != 0 {
-                                    my_changed.push((ixu, iyu, cmask));
-                                }
-                            }
-                        }
-
-                        barrier.wait(); // B1: 全 cp/changed 書き込みが可視。
-
-                        // ── リーダー直列: マスク配列更新 + 次フロンティア / 終了判定 ──
-                        if w == 0 {
-                            iter_count += 1;
-                            // 前ラウンド分のマスクをゼロ化 (今ラウンドの compute はもう読み終えた)。
-                            for &(x, y) in &prev_cells {
-                                mask_ref[midx(x as i32, y as i32)].store(0, Ordering::Relaxed);
-                            }
-                            prev_cells.clear();
-
-                            let mut any = false;
-                            let mut nf = Bitboard2D::new(nx as u32, ny as u32);
-                            for i in 0..nthreads {
-                                // SAFETY: B1 後、各 changed[i] への書きは完了し可視。
-                                let cl = unsafe { &*shared.changed.add(i) };
-                                if !cl.is_empty() {
-                                    any = true;
-                                }
-                                for &(x, y, cm) in cl {
-                                    // セルの書き手は 1 スレッド = リストにも一意に現れる → store で足りる。
-                                    mask_ref[midx(x as i32, y as i32)].store(cm, Ordering::Relaxed);
-                                    nf.set(x, y);
-                                    prev_cells.push((x, y));
-                                }
-                            }
-                            if any && iter_count < max_iter {
-                                let mut next: Vec<(u32, u32)> =
-                                    nf.dilate(dx, dy).enumerate().collect();
-                                // 対称 G-S 風: 走査方向をラウンドごとに反転。
-                                if iter_count % 2 == 1 {
-                                    next.reverse();
-                                }
-                                // SAFETY: 他ワーカーは B1〜B2 間 cand を読まない。
-                                unsafe {
-                                    *shared.cand = next;
-                                }
-                                cursor.store(0, Ordering::Relaxed);
-                            } else {
-                                iters_out.store(iter_count, Ordering::Relaxed);
-                                converged_out.store(!any, Ordering::Relaxed);
-                                done.store(true, Ordering::Relaxed);
-                            }
-                            if let Some(s) = snap.as_mut() {
-                                let now_done = done.load(Ordering::Relaxed);
-                                if now_done || iter_count % s.every == 0 {
-                                    s.dump(g_ref, cp_atomic, pen_ref, iter_count);
-                                }
-                            }
-                        } else {
-                            iter_count += 1;
-                        }
-
-                        barrier.wait(); // B2: リーダーの cand/mask 差し替え / done が可視。
-                        if done.load(Ordering::Relaxed) {
-                            break;
-                        }
+    let out: SolveOutcome = std::thread::scope(|scope| {
+        // ワーカー (w=1..nthreads)。compute とバリアだけを回す。
+        for w in 1..nthreads {
+            let barrier = &barrier;
+            let done = &done;
+            let updates_total = &updates_total;
+            scope.spawn(move || {
+                let mut round = 0u32;
+                loop {
+                    let ups = compute_phase(w, round == 0);
+                    if ups > 0 {
+                        updates_total.fetch_add(ups, Ordering::Relaxed);
                     }
-                    my_updates
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).sum()
+                    round += 1;
+                    barrier.wait(); // B1: 全 cp/changed 書き込みが可視。
+                    barrier.wait(); // B2: リーダーの cand/mask 差し替え / done が可視。
+                    if done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // リーダー (w=0)。呼び出しスレッドでインライン実行。
+        let mut iter_count: u32 = 0;
+        let mut next_boundary: u64 = interval;
+        // 前ラウンドに mask_arr へ書いたセル (ゼロ化用)。
+        let mut prev_cells: Vec<(u32, u32)> = Vec::new();
+        // 可視化スナップショット (env 未設定なら None)。
+        let mut snap = Snapshotter::from_env(t_solve0);
+        let mut outcome: Option<SolveOutcome> = None;
+        loop {
+            let ups = compute_phase(0, iter_count == 0);
+            if ups > 0 {
+                updates_total.fetch_add(ups, Ordering::Relaxed);
+            }
+            barrier.wait(); // B1: 全 cp/changed 書き込みが可視。
+
+            // ── リーダー直列: マスク配列更新 + 次フロンティア / 境界 / 終了判定 ──
+            iter_count += 1;
+            // 前ラウンド分のマスクをゼロ化 (今ラウンドの compute はもう読み終えた)。
+            for &(x, y) in &prev_cells {
+                mask_ref[midx(x as i32, y as i32)].store(0, Ordering::Relaxed);
+            }
+            prev_cells.clear();
+
+            let mut any = false;
+            let mut nf = Bitboard2D::new(nx as u32, ny as u32);
+            for i in 0..nthreads {
+                // SAFETY: B1 後、各 changed[i] への書きは完了し可視。
+                let cl = unsafe { &*shared.changed.add(i) };
+                if !cl.is_empty() {
+                    any = true;
+                }
+                for &(x, y, cm) in cl {
+                    // セルの書き手は 1 スレッド = リストにも一意に現れる → store で足りる。
+                    mask_ref[midx(x as i32, y as i32)].store(cm, Ordering::Relaxed);
+                    nf.set(x, y);
+                    prev_cells.push((x, y));
+                }
+            }
+            let updates_now = updates_total.load(Ordering::Relaxed);
+            let mut flow = SolveFlow::Continue;
+            // 全ワーカーは B2 で待機中 (cp への書き込みは静止) — 具現化はここで安全。
+            // drop_states 時は書き戻す先が無いので境界は呼ばない。
+            if any
+                && iter_count < max_iter
+                && !drop_states
+                && iter_count as u64 >= next_boundary
+            {
+                next_boundary = (iter_count as u64).saturating_add(interval);
+                let mut mat = |vi: &mut ValueIterator| {
+                    let opt =
+                        final_policy_fused_on(g_ref, cp_atomic, eval_ref, nthreads, false);
+                    write_back_fused_on(vi, g_ref, cp_atomic, pen_ref, &opt);
+                };
+                let mut probe =
+                    MaterializeProbe::new(vi, &mut mat, iter_count, updates_now);
+                flow = obs.boundary(&mut probe);
+            }
+            if any && iter_count < max_iter && flow == SolveFlow::Continue {
+                let mut next: Vec<(u32, u32)> = nf.dilate(dx, dy).enumerate().collect();
+                // 対称 G-S 風: 走査方向をラウンドごとに反転。
+                if iter_count % 2 == 1 {
+                    next.reverse();
+                }
+                // SAFETY: 他ワーカーは B1〜B2 間 cand を読まない。
+                unsafe {
+                    *shared.cand = next;
+                }
+                cursor.store(0, Ordering::Relaxed);
+            } else {
+                outcome = Some(match flow {
+                    SolveFlow::Stop => SolveOutcome::stopped(iter_count, updates_now),
+                    SolveFlow::Cancel => SolveOutcome::cancelled(iter_count, updates_now),
+                    SolveFlow::Continue => {
+                        SolveOutcome::running(iter_count, updates_now, !any)
+                    }
+                });
+                done.store(true, Ordering::Relaxed);
+            }
+            if let Some(s) = snap.as_mut() {
+                let now_done = done.load(Ordering::Relaxed);
+                if now_done || iter_count % s.every == 0 {
+                    s.dump(g_ref, cp_atomic, pen_ref, iter_count);
+                }
+            }
+
+            barrier.wait(); // B2: リーダーの cand/mask 差し替え / done が可視。
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        outcome.expect("engine loop sets outcome before exiting")
     });
 
-    let iters = iters_out.load(Ordering::Relaxed);
-    let converged = converged_out.load(Ordering::Relaxed);
-
+    if out.cancelled {
+        // 中断: 場は保証しない契約なので書き戻しをスキップして即戻る。
+        return out;
+    }
     // 方策は cp から最終 argmin (fused と共有)、書き戻しは行バンド並列。
     // 低メモリモードでは states を解放済みなので、書き戻し / policy 算出をスキップする
     // (どちらも states 規模の確保を伴うため、メモリ削減の意味も兼ねる)。
     if !drop_states {
-        let opt = final_policy_fused(&g, &f, nthreads, converged);
+        let opt = final_policy_fused(&g, &f, nthreads, out.converged);
         write_back_fused(vi, &g, &f, &opt);
     }
 
-    (iters, total_updates, converged)
+    out
+}
+
+/// 従来 API (observer なし)。`(iters, updates, converged)`。
+pub fn frontier2d_sparse_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+    frontier2d_sparse_solve_observed(vi, max_iter, &mut NullObserver).tuple()
 }
 
 #[cfg(test)]

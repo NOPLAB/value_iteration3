@@ -11,9 +11,12 @@
 //! 本家の最終 sweep と一致)。
 
 use crate::params::MAX_COST;
+use crate::solvers::observe::{
+    BoundaryPacer, MaterializeProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
+};
 use crate::value_iterator::ValueIterator;
 
-use super::frontier2d_pad::{action_cost_pad, Padded};
+use super::frontier2d_pad::{action_cost_pad, HotCells, Padded};
 use super::{seed_frontier_2d, Bitboard2D};
 
 pub(crate) fn n_threads() -> usize {
@@ -80,16 +83,22 @@ fn compute_round(
     })
 }
 
-/// セット済み `ValueIterator` を決定的並列 Jacobi frontier2d で解く。`(iters, updates, converged)`。
-pub fn frontier2d_par_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+/// セット済み `ValueIterator` を決定的並列 Jacobi frontier2d で解く。
+pub fn frontier2d_par_solve_observed(
+    vi: &mut ValueIterator,
+    max_iter: u32,
+    obs: &mut dyn SolveObserver,
+) -> SolveOutcome {
     let mut m = Padded::build(vi);
     let (nx, ny) = (m.nx, m.ny);
     let nthreads = n_threads();
 
     let (dx, dy) = (m.mx as u32, m.my as u32);
+    let mut pacer = BoundaryPacer::new(obs);
     let mut frontier = seed_frontier_2d(vi);
     let mut updates: u64 = 0;
     let mut iters: u32 = 0;
+    let mut flow = SolveFlow::Continue;
 
     while frontier.popcount() > 0 && iters < max_iter {
         iters += 1;
@@ -106,13 +115,40 @@ pub fn frontier2d_par_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64,
             }
         }
         frontier = new_frontier;
-    }
-    let converged = frontier.popcount() == 0;
 
-    // ── 最終 argmin パス (並列): 収束値から optimal_action を確定。──
+        if frontier.popcount() > 0 && pacer.due(iters as u64) {
+            // ラウンド間なので m は静止している。具現化 (write_back + argmin) は
+            // 観測されたときだけ走る。
+            let mut mat = |vi: &mut ValueIterator| {
+                let opt = final_policy(&m, nthreads);
+                m.write_back(vi, Some(&opt));
+            };
+            let mut probe = MaterializeProbe::new(vi, &mut mat, iters, updates);
+            flow = obs.boundary(&mut probe);
+            match flow {
+                SolveFlow::Continue => {}
+                SolveFlow::Stop | SolveFlow::Cancel => break,
+            }
+        }
+    }
+    let converged = flow == SolveFlow::Continue && frontier.popcount() == 0;
+
+    if flow == SolveFlow::Cancel {
+        // 中断: 場は保証しない契約なので書き戻しをスキップして即戻る。
+        return SolveOutcome::cancelled(iters, updates);
+    }
+    // ── 最終 argmin パス (並列): 現在値から optimal_action を確定。──
     let opt = final_policy(&m, nthreads);
     m.write_back(vi, Some(&opt));
-    (iters, updates, converged)
+    if flow == SolveFlow::Stop {
+        return SolveOutcome::stopped(iters, updates);
+    }
+    SolveOutcome::running(iters, updates, converged)
+}
+
+/// 従来 API (observer なし)。`(iters, updates, converged)`。
+pub fn frontier2d_par_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+    frontier2d_par_solve_observed(vi, max_iter, &mut NullObserver).tuple()
 }
 
 /// 収束した `hot` から全 free・非 final セルの optimal_action を計算 (並列・読み取り専用)。
@@ -121,6 +157,16 @@ pub fn frontier2d_par_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64,
 /// 並列骨格は [`super::final_policy_parallel`] が担い、ここでは Padded 固有の
 /// 評価ガードとコスト関数 (`action_cost_pad`) だけを与える。
 pub(crate) fn final_policy(m: &Padded, nthreads: usize) -> Vec<Option<usize>> {
+    final_policy_hot(m, m.hot.as_slice(), nthreads)
+}
+
+/// `final_policy` の hot 分離版。`frontier2d_par_unsafe` が hot を atomic ビューとして
+/// 取り出したまま境界プローブを具現化するときに使う。
+pub(crate) fn final_policy_hot<H: HotCells + ?Sized + Sync>(
+    m: &Padded,
+    hot: &H,
+    nthreads: usize,
+) -> Vec<Option<usize>> {
     super::final_policy_parallel(
         m.nx,
         m.ny,
@@ -131,17 +177,6 @@ pub(crate) fn final_policy(m: &Padded, nthreads: usize) -> Vec<Option<usize>> {
         &m.precomp,
         nthreads,
         |pad_idx| !m.free[pad_idx] || m.finals[pad_idx],
-        |buckets, pad_col| action_cost_pad(m.hot.as_slice(), &m.free, buckets, pad_col),
+        |buckets, pad_col| action_cost_pad(hot, &m.free, buckets, pad_col),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::frontier2d_par_solve;
-    use crate::solvers::test_support::parity_standard_maps;
-
-    #[test]
-    fn parity_standard_maps_frontier2d_par() {
-        parity_standard_maps(|vi| frontier2d_par_solve(vi, 2000));
-    }
 }

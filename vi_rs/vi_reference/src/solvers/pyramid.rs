@@ -9,6 +9,7 @@
 //! 事前伝播による加速のみを担う（coarse-to-fine の精神は保持）。
 
 use crate::solvers::block::block_refine_sized;
+use crate::solvers::observe::{NullObserver, SolveObserver, SolveOutcome};
 use crate::value_iterator::ValueIterator;
 
 const FINEST: i32 = 8; // 最終レベルのブロックサイズ (= BlockRefine 既定)
@@ -16,7 +17,11 @@ const COARSE_BUDGET: u32 = 4; // 粗レベルの事前伝播の反復上限
 const LOCAL_SWEEPS: u32 = 2;
 
 /// セット済み `ValueIterator` を PyramidSweep（bit-exact 安全版）で収束まで解く。
-pub fn pyramid_sweep_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+pub fn pyramid_sweep_solve_observed(
+    vi: &mut ValueIterator,
+    max_iter: u32,
+    obs: &mut dyn SolveObserver,
+) -> SolveOutcome {
     let max_dim = vi.cell_num_x.max(vi.cell_num_y);
 
     // 粗→細のブロックサイズ列。FINEST より大きく map に意味のある粗サイズを降順に並べ、
@@ -38,24 +43,29 @@ pub fn pyramid_sweep_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, 
         } else {
             COARSE_BUDGET
         };
-        let (it, up, conv) = block_refine_sized(vi, block, LOCAL_SWEEPS, budget);
-        total_iters = total_iters.saturating_add(it);
-        total_updates += up;
-        converged = conv; // 最終レベルの収束が全体の収束
+        // observer から見た iters/updates がレベルをまたいで単調に続くようオフセットを重ねる。
+        let mut off = crate::solvers::observe::OffsetObserver {
+            inner: obs,
+            iters_offset: total_iters,
+            updates_offset: total_updates,
+        };
+        let out = block_refine_sized(vi, block, LOCAL_SWEEPS, budget, &mut off);
+        total_iters = total_iters.saturating_add(out.iters);
+        total_updates += out.updates;
+        if out.stopped || out.cancelled {
+            // 粗→細スケジュールの途中で打ち切り/中断。値は常に MAX_COST から単調降下
+            // しているので、打ち切った場も上界のまま。
+            return SolveOutcome { iters: total_iters, updates: total_updates, ..out };
+        }
+        converged = out.converged; // 最終レベルの収束が全体の収束
         if total_iters >= max_iter {
             break;
         }
     }
-    (total_iters, total_updates, converged)
+    SolveOutcome::running(total_iters, total_updates, converged)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::pyramid_sweep_solve;
-    use crate::solvers::test_support::parity_standard_maps;
-
-    #[test]
-    fn parity_standard_maps_pyramid_sweep() {
-        parity_standard_maps(|vi| pyramid_sweep_solve(vi, 2000));
-    }
+/// 従来 API (observer なし)。`(iters, updates, converged)`。
+pub fn pyramid_sweep_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+    pyramid_sweep_solve_observed(vi, max_iter, &mut NullObserver).tuple()
 }

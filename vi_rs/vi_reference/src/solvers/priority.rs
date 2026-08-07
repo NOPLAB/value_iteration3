@@ -7,6 +7,9 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use crate::params::MAX_COST;
+use crate::solvers::observe::{
+    InPlaceProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
+};
 use crate::value_iterator::{to_index_raw, value_iteration_raw, ValueIterator};
 
 /// 逆θ写像。`rev[it']` = 確定セル `(.., it')` の前駆を列挙する `(dix, diy, t_src)` 列。
@@ -63,6 +66,37 @@ pub struct PrioStats {
 /// `false`→label-correcting（厳密・bit-exact）。`total_cost` を tentative ラベルに流用し、
 /// 二分ヒープで値の昇順に確定 → 前駆を逆θ隣接で relax。
 pub fn priority_solve(vi: &mut ValueIterator, max_iter: u32, label_setting: bool) -> PrioStats {
+    priority_solve_inner(vi, max_iter, label_setting, &mut NullObserver).0
+}
+
+/// observer 付き入口 (`U64Solver::PriorityLabelSetting/Correcting` はこちら)。
+///
+/// ヒープ系に「ラウンド」は無いので、境界は **`clamp(n/16, 64, 65536) × interval` pop ごと**
+/// に呼ぶ (文書化された粒度)。従来の `solve(vi, solver, chunk)` チャンク方式ではヒープを
+/// 失うため priority 系は事実上中断不能だった — この境界でヒープを保持したまま
+/// cancel / stop できる。Stop 時の場は「確定セル + tentative 上界」でどちらも v* 以上
+/// (妥当な relax の結果) なので観測可能。
+pub fn priority_solve_observed(
+    vi: &mut ValueIterator,
+    max_iter: u32,
+    label_setting: bool,
+    obs: &mut dyn SolveObserver,
+) -> SolveOutcome {
+    let (st, flow) = priority_solve_inner(vi, max_iter, label_setting, obs);
+    let iters = st.iters.min(u32::MAX as u64) as u32;
+    match flow {
+        SolveFlow::Stop => SolveOutcome::stopped(iters, st.updates),
+        SolveFlow::Cancel => SolveOutcome::cancelled(iters, st.updates),
+        SolveFlow::Continue => SolveOutcome::running(iters, st.updates, st.converged),
+    }
+}
+
+fn priority_solve_inner(
+    vi: &mut ValueIterator,
+    max_iter: u32,
+    label_setting: bool,
+    obs: &mut dyn SolveObserver,
+) -> (PrioStats, SolveFlow) {
     let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
     let rev = build_rev_theta(vi);
     let n = vi.states.len();
@@ -78,6 +112,12 @@ pub fn priority_solve(vi: &mut ValueIterator, max_iter: u32, label_setting: bool
     }
 
     let pop_cap = (n as u64).saturating_mul(max_iter.max(1) as u64); // 暴走ガード: LC は最大 n*max_iter pops で打ち切り（LS は 1 パス ≤ n pops）
+    // 境界間隔 (pop 数)。地図規模に適応しつつ上限で頭打ち (巨大マップでも
+    // 有界遅延で cancel を観測できる)。
+    let stride = ((n as u64) / 16)
+        .clamp(64, 65536)
+        .saturating_mul(obs.interval().max(1) as u64);
+    let mut next_boundary = stride;
     let mut pops = 0u64;
     let mut iters = 0u64;
     let mut updates = 0u64;
@@ -86,7 +126,19 @@ pub fn priority_solve(vi: &mut ValueIterator, max_iter: u32, label_setting: bool
     while let Some(Reverse((lab, s_star))) = heap.pop() {
         pops += 1;
         if pops > pop_cap {
-            return PrioStats { iters, updates, converged: false, repops };
+            return (PrioStats { iters, updates, converged: false, repops }, SolveFlow::Continue);
+        }
+        if pops >= next_boundary {
+            next_boundary = pops.saturating_add(stride);
+            let mut probe = InPlaceProbe {
+                vi,
+                iters: iters.min(u32::MAX as u64) as u32,
+                updates,
+            };
+            let flow = obs.boundary(&mut probe);
+            if flow != SolveFlow::Continue {
+                return (PrioStats { iters, updates, converged: false, repops }, flow);
+            }
         }
         // 遅延 decrease-key の stale 破棄。
         if lab != vi.states[s_star].total_cost {
@@ -125,7 +177,7 @@ pub fn priority_solve(vi: &mut ValueIterator, max_iter: u32, label_setting: bool
         }
     }
 
-    PrioStats { iters, updates, converged: true, repops }
+    (PrioStats { iters, updates, converged: true, repops }, SolveFlow::Continue)
 }
 
 /// (A1) Priority Label-Setting（近似・最速）。`solve()` 用の軽量タプル。

@@ -10,10 +10,13 @@
 //! (`tc +ʷ (pen +ʷ lp) == (tc +ʷ pen) +ʷ lp`)。収束値・方策は Reference = 本家と bit-exact。
 
 use crate::params::{MAX_COST, PROB_BASE_BIT};
+use crate::solvers::observe::{
+    MaterializeProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
+};
 use crate::state_transition::StateTransition;
 use crate::value_iterator::ValueIterator;
 
-use super::{displacement, frontier2d_driver, seed_frontier_2d};
+use super::{displacement, frontier2d_driver, seed_frontier_2d, Frontier2DSweep};
 
 /// 本家 `actionCost` の SoA 版。`trans` はソースセルの θ の遷移リスト。
 #[inline]
@@ -48,9 +51,80 @@ fn action_cost_soa(
     cost >> PROB_BASE_BIT
 }
 
-/// セット済み `ValueIterator` を Frontier2D-SoA で収束まで解く。`(iters, updates, converged)`。
-pub fn frontier2d_soa_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
+/// SoA モデル: hot/free/finals/opt を所有し、境界では要求時にだけ states へ書き戻す。
+struct SoaSweep<'a> {
+    vi: &'a mut ValueIterator,
+    hot: Vec<[u64; 2]>,
+    free: Vec<bool>,
+    finals: Vec<bool>,
+    opt: Vec<Option<usize>>,
+}
+
+impl SoaSweep<'_> {
+    /// hot/opt を `vi.states` へ書き戻す (値と方策)。境界プローブの具現化と最終書き戻しで共用。
+    fn write_back(vi: &mut ValueIterator, hot: &[[u64; 2]], opt: &[Option<usize>]) {
+        for (i, s) in vi.states.iter_mut().enumerate() {
+            s.total_cost = hot[i][0];
+            s.optimal_action = opt[i];
+        }
+    }
+}
+
+impl Frontier2DSweep for SoaSweep<'_> {
+    fn cell(&mut self, ixu: u32, iyu: u32) -> u64 {
+        let (nx, ny, nt) =
+            (self.vi.cell_num_x, self.vi.cell_num_y, self.vi.cell_num_t);
+        let (ix, iy) = (ixu as i32, iyu as i32);
+        let mut upd = 0u64;
+        for it in 0..nt {
+            let idx = (it + ix * nt + iy * (nt * nx)) as usize;
+            // 本家 valueIteration: 非 free / final_state は更新しない。
+            if !self.free[idx] || self.finals[idx] {
+                continue;
+            }
+            let before = self.hot[idx][0];
+            let mut min_cost = MAX_COST;
+            let mut min_action: Option<usize> = None;
+            for (ai, a) in self.vi.actions.iter().enumerate() {
+                let c = action_cost_soa(
+                    &self.hot,
+                    &self.free,
+                    &a.state_transitions[it as usize],
+                    ix,
+                    iy,
+                    nx,
+                    ny,
+                    nt,
+                );
+                if c < min_cost {
+                    min_cost = c;
+                    min_action = Some(ai);
+                }
+            }
+            self.hot[idx][0] = min_cost;
+            self.opt[idx] = min_action;
+            if min_cost < before {
+                upd += 1;
+            }
+        }
+        upd
+    }
+
+    fn boundary(&mut self, obs: &mut dyn SolveObserver, iters: u32, updates: u64) -> SolveFlow {
+        let (hot, opt, vi) = (&self.hot, &self.opt, &mut *self.vi);
+        let mut mat = |vi: &mut ValueIterator| Self::write_back(vi, hot, opt);
+        let mut probe = MaterializeProbe::new(vi, &mut mat, iters, updates);
+        obs.boundary(&mut probe)
+    }
+}
+
+/// セット済み `ValueIterator` を Frontier2D-SoA で収束まで解く。
+pub fn frontier2d_soa_solve_observed(
+    vi: &mut ValueIterator,
+    max_iter: u32,
+    obs: &mut dyn SolveObserver,
+) -> SolveOutcome {
+    let (nx, ny) = (vi.cell_num_x, vi.cell_num_y);
     let n = vi.states.len();
 
     // ── SoA 構築: hot=[tc, pen]、free/finals。pen は静的なので一度だけ合成。──
@@ -62,65 +136,21 @@ pub fn frontier2d_soa_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64,
         free.push(s.free);
         finals.push(s.final_state);
     }
-    let mut opt: Vec<Option<usize>> = vi.states.iter().map(|s| s.optimal_action).collect();
+    let opt: Vec<Option<usize>> = vi.states.iter().map(|s| s.optimal_action).collect();
 
     let (mx, my, _mt) = displacement(vi);
     let seed = seed_frontier_2d(vi);
-    let actions = &vi.actions;
 
-    let (iters, updates, converged) =
-        frontier2d_driver(nx, ny, seed, mx as u32, my as u32, max_iter, |ixu, iyu| {
-            let (ix, iy) = (ixu as i32, iyu as i32);
-            let mut upd = 0u64;
-            for it in 0..nt {
-                let idx = (it + ix * nt + iy * (nt * nx)) as usize;
-                // 本家 valueIteration: 非 free / final_state は更新しない。
-                if !free[idx] || finals[idx] {
-                    continue;
-                }
-                let before = hot[idx][0];
-                let mut min_cost = MAX_COST;
-                let mut min_action: Option<usize> = None;
-                for (ai, a) in actions.iter().enumerate() {
-                    let c = action_cost_soa(
-                        &hot,
-                        &free,
-                        &a.state_transitions[it as usize],
-                        ix,
-                        iy,
-                        nx,
-                        ny,
-                        nt,
-                    );
-                    if c < min_cost {
-                        min_cost = c;
-                        min_action = Some(ai);
-                    }
-                }
-                hot[idx][0] = min_cost;
-                opt[idx] = min_action;
-                if min_cost < before {
-                    upd += 1;
-                }
-            }
-            upd
-        });
+    let mut model = SoaSweep { vi, hot, free, finals, opt };
+    let out = frontier2d_driver(nx, ny, seed, mx as u32, my as u32, max_iter, obs, &mut model);
 
-    // ── 結果を vi.states へ書き戻し (ハーネス出力・parity 比較が読む)。──
-    for (i, s) in vi.states.iter_mut().enumerate() {
-        s.total_cost = hot[i][0];
-        s.optimal_action = opt[i];
-    }
-    (iters, updates, converged)
+    // ── 結果を vi.states へ書き戻し (ハーネス出力・parity 比較が読む)。cancel 時は
+    // 場を保証しない契約だが、上界値なので書いても害はない (簡潔さ優先)。──
+    SoaSweep::write_back(model.vi, &model.hot, &model.opt);
+    out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::frontier2d_soa_solve;
-    use crate::solvers::test_support::parity_standard_maps;
-
-    #[test]
-    fn parity_standard_maps_frontier2d_soa() {
-        parity_standard_maps(|vi| frontier2d_soa_solve(vi, 2000));
-    }
+/// 従来 API (observer なし)。`(iters, updates, converged)`。
+pub fn frontier2d_soa_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+    frontier2d_soa_solve_observed(vi, max_iter, &mut NullObserver).tuple()
 }

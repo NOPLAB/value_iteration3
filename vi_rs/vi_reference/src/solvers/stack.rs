@@ -7,11 +7,19 @@
 //! bit-exact（評価が無駄に走るだけ）。簡潔さを優先しマスクは省略する。
 
 use crate::params::MAX_COST;
+use crate::solvers::observe::{
+    BoundaryPacer, InPlaceProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
+};
 use crate::solvers::{displacement, Bitboard2D};
 use crate::value_iterator::{value_iteration_raw, ValueIterator};
 
-/// セット済み `ValueIterator` を FrontierStack で収束まで解く。`(iters, updates, converged)` を返す。
-pub fn frontier_stack_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+/// セット済み `ValueIterator` を FrontierStack で収束まで解く。
+pub fn frontier_stack_solve_observed(
+    vi: &mut ValueIterator,
+    max_iter: u32,
+    obs: &mut dyn SolveObserver,
+) -> SolveOutcome {
+    let mut pacer = BoundaryPacer::new(obs);
     let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
     let nt_us = nt as usize;
     let (mx, my, mt) = displacement(vi);
@@ -66,17 +74,19 @@ pub fn frontier_stack_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64,
             }
         }
         frontier = new_frontier;
+        if stack_popcount(&frontier) > 0 && pacer.due(iters as u64) {
+            let mut probe = InPlaceProbe { vi, iters, updates };
+            match obs.boundary(&mut probe) {
+                SolveFlow::Continue => {}
+                SolveFlow::Stop => return SolveOutcome::stopped(iters, updates),
+                SolveFlow::Cancel => return SolveOutcome::cancelled(iters, updates),
+            }
+        }
     }
-    (iters, updates, stack_popcount(&frontier) == 0)
+    SolveOutcome::running(iters, updates, stack_popcount(&frontier) == 0)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::frontier_stack_solve;
-    use crate::solvers::test_support::parity_standard_maps;
-
-    #[test]
-    fn parity_standard_maps_frontier_stack() {
-        parity_standard_maps(|vi| frontier_stack_solve(vi, 2000));
-    }
+/// 従来 API (observer なし)。`(iters, updates, converged)`。
+pub fn frontier_stack_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+    frontier_stack_solve_observed(vi, max_iter, &mut NullObserver).tuple()
 }
