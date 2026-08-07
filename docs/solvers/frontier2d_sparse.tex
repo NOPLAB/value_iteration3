@@ -1,0 +1,378 @@
+\documentclass[11pt]{ltjsarticle}
+\usepackage[margin=25mm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,calc}
+\usepackage{hyperref}
+
+\newtheorem{theorem}{定理}
+\newtheorem{proposition}{命題}
+\newtheorem{lemma}{補題}
+\newtheorem{remark}{注意}
+\newtheorem{definition}{定義}
+
+\DeclareMathOperator*{\argmin}{arg\,min}
+
+% u64 wrapping (mod 2^64) 演算子
+\newcommand{\wadd}{\mathbin{\boxplus}}
+\newcommand{\wsub}{\mathbin{\boxminus}}
+\newcommand{\wmul}{\mathbin{\boxdot}}
+% 大型 wrapping 総和（添字は下付き）
+\newcommand{\bigwadd}{\mathop{\scalebox{1.45}{$\boxplus$}}}
+\newcommand{\circd}{\operatorname{circ}}
+\newcommand{\rotdil}{\operatorname{rotdil}}
+\newcommand{\Rmax}{R_{\max}}        % 原論文の番兵 R_max
+\newcommand{\Xgoal}{\mathcal{X}_{\mathrm{goal}}}
+
+\title{\texttt{frontier2d\_sparse}: $\theta$ マスク疎評価による\\価値反復の高速化}
+\author{ソルバ仕様ノート}
+\date{2026-06}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\texttt{frontier2d\_sparse} は、価値反復（VI）の状態ごとの更新式を一切変えずに計算を速くする CPU ソルバ
+である。原論文の brute-force 価値反復は、全状態を走査してすべての状態の最適コストを厳密に求める。これは
+大きな強みだが、地図が横長になるほどスイープ回数が増え、計算量も増える。本ソルバはこの厳密解を
+保ったまま、(i) 値が変わり得る状態だけを追う\emph{活性集合（フロンティア）}、(ii) ペナルティを値へ畳み
+込んだ\emph{融合レイアウト $cp$}、(iii) \emph{非同期 Gauss--Seidel 並列}、(iv) \emph{$\theta$ マスク疎
+評価}、の四つの工夫で計算量を削る。とくに (iv) は、向き $\theta$ 方向の依存が疎であることを使い、前スイープ
+に変化した $\theta$ だけを再評価して冗長な計算を省くものである。本ノートは各工夫を数式と図で示し、いずれもが
+brute-force 価値反復と\emph{同じ解}（到達可能な状態の値・方策が $64$ ビット単位で一致）を与えることを
+証明する。記法・変数記号は Ueda ら (2023) の brute-force value iteration\footnote{R. Ueda, L. Tonouchi,
+T. Ikebe, and Y. Hayashibara, ``Implementation of Brute-Force Value Iteration for Mobile Robot Path
+Planning and Obstacle Bypassing,'' \textit{J. Robot. Mechatron.}, Vol.35, No.6, pp.~1489--1502, 2023.}
+に合わせる。
+\end{abstract}
+
+\tableofcontents
+
+\section{準備：価値反復と Bellman 更新}
+\label{sec:pre}
+
+高速化を述べる前に、対象となる価値反復の問題と記法を定義する。
+
+\paragraph{状態と定数。}
+格子は $N_x\times N_y\times N_\theta$、状態は $s=(i_x,i_y,i_\theta)$（平面位置と向き）、状態数は
+$N_s=N_x N_y N_\theta$。平面の $1$ マスをセル $c=(i_x,i_y)$ と呼ぶ。値とコストは $64$ ビット整数（u64）上の
+固定小数点で表し、下位 $18$ ビットが小数部、整数 $B=2^{18}$ が実数 $1.0$（$=1$ 歩のコスト）にあたる。
+未到達・占有を表す番兵は原論文と同じく $\Rmax=10^9 B$。各状態は値（cost-to-go）$V(s)$ と二つのペナルティ
+$\rho(s),\lambda(s)$ を持つ。桁あふれを $2^{64}$ の余りに丸める加算・減算・乗算（wrapping 演算）を
+$\wadd,\wsub,\wmul$、整数右シフトを $\gg b_B$（$b_B=18$）と書く。自由（通行可能）な状態の集合を $\mathcal{F}$、
+吸収ゴールの集合を $\Xgoal\subseteq\mathcal{F}$ とし、$1$ 歩あたり必ずかかるステップコスト（原論文 Eq.~(3)
+の $r(s')$）を $r(s)=\rho(s)\wadd\lambda(s)\ge B>0$ と置く。
+
+\paragraph{状態遷移確率。}
+同じ行動でも源セル内の位置で着地先がばらつくため、各セルを $K^3$ 個の小領域に分けて運動モデルで飛ばす
+モンテカルロ積分で、相対変位 $\Delta s'$ の状態遷移確率を得る。これを整数の重み付き分布
+\begin{equation}
+\big\{(\Delta s',p)\big\}=P(\Delta s'\,|\,i_\theta,a),\quad \Delta s'=(d_{ix},d_{iy},d_{it}),\quad \sum p=B
+\label{eq:tau}
+\end{equation}
+として持つ（確率は $P=p/B$、$d_{it}$ は\emph{絶対}の角度インデックス）。状態 $s$ から相対変位 $\Delta s'$ で
+移った先は
+\begin{equation}
+s\oplus\Delta s'=\big(i_x{+}d_{ix},\,i_y{+}d_{iy},\,d_{it}\bmod N_\theta\big).
+\label{eq:oplus}
+\end{equation}
+
+\paragraph{Bellman 更新。}
+行動 $a$ のコストは遷移先の「値 $+$ ステップコスト」を確率で平均したもので、各状態ではそれを最小にする行動
+を選ぶ。これが原論文 Eq.~(13) の更新で、固定小数点では次のように実体化される（確率 $P=p/B$ ゆえ総和を $B$ で
+割る $\gg b_B$ が入る。遷移先が通行不可／範囲外なら番兵 $\Rmax$）：
+\begin{align}
+A(s,a)&=
+\Big(\bigwadd_{(\Delta s',p)}\!\!\big[V(s\oplus\Delta s')\wadd r(s\oplus\Delta s')\big]\wmul p\Big)\gg b_B,
+\label{eq:A}\\
+(\mathcal{T}V)(s)&=\min_{a\in\mathcal{A}}A(s,a),\qquad
+a^\ast=\pi(s)=\argmin_{a\in\mathcal{A}}A(s,a)
+\qquad (s\in\mathcal{F}\setminus\Xgoal).
+\label{eq:T}
+\end{align}
+通行不可セルとゴールでは更新しない（ゴールは $V=0$ に固定）。価値反復とは、この固定点
+$V^\star=\mathcal{T}V^\star$ を求めることである。$r>0$ かつゴールへ確率 $1$ で到達できることから、これは割引
+なし確率的最短経路の問題となり、次が成り立つ。
+
+\begin{proposition}[到達可能な状態で固定点は一意]
+\label{prop:unique}
+固定点 $V^\star$ は到達可能な状態（$V<10^{6}B$）の上で一意に定まる。
+\end{proposition}
+
+\noindent
+この一意性が本ソルバの設計を支える。$\mathcal{T}$ を\emph{状態単位で同じ式}で適用する限り、どの状態を
+どんな順序・並列度で更新するかは\emph{速度だけ}を左右し、到達可能な状態の値・方策は変わらない。以下の四つ
+の工夫はすべてこの事実の上に立つ。
+
+\paragraph{依存の半径。}
+ある状態の値が変わったとき、どこまで遠くの状態を再計算すべきかを決めるため、全遷移の最大変位
+\begin{equation}
+m_x=\max_{a,t,\Delta s'}|d_{ix}|,\quad
+m_y=\max_{a,t,\Delta s'}|d_{iy}|,\quad
+m_t=\max_{a,t,\Delta s'}\circd\!\big(d_{it}-t\big)
+\label{eq:disp}
+\end{equation}
+を定める。$\circd(u)=\min\big(u\bmod N_\theta,\ N_\theta-(u\bmod N_\theta)\big)$ は角度を円環とみた距離である。
+$(m_x,m_y)$ は空間方向、$m_t$ は源の向きからの角度方向の依存半径を表す（\S\ref{sec:sparse} で使う）。
+
+\section{工夫1：活性集合（フロンティア）}
+\label{sec:frontier}
+
+\paragraph{狙い。}
+brute-force な全走査は、すべての状態を毎スイープ更新することで厳密性を保証する。一方、値はゴールから $1$ 歩
+ずつしか広がらないため、$1$ スイープで実際に値が変わるのは、確定した領域と未確定の領域の境目（\emph{波面}）に
+ある状態に限られる（図~\ref{fig:frontier}）。そこで厳密解はそのままに、値が変わった状態とその近傍だけを次の
+更新対象に絞り、$O(\mathrm{diam}\cdot N_s)$ の計算量を削る。
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[scale=0.5, every node/.style={font=\small}]
+  \fill[orange!35] (2,2) rectangle (7,7);     % 候補帯（活性集合）
+  \fill[blue!12]  (3,3) rectangle (6,6);       % 確定領域
+  \fill[red!75]   (4,4) rectangle (5,5);       % ゴール
+  \draw[step=1, gray!45, thin] (0,0) grid (9,9);
+  \node[font=\scriptsize] at (4.5,4.5) {G};
+  \node[anchor=west] at (9.4,7.2) {橙：活性集合（更新する縁）};
+  \node[anchor=west] at (9.4,5.5) {青：確定領域（もう変わらない）};
+  \node[anchor=west] at (9.4,3.8) {白：未到達（まだ触らない）};
+\end{tikzpicture}
+\caption{活性集合（フロンティア）。確定領域（青）の縁にある状態（橙）だけを更新し、外側の未到達セル（白）
+には触れない。スイープごとに橙の輪が外へ広がる。}
+\label{fig:frontier}
+\end{figure}
+
+\paragraph{定義。}
+スイープ $k$ の\emph{フロンティア} $F_k$ を「直前のスイープでいずれかの向き $\theta$ の値が下がったセル」と
+する。初期値は $F_0=\{c:\exists\,i_\theta,\ V(c,i_\theta)<\Rmax\}$（ゴールを含むセル）。各スイープの\emph{候補}
+は、フロンティアを依存半径 $(m_x,m_y)$ だけ空間膨張させた集合
+\begin{equation}
+C_k \;=\; \operatorname{dil}_{(m_x,m_y)}\!\big(F_{k-1}\big)
+\;=\;\big\{c:\exists\,c'\in F_{k-1},\ |i_x-i'_x|\le m_x,\ |i_y-i'_y|\le m_y\big\}
+\label{eq:cand}
+\end{equation}
+とする。候補 $C_k$ の各セルで全 $\theta$ 層に $\mathcal{T}$ を適用し、値が下がった $\theta$ を持つセルを集めて
+次のフロンティア $F_k$ とする。$F_k$ が空になれば収束である。
+
+\begin{proposition}[候補集合は取りこぼさない]
+\label{prop:cand}
+直前のスイープの変化に依存して次に値が変わり得る状態は、すべて候補 $C_k$ \eqref{eq:cand} に含まれる。
+\end{proposition}
+
+\noindent
+\textbf{理由。} ある状態 $s$ の値に影響する手前の状態 $s'$ は $s=s'\oplus\Delta s'$ を満たす、すなわち $s$ から
+空間変位 $(-d_{ix},-d_{iy})$ 以内にある。依存半径 $(m_x,m_y)$ で膨らませればそれらをすべて覆う。向き $\theta$
+方向は候補セル内で全層を評価するのでここでは漏れない。ゆえに $C_k$ は真に再計算が要る状態の上位集合であり、
+活性集合の収束値は全走査と一致する。$\square$
+
+\section{工夫2：ペナルティ融合レイアウト $cp$}
+\label{sec:fused}
+
+\paragraph{狙い。}
+コスト \eqref{eq:A} は遷移先ごとに値 $V$ とペナルティ $\rho,\lambda$ を別々に読む。フロンティア系の内側
+ループはメモリの読み出し量に律速されるので、読む量を減らせば速くなる（図~\ref{fig:cp}）。
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[scale=0.62, every node/.style={font=\small}]
+  % 別配列
+  \node at (2.5,3.1) {別配列（遷移先ごとに $2$ 回ロード）};
+  \foreach \i in {0,...,4} \draw (\i,2) rectangle (\i+1,2.7);
+  \node[left] at (0,2.35) {$V$};
+  \foreach \i in {0,...,4} \draw (\i,1.1) rectangle (\i+1,1.8);
+  \node[left] at (0,1.45) {pen};
+  % 矢印
+  \draw[-{Stealth}, thick] (6.0,1.9) -- (7.2,1.9);
+  % 融合
+  \begin{scope}[shift={(8.2,0)}]
+    \node at (2.5,3.1) {融合 $cp$（$1$ 回ロード）};
+    \foreach \i in {0,...,4} \draw[fill=green!18] (\i,1.55) rectangle (\i+1,2.25);
+    \node[left] at (0,1.9) {$cp$};
+  \end{scope}
+\end{tikzpicture}
+\caption{ペナルティ融合。値とステップコストを一語 $cp=V\wadd r$（$=V\wadd\rho\wadd\lambda$）に畳み込むと、
+遷移先ごとのロードが $2$ 回から $1$ 回になり、帯域律速が緩む。}
+\label{fig:cp}
+\end{figure}
+
+\paragraph{融合。}
+各セルについて、値とステップコストをあらかじめ足した一語
+\begin{equation}
+cp(s)\;=\;V(s)\wadd r(s)\;=\;V(s)\wadd\rho(s)\wadd\lambda(s)\pmod{2^{64}},\qquad
+\mathrm{pen}(s)=\rho(s)\wadd\lambda(s)=r(s)
+\label{eq:cp}
+\end{equation}
+を持たせる。$cp$ は $8$ バイトの単一読み出しで済み、$\mathrm{pen}$ は自セルの値を戻すときだけ使う。通行不可・
+未確定（$V=\Rmax$）のセルには番兵 $cp=\mathrm{UNREACHED}=2^{64}-1$ を入れる（実セルの $cp$ はこれより十分
+小さく、衝突しない）。コストは
+\begin{equation}
+A(s,a)\;=\;\Big(\bigwadd_{(\Delta s',p)} cp(s\oplus\Delta s')\wmul p\Big)\gg b_B
+\qquad(\text{いずれかの } cp=\mathrm{UNREACHED}\ \text{なら } \Rmax)
+\label{eq:Acp}
+\end{equation}
+と書け、遷移先ごとの読み出しが $17$ バイトから $8$ バイトへ減り、通行可否の分岐と $r$ の加算も消える。
+
+\begin{lemma}[融合しても結果は同じ]
+\label{lem:fused}
+\eqref{eq:Acp} は \eqref{eq:A} とすべての $(s,a)$ で完全に一致する。
+\end{lemma}
+
+\noindent
+\textbf{理由。} $2^{64}$ 法の加算は順序を変えても結果が同じなので、$V\wadd r$ を先にまとめても総和は変わら
+ない。番兵への分岐は元の「通行不可・未確定なら $\Rmax$」と同じ条件・同じ位置で同じ値を返す。自セルの現在値は
+$V(s)=cp(s)\wsub\mathrm{pen}(s)$ で正しく戻せる（足し引きは可逆だから）。$\square$
+
+\paragraph{はみ出しの除去。}
+地図を依存半径 $(m_x,m_y)$ ぶん通行不可セルで囲っておくと、範囲外への参照は自動的に番兵を読んで $\Rmax$ に
+なり、境界判定の分岐が不要になる。また、絶対角度と配列の並びから、遷移先の位置は基準列＋一定のずれで表せる
+ので、$(a,\text{源の向き})$ ごとにその「ずれと確率」を前計算しておけば、内側ループから掛け算と余り計算を
+消せる。これらも計算順序を変えないので結果は同じである。
+
+\section{工夫3：非同期 Gauss--Seidel 並列}
+\label{sec:par}
+
+候補 $C_k$ を $m$ 本のスレッドで分担する。各スレッドは共有カウンタでブロック（$16$ セル）を取り合い
+（work stealing）、担当範囲の $cp$ をその場で書き換える。ブロック単位で取り合うので、$1$ つのセルを書くのは
+常に $1$ スレッドだけである。スイープの境目は二つのバリアで区切り、走査方向をスイープごとに反転して収束を
+均す。
+
+\begin{proposition}[非同期並列でも正しく収束する]
+\label{prop:par}
+値は減る一方で、真の固定点 $V^\star$ が下限であり、各セルの書き手は $1$ つだけである。よって反復は必ず止まり、
+「$1$ スイープ丸ごと変化なし」で止まったときは全状態が \eqref{eq:T} を満たす。これは一意固定点 $V^\star$ で
+あり、到達可能な状態の値・方策は全走査の解と一致する。
+\end{proposition}
+
+\noindent
+他スレッドが書きかけの値を読むこともある（逐次更新と一括更新の中間）が、$A(s,a)$ は $cp$ について単調で、
+固定点ではすべての状態が同時に整合するため、読む順序は\emph{最終結果}を変えない。
+
+\section{工夫4：$\theta$ マスク疎評価}
+\label{sec:sparse}
+
+\paragraph{冗長な再評価の所在。}
+工夫1の候補セルは、全 $N_\theta$ 個の向きを毎スイープ再評価していた。実測（$384\times384\times60$ の実地図）
+では、全 $\theta$ を評価する版は Bellman 評価 $52.8$M 回に対し実際に値が下がったのは $16.9$M 回（約 $1/3$）で、
+残り $2/3$ は値が変わらない再評価だった。これは正しさには寄与するが省ける計算であり、原因は向き $\theta$
+方向の依存が疎であることにある。
+
+\paragraph{向き方向の依存。}
+状態 $(c,\theta)$ のコスト \eqref{eq:Acp} の入力は遷移先 $(c+\Delta_{xy},\theta')$ であり、その $\theta'$ は
+源の $\theta$ から角度距離 $\circd(\theta'-\theta)\le m_t$ の範囲にしか現れない（回転行動は
+$d_{ix}=d_{iy}=0$ なので自セルも入力に入る）。これを裏返すと、次が言える。
+
+\begin{lemma}[向きの局所性]
+\label{lem:thetaloc}
+前スイープにセル $n$ で値が下がった向きの集合を $\Theta_n$ とすると、その変化に依存して再評価が要るのは、
+$c$ が $n$ の空間窓 $(\pm m_x,\pm m_y)$ 内にあり、かつ
+\begin{equation}
+\theta\in\rotdil\big(\Theta_n,\,m_t\big)
+\;:=\;\bigcup_{j=-m_t}^{m_t}\operatorname{rot}_j(\Theta_n)
+\label{eq:rotdil}
+\end{equation}
+を満たす $(c,\theta)$ に限られる。$\operatorname{rot}_j$ は周期 $N_\theta$ の円環シフト、
+$\rotdil(\cdot,m_t)$ はそれを $\pm m_t$ ぶん広げた円環膨張である（図~\ref{fig:thetamask} 左）。
+\end{lemma}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[every node/.style={font=\footnotesize}, >={Stealth}]
+  % 左：θ 環
+  \begin{scope}
+    \draw[gray!60] (0,0) circle (1.5);
+    \foreach \k in {0,...,11} \fill[gray!55] (90-\k*30:1.5) circle (1.3pt);
+    % 変化した向き（赤●）
+    \foreach \k in {2,3} \fill[red!80] (90-\k*30:1.5) circle (2.6pt);
+    % rotdil 近傍（赤○）
+    \foreach \k in {1,4} \draw[red!80,line width=0.8pt] (90-\k*30:1.5) circle (3.2pt);
+    \node at (0,0) {\scriptsize $\theta$ 環};
+    \node[below=1.7cm] at (0,0) {変化 $\theta$（赤●）＋ $\pm m_t$（赤○）だけ評価};
+  \end{scope}
+  % 右：空間 gather 窓
+  \begin{scope}[shift={(6.0,0)}, scale=0.5]
+    \draw[step=1, gray!50] (0,0) grid (3,3);
+    \node at (1.5,1.5) {$c$};
+    \foreach \x/\y in {0/0,1/0,2/0,0/1,2/1,0/2,1/2,2/2}
+       \node[font=\tiny] at (\x+0.5,\y+0.5) {$\mu$};
+    \draw[red!80,line width=1pt] (0,0) rectangle (3,3);
+    \node[below=1.7cm] at (1.5,0) {窓内マスク $\mu$ を OR で集約};
+  \end{scope}
+\end{tikzpicture}
+\caption{$\theta$ マスク疎評価。左：向きを円環とみて、前スイープに変化した向き（赤●）とその $\pm m_t$
+（赤○）だけを再評価し、$N_\theta$ 全部は評価しない。右：空間窓 $(\pm m_x,\pm m_y)$ 内のセルの変化マスク
+$\mu$ をまとめて集約する。}
+\label{fig:thetamask}
+\end{figure}
+
+\paragraph{変化マスクの利用。}
+そこで各セルに、「直前のスイープで値が下がった向きビット」を表すマスク $\mu(c)\in\{0,1\}^{N_\theta}$ を
+持たせる（$N_\theta\le64$ なので u64 一語に収まる）。候補セル $c$ を評価するときは、空間窓内のマスクをまとめて
+（OR で）集め、$1$ 回だけ円環膨張する（図~\ref{fig:thetamask} 右）：
+\begin{equation}
+\mathrm{evalmask}(c)\;=\;\rotdil\!\Big(\bigcup_{|u|\le m_x,\ |v|\le m_y}\mu(c+(u,v)),\ m_t\Big).
+\label{eq:evalmask}
+\end{equation}
+$\mathrm{evalmask}(c)=0$ なら入力に変化がないのでセルごと飛ばす。そうでなければ、立っている向きビットだけに
+\eqref{eq:Acp}--\eqref{eq:T} を評価する。マスク配列は約 $1$MB でキャッシュに常駐するため、この集約は遷移先を
+$1$ つずつ読むより十分安い。
+
+マスクの整合はスイープ境界の直列区間で保つ：前スイープに書いたマスクをゼロに戻し、今スイープで値が下がった
+セルのマスクを書き込む（どちらも変化セル数に比例した手間）。セルの書き手は $1$ つなので、上書きで足りる
+（排他制御は不要）。最初のスイープはマスクが育っていないので全 $\theta$ を評価するが、これは上位集合なので
+正しさを損なわない。
+
+\begin{verbatim}
+1 スイープの処理（並列、セル単位で取り合い）:
+  各候補セル c について:
+    初回スイープ: emask = 全θ
+    それ以外:
+      acc = 窓内 |u|<=mx,|v|<=my のマスク mu[c+(u,v)] を OR で集約
+      acc == 0 なら c を飛ばす            # 入力に変化なし
+      emask = rotdil(acc, mt)             # 円環 ±mt 膨張
+    cmask = 0
+    emask の立った向き theta について:
+      評価対象でなければ飛ばす
+      before = cp[c,theta] - pen[c,theta]  # 自値を戻す
+      q = min over a of A((c,theta), a)    # 式(8) のコスト
+      q < before なら:
+        cp[c,theta] = q + pen[c,theta]; cmask に theta を立てる
+    cmask != 0 なら 変化リストに (c, cmask) を追加
+  バリア（全書き込みを可視化）
+  リーダー（直列）:
+    前スイープのマスクをゼロ化 → 変化リストから mu[c]=cmask を書く → 次フロンティア F_k を作る
+    F_k が空、または反復上限なら終了
+  バリア（次の候補・マスクを可視化）
+\end{verbatim}
+
+\section{正しさ：全走査の解と一致する}
+\label{sec:exact}
+
+\begin{theorem}[$\theta$ 疎評価でも解は変わらない]
+\label{thm:exact}
+\texttt{frontier2d\_sparse} が「$1$ スイープ丸ごと変化なし」で止まったとき、到達可能な状態の値 $V$ と方策
+$\pi$ は、全状態を走査する brute-force 価値反復の解と $64$ ビット単位で完全に一致する。
+\end{theorem}
+
+\begin{proof}[証明]
+評価する集合 \eqref{eq:evalmask} は、真に依存する状態の\emph{取りこぼしのない上位集合}である：空間方向は
+$(\pm m_x,\pm m_y)$ 窓（命題~\ref{prop:cand}）、向き方向は円環 $\pm m_t$ 膨張（補題~\ref{lem:thetaloc}）で、
+コスト \eqref{eq:Acp} の真の入力 $(c+\Delta_{xy},\theta')$ を必ず覆う。よって、入力が変わった $(c,\theta)$ は
+必ず次スイープの評価対象に入る。したがって、どの候補でも変化がなくなって止まったとき、すべての $(c,\theta)$
+は現在値で Bellman 式 \eqref{eq:T} を満たしている。これは一意固定点 $V^\star$（命題~\ref{prop:unique}）の定義
+そのものである。融合（補題~\ref{lem:fused}）と非同期並列（命題~\ref{prop:par}）も解を変えないので、到達可能
+な状態の値・方策は全走査の解に一致する。$\square$
+\end{proof}
+
+\noindent
+この一致は回帰テストで確認できる。空き地図・障害物入り地図・ゴールを囲んだ地図、および大きめの空き地図で、
+全走査の固定点と\emph{完全に一致}（不一致 $0$）することを検証している。
+
+\section{まとめ}
+\texttt{frontier2d\_sparse} は、Bellman 更新 \eqref{eq:T} を変えずに、活性集合（\S\ref{sec:frontier}）で
+直径律速を、融合レイアウト $cp$（\S\ref{sec:fused}）と非同期並列（\S\ref{sec:par}）で読み出し量と並列度を、
+$\theta$ マスク疎評価（\S\ref{sec:sparse}）で冗長な向きの再評価を、それぞれ削る。どの工夫も「真に依存する
+状態を取りこぼさない上位集合だけを評価する」点で正当化され、止まったときに一意固定点へ達するため、到達可能
+な状態の値・方策は全走査の解と完全に一致する（定理~\ref{thm:exact}）。
+
+\end{document}
