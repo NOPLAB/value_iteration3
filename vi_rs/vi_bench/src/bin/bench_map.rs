@@ -59,6 +59,7 @@ use vi_bench::params::{canonical_actions, MAX_ACTION_FW_M, N_THETA};
 use vi_bench::pgm::{self, Occupancy, PgmMap};
 use vi_reference::params::{MAX_COST, PROB_BASE};
 use memmap2::MmapMut;
+use vi_reference::solvers::compact_zip::CompressedRamSink;
 use vi_reference::solvers::frontier2d_sparse_compact::{
     default_threads, mapped_goal_cell_count, solve_compact_mapped, CompactSink, RamSink,
 };
@@ -154,6 +155,11 @@ struct Args {
     /// 未指定なら RAM 出力。巨大マップで出力の O(total) RAM を避けたいとき指定する。
     #[arg(long)]
     compact_out_dir: Option<PathBuf>,
+
+    /// compact の確定出力を可逆圧縮 RAM sink（`CompressedRamSink`、列単位 varint 符号化）に
+    /// 置く。生 RAM sink の ~12 B/state を ~1 B/state に落とす（--compact-out-dir と排他）。
+    #[arg(long, default_value_t = false, conflicts_with = "compact_out_dir")]
+    compact_zip: bool,
 
     /// Optional CSV output path (parent dirs created).
     #[arg(long)]
@@ -643,15 +649,27 @@ fn main() -> ExitCode {
                     let mut sink = MmapSink::new(dir, nstates).expect("create mmap output sink");
                     let st = run(&mut sink);
                     (st, Box::new(sink))
+                } else if args.compact_zip {
+                    let mut sink = CompressedRamSink::new(nstates, THETA_CELL_NUM as usize);
+                    let st = run(&mut sink);
+                    eprintln!(
+                        "  output: compressed RAM sink arena={:.1} MB index={:.1} MB (raw {:.1} MB, {} cols written)",
+                        sink.arena_bytes() as f64 / (1024.0 * 1024.0),
+                        sink.index_bytes() as f64 / (1024.0 * 1024.0),
+                        sink.raw_bytes() as f64 / (1024.0 * 1024.0),
+                        sink.written_cols(),
+                    );
+                    (st, Box::new(sink))
                 } else {
                     let mut sink = RamSink::new(nstates);
                     let st = run(&mut sink);
                     (st, Box::new(sink))
                 };
                 eprintln!(
-                    "  memory: resident_blocks_peak={}/{}  freed_blocks={}  resident_cols_peak={}/{}",
+                    "  memory: resident_blocks_peak={}/{} ({:.1} MB)  freed_blocks={}  resident_cols_peak={}/{}",
                     s.peak_resident_blocks,
                     s.total_blocks,
+                    s.peak_resident_block_bytes as f64 / (1024.0 * 1024.0),
                     s.freed_blocks,
                     s.peak_resident_cols,
                     s.reachable_cols,

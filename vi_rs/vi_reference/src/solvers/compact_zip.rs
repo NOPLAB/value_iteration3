@@ -6,9 +6,10 @@
 //! - **到達マスク** u64 LE 8 B: θ ビットが 1 ⟺ `value != MAX_COST`。未到達 θ は暗黙に
 //!   `(MAX_COST, -1)` なので何も格納しない（compact の finalize が書くのは到達列だけ、
 //!   という運用と噛み合う）。
-//! - **値**: 到達 θ を昇順に並べた列を **2 階差分 + zigzag varint**。θ 方向の値プロファイルは
-//!   「V₂D + 回転コスト × 角度差」の区分線形（V 字）にほぼ従うので、1 階差分は ±定数、
-//!   2 階差分は折れ目以外でほぼ 0 → varint 1 B に集中する。u16 量子化と違い**厳密に可逆**。
+//! - **値**: 到達 θ を昇順に並べた列を **2 階差分 + zigzag varint**（`put_term`）。θ 方向の
+//!   値プロファイルは「V₂D + 回転コスト × 角度差」の区分線形（V 字）にほぼ従うので、1 階差分は
+//!   ±傾き、2 階差分は折れ目以外でほぼ 0 に集中する。u16 量子化と違い**厳密に可逆**。
+//!   変種の実測比較は `put_term` の doc を参照（1 階差分・PROB_BASE 商タグはどちらも劣った）。
 //! - **方策**: 到達 θ 昇順の action を RLE `(run 長 u8, action i8)`。方策は θ 方向に長い
 //!   ランを成すので実質数 B。
 //!
@@ -66,6 +67,23 @@ fn unzigzag(z: u64) -> i64 {
     ((z >> 1) as i64) ^ -((z & 1) as i64)
 }
 
+/// 値ストリームの 1 項（zigzag varint）。
+///
+/// 計測メモ（tsudanuma scale3 実データ、値ストリームが支配項）: 2 階差分 + 素の zigzag varint
+/// で 204.2 B/列。試して**劣った**変種: ① 1 階差分のみ = 217.9 B/列。②「PROB_BASE の倍数なら
+/// 商を書く」タグ付き = 212.2 B/列 — 回転 1 手 20° が θ 解像度 6° の 3.33 セルに割れるため
+/// 差分の傾き自体が PROB_BASE の整数倍にならず、ほぼ全項がタグ 1 bit を払うだけだった。
+#[inline]
+fn put_term(out: &mut Vec<u8>, d: i64) {
+    put_varint(out, zigzag(d));
+}
+
+/// `put_term` の逆変換。
+#[inline]
+fn get_term(buf: &[u8], pos: &mut usize) -> i64 {
+    unzigzag(get_varint(buf, pos))
+}
+
 /// 1 列（θ 全周、`values.len() == nt ≤ 64`）を符号化して `out` へ追記する。
 /// フォーマットはモジュール doc の通り。テスト/計測用に公開する。
 pub fn encode_column(values: &[u64], actions: &[i32], out: &mut Vec<u8>) {
@@ -78,17 +96,18 @@ pub fn encode_column(values: &[u64], actions: &[i32], out: &mut Vec<u8>) {
         }
     }
     out.extend_from_slice(&mask.to_le_bytes());
-    // 値: 到達 θ 昇順の列を 2 階差分 + zigzag varint（先頭は絶対値、2 番目は 1 階差分に自然に退化）。
+    // 値: 到達 θ 昇順の列を 2 階差分 + zigzag varint（先頭は絶対値、2 番目は 1 階差分に
+    // 自然に退化）。
     let mut prev: Option<i64> = None;
     let mut prev_d = 0i64;
     for &v in values.iter().filter(|&&v| v != MAX_COST) {
         debug_assert!(v < MAX_COST && v <= i64::MAX as u64);
         let vv = v as i64;
         match prev {
-            None => put_varint(out, zigzag(vv)),
+            None => put_term(out, vv),
             Some(p) => {
                 let d = vv - p;
-                put_varint(out, zigzag(d - prev_d));
+                put_term(out, d - prev_d);
                 prev_d = d;
             }
         }
@@ -132,7 +151,7 @@ pub fn decode_column(blob: &[u8], nt: usize, values: &mut [u64], actions: &mut [
         if (mask >> it) & 1 == 0 {
             continue;
         }
-        let z = unzigzag(get_varint(blob, &mut pos));
+        let z = get_term(blob, &mut pos);
         let vv = match prev {
             None => z,
             Some(p) => {
@@ -161,14 +180,20 @@ pub fn decode_column(blob: &[u8], nt: usize, values: &mut [u64], actions: &mut [
     }
 }
 
-/// 追記アリーナ + 列索引の可逆圧縮 RAM sink。未書き込み列の read は `(MAX_COST, -1)`。
+/// 列索引 1 ページの列数。ページは最初の書き込みで遅延確保するので、到達しない領域
+/// （建物マップでは大半）は 8 B のページポインタしか払わない。
+const INDEX_PAGE: usize = 4096;
+
+/// 追記アリーナ + ページ化列索引の可逆圧縮 RAM sink。未書き込み列の read は `(MAX_COST, -1)`。
 pub struct CompressedRamSink {
     nt: usize,
+    ncols: usize,
     /// 符号化済み列ブロブの追記アリーナ。
     arena: Vec<u8>,
-    /// 列 → `(offset << 24) | len`。0 = 未書き込み（実ブロブは mask 8 B 以上なので len ≥ 8、
-    /// entry 0 と衝突しない）。offset は 40 bit（1 TB）、len は 24 bit（16 MB/列）まで。
-    cols: Vec<u64>,
+    /// 列 → `(offset << 24) | len` のページ化索引（`INDEX_PAGE` 列/ページ、遅延確保）。
+    /// entry 0 = 未書き込み（実ブロブは mask 8 B 以上なので len ≥ 8、0 と衝突しない）。
+    /// offset は 40 bit（1 TB）、len は 24 bit（16 MB/列）まで。
+    pages: Vec<Option<Box<[u64; INDEX_PAGE]>>>,
     /// 直近に復号した列のキャッシュ `(col, values, actions)`。`read` は orig 昇順（同一列の
     /// θ 連続）で呼ばれることが多いので 1 列で十分効く。`col == usize::MAX` は空。
     cache: RefCell<(usize, Vec<u64>, Vec<i32>)>,
@@ -178,11 +203,21 @@ impl CompressedRamSink {
     pub fn new(nstates: usize, nt: usize) -> Self {
         assert!(nt >= 1 && nt <= 64, "θ マスクは u64 前提 (nt={nt})");
         assert!(nstates % nt == 0, "nstates ({nstates}) は nt ({nt}) の倍数のはず");
+        let ncols = nstates / nt;
         Self {
             nt,
+            ncols,
             arena: Vec::new(),
-            cols: vec![0u64; nstates / nt],
+            pages: vec![None; ncols.div_ceil(INDEX_PAGE)],
             cache: RefCell::new((usize::MAX, vec![MAX_COST; nt], vec![-1; nt])),
+        }
+    }
+
+    #[inline]
+    fn entry(&self, col: usize) -> u64 {
+        match &self.pages[col / INDEX_PAGE] {
+            Some(page) => page[col % INDEX_PAGE],
+            None => 0,
         }
     }
 
@@ -191,19 +226,24 @@ impl CompressedRamSink {
         self.arena.len()
     }
 
-    /// 列索引のバイト数。
+    /// 列索引の実確保バイト数（ページポインタ + 確保済みページ）。
     pub fn index_bytes(&self) -> usize {
-        self.cols.len() * 8
+        let allocated = self.pages.iter().flatten().count();
+        self.pages.len() * 8 + allocated * INDEX_PAGE * 8
     }
 
     /// 同じ内容を `RamSink`（u64 + i32）で持った場合のバイト数（比較基準）。
     pub fn raw_bytes(&self) -> usize {
-        self.cols.len() * self.nt * 12
+        self.ncols * self.nt * 12
     }
 
     /// 書き込み済み列数。
     pub fn written_cols(&self) -> usize {
-        self.cols.iter().filter(|&&e| e != 0).count()
+        self.pages
+            .iter()
+            .flatten()
+            .map(|page| page.iter().filter(|&&e| e != 0).count())
+            .sum()
     }
 }
 
@@ -221,7 +261,8 @@ impl CompactSink for CompressedRamSink {
         encode_column(values, actions, &mut self.arena);
         let len = (self.arena.len() as u64 - offset) as u64;
         assert!(len < (1u64 << 24));
-        self.cols[col] = (offset << 24) | len;
+        let page = self.pages[col / INDEX_PAGE].get_or_insert_with(|| Box::new([0u64; INDEX_PAGE]));
+        page[col % INDEX_PAGE] = (offset << 24) | len;
         // 同列のキャッシュは古くなるので破棄する。
         let mut c = self.cache.borrow_mut();
         if c.0 == col {
@@ -232,7 +273,7 @@ impl CompactSink for CompressedRamSink {
     fn read(&self, orig: usize) -> (u64, i32) {
         let col = orig / self.nt;
         let it = orig % self.nt;
-        let entry = self.cols[col];
+        let entry = self.entry(col);
         if entry == 0 {
             return (MAX_COST, -1);
         }
@@ -340,15 +381,18 @@ mod tests {
                 assert_eq!((v, act), (MAX_COST, -1), "unreached must read sentinel @ state {i}");
             }
         }
-        // 圧縮効果のサニティ: アリーナ + 索引が RamSink 相当より十分小さいこと。
-        let total = sink.arena_bytes() + sink.index_bytes();
+        // 圧縮効果のサニティ: データ本体（アリーナ）が RamSink 相当の 1/3 未満であること。
+        // 索引はページ粒度（INDEX_PAGE 列 = 32 KB/ページ）なので、この玩具マップ（768 列）では
+        // 1 ページの固定費が支配的になる。索引はページ数上界だけ確認する。
         assert!(
-            total * 3 < sink.raw_bytes(),
-            "compressed sink should be < 1/3 of raw (arena={}, index={}, raw={})",
+            sink.arena_bytes() * 3 < sink.raw_bytes(),
+            "compressed arena should be < 1/3 of raw (arena={}, raw={})",
             sink.arena_bytes(),
-            sink.index_bytes(),
             sink.raw_bytes()
         );
+        let ncols = nstates / 60;
+        let max_index = ncols.div_ceil(INDEX_PAGE) * (8 + INDEX_PAGE * 8);
+        assert!(sink.index_bytes() <= max_index, "index over page bound: {}", sink.index_bytes());
     }
 
     /// 同一列の再書き込みは索引が最新を指す（旧ブロブはゴミとして残る、が read は正しい）。
