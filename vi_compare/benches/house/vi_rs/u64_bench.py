@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """vi_reference u64 高速ソルバ 比較ドライバ。
 
-ros2 bench_client / ref_bench と **完全に同一の** map_server 意味論で house.pgm を
+ros1 bench_client / ref_bench と **完全に同一の** map_server 意味論で house.pgm を
 OccupancyGrid 化し、その raw int8 (h*w, row-major) を Rust ハーネス `vi_u64_bench` に
 指定ソルバで渡す。ハーネスが value_<solver>.npy / policy_<solver>.npy / timing_<solver>.json
 を out_dir に書く。
@@ -39,7 +39,7 @@ def load_map_yaml(pgm_path):
 
 
 def to_occupancy(w, h, pgm, meta):
-    """ros2 bench_client / ref_bench の to_occupancy と同一。返り値 (h,w) int8。"""
+    """ros1 bench_client / ref_bench の to_occupancy と同一。返り値 (h,w) int8。"""
     p = pgm.astype(np.float64)
     occ_prob = (p / 255.0) if meta['negate'] else ((255.0 - p) / 255.0)
     occ = np.full((h, w), -1, dtype=np.int8)

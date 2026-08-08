@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """vi_reference (本家 u64 忠実移植) 比較ドライバ。
 
-ros2 bench_client と **完全に同一の** map_server 意味論で house.pgm を OccupancyGrid 化し、
+ros1 bench_client と **完全に同一の** map_server 意味論で house.pgm を OccupancyGrid 化し、
 その raw int8 (h*w, row-major) を Rust ハーネス `vi_ref_bench` に渡す。ハーネスが
 value_ref.npy / policy_ref.npy / timing_ref.json を out_dir に書く。
 
@@ -38,7 +38,7 @@ def load_map_yaml(pgm_path):
 
 
 def to_occupancy(w, h, pgm, meta):
-    """ros2 bench_client.to_occupancy と同一: map_server 意味論 + flipud。
+    """ros1 bench_client.to_occupancy と同一: map_server 意味論 + flipud。
     返り値は (h, w) int8 (0=free, 100=occ, -1=unknown), 行優先 (iy=0 が下端)。"""
     p = pgm.astype(np.float64)
     occ_prob = (p / 255.0) if meta['negate'] else ((255.0 - p) / 255.0)

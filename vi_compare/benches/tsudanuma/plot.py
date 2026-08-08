@@ -155,7 +155,7 @@ def load_value(path):
     return v  # v[iy, ix], seconds, NaN=unreachable
 
 
-def load_path(path, img_h):
+def load_path(path, img_h, res=RESO, ox=0.0, oy=0.0):
     """bench_map --dump-path の方策追従経路 ([i32 n][f32 x][f32 y]*n, world m) を
     image (row,col) へ変換して返す。本家 vi_node decision() と同じ closed-loop
     方策追従 (10Hz cmd_vel 積分) で生成された軌跡。"""
@@ -164,8 +164,8 @@ def load_path(path, img_h):
     with open(path, 'rb') as f:
         n = int(np.frombuffer(f.read(4), '<i4')[0])
         xy = np.frombuffer(f.read(n * 8), '<f4').reshape(n, 2)
-    cols = xy[:, 0] / RESO - 0.5
-    rows = (img_h - 0.5) - xy[:, 1] / RESO
+    cols = (xy[:, 0] - ox) / res - 0.5
+    rows = (img_h - 0.5) - (xy[:, 1] - oy) / res
     return np.stack([rows, cols], axis=1)
 
 
@@ -219,173 +219,124 @@ def descend_path(v_img, sr, sc, gr, gc, max_steps=100000):
     return np.array(path)
 
 
-def map_fig():
-    img = load_pgm(f'{RES}/lite/map_tsudanuma_lite.pgm')  # top-down, 255=free
+# マップ別オーバーレイ設定。base は RES 相対、goal/start は image (row,col) を
+# 画像高 h から返す。snap_start: 始点が非到達なら最寄り到達セルへスナップ。
+# descend: path.bin 不在時に V 降下で経路を代替生成。
+OVERLAYS = {
+    'lite': dict(
+        base='.', pgm='lite/map_tsudanuma_lite.pgm',
+        # ベンチマークと同一条件 (penalty=100000) の V を使用。
+        vbin='lite/lite_value_g2.bin', path_bin='lite/lite_path.bin',
+        res=RESO, origin=(0.0, 0.0),
+        goal=lambda h: (h - 1 - 440, 382),   # world grid (ix=382,iy=440)
+        start=lambda h: (h - 1, 0),          # world grid corner (0,0)
+        snap_start=True, descend=True,
+        figsize=(6.8, 6.6), lw=1.8, dpi=140, legend_fs=8,
+        cb='cost-to-go V* [s] (min over theta, benchmark cfg: safety_penalty=1e5)',
+        title=lambda w, h, reach, free: (
+            f'lite Tsudanuma ({w}x{h}, 0.15m) - VI value function V* (vi_rs frontier2d_par)\n'
+            f'reachable: {reach:,} cells (of {free:,} free)  '
+            f'/ goal world(57.4, 66.1), start world(0.1, 0.1)'),
+        out='lite/fig_map_overlay.png',
+    ),
+    'full': dict(
+        base='.', pgm='full/map_tsudanuma_015.pgm',
+        vbin='full/full_value.bin', path_bin='full/full_path.bin',
+        res=RESO, origin=(0.0, 0.0),
+        goal=lambda h: (1042, 1199),   # image (row,col) from distance-transform finder
+        start=lambda h: (248, 234),
+        snap_start=True, descend=True,
+        figsize=(11, 7.6), lw=1.5, dpi=120, legend_fs=9,
+        cb='cost-to-go V* [s] (min over theta, safety_penalty=1e5)',
+        title=lambda w, h, reach, free: (
+            f'FULL Tsudanuma assets ({w}x{h}, 0.15m, 732,683 free) - VI value function V*\n'
+            f'reachable: {reach:,} cells  /  goal world(179.9, 43.7), start world(35.2, 162.8) 187m away\n'
+            f'solved by vi_rs frontier2d_sparse in 11.3 s (12T, exact fixpoint; bit-exact w/ ROS1 original)'),
+        out='full/fig_map_overlay_full.png',
+    ),
+    # tsukuba (13250x7100 @0.05m を x5 プール, 0.25m): origin 非ゼロなので
+    # path の world->image 変換に origin を使う。
+    'tsukuba': dict(
+        base='../tsukuba', pgm='map_tsukuba_pooled.pgm',
+        vbin='value.bin', path_bin='path.bin',
+        res=0.25, origin=(-553.840, -60.609),
+        goal=lambda h: (h - 1 - 238, 2297),   # world(20.5,-1.0) -> cell(2297,iy=238) 右下開放点
+        start=lambda h: (h - 1 - 1370, 568),  # world(-411.7,282.0) -> cell(568,iy=1370)
+        snap_start=False, descend=False,
+        figsize=(13, 7.6), lw=1.5, dpi=120, legend_fs=9,
+        cb='cost-to-go V* [s] (min over theta, safety_penalty=1e5)',
+        title=lambda w, h, reach, free: (
+            f'Tsukuba assets ({w}x{h}, 0.25m pooled x5, 391,070 free) - VI value function V*\n'
+            f'reachable: {reach:,} cells / goal world(20.5, -1.0), start world(-411.7, 282.0)\n'
+            f'solved by vi_rs frontier2d_sparse in 7.7 s (12T, exact fixpoint, 226M states)'),
+        out='fig_map_overlay_tsukuba.png',
+    ),
+}
+
+
+def overlay_fig(name):
+    cfg = OVERLAYS[name]
+    base = os.path.abspath(os.path.join(RES, cfg['base']))
+    pgm = os.path.join(base, cfg['pgm'])
+    vbin = os.path.join(base, cfg['vbin'])
+    if not (os.path.exists(pgm) and os.path.exists(vbin)):
+        print(f'{name} plot skipped (missing', pgm, 'or', vbin, ')')
+        return
+    img = load_pgm(pgm)  # top-down, 255=free
     h, w = img.shape
     free = img == 255
-    # ベンチマークと同一条件 (penalty=100000) の V を使用。
-    v_grid = load_value(f'{RES}/lite/lite_value_g2.bin')        # world bottom-up
-    v_img = v_grid[::-1, :]                                 # flip to top-down (match PGM)
+    v_img = load_value(vbin)[::-1, :]   # world bottom-up -> top-down (match PGM)
     reachable = int(np.isfinite(v_img).sum())
-    # goal: world grid (ix=382,iy=440) -> image (row=h-1-440, col=382)
-    gr, gc = h - 1 - 440, 382
-    # robot start: world grid (ix=0,iy=0) corner -> image (row=h-1-0, col=0)
-    sr, sc = h - 1 - 0, 0
-    if not np.isfinite(v_img[sr, sc]):  # 念のため到達 free セルへスナップ
+    gr, gc = cfg['goal'](h)
+    sr, sc = cfg['start'](h)
+    if cfg['snap_start'] and not np.isfinite(v_img[sr, sc]):  # 到達 free セルへスナップ
         ys, xs = np.where(np.isfinite(v_img))
         d = (ys - sr) ** 2 + (xs - sc) ** 2
         sr, sc = int(ys[d.argmin()]), int(xs[d.argmin()])
-    start_v = float(v_img[sr, sc])
-    path = load_path(f'{RES}/lite/lite_path.bin', h)
+    start_v = float(v_img[sr, sc]) if np.isfinite(v_img[sr, sc]) else float('nan')
+    ox, oy = cfg['origin']
+    path = load_path(os.path.join(base, cfg['path_bin']), h, cfg['res'], ox, oy)
     path_src = 'policy rollout'
-    if path is None:
-        path = descend_path(v_img, sr, sc, gr, gc)
-        path_src = 'V descent'
-
-    reached = bool(abs(path[-1][0]-gr)<=3 and abs(path[-1][1]-gc)<=3)
-    fin = v_img[np.isfinite(v_img)]
-    vmax = float(np.nanpercentile(fin, 90))
-    print('LITE V[s]: p50=%.1f p90=%.1f path_len=%d (%s) reached_goal=%s'
-          % (np.nanpercentile(fin,50), np.nanpercentile(fin,90), len(path), path_src, reached))
-
-    fig, ax = plt.subplots(figsize=(6.8, 6.6))
-    ax.imshow(np.where(free, 0.92, 0.18), cmap='gray', vmin=0, vmax=1, origin='upper')
-    hm = ax.imshow(v_img, cmap='turbo', origin='upper', alpha=0.92, vmin=0, vmax=vmax)
-    if len(path) > 1:
-        ax.plot(path[:, 1], path[:, 0], '-', color='white', lw=1.8, alpha=0.9,
-                label=f'optimal path ({path_src})')
-    ax.plot(gc, gr, '*', color='lime', ms=22, mec='black', mew=1.5, label='goal', zorder=5)
-    ax.plot(sc, sr, 'o', color='magenta', ms=13, mec='black', mew=1.5,
-            label=f'robot start (V={start_v:.0f}s)', zorder=5)
-    cb = fig.colorbar(hm, ax=ax, shrink=0.82)
-    cb.set_label('cost-to-go V* [s] (min over theta, benchmark cfg: safety_penalty=1e5)')
-    ax.set_title(f'lite Tsudanuma ({w}x{h}, 0.15m) - VI value function V* (vi_rs frontier2d_par)\n'
-                 f'reachable: {reachable:,} cells (of {int(free.sum()):,} free)  '
-                 f'/ goal world(57.4, 66.1), start world(0.1, 0.1)')
-    ax.set_xlabel('x [cell]'); ax.set_ylabel('y [cell]'); ax.legend(loc='upper right', fontsize=8)
-    fig.tight_layout()
-    out = f'{RES}/lite/fig_map_overlay.png'
-    fig.savefig(out, dpi=140)
-    print('wrote', out, 'reachable', reachable)
-
-
-def map_fig_full():
-    """full assets インスタンス (1963x1334, 732k free) の V オーバーレイ。"""
-    pgm = f'{RES}/full/map_tsudanuma_015.pgm'
-    vbin = f'{RES}/full/full_value.bin'
-    if not (os.path.exists(pgm) and os.path.exists(vbin)):
-        print('full plot skipped (missing', pgm, 'or', vbin, ')')
-        return
-    img = load_pgm(pgm)
-    h, w = img.shape
-    free = img == 255
-    v_img = load_value(vbin)[::-1, :]
-    reachable = int(np.isfinite(v_img).sum())
-    gr, gc = 1042, 1199   # goal image (row,col) from distance-transform finder
-    sr, sc = 248, 234     # start image (row,col)
-    if not np.isfinite(v_img[sr, sc]):
-        ys, xs = np.where(np.isfinite(v_img))
-        d = (ys - sr) ** 2 + (xs - sc) ** 2
-        sr, sc = int(ys[d.argmin()]), int(xs[d.argmin()])
-    start_v = float(v_img[sr, sc])
-    path = load_path(f'{RES}/full/full_path.bin', h)
-    path_src = 'policy rollout'
-    if path is None:
+    if path is None and cfg['descend']:
         path = descend_path(v_img, sr, sc, gr, gc)
         path_src = 'V descent'
     fin = v_img[np.isfinite(v_img)]
     vmax = float(np.nanpercentile(fin, 90))
-    reached = bool(abs(path[-1][0]-gr)<=3 and abs(path[-1][1]-gc)<=3)
-    print('FULL V[s]: p50=%.0f p90=%.0f path_len=%d (%s) reached_goal=%s reach=%d'
-          % (np.nanpercentile(fin,50), vmax, len(path), path_src, reached, reachable))
+    reached = bool(path is not None and len(path)
+                   and abs(path[-1][0] - gr) <= 3 and abs(path[-1][1] - gc) <= 3)
+    print('%s V[s]: p50=%.1f p90=%.1f reach=%d path=%s (%s) reached_goal=%s'
+          % (name.upper(), np.nanpercentile(fin, 50), vmax, reachable,
+             'none' if path is None else len(path), path_src, reached))
 
-    fig, ax = plt.subplots(figsize=(11, 7.6))
-    ax.imshow(np.where(free, 0.92, 0.18), cmap='gray', vmin=0, vmax=1, origin='upper')
-    hm = ax.imshow(v_img, cmap='turbo', origin='upper', alpha=0.92, vmin=0, vmax=vmax)
-    if len(path) > 1:
-        ax.plot(path[:, 1], path[:, 0], '-', color='white', lw=1.5, alpha=0.9,
-                label=f'optimal path ({path_src})')
-    ax.plot(gc, gr, '*', color='lime', ms=22, mec='black', mew=1.5, label='goal', zorder=5)
-    ax.plot(sc, sr, 'o', color='magenta', ms=13, mec='black', mew=1.5,
-            label=f'robot start (V={start_v:.0f}s)', zorder=5)
-    cb = fig.colorbar(hm, ax=ax, shrink=0.82)
-    cb.set_label('cost-to-go V* [s] (min over theta, safety_penalty=1e5)')
-    ax.set_title(f'FULL Tsudanuma assets ({w}x{h}, 0.15m, 732,683 free) - VI value function V*\n'
-                 f'reachable: {reachable:,} cells  /  goal world(179.9, 43.7), start world(35.2, 162.8) 187m away\n'
-                 f'solved by vi_rs frontier2d_sparse in 11.3 s (12T, exact fixpoint; bit-exact w/ ROS1 original)')
-    ax.set_xlabel('x [cell]'); ax.set_ylabel('y [cell]'); ax.legend(loc='upper right', fontsize=9)
-    fig.tight_layout()
-    out = f'{RES}/full/fig_map_overlay_full.png'
-    fig.savefig(out, dpi=120)
-    print('wrote', out)
-
-
-# ---------- Fig 4: tsukuba assets full-map overlay (PoC) ----------
-def map_fig_tsukuba():
-    """map_tsukuba (13250x7100 @0.05m, origin (-553.84,-60.609)) を x5 プール (0.25m) した
-    インスタンスの V オーバーレイ。tsudanuma と異なり origin 非ゼロなので座標変換を持つ。"""
-    tdir = os.path.abspath(f'{RES}/../tsukuba')
-    pgm = f'{tdir}/map_tsukuba_pooled.pgm'
-    vbin = f'{tdir}/value.bin'
-    if not (os.path.exists(pgm) and os.path.exists(vbin)):
-        print('tsukuba plot skipped (missing inputs in', tdir, ')')
-        return
-    TRES, TOX, TOY = 0.25, -553.840, -60.609
-    img = load_pgm(pgm)
-    h, w = img.shape
-    free = img == 255
-    v_img = load_value(vbin)[::-1, :]
-    reachable = int(np.isfinite(v_img).sum())
-    gr, gc = h - 1 - 238, 2297   # goal world(20.5, -1.0) -> cell(2297, iy=238) 右下開放点
-    sr, sc = h - 1 - 1370, 568   # start world(-411.7, 282.0) -> cell(568, iy=1370)
-    start_v = float(v_img[h - 1 - 1370 + 0, sc]) if np.isfinite(v_img[sr, sc]) else float('nan')
-    path = None
-    try:
-        with open(f'{tdir}/path.bin', 'rb') as f:
-            n = int(np.frombuffer(f.read(4), '<i4')[0])
-            xy = np.frombuffer(f.read(n * 8), '<f4').reshape(n, 2)
-        cols = (xy[:, 0] - TOX) / TRES - 0.5
-        rows = (h - 0.5) - (xy[:, 1] - TOY) / TRES
-        path = np.stack([rows, cols], axis=1)
-    except FileNotFoundError:
-        pass
-    fin = v_img[np.isfinite(v_img)]
-    vmax = float(np.nanpercentile(fin, 90))
-    print('TSUKUBA V[s]: p50=%.0f p90=%.0f reach=%d path=%s'
-          % (np.nanpercentile(fin, 50), vmax, reachable,
-             'none' if path is None else len(path)))
-
-    fig, ax = plt.subplots(figsize=(13, 7.6))
+    fig, ax = plt.subplots(figsize=cfg['figsize'])
     ax.imshow(np.where(free, 0.92, 0.18), cmap='gray', vmin=0, vmax=1, origin='upper')
     hm = ax.imshow(v_img, cmap='turbo', origin='upper', alpha=0.92, vmin=0, vmax=vmax)
     if path is not None and len(path) > 1:
-        ax.plot(path[:, 1], path[:, 0], '-', color='white', lw=1.5, alpha=0.9,
-                label='optimal path (policy rollout)')
+        ax.plot(path[:, 1], path[:, 0], '-', color='white', lw=cfg['lw'], alpha=0.9,
+                label=f'optimal path ({path_src})')
     ax.plot(gc, gr, '*', color='lime', ms=22, mec='black', mew=1.5, label='goal', zorder=5)
     ax.plot(sc, sr, 'o', color='magenta', ms=13, mec='black', mew=1.5,
             label=f'robot start (V={start_v:.0f}s)', zorder=5)
     cb = fig.colorbar(hm, ax=ax, shrink=0.82)
-    cb.set_label('cost-to-go V* [s] (min over theta, safety_penalty=1e5)')
-    ax.set_title(f'Tsukuba assets ({w}x{h}, 0.25m pooled x5, 391,070 free) - VI value function V*\n'
-                 f'reachable: {reachable:,} cells / goal world(20.5, -1.0), start world(-411.7, 282.0)\n'
-                 f'solved by vi_rs frontier2d_sparse in 7.7 s (12T, exact fixpoint, 226M states)')
-    ax.set_xlabel('x [cell]'); ax.set_ylabel('y [cell]'); ax.legend(loc='upper right', fontsize=9)
+    cb.set_label(cfg['cb'])
+    ax.set_title(cfg['title'](w, h, reachable, int(free.sum())))
+    ax.set_xlabel('x [cell]'); ax.set_ylabel('y [cell]')
+    ax.legend(loc='upper right', fontsize=cfg['legend_fs'])
     fig.tight_layout()
-    out = f'{tdir}/fig_map_overlay_tsukuba.png'
-    fig.savefig(out, dpi=120)
+    out = os.path.join(base, cfg['out'])
+    fig.savefig(out, dpi=cfg['dpi'])
     print('wrote', out)
 
 
 if __name__ == '__main__':
-    import sys as _sys
-    mode = _sys.argv[2] if len(_sys.argv) > 2 else 'all'
+    mode = sys.argv[2] if len(sys.argv) > 2 else 'all'
     if mode in ('all', 'speed'):
         speed_fig()
     if mode in ('all', 'house'):
         house_fig()
     if mode in ('all', 'lite'):
-        map_fig()
+        overlay_fig('lite')
     if mode in ('all', 'full'):
-        map_fig_full()
+        overlay_fig('full')
     if mode == 'tsukuba':
-        map_fig_tsukuba()
+        overlay_fig('tsukuba')

@@ -52,7 +52,6 @@ DOCKER_IMG="${VI_COMPARE_DOCKER_IMG:-vi_compare_ros1:noetic}"
 VI_ORIG="${VI_ORIG:-$ROOT/../value_iteration}"
 REPS_VIRS="$SCRIPT_DIR/tsudanuma/vi_rs/run_sweep_vi_rs_reps.sh"
 REPS_ROS1="$SCRIPT_DIR/tsudanuma/ros1/run_sweep_ros1_reps.sh"
-SWEEP_ROS1="$SCRIPT_DIR/tsudanuma/ros1/run_sweep_ros1.sh"
 SNAP_TSUKUBA="$SCRIPT_DIR/tsukuba/ros1/run_snap_tsukuba.sh"
 AGG="$SCRIPT_DIR/aggregate_stats.py"
 BM=vi_rs/target/release/bench_map
@@ -112,123 +111,95 @@ docker_ros1() { # docker_ros1 NAME SCRIPT_IN_CONTAINER LOG_HOST_PATH env...
   trap - INT TERM
 }
 
-# ---------------------------------------------------------------- house -----
-bench_house() {
-  local out
-  if [ "${ROS1_ONLY:-0}" != "1" ]; then
-    preflight_virs
-    out=vi_compare/results/house/sweep_vi_rs_sparse_house_x${REPS}.csv
-    bak "$out"
-    log "house vi_rs sparse n=$REPS (m=1..16)"
-    MAP=vi_compare/results/house/house.yaml OUT="$out" \
-      GOAL_X=6.0 GOAL_Y=-2.0 GOAL_THETA=90 SOLVER=frontier2d_sparse REPS="$REPS" \
-      bash "$REPS_VIRS"
-    prepend_hdr "$out" <<EOF
-# house (384x384x60, 0.05m, 自由 2.34M) frontier2d_sparse n=$REPS 反復掃引
-# goal (6.0,-2.0,90°), 0.3m/±15°, 安全0.2m/1e5, unknown=obstacle, 18bit u64。VI_THREADS=m
-EOF
-    python3 "$AGG" "$out"
-  fi
-  if [ "${VIRS_ONLY:-0}" != "1" ]; then
-    preflight_ros1
-    out=vi_compare/results/house/sweep_ros1_house_x${REPS}.csv
-    bak "$out"
-    log "house ROS1 Node B n=$REPS (m=1..16, TIMEOUT=120)"
-    docker_ros1 vi_bench_ros1_house "$REPS_ROS1" \
-      /workspace/vi_compare/results/house/run_house_x${REPS}.log \
-      MAP_YAML=/workspace/vi_compare/results/house/house.yaml \
-      GOAL_X=6.0 GOAL_Y=-2.0 GOAL_YAW=90 \
-      DELTA_THR=$DELTA_THR TIMEOUT=120 REPS="$REPS" \
-      OUTDIR=/results/house/x${REPS}_logs SWEEP_CSV=/results/house/sweep_ros1_house_x${REPS}.csv
-    prepend_hdr "$out" <<EOF
-# house 本家 value_iteration Node B n=$REPS 反復掃引: goal (6.0,-2.0,90°),
-# goal_margin 0.3m/±15°, safety 0.2m/1e5, theta=60, delta_threshold=$DELTA_THR (=0.1s), TIMEOUT=120
-EOF
-    python3 "$AGG" "$out"
-  fi
-}
-
-# ----------------------------------------------------------------- lite -----
-bench_lite() {
-  local out
-  if [ "${ROS1_ONLY:-0}" != "1" ]; then
-    preflight_virs
-    out=vi_compare/results/tsudanuma/sweep_vi_rs_sparse_lite_x${REPS}.csv
-    bak "$out"
-    log "lite vi_rs sparse n=$REPS (m=1..16)"
-    MAP=vi_compare/results/tsudanuma/lite/map_tsudanuma_lite.yaml OUT="$out" \
-      GOAL_X=57.375 GOAL_Y=66.075 GOAL_THETA=0 SOLVER=frontier2d_sparse REPS="$REPS" \
-      bash "$REPS_VIRS"
-    prepend_hdr "$out" <<EOF
-# 津田沼 lite (540x540x60, 0.15m, 自由 9.73M = 論文 Actual の 98.2%) frontier2d_sparse n=$REPS 反復掃引
-# goal (57.375,66.075,0°), 0.3m/±15°, 安全0.2m/1e5, unknown=obstacle, 18bit u64。VI_THREADS=m
-EOF
-    python3 "$AGG" "$out"
-  fi
-  if [ "${VIRS_ONLY:-0}" != "1" ]; then
-    preflight_ros1
-    bak vi_compare/results/tsudanuma/sweep_ros1.csv
-    log "lite ROS1 Node B 単発掃引 (m=1..16, TIMEOUT=900 → 約 2 h)"
-    docker_ros1 vi_bench_ros1_lite "$SWEEP_ROS1" \
-      /workspace/vi_compare/results/tsudanuma/lite/run_lite_sweep.log \
-      TIMEOUT=900 DELTA_THR=$DELTA_THR
-    python3 "$AGG" vi_compare/results/tsudanuma/sweep_ros1.csv
-  fi
-}
-
-# -------------------------------------------------------------- fullext -----
-bench_fullext() {
-  local out
-  preflight_fullext_map
-  if [ "${ROS1_ONLY:-0}" != "1" ]; then
-    preflight_virs
-    out=vi_compare/results/tsudanuma/sweep_vi_rs_sparse_fullext_x${REPS}.csv
-    bak "$out"
-    log "fullext vi_rs sparse n=$REPS (m=1..16, 各 run 状態 157M 確保 → 約 70 min)"
-    MAP=vi_compare/results/tsudanuma/fullext/map_tsudanuma_fullext.yaml OUT="$out" \
-      GOAL_X=164.175 GOAL_Y=125.625 GOAL_THETA=0 SOLVER=frontier2d_sparse REPS="$REPS" \
-      bash "$REPS_VIRS"
-    prepend_hdr "$out" <<EOF
-# 津田沼 full-extent (論文条件一致: 157,118,520 総状態 / 自由 9,727,800) frontier2d_sparse n=$REPS 反復掃引
-# goal (164.175,125.625,0°) = lite goal の full 座標, 0.3m/±15°, 安全0.2m/1e5, unknown=obstacle, 18bit u64
-EOF
-    python3 "$AGG" "$out"
-  fi
-  if [ "${VIRS_ONLY:-0}" != "1" ]; then
-    preflight_ros1
-    bak vi_compare/results/tsudanuma/sweep_ros1_fullext.csv
-    log "fullext ROS1 Node B (m=8,16, TIMEOUT=900 → 約 33 min)"
-    docker_ros1 vi_bench_ros1_fullext "$SWEEP_ROS1" \
-      /workspace/vi_compare/results/tsudanuma/fullext/run_fullext.log \
-      MAP_YAML=/workspace/vi_compare/results/tsudanuma/fullext/map_tsudanuma_fullext.yaml \
-      GOAL_X=164.175 GOAL_Y=125.625 GOAL_YAW=0 \
-      DELTA_THR=$DELTA_THR TIMEOUT=900 MLIST="8 16" \
-      OUTDIR=/results/tsudanuma/fullext SWEEP_CSV=/results/tsudanuma/sweep_ros1_fullext.csv
-    python3 "$AGG" vi_compare/results/tsudanuma/sweep_ros1_fullext.csv
-  fi
-}
-
-# -------------------------------------------------------------- tsukuba -----
-bench_tsukuba() {
-  local out
-  if [ "${ROS1_ONLY:-0}" != "1" ]; then
-    preflight_virs
-    out=vi_compare/results/tsukuba/sweep_vi_rs_compact_015_x${REPS}.csv
-    bak "$out"
-    log "tsukuba vi_rs sparse_compact n=$REPS (m=4,8,12,16 → 約 80 min)"
-    MAP=vi_compare/results/tsukuba/map_tsukuba_pooled.yaml OUT="$out" \
-      GOAL_X=20.5 GOAL_Y=-1.0 GOAL_THETA=0 \
-      SOLVER=frontier2d_sparse_compact MLIST="4 8 12 16" REPS="$REPS" \
-      bash "$REPS_VIRS"
-    prepend_hdr "$out" <<EOF
-# tsukuba 0.15m (4417x2367x60 = 総 627M / 自由 71.3M) frontier2d_sparse_compact n=$REPS 反復掃引
+# ---------------------------------------------------------------- bench -----
+# 全ターゲット共通の実行器 (vi_rs 側 → ROS1 側の順、直列)。map/goal/solver/
+# MLIST/TIMEOUT/出力先/キャプションは冒頭の case 表で選ぶ。ROS1 側は
+# run_sweep_ros1_reps.sh に一本化 (単発は REPS=1; CSV に rep 列が付くが
+# aggregate_stats.py は両対応)。tsukuba の ROS1 側のみ snap スクリプト。
+bench() {
+  local t="$1"
+  local map gx gy gt solver virs_mlist virs_out virs_log virs_hdr
+  local ros1_reps ros1_timeout ros1_mlist ros1_csv ros1_outdir ros1_runlog ros1_log ros1_hdr=""
+  case "$t" in
+    house)
+      map=vi_compare/results/house/house.yaml
+      gx=6.0 gy=-2.0 gt=90 solver=frontier2d_sparse virs_mlist=""
+      virs_out=vi_compare/results/house/sweep_vi_rs_sparse_house_x${REPS}.csv
+      virs_log="house vi_rs sparse n=$REPS (m=1..16)"
+      virs_hdr="# house (384x384x60, 0.05m, 自由 2.34M) frontier2d_sparse n=$REPS 反復掃引
+# goal (6.0,-2.0,90°), 0.3m/±15°, 安全0.2m/1e5, unknown=obstacle, 18bit u64。VI_THREADS=m"
+      ros1_reps=$REPS ros1_timeout=120 ros1_mlist=""
+      ros1_csv=vi_compare/results/house/sweep_ros1_house_x${REPS}.csv
+      ros1_outdir=/results/house/x${REPS}_logs
+      ros1_runlog=/workspace/vi_compare/results/house/run_house_x${REPS}.log
+      ros1_log="house ROS1 Node B n=$REPS (m=1..16, TIMEOUT=120)"
+      ros1_hdr="# house 本家 value_iteration Node B n=$REPS 反復掃引: goal (6.0,-2.0,90°),
+# goal_margin 0.3m/±15°, safety 0.2m/1e5, theta=60, delta_threshold=$DELTA_THR (=0.1s), TIMEOUT=120"
+      ;;
+    lite)
+      map=vi_compare/results/tsudanuma/lite/map_tsudanuma_lite.yaml
+      gx=57.375 gy=66.075 gt=0 solver=frontier2d_sparse virs_mlist=""
+      virs_out=vi_compare/results/tsudanuma/sweep_vi_rs_sparse_lite_x${REPS}.csv
+      virs_log="lite vi_rs sparse n=$REPS (m=1..16)"
+      virs_hdr="# 津田沼 lite (540x540x60, 0.15m, 自由 9.73M = 論文 Actual の 98.2%) frontier2d_sparse n=$REPS 反復掃引
+# goal (57.375,66.075,0°), 0.3m/±15°, 安全0.2m/1e5, unknown=obstacle, 18bit u64。VI_THREADS=m"
+      ros1_reps=1 ros1_timeout=900 ros1_mlist=""
+      ros1_csv=vi_compare/results/tsudanuma/sweep_ros1.csv
+      ros1_outdir=/results/tsudanuma/lite
+      ros1_runlog=/workspace/vi_compare/results/tsudanuma/lite/run_lite_sweep.log
+      ros1_log="lite ROS1 Node B 単発掃引 (m=1..16, TIMEOUT=900 → 約 2 h)"
+      ;;
+    fullext)
+      map=vi_compare/results/tsudanuma/fullext/map_tsudanuma_fullext.yaml
+      gx=164.175 gy=125.625 gt=0 solver=frontier2d_sparse virs_mlist=""
+      virs_out=vi_compare/results/tsudanuma/sweep_vi_rs_sparse_fullext_x${REPS}.csv
+      virs_log="fullext vi_rs sparse n=$REPS (m=1..16, 各 run 状態 157M 確保 → 約 70 min)"
+      virs_hdr="# 津田沼 full-extent (論文条件一致: 157,118,520 総状態 / 自由 9,727,800) frontier2d_sparse n=$REPS 反復掃引
+# goal (164.175,125.625,0°) = lite goal の full 座標, 0.3m/±15°, 安全0.2m/1e5, unknown=obstacle, 18bit u64"
+      ros1_reps=1 ros1_timeout=900 ros1_mlist="8 16"
+      ros1_csv=vi_compare/results/tsudanuma/sweep_ros1_fullext.csv
+      ros1_outdir=/results/tsudanuma/fullext
+      ros1_runlog=/workspace/vi_compare/results/tsudanuma/fullext/run_fullext.log
+      ros1_log="fullext ROS1 Node B (m=8,16, TIMEOUT=900 → 約 33 min)"
+      ;;
+    tsukuba)
+      map=vi_compare/results/tsukuba/map_tsukuba_pooled.yaml
+      gx=20.5 gy=-1.0 gt=0 solver=frontier2d_sparse_compact virs_mlist="4 8 12 16"
+      virs_out=vi_compare/results/tsukuba/sweep_vi_rs_compact_015_x${REPS}.csv
+      virs_log="tsukuba vi_rs sparse_compact n=$REPS (m=4,8,12,16 → 約 80 min)"
+      virs_hdr="# tsukuba 0.15m (4417x2367x60 = 総 627M / 自由 71.3M) frontier2d_sparse_compact n=$REPS 反復掃引
 # goal (20.5,-1.0,0°), 0.3m/±15°, 安全0.2m/1e5, unknown=obstacle, 18bit u64, band=auto, RAM sink
-# plain sparse は常駐 ~59GB で WSL 54GiB に載らないため compact（収束値 bit-exact）を採用
-EOF
-    python3 "$AGG" "$out"
+# plain sparse は常駐 ~59GB で WSL 54GiB に載らないため compact（収束値 bit-exact）を採用"
+      ;;
+    fullassets)
+      map=vi_compare/results/tsudanuma/full/map_tsudanuma_015.yaml
+      gx=179.9 gy=43.7 gt=0 solver=frontier2d_sparse virs_mlist="4 8 12 16"
+      virs_out=vi_compare/results/tsudanuma/sweep_vi_rs_sparse_full_x${REPS}.csv
+      virs_log="full(assets) vi_rs sparse n=$REPS (m=4,8,12,16・参考行)"
+      virs_hdr="# 津田沼 full(assets) (1963x1334x60, 自由 44M = 黒線なし・論文の 4.4×・参考) frontier2d_sparse n=$REPS
+# goal (179.9,43.7,0°), 0.3m/±15°, 安全0.2m/1e5, unknown=obstacle, 18bit u64"
+      ros1_reps=1 ros1_timeout=900 ros1_mlist="16"
+      ros1_csv=vi_compare/results/tsudanuma/sweep_ros1_full.csv
+      ros1_outdir=/results/tsudanuma/full
+      ros1_runlog=/workspace/vi_compare/results/tsudanuma/full/run_fullassets.log
+      ros1_log="full(assets) ROS1 Node B (m=16, TIMEOUT=900・参考行)"
+      ;;
+  esac
+  if [ "$t" = "fullext" ]; then preflight_fullext_map; fi
+
+  if [ "${ROS1_ONLY:-0}" != "1" ]; then
+    preflight_virs
+    bak "$virs_out"
+    log "$virs_log"
+    MAP="$map" OUT="$virs_out" GOAL_X=$gx GOAL_Y=$gy GOAL_THETA=$gt \
+      SOLVER=$solver MLIST="$virs_mlist" REPS="$REPS" \
+      bash "$REPS_VIRS"
+    prepend_hdr "$virs_out" <<<"$virs_hdr"
+    python3 "$AGG" "$virs_out"
   fi
-  if [ "${VIRS_ONLY:-0}" != "1" ]; then
-    preflight_ros1
+  if [ "${VIRS_ONLY:-0}" = "1" ]; then return 0; fi
+  preflight_ros1
+  if [ "$t" = "tsukuba" ]; then
     # 本家は states 構築で常駐 ~30GB＋一時 ~50GB（627M states, vector doubling）
     mem_guard 50000 "tsukuba ROS1 states 構築"
     log "tsukuba ROS1 Node B (m=16, TIMEOUT=900, 構築 ~190s 込み → 約 19 min)"
@@ -241,39 +212,16 @@ EOF
       DELTA_THR=$DELTA_THR TIMEOUT=900 THREAD_NUM=16 \
       VI_SNAP_MS=10000000 OUT_PREFIX=ros1_015_g15_m16_t900
     python3 -c "import json;j=json.load(open('vi_compare/results/tsukuba/snap_run/ros1_015_g15_m16_t900.json'));print({k:j.get(k) for k in ('elapsed_sec','sweeps','converged','last_max_delta','thread_num')})"
+    return 0
   fi
-}
-
-# --------------------------------------------------- fullassets（参考） -----
-bench_fullassets() {
-  local out
-  if [ "${ROS1_ONLY:-0}" != "1" ]; then
-    preflight_virs
-    out=vi_compare/results/tsudanuma/sweep_vi_rs_sparse_full_x${REPS}.csv
-    bak "$out"
-    log "full(assets) vi_rs sparse n=$REPS (m=4,8,12,16・参考行)"
-    MAP=vi_compare/results/tsudanuma/full/map_tsudanuma_015.yaml OUT="$out" \
-      GOAL_X=179.9 GOAL_Y=43.7 GOAL_THETA=0 SOLVER=frontier2d_sparse \
-      MLIST="4 8 12 16" REPS="$REPS" \
-      bash "$REPS_VIRS"
-    prepend_hdr "$out" <<EOF
-# 津田沼 full(assets) (1963x1334x60, 自由 44M = 黒線なし・論文の 4.4×・参考) frontier2d_sparse n=$REPS
-# goal (179.9,43.7,0°), 0.3m/±15°, 安全0.2m/1e5, unknown=obstacle, 18bit u64
-EOF
-    python3 "$AGG" "$out"
-  fi
-  if [ "${VIRS_ONLY:-0}" != "1" ]; then
-    preflight_ros1
-    bak vi_compare/results/tsudanuma/sweep_ros1_full.csv
-    log "full(assets) ROS1 Node B (m=16, TIMEOUT=900・参考行)"
-    docker_ros1 vi_bench_ros1_fullassets "$SWEEP_ROS1" \
-      /workspace/vi_compare/results/tsudanuma/full/run_fullassets.log \
-      MAP_YAML=/workspace/vi_compare/results/tsudanuma/full/map_tsudanuma_015.yaml \
-      GOAL_X=179.9 GOAL_Y=43.7 GOAL_YAW=0 \
-      DELTA_THR=$DELTA_THR TIMEOUT=900 MLIST="16" \
-      OUTDIR=/results/tsudanuma/full SWEEP_CSV=/results/tsudanuma/sweep_ros1_full.csv
-    python3 "$AGG" vi_compare/results/tsudanuma/sweep_ros1_full.csv
-  fi
+  bak "$ros1_csv"
+  log "$ros1_log"
+  docker_ros1 "vi_bench_ros1_$t" "$REPS_ROS1" "$ros1_runlog" \
+    MAP_YAML="/workspace/$map" GOAL_X=$gx GOAL_Y=$gy GOAL_YAW=$gt \
+    DELTA_THR=$DELTA_THR TIMEOUT=$ros1_timeout MLIST="$ros1_mlist" REPS=$ros1_reps \
+    OUTDIR="$ros1_outdir" SWEEP_CSV="/results/${ros1_csv#vi_compare/results/}"
+  if [ -n "$ros1_hdr" ]; then prepend_hdr "$ros1_csv" <<<"$ros1_hdr"; fi
+  python3 "$AGG" "$ros1_csv"
 }
 
 # ------------------------------------------------------------------ main ----
@@ -281,12 +229,8 @@ targets=("$@")
 [ ${#targets[@]} -eq 0 ] && targets=(all)
 for t in "${targets[@]}"; do
   case "$t" in
-    all)        bench_house; bench_lite; bench_fullext; bench_tsukuba ;;
-    house)      bench_house ;;
-    lite)       bench_lite ;;
-    fullext)    bench_fullext ;;
-    tsukuba)    bench_tsukuba ;;
-    fullassets) bench_fullassets ;;
+    all) bench house; bench lite; bench fullext; bench tsukuba ;;
+    house|lite|fullext|tsukuba|fullassets) bench "$t" ;;
     *) echo "unknown target: $t (house|lite|fullext|tsukuba|fullassets|all)" >&2; exit 1 ;;
   esac
 done

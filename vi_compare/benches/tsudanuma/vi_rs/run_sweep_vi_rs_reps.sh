@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # bench_map の m 掃引を各 m につき REPS 回計測し、rep 列付き CSV を出力する。
-# 統計 (mean±std) は後段で集計する。単発版と同じく VI_THREADS=m で bench_map を回す。
+# 統計 (mean±std) は後段 (aggregate_stats.py) で集計する。VI_THREADS=m で bench_map を回す。
 set -e
-cd "${REPO_ROOT:-/home/nop/dev/mywork/value_iteration3}"
+cd "${REPO_ROOT:-$(cd "$(dirname "$0")/../../../.." && pwd)}"
 BM=vi_rs/target/release/bench_map
 MAP="${MAP:?set MAP}"
 OUT="${OUT:?set OUT}"

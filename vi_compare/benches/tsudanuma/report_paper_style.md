@@ -365,8 +365,8 @@ iters/updates とも完全同一（`../tsukuba/probe_margin15_s5.csv`）＝**goa
 `../house/sweep_vi_rs_unsafe_house.csv`, `../house/sweep_vi_rs_sparse_house.csv`, `fig_tables.md`。
 図: `lite/fig_speed_compare.png`, `../house/fig_house_speed.png`, `lite/fig_map_overlay.png`,
 `full/fig_map_overlay_full.png`。
-スクリプト: `crop_pool.py`（lite 生成）, `embed_fullext.py`（full-extent 生成）, `run_sweep_vi_rs.sh`,
-`run_sweep_ros1.sh`, `plot.py`。
+スクリプト: `crop_pool.py`（lite 生成）, `embed_fullext.py`（full-extent 生成）, `run_sweep_vi_rs_reps.sh`,
+`run_sweep_ros1_reps.sh`, `plot.py`。
 **一括再現: `../run_all_benchmarks.sh`（vi_compare/benches/ 直下）** — 全マップの採用条件
 （goal・0.3 m/±15°・ソルバ選択・TIMEOUT・n=10 反復）をエンコードした直列実行オーケストレータ。
 `bash vi_compare/benches/run_all_benchmarks.sh [house|lite|fullext|tsukuba|fullassets|all]`、

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """assets/map_tsudanuma.pgm を ×3 min-pool した後、中心付近の正方窓で crop し、
 論文 Ueda 2023 Table 2 "Actual" 列と同規模 (自由セル ~165k / 自由状態 ~9.9M) の
-0.15 m/cell インスタンスを生成する。pool 部は pool_tsudanuma.py / bench_map::build_occupancy
-と bit 一致 (div_ceil, obstacle-if-any, unknown->obstacle, 上下反転)。
+0.15 m/cell インスタンスを生成する。pool 部は tsukuba/maps/pool_tsukuba.py /
+bench_map::build_occupancy と bit 一致 (div_ceil, obstacle-if-any, unknown->obstacle, 上下反転)。
 
 usage:
   crop_pool.py SRC.pgm probe                 # 各 half-size の自由セル数を表示

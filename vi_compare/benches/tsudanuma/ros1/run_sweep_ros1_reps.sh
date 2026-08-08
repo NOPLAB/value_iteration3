@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# run_sweep_ros1.sh の n 回反復版: 各 m を REPS 回計測し、rep 列付き CSV を出力する。
-# 論文 §4.4.1 と同じく各構成 10 試行の平均を取るための生データ。コンテナ内実行。
+# 本家 vi_node (Node B) を thread_num=m で掃引し、各 m を REPS 回計測して
+# rep 列付き CSV を出力する (REPS=1 で単発掃引。論文 §4.4.1 は各構成 10 試行の平均)。
+# 収束判定は論文 §4.4.1 基準 (ΔV<0.1s/sweep = raw 26214)。コンテナ内実行。
 # mounts: /src_value_iteration(ro), /workspace, /catkin_ws, /results。
 set -e
 source /opt/ros/noetic/setup.bash
@@ -33,7 +34,8 @@ echo "m,rep,sweeps,elapsed_sec,converged,resid_s,thread_num" > "$SWEEP_CSV"
 for m in $MLIST; do
   for r in $(seq 1 "$REPS"); do
     echo "[ros1 reps] m=$m rep=$r ..."
-    roslaunch "$TS/ros1/bench_tsudanuma.launch" map_yaml:=$MAP thread_num:=$m online:=false \
+    roslaunch "$TS/../tsukuba/ros1/bench_tsukuba.launch" map_yaml:=$MAP thread_num:=$m online:=false \
+      goal_margin_radius:=0.3 goal_margin_theta:=15 \
       >"$OUTDIR/node_m${m}_r${r}.log" 2>&1 &
     LP=$!
     sleep 1

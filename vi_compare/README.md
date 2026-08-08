@@ -13,25 +13,25 @@ vi_compare/
 ├── benches/
 │   ├── house/               house マップでのオラクル比較スイート (単スレ中心)
 │   │   ├── params.yaml      共通パラメータ (goal, theta 数など)
-│   │   ├── ros1/  ros2/     本家ノード / vi_node を action 経由で叩くベンチ
+│   │   ├── ros1/            本家ノードを action 経由で叩くベンチ
 │   │   ├── vi_rs/           ROS 非経由の Rust 直接ハーネス
 │   │   │                    (ref_bench = vi_reference 忠実移植単体,
 │   │   │                     u64_bench = u64 高速ソルバ群一括)
 │   │   └── compare/         npy 突き合わせ・レポート生成 (compare.py ほか)
 │   └── tsudanuma/           論文 (Ueda+ 2023) 構成の並列スイープ再現スイート
-│       ├── maps/            pool_tsudanuma.py / crop_pool.py (lite/full 地図生成)
-│       ├── ros1/            bench_tsudanuma.launch + bench_client +
-│       │                    run_sweep_ros1.sh / run_sweep_ros1_reps.sh (m掃引)
+│       ├── maps/            crop_pool.py / embed_fullext.py (lite/full 地図生成;
+│       │                    プールは tsukuba/maps/pool_tsukuba.py を共用)
+│       ├── ros1/            bench_client_tsudanuma.py (tsukuba と共用) +
+│       │                    run_sweep_ros1_reps.sh (m掃引; REPS=1 で単発)
 │       ├── vi_rs/           run_sweep_vi_rs_reps.sh (bench_map の m 掃引; host 実行)
 │       ├── plot.py          図生成 (speed/house/lite/full/tsukuba モード)
 │       └── report_paper_style.md              論文対応レポート
 │   └── tsukuba/             tsukuba フル地図 (226M states) の動画素材生成
-│       └── ros1/            bench_tsukuba.launch + bench_client_tsukuba.py +
+│       └── ros1/            bench_tsukuba.launch (tsudanuma 系ベンチと共用) +
 │                            run_snap_tsukuba.sh (snapshot 付き TIMEOUT ラン)
 ├── video/                   スイープ可視化動画のレンダラ
-│   ├── render_frames_house.py     house 版 (×8 スローモーション)
-│   ├── render_frames_tsudanuma.py 津田沼フル版 (real-time → ×40 timelapse)
-│   ├── render_frames_tsukuba.py   tsukuba 版 (226M states; real-time → ×40 timelapse)
+│   ├── render_frames.py         house / tsudanuma / tsukuba 共通レンダラ
+│   │                            (house = ×8 スローモーション, 他 = real-time → ×40 timelapse)
 │   └── snapshot.patch           本家へ snapshotWorker を足すパッチ (コピーに適用)
 ├── results/                 生成物 (git 管理外; 下記)
 └── .cache/                  catkin_ws / cargo target の永続キャッシュ (git 管理外)
@@ -78,8 +78,8 @@ make compare-strict         # 真の固定点での bit 比較 (scripts/compare_
 
 ### 津田沼 / 並列スイープ
 
-`benches/tsudanuma/ros1/` の `run_sweep_ros1.sh` / `run_sweep_ros1_reps.sh`
-(スレッド数掃引) を docker (`vi_compare_ros1:noetic`) 内で、
+`benches/tsudanuma/ros1/` の `run_sweep_ros1_reps.sh`
+(スレッド数掃引; 単発は REPS=1) を docker (`vi_compare_ros1:noetic`) 内で、
 `vi_rs/run_sweep_vi_rs_reps.sh` を host で実行。env (`MAP_YAML`, `OUTDIR`,
 `GOAL_*`, `MLIST`, `DELTA_THR`, `TIMEOUT`, `SOLVER` など) で制御。
 図は `plot.py [RES] [mode]` (mode = all/speed/house/lite/full/tsukuba,
@@ -92,7 +92,7 @@ matplotlib は docker イメージ `raspicat-vla-sim:latest` で実行)。
    (frontier2d_sparse の Snapshotter)、本家側は無改変の本家 checkout を
    `/src_value_iteration` にマウントし `VI_SNAP_DIR`/`VI_SNAP_MS` env
    (run_snap_tsukuba.sh がコピーへ `video/snapshot.patch` を適用する)。
-2. レンダリング: `video/render_frames_{house,tsudanuma,tsukuba}.py` を raspicat-vla-sim で実行
+2. レンダリング: `video/render_frames.py {house,tsudanuma,tsukuba}` を raspicat-vla-sim で実行
    (リポジトリを `/work` にマウント) → `results/<map>/video_frames/` に PNG。
 3. エンコード: host ffmpeg は libx264 無し — `h264_nvenc -cq 21` か
    `libopenh264` を使う。
@@ -122,7 +122,7 @@ docker run --rm \
 
 # レンダ + エンコード
 docker run --rm -v "$PWD:/work" raspicat-vla-sim:latest \
-  python3 /work/vi_compare/video/render_frames_tsukuba.py
+  python3 /work/vi_compare/video/render_frames.py tsukuba
 cd vi_compare/results/tsukuba && ffmpeg -y -framerate 30 \
   -i video_frames/frame_%05d.png -c:v libx264 -crf 20 -preset medium -pix_fmt yuv420p \
   video_ros1_vs_virs_tsukuba_015.mp4   # libx264 無い環境は -c:v h264_nvenc -cq 21

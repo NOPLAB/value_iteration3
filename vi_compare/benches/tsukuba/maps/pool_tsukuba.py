@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""map_tsukuba.pgm を ×scale で obstacle-dominant min-pool し、本家 map_server が読める
-pooled PGM+YAML を出力する (ベクトル化版)。
+"""map_server 形式マップ (yaml+PGM) を ×scale で obstacle-dominant min-pool し、
+本家 map_server が読める pooled PGM+YAML を出力する (ベクトル化版。
+tsudanuma / tsukuba 共用)。
 
 bench_map.rs::build_occupancy と bit 一致させる:
   - ow = ceil(w/scale), oh = ceil(h/scale)
@@ -8,8 +9,13 @@ bench_map.rs::build_occupancy と bit 一致させる:
   - unknown は obstacle 扱い (--unknown obstacle)
   - occ index は world bottom-up。PGM 画像 row r には pooled row (oh-1-r) を書き、
     map_server の上下反転が occ[gy][gx] を再現する。
-  - origin は元 yaml をそのまま継承 (goal world->cell が bench_map と一致するため)。
+  - resolution / origin / negate / 閾値はソース yaml から読み、origin はそのまま
+    継承 (本家 setStateValues の goal 円盤は origin 依存なので、goal world->cell
+    が bench_map と一致するため)。
+
+usage: pool_tsukuba.py SRC_YAML SCALE OUT_PGM OUT_YAML
 """
+import os
 import sys
 import numpy as np
 
@@ -26,17 +32,30 @@ def load_pgm(path):
     return w, h, data
 
 
+def load_map_yaml(path):
+    """map_server yaml の単純な key: value 行だけ読む (pyyaml 非依存)。"""
+    m = {}
+    with open(path) as f:
+        for line in f:
+            line = line.split('#', 1)[0].strip()
+            if ':' in line:
+                k, v = line.split(':', 1)
+                m[k.strip()] = v.strip()
+    return m
+
+
 def main():
-    src = sys.argv[1]
+    src_yaml = sys.argv[1]
     scale = int(sys.argv[2])
     out_pgm = sys.argv[3]
     out_yaml = sys.argv[4]
-    # tsukuba yaml
-    full_res = 0.05
-    origin = (-553.840, -60.609, 0.0)
-    occupied_thresh = 0.65
-    free_thresh = 0.196
-    negate = 0
+    meta = load_map_yaml(src_yaml)
+    src = os.path.join(os.path.dirname(src_yaml), meta['image'])
+    full_res = float(meta['resolution'])
+    origin = [float(x) for x in meta['origin'].strip('[]').split(',')]
+    occupied_thresh = float(meta.get('occupied_thresh', 0.65))
+    free_thresh = float(meta.get('free_thresh', 0.196))
+    negate = int(meta.get('negate', 0))
 
     w, h, pix = load_pgm(src)
     p = pix.astype(np.float64)

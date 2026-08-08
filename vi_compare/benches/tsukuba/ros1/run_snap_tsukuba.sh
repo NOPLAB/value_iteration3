@@ -59,7 +59,7 @@ LAUNCH_PID=$!
 trap 'kill $LAUNCH_PID 2>/dev/null || true' EXIT
 
 echo "[run_snap] client: goal=(${GOAL_X},${GOAL_Y},${GOAL_YAW}) margin=(${GOAL_MARGIN_RADIUS}m,${GOAL_MARGIN_THETA}deg) thr=${DELTA_THR} timeout=${TIMEOUT}s"
-python3 "$TS/ros1/bench_client_tsukuba.py" \
+python3 "$TS/../tsudanuma/ros1/bench_client_tsudanuma.py" \
   "$GOAL_X" "$GOAL_Y" "$GOAL_YAW" "$DELTA_THR" "$MAX_SWEEPS" "$TIMEOUT" "$THREAD_NUM" \
   "$OUTDIR/snap_run/${OUT_PREFIX}"
 

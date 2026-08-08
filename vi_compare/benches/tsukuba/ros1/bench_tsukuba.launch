@@ -1,6 +1,8 @@
 <launch>
-  <!-- 本家 value_iteration を tsukuba プールマップ上で並列スイープ実行する
-       ベンチ用 launch。map_server(プールPGM) + vi_node。
+  <!-- 本家 value_iteration をプールマップ上で並列スイープ実行するベンチ用
+       launch (tsukuba / tsudanuma 系共用。run_sweep_ros1_reps.sh は
+       goal_margin_radius:=0.3 goal_margin_theta:=15 を渡す)。
+       map_server(プールPGM) + vi_node。
        planning params は vi_rs (bench_map) 側と一致させてある:
          theta=60, safety_radius=0.2m, safety_radius_penalty=100000。
        goal margin は arg で可変 (default は動画向けの 0.5m/180=全θ受容)。

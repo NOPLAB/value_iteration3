@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 import numpy as np
 import compare as C
 
@@ -35,7 +36,6 @@ def test_value_metrics_empty_and_constant():
     a = np.full((H, W, T), 7.0)
     b = np.arange(H * W * T, dtype=np.float64).reshape(H, W, T)
     # empty reach -> all NaN
-    import math
     m0 = C.value_metrics(a, b, reach=np.zeros((H, W, T), bool))
     assert m0['n'] == 0 and math.isnan(m0['rmse']) and math.isnan(m0['spearman'])
     # constant `a` over full reach -> pearson AND spearman both NaN (the fix)
@@ -43,12 +43,10 @@ def test_value_metrics_empty_and_constant():
     assert math.isnan(m1['pearson']) and math.isnan(m1['spearman'])
 
 def test_directional_unreach_agreement():
-    import numpy as np
     small = np.zeros((4,4,2), bool); small[0,0,0]=True; small[1,1,0]=True  # 2 cells
     big = np.zeros((4,4,2), bool); big[0,0,0]=True; big[1,1,0]=True; big[2,2,0]=True; big[3,3,0]=True  # superset+extra
     assert abs(C.directional_unreach_agreement(small, big) - 1.0) < 1e-9
     small2 = np.zeros((2,2,1), bool)  # empty
-    import math
     assert math.isnan(C.directional_unreach_agreement(small2, big[:2,:2,:1]))
 
 if __name__ == '__main__':

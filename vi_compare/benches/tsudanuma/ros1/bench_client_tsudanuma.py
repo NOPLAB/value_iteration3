@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""ROS1 津田沼ベンチ・タイミング専用クライアント。
+"""ROS1 ベンチ・タイミング専用クライアント (tsudanuma / tsukuba 共用)。
 
 bench_client.py と同じ収束検知 (feedback delta) を使うが、巨大マップ
-(1963x1334x60) では /value・/policy gridmap の取得が 2.5GB 級になり非現実的
+(1963x1334x60 など) では /value・/policy gridmap の取得が 2.5GB 級になり非現実的
 なので **gridmap は取得しない**。goal 送信→収束検知までの wall-clock と
 sweep 数だけを記録する。これは bench_map (vi_rs) の solve() 計測と対をなす
-本家側の VI 時間。
+本家側の VI 時間。json 記録用のマップ名・goal margin は env
+(MAP_YAML / GOAL_MARGIN_RADIUS / GOAL_MARGIN_THETA) から取る。
 
 usage: bench_client_tsudanuma.py GOAL_X GOAL_Y GOAL_YAW_DEG DELTA_THR MAX_SWEEPS TIMEOUT_SEC THREAD_NUM OUT_PREFIX
   DELTA_THR: 本家 _delta は (max_delta>>18) の整数秒。0 で「1秒以上動くセルが無く
@@ -88,7 +89,7 @@ def main():
     thread_num = int(sys.argv[7])
     out_prefix = sys.argv[8]
 
-    rospy.init_node('vi_bench_client_tsudanuma')
+    rospy.init_node('vi_bench_client')
     b = Bench(thr, max_sweeps, timeout)
     b.run(gx, gy, gyaw)
 
@@ -96,14 +97,16 @@ def main():
     timing = dict(elapsed_sec=b.elapsed, sweeps=b.sweeps, converged=b.converged,
                   last_max_delta=b.last_delta, thread_num=thread_num,
                   delta_threshold=thr, goal=[gx, gy, gyaw], side='ros1',
-                  map='map_tsudanuma_015 (0.15m, scale3)')
+                  map=os.path.basename(os.environ.get('MAP_YAML', '')),
+                  goal_margin_radius=float(os.environ.get('GOAL_MARGIN_RADIUS', 'nan')),
+                  goal_margin_theta=float(os.environ.get('GOAL_MARGIN_THETA', 'nan')))
     with open(out_prefix + '.json', 'w') as f:
         json.dump(timing, f, indent=2)
     with open(out_prefix + '.csv', 'w') as f:
         f.write('solver,sweeps,elapsed_sec,converged,thread_num\n')
         f.write('ros1_parallel,%s,%.3f,%s,%d\n' % (
             b.sweeps, b.elapsed, 'Y' if b.converged else 'N', thread_num))
-    rospy.loginfo("ROS1 tsudanuma bench done: %s", timing)
+    rospy.loginfo("ROS1 bench done: %s", timing)
 
 
 if __name__ == '__main__':
