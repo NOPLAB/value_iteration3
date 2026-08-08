@@ -13,7 +13,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # vi_planner core (rclrs-free) unit tests. They run under `--lib` so cargo does
 # NOT build the rclrs `vi_planner` binary, which links only via colcon (a plain
 # `cargo test --test ...` would fail to find the nav2_msgs C typesupport libs).
-cd "$REPO_ROOT/vi_ros2/vi_planner"
+cd "$REPO_ROOT/vi_rs/vi_planner"
 cargo test --lib
 
 # Full colcon build (this is what links the rclrs `vi_planner` binary; plain

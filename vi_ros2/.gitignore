@@ -1,2 +1,0 @@
-# cargo artifacts (vi_planner は vi_rs ワークスペースの外で自前の target/ を持つ)
-**/target/

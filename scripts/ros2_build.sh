@@ -11,7 +11,7 @@ set -u
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WS="$REPO_ROOT/vi_ros2_ws"
 mkdir -p "$WS/src"
-ln -sfn "$REPO_ROOT/vi_ros2/vi_planner" "$WS/src/vi_planner"
+ln -sfn "$REPO_ROOT/vi_rs/vi_planner" "$WS/src/vi_planner"
 
 # Run colcon from $REPO_ROOT (not $WS) so the generated cargo config is found,
 # and use --merge-install so the linker finds the message packages' C libs:
@@ -20,12 +20,12 @@ ln -sfn "$REPO_ROOT/vi_ros2/vi_planner" "$WS/src/vi_planner"
 #     (the [patch.crates-io] redirects to the locally-built rclrs / message
 #     crates) into colcon's current working directory. The package sources are
 #     symlinked into $WS/src, and cargo canonicalizes its cwd through those
-#     symlinks to the real paths under $REPO_ROOT/vi_ros2 before searching
+#     symlinks to the real paths under $REPO_ROOT/vi_rs before searching
 #     upward for `.cargo/config.toml`. Run from $WS and the config lands in
 #     $WS/.cargo, which the real source tree never sees, so the patches go unused
 #     and cargo fails to resolve the ROS crates from crates.io. Running from
-#     $REPO_ROOT puts it at $REPO_ROOT/.cargo/config.toml, the common ancestor of
-#     both the real package sources and the ../../vi_rs/* path deps.
+#     $REPO_ROOT puts it at $REPO_ROOT/.cargo/config.toml, an ancestor of
+#     both the real package sources and the ../vi_lib path dep.
 #
 #  2. --merge-install: rosidl_runtime_rs's build.rs adds `<prefix>/lib` to the
 #     linker search path for each prefix on AMENT_PREFIX_PATH (this is also how

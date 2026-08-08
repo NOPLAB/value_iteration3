@@ -1,1 +1,3 @@
 /target
+# vi_planner は workspace 外で自前の target/ を持つ (colcon/cargo 生成物)
+/vi_planner/target/
