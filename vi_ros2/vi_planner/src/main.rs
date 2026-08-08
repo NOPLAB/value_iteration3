@@ -96,8 +96,8 @@ use vi_reference::Action;
 // nav_msgs::msg::OccupancyGrid と名前が衝突するので別名で入れる。
 
 use vi_planner::core::{
-    value_grid_on, BuildParams, Decision, PlanConfig, PlanError, PlanStats, PlannerCore,
-    Prefetcher, SweepCursor,
+    value_grid_on, BuildParams, Decision, FollowKind, PlanConfig, PlanError, PlanStats,
+    PlannerCore, Prefetcher, SweepCursor,
 };
 
 use rclrs::*;
@@ -158,6 +158,12 @@ struct Params {
     refine_budget_ms: i64,
     action_tolerance: f64,
     no_action_timeout_sec: f64,
+    /// follow 1 tick の判断器 ("greedy" = 本家 decision / "dwa" = 連続行動)。
+    follow_controller: String,
+    /// DWA の前方シミュレーション時間 [s] と (v, ω) 候補数。
+    dwa_horizon_s: f64,
+    dwa_n_v: i64,
+    dwa_n_w: i64,
     // ── スタンドアロン (navigate_to_pose / follow_waypoints) ──
     standalone: bool,
     goal_retry_limit: i64,
@@ -235,6 +241,16 @@ fn read_params(node: &Node) -> Result<Params> {
     let refine_budget_ms = p!("refine_budget_ms", i64, 40);
     let action_tolerance = p!("action_tolerance", f64, 0.2);
     let no_action_timeout_sec = p!("no_action_timeout_sec", f64, 3.0);
+    // follow 1 tick の判断器。"greedy" (既定) は本家 ViNode::decision 準拠の離散
+    // 6 行動。"dwa" は同じ価値関数を連続に読む (V̂ 補間 + (v, ω) 候補格子、
+    // core::follow の doc 参照)。指令の速度範囲は行動集合と同じで、候補全滅時は
+    // greedy へフォールバックするので、切り替えても失敗の形は変わらない。
+    let follow_controller = p!("follow_controller", Arc<str>, "greedy".into()).to_string();
+    // DWA の前方シミュレーション時間と候補数 (計算量 ∝ n_v × n_w × horizon)。
+    // 既定 (1.0 s, 7×11) の実測は decide ~30 µs — 10 Hz の 40 ms 予算には遠い。
+    let dwa_horizon_s = p!("dwa_horizon_s", f64, 1.0);
+    let dwa_n_v = p!("dwa_n_v", i64, 7);
+    let dwa_n_w = p!("dwa_n_w", i64, 11);
 
     // navigate_to_pose と follow_waypoints をこのノード自身が提供する
     // (= bt_navigator / behavior_server / waypoint_follower を立てない)。
@@ -367,6 +383,10 @@ fn read_params(node: &Node) -> Result<Params> {
         refine_budget_ms,
         action_tolerance,
         no_action_timeout_sec,
+        follow_controller,
+        dwa_horizon_s,
+        dwa_n_v,
+        dwa_n_w,
         standalone,
         goal_retry_limit,
         goal_retry_settle_sec,
@@ -415,6 +435,12 @@ fn validate(p: &Params) -> Result<U64Solver> {
     // follow を切る組み合わせは成立しない。
     if p.standalone && !p.follow {
         return Err(anyhow!("standalone: true requires follow: true"));
+    }
+    if FollowKind::from_name(&p.follow_controller).is_none() {
+        return Err(anyhow!(
+            "unknown follow_controller: {} (expected \"greedy\" or \"dwa\")",
+            p.follow_controller
+        ));
     }
     let solver = U64Solver::from_name(&p.solver)
         .ok_or_else(|| anyhow!("unknown solver: {} (see U64Solver::from_name)", p.solver))?;
@@ -1186,6 +1212,16 @@ fn main() -> Result<()> {
         goal_margin_radius: params.goal_margin_radius,
         goal_margin_theta: params.goal_margin_theta_deg as i32,
     };
+    // validate() 済みなので必ず解ける。
+    let follow_kind = FollowKind::from_name(&params.follow_controller)
+        .ok_or_else(|| anyhow!("unknown follow_controller: {}", params.follow_controller))?;
+    if follow_kind == FollowKind::Dwa {
+        eprintln!(
+            "vi_planner: follow controller = dwa (continuous; horizon {:.2} s, {}x{} candidates, \
+             greedy fallback)",
+            params.dwa_horizon_s, params.dwa_n_v, params.dwa_n_w
+        );
+    }
     let cfg = PlanConfig {
         solver,
         max_solve_iter: params.max_solve_iter.max(1) as u32,
@@ -1196,6 +1232,11 @@ fn main() -> Result<()> {
         start_tolerance_cells,
         path_spacing: params.path_spacing,
         action_tolerance_cells,
+        follow_controller: follow_kind,
+        dwa_tick_s: 1.0 / params.control_frequency,
+        dwa_horizon_s: params.dwa_horizon_s,
+        dwa_n_v: params.dwa_n_v.max(2) as usize,
+        dwa_n_w: params.dwa_n_w.max(3) as usize,
         compact_sink_dir: sink_dir,
         // 先読みを入れると場が 2 つ同時に生きるので、compact の確定出力は solve
         // ごとに使い捨てのディレクトリ (<compact_sink_dir>/gen<N>) へ分ける。

@@ -113,9 +113,12 @@
 //! できる (分離クレート方式; リポジトリ CLAUDE.md 参照)。
 
 mod compact;
+mod follow;
 mod prefetch;
 #[cfg(test)]
 mod tests;
+
+pub use follow::{DwaController, FollowController, FollowKind, GreedyController};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -187,6 +190,16 @@ pub struct PlanConfig {
     // ── 狭域 (follow_path) ──
     /// 現在セルに方策が無いとき近傍から行動を借りる範囲 (セル数)。
     pub action_tolerance_cells: i32,
+    /// follow 1 tick の判断器 ([`FollowKind::Greedy`] = 本家 decision /
+    /// [`FollowKind::Dwa`] = 連続行動)。詳細は [`follow`] モジュールの doc。
+    pub follow_controller: FollowKind,
+    /// DWA: 制御周期 [s] (= 1/control_frequency)。候補評価の時間刻みの上限。
+    pub dwa_tick_s: f64,
+    /// DWA: 前方シミュレーション時間 [s]。
+    pub dwa_horizon_s: f64,
+    /// DWA: 並進 / 角速度の候補数 (格子は n_v × n_w)。
+    pub dwa_n_v: usize,
+    pub dwa_n_w: usize,
 
     // ── アウトオブコア (compact) 経路 ──
     /// 確定出力の置き場。`solver` が `frontier2d_sparse_compact` のときだけ参照する。
@@ -279,9 +292,11 @@ impl std::fmt::Display for PlanError {
 pub enum Decision {
     /// 現在姿勢がゴール圏 (`final_state`)。
     Goal,
-    /// 最適行動。`fw` は前進量 [m]、`rot_deg` は回転量 [deg]
+    /// 実行する行動。`fw` は前進量 [m]、`rot_deg` は回転量 [deg]
     /// (本家 `ViNode::decision` はこれをそのまま速度指令として配信する)。
-    Action { id: usize, fw: f64, rot_deg: f64 },
+    /// `id` は離散方策の行動 id — 連続コントローラ ([`DwaController`]) の指令は
+    /// 離散行動に対応しないので `None`。
+    Action { id: Option<usize>, fw: f64, rot_deg: f64 },
     /// 方策なし (地図外 / 障害物セル / 未到達セル)。
     NoAction,
 }
@@ -343,6 +358,9 @@ pub struct PlannerCore {
     /// 追従の道具 (パッチ・penalty 表・修復タイル) を持たず solve だけをする核か。
     /// 先読みワーカーが抱える予備の核がこれ ([`PlannerCore::new_solve_only`])。
     solve_only: bool,
+    /// follow 1 tick の判断器 ([`PlanConfig::follow_controller`] から組む)。
+    /// solve・ロールアウトには関与しない — `decide` だけがこれを通る。
+    follow: Box<dyn FollowController>,
 }
 
 /// 円環上の角度差 (度、0..=180)。
@@ -418,7 +436,7 @@ fn action_at(vi: &ValueIterator, ix: i32, iy: i32, it: i32) -> Option<Decision> 
         return None;
     }
     let a = vi.actions.iter().find(|a| a.id == id)?;
-    Some(Decision::Action { id: id as usize, fw: a.delta_fw, rot_deg: a.delta_rot })
+    Some(Decision::Action { id: Some(id as usize), fw: a.delta_fw, rot_deg: a.delta_rot })
 }
 
 /// 範囲内で final_state か (境界チェック込み)。
@@ -462,9 +480,11 @@ impl PlannerCore {
         // 修復タイルは遷移表の再計算が要るので、パッチと一緒に最初の solve で作る
         // (`prepare_goal_with_progress`)。掃きスレッドの中で作ると、数秒かかる
         // 再計算をロックの中でやることになる。
+        let follow = follow::make_controller(&cfg, &build.actions);
         Self {
             build,
             cfg,
+            follow,
             cached: None,
             patch: None,
             penalty,
@@ -1091,42 +1111,12 @@ impl PlannerCore {
         (delta, false)
     }
 
-    /// 現在姿勢の判断 (本家 `ViNode::decision` の `posToAction` 相当、読み取り
-    /// 専用)。現在セルに方策が無ければ同一 θ の近傍 (チェビシェフ距離
-    /// `action_tolerance_cells` 以内) から最近傍の行動 / ゴールセルを借りる。
+    /// 現在姿勢の判断 (読み取り専用)。実体は [`PlanConfig::follow_controller`] で
+    /// 選んだ [`FollowController`] — 既定の greedy は本家 `ViNode::decision` の
+    /// `posToAction` 相当 (方策が無ければ近傍借用)、dwa は連続行動。
     /// compact 経路では `set_window` でパッチを起こしてから呼ぶこと。
     pub fn decide(&self, pose: PoseView) -> Decision {
         let Some(local) = self.local() else { return Decision::NoAction };
-        let vi = &local.base;
-        let (ix, iy, it) = pose_to_cell(vi, pose.x, pose.y, pose.yaw_rad);
-
-        if is_final(vi, ix, iy, it) {
-            return Decision::Goal;
-        }
-        if let Some(d) = action_at(vi, ix, iy, it) {
-            return d;
-        }
-
-        let tol = self.cfg.action_tolerance_cells;
-        let mut best: Option<(i64, Decision)> = None;
-        for dy in -tol..=tol {
-            for dx in -tol..=tol {
-                if dx == 0 && dy == 0 {
-                    continue;
-                }
-                let (nx, ny) = (ix + dx, iy + dy);
-                let cand = if is_final(vi, nx, ny, it) {
-                    Some(Decision::Goal)
-                } else {
-                    action_at(vi, nx, ny, it)
-                };
-                let Some(cand) = cand else { continue };
-                let d2 = (dx as i64) * (dx as i64) + (dy as i64) * (dy as i64);
-                if best.as_ref().map(|(bd, _)| d2 < *bd).unwrap_or(true) {
-                    best = Some((d2, cand));
-                }
-            }
-        }
-        best.map(|(_, d)| d).unwrap_or(Decision::NoAction)
+        self.follow.decide(&local.base, &self.cfg, pose)
     }
 }

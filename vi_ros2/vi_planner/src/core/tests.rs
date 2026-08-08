@@ -50,6 +50,11 @@ fn cfg() -> PlanConfig {
         start_tolerance_cells: 10,
         path_spacing: RES,
         action_tolerance_cells: 4,
+        follow_controller: FollowKind::Greedy,
+        dwa_tick_s: 0.1,
+        dwa_horizon_s: 1.0,
+        dwa_n_v: 7,
+        dwa_n_w: 11,
         compact_sink_dir: None,
         compact_sink_gen: None,
         vi_threads: 1,
@@ -234,6 +239,116 @@ fn compact_recenters_repeatedly_with_an_interior_patch() {
         }
     }
     panic!("did not reach the goal in 500 steps ({hydrations} hydrations)");
+}
+
+/// DWA (連続行動) コントローラでも同じ場でゴール圏まで走り切れること。greedy と
+/// 違い指令は速度なので、実機と同じく tick (0.1 s) ごとに定速弧で積分して再決定
+/// する (greedy 系テストの「fw を 1 歩ぶん跳ぶ」とは実行モデルが違う)。
+#[test]
+fn dwa_follows_to_goal_on_empty_map() {
+    use vi_reference::ctrl::unicycle_step;
+    let mut c = cfg();
+    c.follow_controller = FollowKind::Dwa;
+    let mut core = PlannerCore::new(build(64), c);
+    let cancel = AtomicBool::new(false);
+    let goal = pose(2.0, 2.0, 0.0);
+    core.prepare_goal(goal, &cancel).expect("solve");
+
+    let tick = 0.1f64;
+    let (mut x, mut y, mut yaw) = (0.6f64, 0.6f64, 0.0f64);
+    let mut saw_dwa = false;
+    for _ in 0..3000 {
+        let p = pose(x, y, yaw);
+        core.set_window(p);
+        match core.decide(p) {
+            Decision::Goal => {
+                let d = core.goal_distance(x, y).unwrap();
+                assert!(d <= 0.3, "goal margin: d = {d}");
+                assert!(saw_dwa, "DWA must have decided at least once (not only fallback)");
+                return;
+            }
+            Decision::Action { id, fw, rot_deg } => {
+                // DWA 自身の指令は id を持たない (greedy 救済のときだけ Some)。
+                saw_dwa |= id.is_none();
+                let (nx, ny, nyaw) = unicycle_step(x, y, yaw, fw, rot_deg.to_radians(), tick);
+                x = nx;
+                y = ny;
+                yaw = nyaw;
+            }
+            Decision::NoAction => panic!("no action at ({x:.2}, {y:.2})"),
+        }
+    }
+    panic!("did not reach the goal in 3000 ticks");
+}
+
+/// compact 経路 (パッチ上) でも DWA が走り切れること。ホライズンの端がパッチ外に
+/// 出る候補は V̂ 評価不能で棄却されるだけ (凍結境界の不変条件はそのまま) で、
+/// パッチは走行中に置き直され続ける。
+#[test]
+fn dwa_follows_to_goal_on_compact_patch() {
+    use vi_reference::ctrl::unicycle_step;
+    let mut c = cfg_compact();
+    c.follow_controller = FollowKind::Dwa;
+    let mut core = PlannerCore::new(build(96), c);
+    let cancel = AtomicBool::new(false);
+    let goal = pose(4.0, 4.0, 0.0);
+    core.prepare_goal(goal, &cancel).expect("compact solve");
+
+    let tick = 0.1f64;
+    let (mut x, mut y, mut yaw) = (0.6f64, 0.6f64, 0.0f64);
+    let (mut saw_dwa, mut hydrations) = (false, 0usize);
+    let mut last_at = None;
+    for _ in 0..6000 {
+        let p = pose(x, y, yaw);
+        core.set_window(p);
+        let at = core.patch.as_ref().and_then(|p| p.at);
+        if at != last_at {
+            hydrations += 1;
+            last_at = at;
+        }
+        // refine はしない (スキャンを入れないので値は動かない)。decide だけを回す。
+        match core.decide(p) {
+            Decision::Goal => {
+                let d = core.goal_distance(x, y).unwrap();
+                assert!(d <= 0.3, "goal margin: d = {d}");
+                assert!(saw_dwa, "DWA must have decided at least once (not only fallback)");
+                assert!(hydrations > 1, "the patch must have moved along the way");
+                return;
+            }
+            Decision::Action { id, fw, rot_deg } => {
+                saw_dwa |= id.is_none();
+                let (nx, ny, nyaw) = unicycle_step(x, y, yaw, fw, rot_deg.to_radians(), tick);
+                x = nx;
+                y = ny;
+                yaw = nyaw;
+            }
+            Decision::NoAction => panic!("no action at ({x:.2}, {y:.2})"),
+        }
+    }
+    panic!("did not reach the goal in 6000 ticks");
+}
+
+/// DWA でも方策なしセル (膨張内・非 free) からは greedy の近傍救済が効くこと —
+/// 候補全滅時のフォールバックが `decide_borrows_action_from_neighbors` と同じ
+/// 意味論を保つ。
+#[test]
+fn dwa_falls_back_to_greedy_on_unevaluable_cells() {
+    let size = 64;
+    let mut b = build(size);
+    for y in 18..=22 {
+        for x in 18..=22 {
+            b.grid.data[(y * size + x) as usize] = 100;
+        }
+    }
+    let mut c = cfg();
+    c.follow_controller = FollowKind::Dwa;
+    let mut core = PlannerCore::new(b, c);
+    let cancel = AtomicBool::new(false);
+    core.prepare_goal(pose(2.5, 2.5, 0.0), &cancel).expect("solve");
+
+    // 障害物セルの上: DWA は評価不能 → greedy 借用が離散行動 (id: Some) を返す。
+    let on_obstacle = pose(20.5 * RES, 20.5 * RES, 0.0);
+    assert!(matches!(core.decide(on_obstacle), Decision::Action { id: Some(_), .. }));
 }
 
 /// compact 経路の広域側が密経路と同じ経路を返すこと (ロールアウトは sink を読む)。
@@ -836,6 +951,7 @@ fn decide_borrows_action_from_neighbors() {
     // tolerance 0 だと NoAction。
     let mut strict = cfg();
     strict.action_tolerance_cells = 0;
+    let strict_follow = follow::make_controller(&strict, &core.build.actions);
     let strict_core = PlannerCore {
         build: core.build.clone(),
         cfg: strict,
@@ -846,9 +962,11 @@ fn decide_borrows_action_from_neighbors() {
         dirty: false,
         prefetch: None,
         solve_only: false,
+        follow: strict_follow,
     };
     assert_eq!(strict_core.decide(on_obstacle), Decision::NoAction);
     // tolerance 4 (0.2m) なら近傍の行動を借りられる。
+    let relaxed_follow = follow::make_controller(&cfg(), &strict_core.build.actions);
     let relaxed_core = PlannerCore {
         build: strict_core.build.clone(),
         cfg: cfg(),
@@ -859,6 +977,7 @@ fn decide_borrows_action_from_neighbors() {
         dirty: false,
         prefetch: None,
         solve_only: false,
+        follow: relaxed_follow,
     };
     assert!(matches!(relaxed_core.decide(on_obstacle), Decision::Action { .. }));
 }
