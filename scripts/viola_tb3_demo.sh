@@ -37,7 +37,7 @@ ros2 run nav2_map_server map_server --ros-args \
     -p use_sim_time:=true >"$LOG/map_server.log" 2>&1 &
 
 ros2 run vi_planner vi_planner --ros-args \
-    -p localizer:=grid \
+    -p localizer:=adaptive \
     -p standalone:=true \
     -p use_sim_time:=true \
     -p map_wait_sec:=120 \
