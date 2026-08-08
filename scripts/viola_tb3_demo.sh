@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# VIOLA (vi_planner standalone + GridLocalizer) を TurtleBot3 world (Gazebo classic)
-# で走らせるデモ。ネイティブ RoboStack 環境用。
+# VIOLA (vi_planner standalone + 内蔵 localizer=viterbi + QMDP + 能動的再定位)
+# を TurtleBot3 world (Gazebo classic) で走らせるデモ。ネイティブ RoboStack 環境用。
 #
 #   scripts/ros2_build.sh          # 先にネイティブビルド
 #   scripts/viola_tb3_demo.sh      # Gazebo + map_server + vi_planner + RViz
@@ -41,14 +41,106 @@ ros2 run nav2_map_server map_server --ros-args \
     -p yaml_filename:="$REPO_ROOT/assets/tb3_world/map.yaml" \
     -p use_sim_time:=true >"$LOG/map_server.log" 2>&1 &
 
-ros2 run vi_planner vi_planner --ros-args \
-    -p localizer:=adaptive \
-    -p standalone:=true \
-    -p use_sim_time:=true \
-    -p map_wait_sec:=120 \
-    -p pose_topic:=initialpose \
-    -p publish_tf:=true \
-    -p scan_topic:=scan >"$LOG/vi_planner.log" 2>&1 &
+# vi_planner の全パラメータ (main.rs の宣言順)。値はこのデモの設定で、各行の
+# コメントが規定値。規定値から変えているのは use_sim_time / map_wait_sec /
+# pose_topic / publish_tf / localizer / belief_radius / follow_controller /
+# qmdp / active_reloc / standalone のみ。
+VI_ARGS=(
+    -p use_sim_time:=true                # 規定: false (ROS 標準) — Gazebo の /clock に乗る
+    # ── ソルバ / 地図 ──
+    -p solver:=frontier2d_sparse         # 規定: frontier2d_sparse (U64Solver の名前)
+    -p theta_cell_num:=60                # 規定: 60 (θ の離散数)
+    -p safety_radius:=0.2                # 規定: 0.2 [m] (障害物マージン帯の半径)
+    -p safety_radius_penalty:=30         # 規定: 30 [秒相当/セル] (マージン帯の penalty)
+    -p goal_margin_radius:=0.3           # 規定: 0.3 [m] (ゴール判定の XY 半径)
+    -p goal_margin_theta:=15.0           # 規定: 15.0 [deg] (ゴール判定の θ 幅)
+    -p map_wait_sec:=120                 # 規定: 30 — GUI 起動で discovery が遅れるので延長
+    # -p action_names:="[forward, back, right, rightfw, left, leftfw]"   # 規定: 左記 6 行動
+    # -p action_forward_m:="[0.3, -0.2, 0.0, 0.2, 0.0, 0.2]"             # 規定: 左記 [m]
+    # -p action_rotation_deg:="[0.0, 0.0, -20.0, -20.0, 20.0, 20.0]"     # 規定: 左記 [deg]
+    -p unknown_as_obstacle:=true         # 規定: true (未知セルを障害物扱い)
+    -p map_scale:=1                      # 規定: 1 (ダウンサンプル倍率、1 = 等倍)
+    -p downsample_policy:=conservative   # 規定: conservative (障害物優先) | optimistic
+    # -p compact_sink_dir:=/path         # 規定: "" = RAM (compact ソルバのときだけ効く)
+    -p compact_ram_limit_mb:=512         # 規定: 512 — sink がこれを超えると /tmp/vi_planner_sink へ
+    -p dense_limit_mb:=1500              # 規定: 1500 — 密の価値関数がこれを超えたら起動拒否
+    -p vi_threads:=0                     # 規定: 0 = VI_THREADS を触らない (>0 で設定)
+    -p max_solve_iter:=1000000           # 規定: 1000000 (solve の反復上限)
+    -p solve_chunk:=64                   # 規定: 64 (キャンセル/進捗確認の粒度)
+    # ── ゴール判定 / 姿勢・TF ──
+    -p goal_tolerance_xy:=0.25           # 規定: 0.25 [m] (navigate_to_pose の達成判定)
+    -p goal_tolerance_deg:=10.0          # 規定: 10.0 [deg]
+    -p pose_topic:=initialpose           # 規定: mcl_pose — grid/adaptive では手動シード口
+    -p global_frame:=map                 # 規定: map
+    -p publish_tf:=true                  # 規定: false — map→odom TF を配信 (AMCL の契約の置き換え)
+    -p transform_tolerance:=0.5          # 規定: 0.5 [s] (TF スタンプの未来日付け)
+    -p odom_topic:=odom                  # 規定: odom (publish_tf 用の T_odom→base の出どころ)
+    # ── 自己位置推定 ──
+    -p localizer:=viterbi                # 規定: external | grid | adaptive (多重解像度) | viterbi (同 min-plus 版)
+    -p belief_radius:=5.0                # 規定: 2.5 [m] (belief 窓の半径)
+    -p belief_sensor_sigma:=0.2          # 規定: 0.2 [m] (尤度場のガウス幅)
+    -p belief_beam_step:=10              # 規定: 10 (補正に使うビームの間引き、1 = 全ビーム)
+    -p belief_max_range:=25.0            # 規定: 25.0 [m] (これより遠いレンジは補正に使わない)
+    -p belief_motion_sigma_xy:=0.03      # 規定: 0.03 [m/tick] (predict の位置ノイズ)
+    -p belief_motion_sigma_theta_deg:=2.0 # 規定: 2.0 [deg/tick]
+    -p belief_z_min:=0.05                # 規定: 0.05 (ビーム尤度の床)
+    -p belief_weight_skip_ratio:=0.0001  # 規定: 1e-4 (補正で読む重みの相対しきい値)
+    -p scan_quality_gate:=0.25           # 規定: 0.25 — 観測一致度がこれ未満の scan は注入を減衰、0 で無効
+    -p scan_attribution_m:=0.4           # 規定: 0.4 [m] — 地図障害物のこの距離以内のヒットは注入しない (再投影ゴースト対策)、0 で無効
+    -p footprint_clear_m:=0.2            # 規定: 0.2 [m] — 注入のたびに機体周囲の local_penalty を消す、0 で無効
+    # ── 広域 (compute_path_to_pose) ──
+    -p max_rollout_steps:=10000          # 規定: 10000 (経路ロールアウトの上限歩数)
+    -p start_tolerance:=0.5              # 規定: 0.5 [m] (開始姿勢と地図のずれ許容)
+    -p path_spacing:=0.05                # 規定: 0.05 [m] (densify の点間隔)
+    # ── 狭域 (follow_path) ──
+    -p local_xy_range:=1.0               # 規定: 1.0 [m] (ローカルウィンドウ半径、本家固定値)
+    -p follow:=true                      # 規定: true — false で global-only (nav2_controller と組む)
+    -p scan_topic:=scan                  # 規定: scan
+    -p control_frequency:=10.0           # 規定: 10.0 [Hz]
+    -p refine_budget_ms:=40              # 規定: 40 [ms/tick] (ローカル反復の予算)
+    -p action_tolerance:=0.2             # 規定: 0.2 [m] (方策なしセルの最近傍借用半径)
+    -p no_action_timeout_sec:=3.0        # 規定: 3.0 [s] (方策なし連続でこの時間 → 追従失敗)
+    -p invalid_range_m:=1000000.0        # 規定: 1e6 [m] (inf/NaN レンジの差し替え値)
+    -p busy_ticks_before_stop:=3         # 規定: 3 (ロック取れず連続 n tick で停止指令)
+    -p patch_slack_cells:=2              # 規定: 2 (compact パッチの寸法スラック)
+    -p repair_interior_cells:=16         # 規定: 16 (修復タイルの interior 一辺)
+    -p follow_controller:=mppi         # 規定: greedy (本家 decision) | dwa | mppi
+    -p dwa_horizon_s:=1.0                # 規定: 1.0 [s] (DWA/MPPI の前方シミュレーション)
+    -p dwa_n_v:=7                        # 規定: 7 (DWA の v 候補数)
+    -p dwa_n_w:=11                       # 規定: 11 (DWA の ω 候補数)
+    -p dwa_lethal_penalty:=2.0           # 規定: 2.0 [PROB_BASE 単位] (margin 帯棄却、0 で無効)
+    -p mppi_samples:=256                 # 規定: 256
+    -p mppi_lambda:=1.0                  # 規定: 1.0 (softmax 温度)
+    -p mppi_sigma_v:=0.0                 # 規定: 0.0 = 行動集合から自動
+    -p mppi_sigma_w_deg:=0.0             # 規定: 0.0 = 行動集合から自動
+    -p qmdp:=true                        # 規定: false — belief 多峰の tick は QMDP で行動選択
+    -p active_reloc:=true                # 規定: false — ロスト中は判別点への多目標 VI を解いて QMDP で走る (密ソルバのみ)
+    -p reloc_timeout_sec:=30.0           # 規定: 30.0 [s] (能動的再定位を諦めて停止待ちに戻すまで)
+    # ── スタンドアロン (navigate_to_pose / follow_waypoints) ──
+    -p standalone:=true                  # 規定: false — bt_navigator 等の代わりに自前で提供
+    -p goal_retry_limit:=3               # 規定: 3 (追従失敗時の投げ直し上限、負で無制限)
+    -p goal_retry_settle_sec:=3.0        # 規定: 3.0 [s] (投げ直し前の settle — 場を動かす待ち)
+    -p stop_on_failure:=false            # 規定: false (巡回で 1 点失敗しても次へ)
+    -p waypoint_pause_sec:=0.2           # 規定: 0.2 [s] (点に着いてから次へ向かうまでの settle)
+    # ── 狭域 → 広域フィードバック (全域掃き) ──
+    -p global_sweep:=true                # 規定: true (local_penalty を全域へ伝播)
+    -p global_sweep_budget_ms:=20        # 規定: 20 [ms] (1 回のロックで掃く時間)
+    -p global_sweep_idle_ms:=60          # 規定: 60 [ms] (ロックを手放して待つ時間、比 = CPU 取り分)
+    -p global_sweep_cells_per_step:=5000 # 規定: 5000 (密経路のチャンク粒度)
+    -p global_sweep_report_sec:=2.0      # 規定: 2.0 [s] (伝播中の進捗報告・再配信間隔)
+    # ── ウェイポイント先読み / 早期発進 ──
+    -p waypoint_prefetch:=false          # 規定: false — 次の点の価値関数を走行中に解く (メモリ 2 倍)
+    -p waypoint_topic:=waypoints         # 規定: waypoints (nav_msgs/Path, transient_local)
+    -p waypoint_prefetch_threads:=1      # 規定: 1 (compact 経路のみ効く)
+    -p waypoint_prefetch_poll_ms:=50     # 規定: 50 [ms]
+    -p early_start:=false                # 規定: false — 現在地→ゴールが繋がった時点で solve 打ち切り
+    # ── 可視化 ──
+    -p publish_value_function:=true      # 規定: true (value_function トピック、θ=0 スライス)
+    -p value_publish_interval_ms:=500    # 規定: 500 [ms] (solve 途中経過の配信間隔、0 = 完了時のみ)
+    -p cost_drawing_threshold:=60        # 規定: 60 (value_function の描画スケール上限)
+    -p window_cost_drawing_threshold:=60 # 規定: 60 (local_window_value 用)
+)
+ros2 run vi_planner vi_planner --ros-args "${VI_ARGS[@]}" >"$LOG/vi_planner.log" 2>&1 &
 
 rviz2 -d "$REPO_ROOT/assets/tb3_world/viola.rviz" >"$LOG/rviz.log" 2>&1 &
 
