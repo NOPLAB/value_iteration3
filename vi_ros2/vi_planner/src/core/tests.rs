@@ -55,6 +55,10 @@ fn cfg() -> PlanConfig {
         dwa_horizon_s: 1.0,
         dwa_n_v: 7,
         dwa_n_w: 11,
+        mppi_samples: 256,
+        mppi_lambda: 1.0,
+        mppi_sigma_v: 0.0,
+        mppi_sigma_w_deg: 0.0,
         compact_sink_dir: None,
         compact_sink_gen: None,
         vi_threads: 1,
@@ -347,6 +351,65 @@ fn dwa_falls_back_to_greedy_on_unevaluable_cells() {
     core.prepare_goal(pose(2.5, 2.5, 0.0), &cancel).expect("solve");
 
     // 障害物セルの上: DWA は評価不能 → greedy 借用が離散行動 (id: Some) を返す。
+    let on_obstacle = pose(20.5 * RES, 20.5 * RES, 0.0);
+    assert!(matches!(core.decide(on_obstacle), Decision::Action { id: Some(_), .. }));
+}
+
+/// MPPI (連続行動) でも同じ場でゴール圏まで走り切れること。tick 間状態 (warm
+/// start の名目列) は MppiController が Mutex で持ち、decide は &self のまま。
+#[test]
+fn mppi_follows_to_goal_on_empty_map() {
+    use vi_reference::ctrl::unicycle_step;
+    let mut c = cfg();
+    c.follow_controller = FollowKind::Mppi;
+    let mut core = PlannerCore::new(build(64), c);
+    let cancel = AtomicBool::new(false);
+    let goal = pose(2.0, 2.0, 0.0);
+    core.prepare_goal(goal, &cancel).expect("solve");
+
+    let tick = 0.1f64;
+    let (mut x, mut y, mut yaw) = (0.6f64, 0.6f64, 0.0f64);
+    let mut saw_mppi = false;
+    for _ in 0..3000 {
+        let p = pose(x, y, yaw);
+        core.set_window(p);
+        match core.decide(p) {
+            Decision::Goal => {
+                let d = core.goal_distance(x, y).unwrap();
+                assert!(d <= 0.3, "goal margin: d = {d}");
+                assert!(saw_mppi, "MPPI must have decided at least once (not only fallback)");
+                return;
+            }
+            Decision::Action { id, fw, rot_deg } => {
+                saw_mppi |= id.is_none();
+                let (nx, ny, nyaw) = unicycle_step(x, y, yaw, fw, rot_deg.to_radians(), tick);
+                x = nx;
+                y = ny;
+                yaw = nyaw;
+            }
+            Decision::NoAction => panic!("no action at ({x:.2}, {y:.2})"),
+        }
+    }
+    panic!("did not reach the goal in 3000 ticks");
+}
+
+/// MPPI でも方策なしセルからは greedy の近傍救済が効くこと (フォールバック時は
+/// 名目列を捨てる経路も通る)。
+#[test]
+fn mppi_falls_back_to_greedy_on_unevaluable_cells() {
+    let size = 64;
+    let mut b = build(size);
+    for y in 18..=22 {
+        for x in 18..=22 {
+            b.grid.data[(y * size + x) as usize] = 100;
+        }
+    }
+    let mut c = cfg();
+    c.follow_controller = FollowKind::Mppi;
+    let mut core = PlannerCore::new(b, c);
+    let cancel = AtomicBool::new(false);
+    core.prepare_goal(pose(2.5, 2.5, 0.0), &cancel).expect("solve");
+
     let on_obstacle = pose(20.5 * RES, 20.5 * RES, 0.0);
     assert!(matches!(core.decide(on_obstacle), Decision::Action { id: Some(_), .. }));
 }

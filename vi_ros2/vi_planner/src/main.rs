@@ -158,12 +158,17 @@ struct Params {
     refine_budget_ms: i64,
     action_tolerance: f64,
     no_action_timeout_sec: f64,
-    /// follow 1 tick の判断器 ("greedy" = 本家 decision / "dwa" = 連続行動)。
+    /// follow 1 tick の判断器 ("greedy" = 本家 decision / "dwa"・"mppi" = 連続行動)。
     follow_controller: String,
-    /// DWA の前方シミュレーション時間 [s] と (v, ω) 候補数。
+    /// DWA/MPPI の前方シミュレーション時間 [s] と DWA の (v, ω) 候補数。
     dwa_horizon_s: f64,
     dwa_n_v: i64,
     dwa_n_w: i64,
+    /// MPPI のサンプル本数 / softmax 温度 / 制御ノイズ標準偏差 (0 = 行動集合から自動)。
+    mppi_samples: i64,
+    mppi_lambda: f64,
+    mppi_sigma_v: f64,
+    mppi_sigma_w_deg: f64,
     // ── スタンドアロン (navigate_to_pose / follow_waypoints) ──
     standalone: bool,
     goal_retry_limit: i64,
@@ -242,15 +247,20 @@ fn read_params(node: &Node) -> Result<Params> {
     let action_tolerance = p!("action_tolerance", f64, 0.2);
     let no_action_timeout_sec = p!("no_action_timeout_sec", f64, 3.0);
     // follow 1 tick の判断器。"greedy" (既定) は本家 ViNode::decision 準拠の離散
-    // 6 行動。"dwa" は同じ価値関数を連続に読む (V̂ 補間 + (v, ω) 候補格子、
+    // 6 行動。"dwa" / "mppi" は同じ価値関数を連続に読む (V̂ 補間 + 軌道サンプリング、
     // core::follow の doc 参照)。指令の速度範囲は行動集合と同じで、候補全滅時は
     // greedy へフォールバックするので、切り替えても失敗の形は変わらない。
     let follow_controller = p!("follow_controller", Arc<str>, "greedy".into()).to_string();
-    // DWA の前方シミュレーション時間と候補数 (計算量 ∝ n_v × n_w × horizon)。
+    // DWA/MPPI の前方シミュレーション時間と DWA の候補数 (計算量 ∝ n_v × n_w × horizon)。
     // 既定 (1.0 s, 7×11) の実測は decide ~30 µs — 10 Hz の 40 ms 予算には遠い。
     let dwa_horizon_s = p!("dwa_horizon_s", f64, 1.0);
     let dwa_n_v = p!("dwa_n_v", i64, 7);
     let dwa_n_w = p!("dwa_n_w", i64, 11);
+    // MPPI のサンプル本数・温度・ノイズ (0 = 行動集合から自動)。実測 decide ~0.2 ms。
+    let mppi_samples = p!("mppi_samples", i64, 256);
+    let mppi_lambda = p!("mppi_lambda", f64, 1.0);
+    let mppi_sigma_v = p!("mppi_sigma_v", f64, 0.0);
+    let mppi_sigma_w_deg = p!("mppi_sigma_w_deg", f64, 0.0);
 
     // navigate_to_pose と follow_waypoints をこのノード自身が提供する
     // (= bt_navigator / behavior_server / waypoint_follower を立てない)。
@@ -387,6 +397,10 @@ fn read_params(node: &Node) -> Result<Params> {
         dwa_horizon_s,
         dwa_n_v,
         dwa_n_w,
+        mppi_samples,
+        mppi_lambda,
+        mppi_sigma_v,
+        mppi_sigma_w_deg,
         standalone,
         goal_retry_limit,
         goal_retry_settle_sec,
@@ -438,7 +452,7 @@ fn validate(p: &Params) -> Result<U64Solver> {
     }
     if FollowKind::from_name(&p.follow_controller).is_none() {
         return Err(anyhow!(
-            "unknown follow_controller: {} (expected \"greedy\" or \"dwa\")",
+            "unknown follow_controller: {} (expected \"greedy\", \"dwa\" or \"mppi\")",
             p.follow_controller
         ));
     }
@@ -1221,6 +1235,12 @@ fn main() -> Result<()> {
              greedy fallback)",
             params.dwa_horizon_s, params.dwa_n_v, params.dwa_n_w
         );
+    } else if follow_kind == FollowKind::Mppi {
+        eprintln!(
+            "vi_planner: follow controller = mppi (continuous; horizon {:.2} s, {} samples, \
+             lambda {:.2}, greedy fallback)",
+            params.dwa_horizon_s, params.mppi_samples, params.mppi_lambda
+        );
     }
     let cfg = PlanConfig {
         solver,
@@ -1237,6 +1257,10 @@ fn main() -> Result<()> {
         dwa_horizon_s: params.dwa_horizon_s,
         dwa_n_v: params.dwa_n_v.max(2) as usize,
         dwa_n_w: params.dwa_n_w.max(3) as usize,
+        mppi_samples: params.mppi_samples.max(2) as usize,
+        mppi_lambda: params.mppi_lambda.max(1e-3),
+        mppi_sigma_v: params.mppi_sigma_v.max(0.0),
+        mppi_sigma_w_deg: params.mppi_sigma_w_deg.max(0.0),
         compact_sink_dir: sink_dir,
         // 先読みを入れると場が 2 つ同時に生きるので、compact の確定出力は solve
         // ごとに使い捨てのディレクトリ (<compact_sink_dir>/gen<N>) へ分ける。

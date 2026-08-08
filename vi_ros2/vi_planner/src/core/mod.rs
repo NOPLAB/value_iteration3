@@ -118,7 +118,7 @@ mod prefetch;
 #[cfg(test)]
 mod tests;
 
-pub use follow::{DwaController, FollowController, FollowKind, GreedyController};
+pub use follow::{DwaController, FollowController, FollowKind, GreedyController, MppiController};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -191,15 +191,22 @@ pub struct PlanConfig {
     /// 現在セルに方策が無いとき近傍から行動を借りる範囲 (セル数)。
     pub action_tolerance_cells: i32,
     /// follow 1 tick の判断器 ([`FollowKind::Greedy`] = 本家 decision /
-    /// [`FollowKind::Dwa`] = 連続行動)。詳細は [`follow`] モジュールの doc。
+    /// [`FollowKind::Dwa`] / [`FollowKind::Mppi`] = 連続行動)。詳細は
+    /// [`follow`] モジュールの doc。
     pub follow_controller: FollowKind,
-    /// DWA: 制御周期 [s] (= 1/control_frequency)。候補評価の時間刻みの上限。
+    /// DWA/MPPI: 制御周期 [s] (= 1/control_frequency)。候補評価の時間刻みの上限。
     pub dwa_tick_s: f64,
-    /// DWA: 前方シミュレーション時間 [s]。
+    /// DWA/MPPI: 前方シミュレーション時間 [s]。
     pub dwa_horizon_s: f64,
     /// DWA: 並進 / 角速度の候補数 (格子は n_v × n_w)。
     pub dwa_n_v: usize,
     pub dwa_n_w: usize,
+    /// MPPI: サンプル本数 / softmax 温度 / 制御ノイズ標準偏差 (0 = 行動集合から
+    /// 自動 — σ_v は速度幅の 1/4、σ_ω は上限の 1/4)。
+    pub mppi_samples: usize,
+    pub mppi_lambda: f64,
+    pub mppi_sigma_v: f64,
+    pub mppi_sigma_w_deg: f64,
 
     // ── アウトオブコア (compact) 経路 ──
     /// 確定出力の置き場。`solver` が `frontier2d_sparse_compact` のときだけ参照する。

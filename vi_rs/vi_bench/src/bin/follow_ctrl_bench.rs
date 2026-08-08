@@ -1,13 +1,16 @@
 //! `follow_ctrl_bench` — solve 済みの場に対する follow 制御の比較ベンチ。
 //!
 //! 実地図 (PGM/YAML) を bench_map と同じ規約でロードして u64 ソルバで解き、同じ
-//! 収束場から 2 種類のコントローラでシミュレーション走行して品質を比較する:
+//! 収束場から 3 種類のコントローラでシミュレーション走行して品質を比較する:
 //!
 //! - `greedy` — 現行 `vi_planner` の `decide` 相当 (本家 `ViNode::decision` 準拠)。
 //!   セルに丸めて離散 6 行動の方策を引き、`linear.x = delta_fw [m/s]`、
 //!   `angular.z = delta_rot [deg/s]` を 1 tick 保持する。
 //! - `dwa` — `vi_reference::ctrl` の連続行動 (V̂ 三線形補間 + (v, ω) 候補格子の
 //!   軌道サンプリング、終端 V̂ 最小)。棄却全滅時は greedy へフォールバック。
+//! - `mppi` — 同じく `vi_reference::ctrl` の MPPI 型 (名目制御列の周りにガウス
+//!   摂動列をサンプルし softmax 重み付き平均、warm start 付き)。評価規約は
+//!   dwa と同一 (衝突棄却 + 終端 V̂ のみ)。棄却全滅時は greedy へフォールバック。
 //!
 //! ロボットは両者とも同じユニサイクルモデル (定速弧、`--tick-s` 周期で再決定) で
 //! 積分する。指標: 到達率 / 所要 tick / 経路長 / 総回転量 / コマンド変動 (Σ|Δω|) /
@@ -26,14 +29,14 @@ use clap::Parser;
 
 use vi_bench::params::{canonical_actions, N_THETA};
 use vi_bench::pgm::{self, Occupancy, PgmMap};
-use vi_reference::ctrl::{dwa_decide, unicycle_step, CostView, DwaConfig};
+use vi_reference::ctrl::{dwa_decide, mppi_decide, unicycle_step, CostView, DwaConfig, MppiConfig, MppiState};
 use vi_reference::params::MAX_COST;
 use vi_reference::planner::{pose_to_cell, PolicyView};
 use vi_reference::solvers::{solve, U64Solver};
 use vi_reference::{Action, OccupancyGrid, Quaternion, ValueIterator};
 
 #[derive(Parser)]
-#[command(about = "Compare follow controllers (discrete greedy vs continuous DWA) on a solved VI field.")]
+#[command(about = "Compare follow controllers (discrete greedy vs continuous DWA/MPPI) on a solved VI field.")]
 struct Args {
     /// Map YAML (bench_map と同じ規約)。既定は同梱の津田沼キャンパス地図。
     #[arg(long)]
@@ -109,13 +112,28 @@ struct Args {
     #[arg(long, default_value_t = 6000)]
     max_ticks: usize,
 
-    /// DWA のホライズン [s] / 候補数。
+    /// DWA/MPPI のホライズン [s]、DWA の候補数。
     #[arg(long, default_value_t = 1.0)]
     horizon_s: f64,
     #[arg(long, default_value_t = 7)]
     n_v: usize,
     #[arg(long, default_value_t = 11)]
     n_w: usize,
+
+    /// MPPI のサンプル本数 / softmax 温度 / ノイズ時間相関 / 制御逸脱ペナルティ /
+    /// 制御ノイズ標準偏差 (省略・0 = `MppiConfig::from_actions` の既定)。
+    #[arg(long, default_value_t = 256)]
+    mppi_samples: usize,
+    #[arg(long)]
+    mppi_lambda: Option<f64>,
+    #[arg(long)]
+    mppi_alpha: Option<f64>,
+    #[arg(long)]
+    mppi_gamma: Option<f64>,
+    #[arg(long, default_value_t = 0.0)]
+    mppi_sigma_v: f64,
+    #[arg(long, default_value_t = 0.0)]
+    mppi_sigma_w: f64,
 
     /// greedy の近傍借用半径 (チェビシェフ、セル)。vi_planner の action_tolerance 相当。
     #[arg(long, default_value_t = 4)]
@@ -270,12 +288,14 @@ fn scaled_actions(scale: f64) -> Vec<Action> {
 enum Ctrl {
     Greedy,
     Dwa,
+    Mppi,
 }
 impl Ctrl {
     fn name(self) -> &'static str {
         match self {
             Ctrl::Greedy => "greedy",
             Ctrl::Dwa => "dwa",
+            Ctrl::Mppi => "mppi",
         }
     }
 }
@@ -344,10 +364,12 @@ fn simulate(
     res: f64,
     ctrl: Ctrl,
     dwa_cfg: &DwaConfig,
+    mppi_cfg: &MppiConfig,
     start: (f64, f64, f64),
     args: &Args,
 ) -> RunResult {
     let (mut x, mut y, mut yaw) = start;
+    let mut mppi_state = MppiState::new(mppi_cfg.seed);
     let mut r = RunResult {
         ctrl: ctrl.name(),
         reached: false,
@@ -397,6 +419,22 @@ fn simulate(
             Ctrl::Dwa => match dwa_decide(vi, vi, dwa_cfg, x, y, yaw) {
                 Some(c) => Some((c.v, c.w_deg)),
                 None => {
+                    r.fallbacks += 1;
+                    match greedy_decide(vi, ix, iy, it, args.action_tolerance_cells) {
+                        GreedyOut::Goal => {
+                            r.reached = true;
+                            break;
+                        }
+                        GreedyOut::Act(fw, rot) => Some((fw, rot)),
+                        GreedyOut::NoAction => None,
+                    }
+                }
+            },
+            Ctrl::Mppi => match mppi_decide(vi, vi, mppi_cfg, &mut mppi_state, x, y, yaw) {
+                Some(c) => Some((c.v, c.w_deg)),
+                None => {
+                    // 名目列は場に合っていないので捨ててから greedy 救済。
+                    mppi_state.reset();
                     r.fallbacks += 1;
                     match greedy_decide(vi, ix, iy, it, args.action_tolerance_cells) {
                         GreedyOut::Goal => {
@@ -570,6 +608,25 @@ fn main() -> ExitCode {
     dwa_cfg.n_v = args.n_v;
     dwa_cfg.n_w = args.n_w;
 
+    let mut mppi_cfg = MppiConfig::from_actions(&vi.actions, args.tick_s);
+    mppi_cfg.horizon_s = args.horizon_s;
+    mppi_cfg.n_samples = args.mppi_samples;
+    if let Some(l) = args.mppi_lambda {
+        mppi_cfg.lambda = l;
+    }
+    if let Some(a) = args.mppi_alpha {
+        mppi_cfg.alpha = a;
+    }
+    if let Some(g) = args.mppi_gamma {
+        mppi_cfg.gamma = g;
+    }
+    if args.mppi_sigma_v > 0.0 {
+        mppi_cfg.sigma_v = args.mppi_sigma_v;
+    }
+    if args.mppi_sigma_w > 0.0 {
+        mppi_cfg.sigma_w_deg = args.mppi_sigma_w;
+    }
+
     let mut results: Vec<(usize, RunResult)> = Vec::new();
     for (si, &start) in starts.iter().enumerate() {
         let dist = ((start.0 - goal_wx).powi(2) + (start.1 - goal_wy).powi(2)).sqrt();
@@ -579,8 +636,8 @@ fn main() -> ExitCode {
             start.1,
             start.2.to_degrees()
         );
-        for ctrl in [Ctrl::Greedy, Ctrl::Dwa] {
-            let r = simulate(&vi, &chamfer, ow, res, ctrl, &dwa_cfg, start, &args);
+        for ctrl in [Ctrl::Greedy, Ctrl::Dwa, Ctrl::Mppi] {
+            let r = simulate(&vi, &chamfer, ow, res, ctrl, &dwa_cfg, &mppi_cfg, start, &args);
             let outcome = if r.reached {
                 "reached".to_string()
             } else if r.collided {
@@ -613,7 +670,7 @@ fn main() -> ExitCode {
     println!();
     println!("| ctrl | reach | ticks | time_s | len_m | rot_deg | cmd_dw | min_clr_m | decide_us | max_us |");
     println!("|------|-------|-------|--------|-------|---------|--------|-----------|-----------|--------|");
-    for ctrl in ["greedy", "dwa"] {
+    for ctrl in ["greedy", "dwa", "mppi"] {
         let all: Vec<&RunResult> = results.iter().map(|(_, r)| r).filter(|r| r.ctrl == ctrl).collect();
         let ok: Vec<&&RunResult> = all.iter().filter(|r| r.reached).collect();
         println!(

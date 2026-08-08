@@ -15,13 +15,20 @@
 //!   バックするので、失敗の形は greedy と同じに保たれる。実測
 //!   (`follow_ctrl_bench`, 津田沼 scale 3): 同到達率 6/6 でコマンド変動 Σ|Δω|
 //!   半減・到達 5% 短縮、decide は ~30 µs (40 ms 予算の 0.1%)。
+//! - [`MppiController`] — MPPI 型 (名目制御列へのガウス摂動 + softmax 重み付き
+//!   平均、warm start)。評価規約は DWA と同一。乱数は決定的で、tick 間状態
+//!   (名目列) は `Mutex` の内部可変性で持つ (`decide` は共有ロック下で `&self`)。
+//!   フォールバック時は名目列を捨てる — 場に合っていない列を次 tick に
+//!   持ち越さないため。
 //!
-//! compact 経路との整合: DWA のホライズン (既定 1.0 s × v_max 0.3 m/s = 0.3 m)
-//! は ±1 m ウィンドウの内側に収まり、パッチ外へ出る候補は `value_at` が
+//! compact 経路との整合: DWA/MPPI のホライズン (既定 1.0 s × v_max 0.3 m/s =
+//! 0.3 m) は ±1 m ウィンドウの内側に収まり、パッチ外へ出る候補は `value_at` が
 //! `MAX_COST` を返して自然に棄却される (凍結境界の不変条件はそのまま)。
 
+use std::sync::Mutex;
+
 use vi_reference::bridge::PoseView;
-use vi_reference::ctrl::{dwa_decide, DwaConfig};
+use vi_reference::ctrl::{dwa_decide, mppi_decide, DwaConfig, MppiConfig, MppiState};
 use vi_reference::planner::pose_to_cell;
 use vi_reference::value_iterator::ValueIterator;
 use vi_reference::Action;
@@ -35,6 +42,8 @@ pub enum FollowKind {
     Greedy,
     /// 連続行動 (V̂ 補間 + DWA 型軌道サンプリング、greedy フォールバック付き)。
     Dwa,
+    /// 連続行動 (V̂ 補間 + MPPI 型サンプリング、greedy フォールバック付き)。
+    Mppi,
 }
 
 impl FollowKind {
@@ -42,6 +51,7 @@ impl FollowKind {
         Some(match s {
             "greedy" => FollowKind::Greedy,
             "dwa" => FollowKind::Dwa,
+            "mppi" => FollowKind::Mppi,
             _ => return None,
         })
     }
@@ -63,6 +73,7 @@ pub(super) fn make_controller(cfg: &PlanConfig, actions: &[Action]) -> Box<dyn F
     match cfg.follow_controller {
         FollowKind::Greedy => Box::new(GreedyController),
         FollowKind::Dwa => Box::new(DwaController::new(cfg, actions)),
+        FollowKind::Mppi => Box::new(MppiController::new(cfg, actions)),
     }
 }
 
@@ -142,6 +153,55 @@ impl FollowController for DwaController {
         }
         // 候補全滅: 従来の離散 greedy (近傍借用込み) で救済する。膨張域の縁に
         // 掛かった・パッチの縁で評価不能、のような場面でロボットを止めないため。
+        GreedyController.decide(vi, cfg, pose)
+    }
+}
+
+/// 連続行動 (MPPI): `vi_reference::ctrl::mppi_decide` のラッパ。tick 間状態
+/// (warm start の名目制御列 + 乱数) は `Mutex` の内部可変性で持つ — `decide` は
+/// 共有ロックの下で `&self` で呼ばれるため。この Mutex は follow ループの
+/// 1 tick 内でしか取られないので競合しない。
+pub struct MppiController {
+    mppi: MppiConfig,
+    state: Mutex<MppiState>,
+}
+
+impl MppiController {
+    pub fn new(cfg: &PlanConfig, actions: &[Action]) -> Self {
+        let mut mppi = MppiConfig::from_actions(actions, cfg.dwa_tick_s.max(1e-3));
+        mppi.horizon_s = cfg.dwa_horizon_s.max(cfg.dwa_tick_s);
+        mppi.n_samples = cfg.mppi_samples.max(2);
+        mppi.lambda = cfg.mppi_lambda;
+        if cfg.mppi_sigma_v > 0.0 {
+            mppi.sigma_v = cfg.mppi_sigma_v;
+        }
+        if cfg.mppi_sigma_w_deg > 0.0 {
+            mppi.sigma_w_deg = cfg.mppi_sigma_w_deg;
+        }
+        let state = Mutex::new(MppiState::new(mppi.seed));
+        Self { mppi, state }
+    }
+}
+
+impl FollowController for MppiController {
+    fn name(&self) -> &'static str {
+        "mppi"
+    }
+
+    fn decide(&self, vi: &ValueIterator, cfg: &PlanConfig, pose: PoseView) -> Decision {
+        let (ix, iy, it) = pose_to_cell(vi, pose.x, pose.y, pose.yaw_rad);
+        if is_final(vi, ix, iy, it) {
+            return Decision::Goal;
+        }
+        let mut state = self.state.lock().unwrap();
+        if let Some(c) = mppi_decide(vi, vi, &self.mppi, &mut state, pose.x, pose.y, pose.yaw_rad)
+        {
+            return Decision::Action { id: None, fw: c.v, rot_deg: c.w_deg };
+        }
+        // 候補全滅: 名目列は場に合っていないので捨てて (次の成功 tick で作り
+        // 直される)、DWA と同じく離散 greedy で救済する。
+        state.reset();
+        drop(state);
         GreedyController.decide(vi, cfg, pose)
     }
 }
