@@ -89,6 +89,12 @@ pub struct BeliefConfig {
     /// `set_pose` (手動シード) で置く初期 belief の σ [m] / [deg]。
     pub init_sigma_xy_m: f64,
     pub init_sigma_theta_deg: f64,
+    /// ビームごとの尤度の床 (完全ミスマッチでも重みを 0 にしない)。本家 likelihood
+    /// field モデルの z_rand/z_max 混合に相当する 1 定数。
+    pub z_min: f64,
+    /// 補正で読む重みの相対しきい値 (max との比)。収束後の補正コストを belief の
+    /// 広がりに比例させる (窓サイズには比例させない) ための枝刈り。
+    pub weight_skip_ratio: f32,
 }
 
 impl Default for BeliefConfig {
@@ -102,17 +108,11 @@ impl Default for BeliefConfig {
             motion_sigma_theta_deg: 2.0,
             init_sigma_xy_m: 0.3,
             init_sigma_theta_deg: 10.0,
+            z_min: 0.05,
+            weight_skip_ratio: 1e-4,
         }
     }
 }
-
-/// ビームごとの尤度の床 (完全ミスマッチでも重みを 0 にしない)。本家 likelihood
-/// field モデルの z_rand/z_max 混合に相当する 1 定数。
-const Z_MIN: f64 = 0.05;
-
-/// 補正で読む重みの相対しきい値 (max との比)。収束後の補正コストを belief の
-/// 広がりに比例させる (窓サイズには比例させない) ための枝刈り。
-const WEIGHT_SKIP_RATIO: f32 = 1e-4;
 
 /// belief の添字。θ 面優先 (`(it*nw + iy)*nw + ix`) — predict の xy シフトが
 /// θ 面ごとの連続 2D 面で回るように。自由関数なのは、可変インデックスの中で
@@ -513,7 +513,8 @@ impl Localizer for GridLocalizer {
 
         let nw = self.nw;
         let maxw = self.b.iter().cloned().fold(0.0f32, f32::max);
-        let thr = maxw * WEIGHT_SKIP_RATIO;
+        let thr = maxw * self.cfg.weight_skip_ratio;
+        let z_min = self.cfg.z_min;
         let mut quality = 0.0f64;
         for it in 0..self.nt {
             let th = self.theta_center(it);
@@ -532,7 +533,7 @@ impl Localizer for GridLocalizer {
                         let a = th + ba;
                         let l = self.field.at(cx + r * a.cos(), cy + r * a.sin());
                         lsum += l;
-                        prod *= Z_MIN + (1.0 - Z_MIN) * l;
+                        prod *= z_min + (1.0 - z_min) * l;
                     }
                     // belief (正規化済み) 加重のビーム平均尤度 = 観測一致度。
                     quality += w as f64 * (lsum / beams.len() as f64);

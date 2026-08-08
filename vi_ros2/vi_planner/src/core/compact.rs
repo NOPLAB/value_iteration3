@@ -61,11 +61,6 @@ use super::{
     BuildParams, Field, PlanError, PlannerCore, SinkDir, SinkGen, SolveDirector, SolveStats,
 };
 
-/// `ValueIteratorLocal::set_map_with_occupancy_grid` が固定で入れるローカル
-/// ウィンドウ半径 [m]。パッチの寸法を決めるのに先に知る必要があるので写しを持つ
-/// (vi_rs 側は変更しない。ズレたら `new_patch` の検証が落ちる)。
-const LOCAL_XY_RANGE_M: f64 = 1.0;
-
 /// compact 経路の solve 結果。`sink` は orig 索引で `(total_cost, action)` を返す確定出力。
 pub(super) struct CompactField {
     pub(super) sink: Box<dyn CompactSink + Send>,
@@ -202,12 +197,6 @@ impl PenaltyOverlay {
     }
 }
 
-/// 修復タイルの interior の 1 辺 [セル]。大きいほど 1 訪問あたりの halo の
-/// 割り増し (`(I+2h)²/I²`) が減って効率が上がり、代わりにタイル 1 枚のメモリと
-/// ロックを握る時間が増える。16 は 0.25 m/cell (halo 2) で
-/// 20x20x60 = 1.9 MB・ハイドレート 288 KB あたり。
-const REPAIR_INTERIOR_CELLS: i32 = 16;
-
 /// compact 経路の全域伝播 (タイル修復) の作業場。密経路では作らない。
 ///
 /// 密経路の `sweep_global` は全域の `states` を Gauss–Seidel で掃くが、compact に
@@ -308,12 +297,12 @@ pub(super) fn new_patch(build: &BuildParams) -> Result<Patch, PlanError> {
     if res <= 0.0 {
         return Err(PlanError::Patch(format!("planner grid resolution is {res}")));
     }
-    let win = (LOCAL_XY_RANGE_M / res) as i32; // ValueIteratorLocal と同じ式
+    let win = (build.local_xy_range / res) as i32; // ValueIteratorLocal と同じ式
                                                // 遷移の x/y 変位の上界。`cell_delta` はセル内オフセット (0..res) を足してから
                                                // floor するので、正側は floor(|fw|/res)、負側は -floor(|fw|/res)-1 まで届く。
     let max_fw = build.actions.iter().map(|a| a.delta_fw.abs()).fold(0.0f64, f64::max);
     let reach_bound = (max_fw / res).floor() as i32 + 1;
-    let half = 2 * win + reach_bound + 2;
+    let half = 2 * win + reach_bound + build.patch_slack_cells;
     let side = 2 * half + 1;
 
     let mut vi = ValueIteratorLocal::new(build.actions.clone(), 1);
@@ -336,6 +325,7 @@ pub(super) fn new_patch(build: &BuildParams) -> Result<Patch, PlanError> {
         build.goal_margin_radius,
         build.goal_margin_theta,
     );
+    vi.set_local_xy_range(build.local_xy_range);
 
     // 凍結境界の成立条件: ウィンドウ内のセルの遷移先がパッチに収まること。
     // 解析上界ではなく遷移表の実測で確かめる (1 セル足りないと、ある方位でだけ
@@ -354,14 +344,14 @@ pub(super) fn new_patch(build: &BuildParams) -> Result<Patch, PlanError> {
 /// compact 経路の修復タイルを 1 枚作る (ゴール非依存)。`reach` は [`new_patch`] が
 /// 遷移表から実測した値。
 ///
-/// interior は `REPAIR_INTERIOR_CELLS` だが `reach` を下回らせない。取りこぼしの
+/// interior は `BuildParams::repair_interior_cells` だが `reach` を下回らせない。取りこぼしの
 /// 心配は無い ([`Repair::enqueue_around`] はセル単位で `halo` ぶん広げてから
 /// タイルに割るので、interior の大きさに依らず上流を覆う)。halo より薄い interior は
 /// ハイドレートした `(interior + 2*halo)²` のうち更新するのが 1/9 未満になって
 /// 割に合わないだけ。
 pub(super) fn new_repair(build: &BuildParams, reach: i32) -> Result<Repair, PlanError> {
     let halo = reach.max(1);
-    let interior = REPAIR_INTERIOR_CELLS.max(halo);
+    let interior = build.repair_interior_cells.max(halo);
     let side = interior + 2 * halo;
 
     let mut vi = ValueIterator::new(build.actions.clone(), 1);

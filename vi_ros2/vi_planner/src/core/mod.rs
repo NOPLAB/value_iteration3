@@ -89,6 +89,15 @@ pub struct BuildParams {
     pub safety_radius_penalty: f64,
     pub goal_margin_radius: f64,
     pub goal_margin_theta: i32,
+    /// 追従のローカルウィンドウ半径 [m] (本家 `ValueIteratorLocal` は 1.0 固定)。
+    pub local_xy_range: f64,
+    /// compact パッチの寸法スラック [セル] (`half = 2*win + reach + slack`)。
+    pub patch_slack_cells: i32,
+    /// 修復タイルの interior の 1 辺 [セル]。大きいほど 1 訪問あたりの halo の
+    /// 割り増し (`(I+2h)²/I²`) が減って効率が上がり、代わりにタイル 1 枚の
+    /// メモリとロックを握る時間が増える。16 は 0.25 m/cell (halo 2) で
+    /// 20x20x60 = 1.9 MB・ハイドレート 288 KB あたり。
+    pub repair_interior_cells: i32,
 }
 
 /// アウトオブコア (compact) 経路の確定出力の置き場。`None` = RAM (`RamSink`)、
@@ -153,6 +162,10 @@ pub struct PlanConfig {
     pub compact_sink_gen: SinkGen,
     /// compact 経路のワーカースレッド数 (0 = `default_threads()`)。
     pub vi_threads: usize,
+
+    // ── ウェイポイントの先読み ──
+    /// 進行中の先読みを待つときの観測間隔 [ms] (cancel を見る刻みでもある)。
+    pub prefetch_poll_ms: u64,
 
     // ── 狭域 → 広域の全域伝播 ──
     /// 全域掃き ([`PlannerCore::sweep_global`]) を回すか。compact 経路では
@@ -699,6 +712,7 @@ impl PlannerCore {
             self.build.goal_margin_radius,
             self.build.goal_margin_theta,
         );
+        vi.set_local_xy_range(self.build.local_xy_range);
         vi.base.set_goal(goal.x, goal.y, goal_t_deg);
 
         let mut director =

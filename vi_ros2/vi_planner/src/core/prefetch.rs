@@ -33,10 +33,6 @@ use vi_reference::bridge::{yaw_to_goal_theta_deg, PoseView};
 
 use super::{goal_matches, lock, BuildParams, CachedGoal, PlanConfig, PlanError, PlannerCore};
 
-/// 進行中の先読みを待つときの観測間隔。呼び出し側の cancel (プリエンプト) を
-/// 見る刻みでもあるので、待ちが長引いても取り消しはこの粒度で効く。
-const WAIT_TICK: Duration = Duration::from_millis(50);
-
 /// 先読みの取っ手。中身は共有なので clone しても同じワーカーを指す。
 pub struct Prefetcher(Arc<Shared>);
 
@@ -51,6 +47,9 @@ struct Shared {
     /// 違うと「先読みは持っているのに採用されない」が静かに起きる。
     tol_xy: f64,
     tol_deg: f64,
+    /// 進行中の先読みを待つときの観測間隔 ([`PlanConfig::prefetch_poll_ms`])。
+    /// 呼び出し側の cancel (プリエンプト) を見る刻みでもある。
+    wait_tick: Duration,
     state: Mutex<State>,
     cv: Condvar,
 }
@@ -89,6 +88,7 @@ impl Prefetcher {
         let shared = Arc::new(Shared {
             tol_xy: cfg.goal_tolerance_xy,
             tol_deg: cfg.goal_tolerance_deg,
+            wait_tick: Duration::from_millis(cfg.prefetch_poll_ms.max(1)),
             state: Mutex::new(State::default()),
             cv: Condvar::new(),
         });
@@ -191,7 +191,7 @@ impl Prefetcher {
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
-            st = self.0.cv.wait_timeout(st, WAIT_TICK).map(|(g, _)| g).unwrap_or_else(|e| {
+            st = self.0.cv.wait_timeout(st, self.0.wait_tick).map(|(g, _)| g).unwrap_or_else(|e| {
                 let (g, _) = e.into_inner();
                 g
             });

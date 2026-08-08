@@ -67,17 +67,6 @@ use vi_planner::core::{
 
 use rclrs::*;
 
-/// 無効レンジ (inf / NaN / 非正) の差し替え値 [m]。ローカルウィンドウ (±1m)
-/// から十分遠く、セル座標化しても i32 に収まる。本家 C++ は float→int の
-/// 未定義動作に頼っていたが、Rust では添字とビーム角の対応を保ったまま
-/// ウィンドウ外へ飛ばして無害化する。
-const INVALID_RANGE_M: f64 = 1.0e6;
-
-/// 追従ループが `PlannerCore` のロックをこの回数だけ連続で取れなかったら停止指令を出す。
-/// 1〜2 tick は同一ゴールのロールアウト (BT の 1Hz リプラン) との競合なので止めない。
-/// control_frequency 10Hz なら 3 tick = 300ms。
-const BUSY_TICKS_BEFORE_STOP: u32 = 3;
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Parameters
 // ──────────────────────────────────────────────────────────────────────────────
@@ -123,17 +112,29 @@ struct Params {
     /// grid: predict 1 tick あたりの動作ノイズ σ ([m] / [deg])。
     belief_motion_sigma_xy: f64,
     belief_motion_sigma_theta_deg: f64,
+    /// grid: ビームごとの尤度の床 / 補正で読む重みの相対しきい値。
+    belief_z_min: f64,
+    belief_weight_skip_ratio: f64,
     // ── 広域 (compute_path_to_pose) ──
     max_rollout_steps: i64,
     start_tolerance: f64,
     path_spacing: f64,
     // ── 狭域 (follow_path) ──
+    /// ローカルウィンドウ半径 [m] (本家 ValueIteratorLocal は 1.0 固定)。
+    local_xy_range: f64,
     follow: bool,
     scan_topic: String,
     control_frequency: f64,
     refine_budget_ms: i64,
     action_tolerance: f64,
     no_action_timeout_sec: f64,
+    /// 無効レンジ (inf / NaN / 非正) の差し替え値 [m]。
+    invalid_range_m: f64,
+    /// ロックをこの tick 数連続で取れなかったら停止指令を出す。
+    busy_ticks_before_stop: i64,
+    /// compact パッチの寸法スラック [セル] / 修復タイルの interior の 1 辺 [セル]。
+    patch_slack_cells: i64,
+    repair_interior_cells: i64,
     /// follow 1 tick の判断器 ("greedy" = 本家 decision / "dwa"・"mppi" = 連続行動)。
     follow_controller: String,
     /// DWA/MPPI の前方シミュレーション時間 [s] と DWA の (v, ω) 候補数。
@@ -155,10 +156,15 @@ struct Params {
     global_sweep: bool,
     global_sweep_budget_ms: i64,
     global_sweep_idle_ms: i64,
+    /// 密経路の 1 チャンクの粒度 [セル] / 伝播中の進捗報告と価値関数再配信の間隔 [s]。
+    global_sweep_cells_per_step: i64,
+    global_sweep_report_sec: f64,
     // ── ウェイポイントの先読み ──
     waypoint_prefetch: bool,
     waypoint_topic: String,
     waypoint_prefetch_threads: i64,
+    /// 進行中の先読みを待つときの観測間隔 [ms]。
+    waypoint_prefetch_poll_ms: i64,
     // ── 走り出しの短縮 ──
     early_start: bool,
     // ── 可視化 ──
@@ -260,6 +266,10 @@ fn read_params(node: &Node) -> Result<Params> {
         belief_max_range: p!("belief_max_range", f64, 25.0),
         belief_motion_sigma_xy: p!("belief_motion_sigma_xy", f64, 0.03),
         belief_motion_sigma_theta_deg: p!("belief_motion_sigma_theta_deg", f64, 2.0),
+        // 尤度の床 (本家 likelihood field の z_rand/z_max 混合に相当) と、補正で
+        // 読む belief 重みの相対しきい値 (max との比、小さいほど正確で遅い)。
+        belief_z_min: p!("belief_z_min", f64, 0.05),
+        belief_weight_skip_ratio: p!("belief_weight_skip_ratio", f64, 1e-4),
 
         max_rollout_steps: p!("max_rollout_steps", i64, 10_000),
         start_tolerance: p!("start_tolerance", f64, 0.5),
@@ -268,12 +278,24 @@ fn read_params(node: &Node) -> Result<Params> {
         // follow_path サーバを立てるか。false は nav2_controller (controller_server) と
         // 組む構成 — 立てると follow_path のサーバが 2 つになるため。false のとき
         // このノードは compute_path_to_pose 専用になる。
+        // 追従が見る・スキャンで補正するウィンドウの半径。広げると 1 tick の
+        // refine 対象と compact パッチ (辺 ∝ 2×半径) が大きくなる。
+        local_xy_range: p!("local_xy_range", f64, 1.0),
         follow: p!("follow", bool, true),
         scan_topic: p!("scan_topic", Arc<str>, "scan".into()).to_string(),
         control_frequency: p!("control_frequency", f64, 10.0),
         refine_budget_ms: p!("refine_budget_ms", i64, 40),
         action_tolerance: p!("action_tolerance", f64, 0.2),
         no_action_timeout_sec: p!("no_action_timeout_sec", f64, 3.0),
+        // 無効レンジの差し替え値。ローカルウィンドウから十分遠く、セル座標化しても
+        // i32 に収まること (set_local_cost がウィンドウ外として自然に無視する)。
+        invalid_range_m: p!("invalid_range_m", f64, 1.0e6),
+        // 1〜2 tick は同一ゴールのロールアウト (BT の 1Hz リプラン) との競合なので
+        // 止めない。control_frequency 10Hz なら 3 tick = 300ms。
+        busy_ticks_before_stop: p!("busy_ticks_before_stop", i64, 3),
+        // compact パッチの寸法スラックと修復タイルの interior (詳細は core の doc)。
+        patch_slack_cells: p!("patch_slack_cells", i64, 2),
+        repair_interior_cells: p!("repair_interior_cells", i64, 16),
         // follow 1 tick の判断器。"greedy" (既定) は本家 ViNode::decision 準拠の離散
         // 6 行動。"dwa" / "mppi" は同じ価値関数を連続に読む (V̂ 補間 + 軌道サンプリング、
         // core::follow の doc 参照)。指令の速度範囲は行動集合と同じで、候補全滅時は
@@ -321,6 +343,14 @@ fn read_params(node: &Node) -> Result<Params> {
         // budget を伸ばすときは idle も一緒に伸ばすこと。
         global_sweep_budget_ms: p!("global_sweep_budget_ms", i64, 20),
         global_sweep_idle_ms: p!("global_sweep_idle_ms", i64, 60),
+        // 密経路の 1 チャンクの粒度 (budget の経過時間を見る刻み)。Pi4 (実測 ~1M
+        // cells/s) で数 ms になる大きさ。compact 経路では使わない (1 呼び出し =
+        // タイル 1 枚)。
+        global_sweep_cells_per_step: p!("global_sweep_cells_per_step", i64, 5_000),
+        // 伝播が続いている間の進捗報告と value_function 再配信の間隔。可視化 1 枚は
+        // 100 万セル級をロックの中で作るので、詰めすぎると追従ループの try_lock が
+        // 落ちる (3 tick 連続で機体が止まる)。
+        global_sweep_report_sec: p!("global_sweep_report_sec", f64, 2.0),
 
         // 次のウェイポイントの価値関数を、いまの点へ走っている間に解いておく
         // (core::Prefetcher)。巡回では点が変わるたびに solve が丸ごと 1 回走り、その間
@@ -338,6 +368,8 @@ fn read_params(node: &Node) -> Result<Params> {
         // スレッド数を環境変数 VI_THREADS から読む (プロセスで 1 つ) ので、先読みだけを
         // 絞ることができない。
         waypoint_prefetch_threads: p!("waypoint_prefetch_threads", i64, 1),
+        // 進行中の先読みを待つときの観測間隔。プリエンプトの効きの粒度でもある。
+        waypoint_prefetch_poll_ms: p!("waypoint_prefetch_poll_ms", i64, 50),
 
         // 機体の現在地からゴールまで方策が繋がった時点で solve を打ち切って走り出す
         // (core::PlanConfig::early_start)。**既定は false**: 経路の外は未確定のままに
@@ -380,6 +412,9 @@ fn validate(p: &Params) -> Result<U64Solver> {
     }
     if p.control_frequency <= 0.0 {
         return Err(anyhow!("control_frequency must be > 0, got {}", p.control_frequency));
+    }
+    if p.local_xy_range <= 0.0 {
+        return Err(anyhow!("local_xy_range must be > 0, got {}", p.local_xy_range));
     }
     // standalone は navigate_to_pose / follow_waypoints が追従本体を回すので
     // follow を切る組み合わせは成立しない。
@@ -441,9 +476,9 @@ fn poses_to_path(poses: &[PathPose], frame_id: &str, stamp: (i32, u32)) -> nav_m
 }
 
 /// sensor_msgs/LaserScan → vi_reference::LaserScan。ビーム角と添字の対応を
-/// 保つため無効レンジは取り除かず `INVALID_RANGE_M` に差し替える
+/// 保つため無効レンジは取り除かず `invalid_range_m` に差し替える
 /// (`set_local_cost` がウィンドウ外として自然に無視する)。
-fn vi_scan_from(msg: &sensor_msgs::msg::LaserScan) -> ViLaserScan {
+fn vi_scan_from(msg: &sensor_msgs::msg::LaserScan, invalid_range_m: f64) -> ViLaserScan {
     ViLaserScan {
         angle_min: msg.angle_min as f64,
         angle_increment: msg.angle_increment as f64,
@@ -455,7 +490,7 @@ fn vi_scan_from(msg: &sensor_msgs::msg::LaserScan) -> ViLaserScan {
                 if r.is_finite() && r > 0.0 {
                     r
                 } else {
-                    INVALID_RANGE_M
+                    invalid_range_m
                 }
             })
             .collect(),
@@ -584,6 +619,8 @@ struct FollowTuning {
     refine_budget: Duration,
     /// pose 欠落 / 方策なしをこの連続 tick 数で追従失敗とみなす。
     failure_ticks_limit: u32,
+    /// ロックをこの tick 数連続で取れなかったら停止指令を出す。
+    busy_ticks_before_stop: u32,
 }
 
 enum Outcome {
@@ -812,7 +849,7 @@ fn run_follow(
             // 挙動が戻ってしまうので、直前の指令を保ったまま次の tick を待つ。
             // 連続で取れない = 本当に長い solve が走っているので、そのときだけ止める。
             busy_ticks += 1;
-            if busy_ticks >= BUSY_TICKS_BEFORE_STOP {
+            if busy_ticks >= tuning.busy_ticks_before_stop {
                 stop_cmd(cmd_pub);
             }
             if let Some(rest) = tuning.period.checked_sub(tick_start.elapsed()) {
@@ -1134,6 +1171,8 @@ fn main() -> Result<()> {
                 max_range_m: params.belief_max_range.max(0.1),
                 motion_sigma_xy_m: params.belief_motion_sigma_xy.max(0.0),
                 motion_sigma_theta_deg: params.belief_motion_sigma_theta_deg.max(0.0),
+                z_min: params.belief_z_min.clamp(0.0, 1.0),
+                weight_skip_ratio: params.belief_weight_skip_ratio.max(0.0) as f32,
                 ..BeliefConfig::default()
             };
             let g = GridLocalizer::new(&binary_grid, params.theta_cell_num as i32, bc);
@@ -1237,6 +1276,9 @@ fn main() -> Result<()> {
         safety_radius_penalty: params.safety_radius_penalty as f64,
         goal_margin_radius: params.goal_margin_radius,
         goal_margin_theta: params.goal_margin_theta_deg as i32,
+        local_xy_range: params.local_xy_range,
+        patch_slack_cells: params.patch_slack_cells.max(0) as i32,
+        repair_interior_cells: params.repair_interior_cells.max(1) as i32,
     };
     // validate() 済みなので必ず解ける。
     let follow_kind = FollowKind::from_name(&params.follow_controller)
@@ -1281,6 +1323,7 @@ fn main() -> Result<()> {
         // 先読み側の核と共有すること。
         compact_sink_gen: params.waypoint_prefetch.then(|| Arc::new(AtomicU64::new(0))),
         vi_threads: params.vi_threads.max(0) as usize,
+        prefetch_poll_ms: params.waypoint_prefetch_poll_ms.max(1) as u64,
         global_sweep: params.global_sweep,
         early_start: params.early_start,
     };
@@ -1384,10 +1427,11 @@ fn main() -> Result<()> {
     //     収束後は数百セル × 数十ビーム — エグゼキュータスレッドで足りる)。
     let _scan_sub = {
         let h = Arc::clone(&handles);
+        let invalid_range_m = params.invalid_range_m;
         node.create_subscription::<sensor_msgs::msg::LaserScan, _>(
             params.scan_topic.as_str().best_effort().keep_last(5),
             move |msg: sensor_msgs::msg::LaserScan| {
-                let scan = vi_scan_from(&msg);
+                let scan = vi_scan_from(&msg, invalid_range_m);
                 {
                     let mut l = lock(&h.localizer);
                     l.observe(&scan);
@@ -1464,25 +1508,25 @@ fn main() -> Result<()> {
         let h = Arc::clone(&handles);
         let budget = Duration::from_millis(params.global_sweep_budget_ms.max(1) as u64);
         let idle = Duration::from_millis(params.global_sweep_idle_ms.max(0) as u64);
+        // 密経路の 1 チャンクの粒度。budget の中で経過時間を見る刻みでもあるので、
+        // Pi4 (実測 1 掃き 7.9M セルで 8-11 秒 = 約 1M cells/s) で数 ms になる
+        // 大きさにしてある。compact 経路はこの値を使わず、1 呼び出し = タイル 1 枚
+        // (これも数十 ms で頭打ち)。
+        let cells_per_step = params.global_sweep_cells_per_step.max(1) as usize;
+        // 伝播が続いている間の報告間隔。**走行中は待ち行列がまず空にならない**
+        // ので (壁が窓に入っていれば `set_local_cost` が毎 tick penalty を塗り
+        // 直す)、下の「done」の行はほとんど出ない。掃きが動いているかを見る
+        // 手掛かりはこの間隔で出る進捗のほうになる。
+        //
+        // 価値関数の再配信もここに乗せる。追従中は solve が走らないので、
+        // ここで出さないと `value_function` は solve した瞬間のまま固まり、
+        // **伝播が効いていても画面では何も起きない** (追従ループが出すのは
+        // ローカルウィンドウだけ)。全域 1 枚は 19F (scale 2) で 13 万セル、津田沼
+        // (scale 5) で 94 万セル読むので、10 Hz の追従ループには置けない。
+        // 作るのはロックの中なので、この間隔の tick だけ追従ループが try_lock に
+        // 失敗し得る (2 秒に 1 回なら 3 tick 連続にはならず、機体は止まらない)。
+        let report_every = Duration::from_secs_f64(params.global_sweep_report_sec.max(0.1));
         std::thread::spawn(move || {
-            // 密経路の 1 チャンクの粒度。budget の中で経過時間を見る刻みでも
-            // あるので、Pi4 (実測 1 掃き 7.9M セルで 8-11 秒 = 約 1M cells/s) で
-            // 数 ms になる大きさにしてある。compact 経路はこの値を使わず、
-            // 1 呼び出し = タイル 1 枚 (これも数十 ms で頭打ち)。
-            const CELLS_PER_STEP: usize = 5_000;
-            // 伝播が続いている間の報告間隔。**走行中は待ち行列がまず空にならない**
-            // ので (壁が窓に入っていれば `set_local_cost` が毎 tick penalty を塗り
-            // 直す)、下の「done」の行はほとんど出ない。掃きが動いているかを見る
-            // 手掛かりはこの間隔で出る進捗のほうになる。
-            //
-            // 価値関数の再配信もここに乗せる。追従中は solve が走らないので、
-            // ここで出さないと `value_function` は solve した瞬間のまま固まり、
-            // **伝播が効いていても画面では何も起きない** (追従ループが出すのは
-            // ±1m の窓だけ)。全域 1 枚は 19F (scale 2) で 13 万セル、津田沼
-            // (scale 5) で 94 万セル読むので、10 Hz の追従ループには置けない。
-            // 作るのはロックの中なので、この間隔の tick だけ追従ループが try_lock に
-            // 失敗し得る (2 秒に 1 回なので 3 tick 連続にはならず、機体は止まらない)。
-            const REPORT_EVERY: Duration = Duration::from_secs(2);
             let mut cur = SweepCursor::default();
             let mut sweep_start: Option<Instant> = None;
             let mut last_report = Instant::now();
@@ -1503,7 +1547,7 @@ fn main() -> Result<()> {
                     let started = *sweep_start.get_or_insert(t0);
                     let mut done = false;
                     loop {
-                        if c.sweep_global(&mut cur, CELLS_PER_STEP).1 {
+                        if c.sweep_global(&mut cur, cells_per_step).1 {
                             done = true;
                             break;
                         }
@@ -1512,7 +1556,7 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    if done || last_report.elapsed() >= REPORT_EVERY {
+                    if done || last_report.elapsed() >= report_every {
                         last_report = Instant::now();
                         if done {
                             // 伝播 1 回に実際かかった時間 (idle を含む実時間 =
@@ -1578,6 +1622,7 @@ fn main() -> Result<()> {
         failure_ticks_limit: (params.no_action_timeout_sec.max(0.0) * params.control_frequency)
             .ceil()
             .max(1.0) as u32,
+        busy_ticks_before_stop: params.busy_ticks_before_stop.max(1) as u32,
     };
     let retry = RetryTuning {
         limit: params.goal_retry_limit,

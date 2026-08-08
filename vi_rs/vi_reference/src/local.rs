@@ -56,6 +56,17 @@ impl ValueIteratorLocal {
         self.local_iy_max = self.local_ixy_range * 2;
     }
 
+    /// ローカルウィンドウ半径 [m] を変更する (本家は 1.0 固定)。
+    /// `set_map_with_occupancy_grid` が半径を 1.0 に戻すので、その後に呼ぶこと。
+    pub fn set_local_xy_range(&mut self, range_m: f64) {
+        self.local_xy_range = range_m;
+        self.local_ixy_range = (range_m / self.base.xy_resolution) as i32;
+        self.local_ix_min = 0;
+        self.local_iy_min = 0;
+        self.local_ix_max = self.local_ixy_range * 2;
+        self.local_iy_max = self.local_ixy_range * 2;
+    }
+
     /// 本家 `inLocalArea`。
     fn in_local_area(&self, ix: i32, iy: i32) -> bool {
         ix >= self.local_ix_min
@@ -171,6 +182,18 @@ mod tests {
         assert_eq!(vi.local_ixy_range, 20);
         assert_eq!(vi.local_ix_max, 40);
         assert_eq!(vi.local_iy_max, 40);
+    }
+
+    #[test]
+    fn set_local_xy_range_resizes_window() {
+        let mut vi = ValueIteratorLocal::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
+        let map = free_grid(120, 120);
+        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.2, 10);
+        vi.set_local_xy_range(2.0); // res=0.05 → range = 40 セル
+        assert_eq!(vi.local_ixy_range, 40);
+        vi.set_local_window(2.5, 2.5); // ix=iy=50 → 10..=90
+        assert_eq!(vi.local_ix_min, 10);
+        assert_eq!(vi.local_ix_max, 90);
     }
 
     #[test]

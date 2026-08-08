@@ -36,6 +36,9 @@ fn build(size: i32) -> BuildParams {
         safety_radius_penalty: 30.0,
         goal_margin_radius: 0.2,
         goal_margin_theta: 180,
+        local_xy_range: 1.0,
+        patch_slack_cells: 2,
+        repair_interior_cells: 16,
     }
 }
 
@@ -62,6 +65,7 @@ fn cfg() -> PlanConfig {
         compact_sink_dir: None,
         compact_sink_gen: None,
         vi_threads: 1,
+        prefetch_poll_ms: 50,
         global_sweep: true,
         early_start: false,
     }
