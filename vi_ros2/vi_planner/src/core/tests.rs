@@ -1847,3 +1847,132 @@ fn discard_truncated_leaves_a_converged_field_alone() {
     assert!(!core.discard_truncated());
     assert!(core.is_cached_goal(goal), "捨てられていないこと");
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Localizer (core::localizer) — external の素通しと grid のヒストグラム MCL
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// 外周を壁で囲い、対称性崩しの内部ブロックを 1 つ置いた占有格子。
+fn walled_grid(size: i32) -> OccupancyGrid {
+    let mut g = build(size).grid;
+    for i in 0..size {
+        for (x, y) in [(i, 0), (i, size - 1), (0, i), (size - 1, i)] {
+            g.data[(y * size + x) as usize] = 100;
+        }
+    }
+    for y in 10..14 {
+        for x in 40..44 {
+            g.data[(y * size + x) as usize] = 100;
+        }
+    }
+    g
+}
+
+/// 真値姿勢からの全周スキャンをレイマーチで合成する (angle_min = 0)。
+fn cast_scan(g: &OccupancyGrid, truth: PoseView, n_beams: usize, max_r: f64) -> LaserScan {
+    let inc = 2.0 * std::f64::consts::PI / n_beams as f64;
+    let step = g.resolution / 2.0;
+    let ranges = (0..n_beams)
+        .map(|i| {
+            let a = truth.yaw_rad + i as f64 * inc;
+            let mut r = step;
+            loop {
+                if r >= max_r {
+                    break max_r;
+                }
+                let ix = ((truth.x + r * a.cos() - g.origin_x) / g.resolution).floor() as i32;
+                let iy = ((truth.y + r * a.sin() - g.origin_y) / g.resolution).floor() as i32;
+                if ix < 0 || iy < 0 || ix >= g.width || iy >= g.height {
+                    break max_r;
+                }
+                if g.data[(iy * g.width + ix) as usize] != 0 {
+                    break r;
+                }
+                r += step;
+            }
+        })
+        .collect();
+    LaserScan { angle_min: 0.0, angle_increment: inc, ranges }
+}
+
+fn wrap_rad(d: f64) -> f64 {
+    use std::f64::consts::PI;
+    (d + PI).rem_euclid(2.0 * PI) - PI
+}
+
+#[test]
+fn external_localizer_passes_pose_through() {
+    let mut l = ExternalLocalizer::default();
+    assert!(l.pose().is_none());
+    // predict/observe は no-op のまま落ちないこと。
+    l.predict(0.3, 20.0, 0.1);
+    l.observe(&LaserScan::default());
+    l.set_pose(pose(1.0, 2.0, 0.5));
+    let p = l.pose().expect("set_pose 後は返す");
+    assert_eq!((p.x, p.y, p.yaw_rad), (1.0, 2.0, 0.5));
+    assert_eq!(l.quality(), 1.0);
+}
+
+/// grid: ずらしたシードから合成スキャンで真値へ収束すること (correct の本体)。
+#[test]
+fn grid_localizer_tightens_onto_the_true_pose() {
+    let g = walled_grid(60); // 3m×3m @0.05
+    let truth = pose(1.2, 1.5, 0.5);
+    let bc = BeliefConfig {
+        half_m: 1.0,
+        beam_step: 1,
+        init_sigma_xy_m: 0.3,
+        init_sigma_theta_deg: 20.0,
+        ..BeliefConfig::default()
+    };
+    let mut loc = GridLocalizer::new(&g, 36, bc);
+    assert!(loc.pose().is_none(), "シード前は None");
+
+    // 真値から 0.14m / 11° ずらして手動シード。
+    loc.set_pose(pose(1.3, 1.4, 0.3));
+    let scan = cast_scan(&g, truth, 36, 5.0);
+    for _ in 0..6 {
+        loc.observe(&scan);
+        loc.predict(0.0, 0.0, 0.1); // 静止でも動作ノイズのぼかしは回る
+    }
+
+    let m = loc.pose().expect("収束後の平均");
+    assert!(
+        (m.x - truth.x).abs() < 0.1 && (m.y - truth.y).abs() < 0.1,
+        "mean ({:.3}, {:.3}) が真値 ({:.3}, {:.3}) から遠い",
+        m.x, m.y, truth.x, truth.y
+    );
+    assert!(
+        wrap_rad(m.yaw_rad - truth.yaw_rad).abs() < 0.2,
+        "yaw {:.3} が真値 {:.3} から遠い",
+        m.yaw_rad, truth.yaw_rad
+    );
+    assert!(loc.quality() > 0.5, "観測一致度が低すぎる: {}", loc.quality());
+}
+
+/// grid: predict が指令どおり平均を進め、回すこと (動作モデル = 自分の cmd_vel)。
+#[test]
+fn grid_localizer_predict_advances_the_mean_along_the_heading() {
+    let g = walled_grid(60);
+    let mut loc = GridLocalizer::new(&g, 36, BeliefConfig { half_m: 1.0, ..BeliefConfig::default() });
+    loc.set_pose(pose(1.5, 1.5, 0.0));
+
+    // 前進 0.3 m/s × 1.0 s。
+    for _ in 0..10 {
+        loc.predict(0.3, 0.0, 0.1);
+    }
+    let m = loc.pose().expect("平均");
+    assert!((m.x - 1.8).abs() < 0.08, "x = {:.3} (期待 1.8 付近)", m.x);
+    assert!((m.y - 1.5).abs() < 0.05, "y = {:.3} (期待 1.5 のまま)", m.y);
+
+    // その場旋回 90 deg/s × 1.0 s。
+    for _ in 0..10 {
+        loc.predict(0.0, 90.0, 0.1);
+    }
+    let m = loc.pose().expect("平均");
+    assert!(
+        wrap_rad(m.yaw_rad - std::f64::consts::FRAC_PI_2).abs() < 0.2,
+        "yaw = {:.3} (期待 π/2 付近)",
+        m.yaw_rad
+    );
+}

@@ -60,8 +60,9 @@ use vi_reference::Action;
 // nav_msgs::msg::OccupancyGrid と名前が衝突するので別名で入れる。
 
 use vi_planner::core::{
-    lock, try_lock, value_grid_on, BuildParams, Decision, FollowKind, PlanConfig, PlanError,
-    PlanStats, PlannerCore, Prefetcher, SweepCursor,
+    lock, try_lock, value_grid_on, BeliefConfig, BuildParams, Decision, ExternalLocalizer,
+    FollowKind, GridLocalizer, Localizer, PlanConfig, PlanError, PlanStats, PlannerCore,
+    Prefetcher, SweepCursor,
 };
 
 use rclrs::*;
@@ -111,6 +112,17 @@ struct Params {
     goal_tolerance_deg: f64,
     pose_topic: String,
     global_frame: String,
+    // ── 自己位置推定 (core::Localizer) ──
+    /// 自己位置の出どころ ("external" | "grid")。
+    localizer: String,
+    /// grid: belief 窓の半径 [m] / 尤度場の σ [m] / ビーム間引き / レンジ上限 [m]。
+    belief_radius: f64,
+    belief_sensor_sigma: f64,
+    belief_beam_step: i64,
+    belief_max_range: f64,
+    /// grid: predict 1 tick あたりの動作ノイズ σ ([m] / [deg])。
+    belief_motion_sigma_xy: f64,
+    belief_motion_sigma_theta_deg: f64,
     // ── 広域 (compute_path_to_pose) ──
     max_rollout_steps: i64,
     start_tolerance: f64,
@@ -232,6 +244,22 @@ fn read_params(node: &Node) -> Result<Params> {
         goal_tolerance_deg: p!("goal_tolerance_deg", f64, 10.0),
         pose_topic: p!("pose_topic", Arc<str>, "mcl_pose".into()).to_string(),
         global_frame: p!("global_frame", Arc<str>, "map".into()).to_string(),
+
+        // 自己位置の出どころ。"external" (既定) = pose_topic の推定をそのまま使う
+        // (mcl 等の外部推定器)。"grid" = 内蔵ヒストグラム MCL — pose_topic は
+        // **手動シード** (initialpose 等) として扱い、メッセージごとに belief を
+        // 初期化し直す。以後は scan_topic と自分の出した cmd_vel だけで推定する
+        // ので、"grid" のときは pose_topic を mcl の連続出力に向けないこと
+        // (毎メッセージでリセットされて素通しと変わらなくなる)。
+        localizer: p!("localizer", Arc<str>, "external".into()).to_string(),
+        // belief 窓は native 解像度 (map_scale をかける前) の 2×radius 四方 × θ。
+        // 0.05 m/cell で radius 2.5 なら 100×100×60 = 60 万セル ≈ 5 MB。
+        belief_radius: p!("belief_radius", f64, 2.5),
+        belief_sensor_sigma: p!("belief_sensor_sigma", f64, 0.2),
+        belief_beam_step: p!("belief_beam_step", i64, 10),
+        belief_max_range: p!("belief_max_range", f64, 25.0),
+        belief_motion_sigma_xy: p!("belief_motion_sigma_xy", f64, 0.03),
+        belief_motion_sigma_theta_deg: p!("belief_motion_sigma_theta_deg", f64, 2.0),
 
         max_rollout_steps: p!("max_rollout_steps", i64, 10_000),
         start_tolerance: p!("start_tolerance", f64, 0.5),
@@ -362,6 +390,12 @@ fn validate(p: &Params) -> Result<U64Solver> {
         return Err(anyhow!(
             "unknown follow_controller: {} (expected \"greedy\", \"dwa\" or \"mppi\")",
             p.follow_controller
+        ));
+    }
+    if !matches!(p.localizer.as_str(), "external" | "grid") {
+        return Err(anyhow!(
+            "unknown localizer: {} (expected \"external\" or \"grid\")",
+            p.localizer
         ));
     }
     let solver = U64Solver::from_name(&p.solver)
@@ -589,6 +623,7 @@ struct PlanPub {
 struct FollowCtx<'a> {
     core: &'a Mutex<PlannerCore>,
     latest_pose: &'a Mutex<Option<PoseView>>,
+    localizer: &'a Mutex<Box<dyn Localizer>>,
     scan_queue: &'a Mutex<Vec<ViLaserScan>>,
     cmd_pub: &'a Publisher<geometry_msgs::msg::Twist>,
     /// 表示専用の経路。None なら出さない (`follow_path` 構成では BT 側の
@@ -604,6 +639,9 @@ struct FollowCtx<'a> {
 struct Handles {
     core: Mutex<PlannerCore>,
     latest_pose: Mutex<Option<PoseView>>,
+    /// 自己位置推定器 (core::Localizer)。`latest_pose` はこれの出力キャッシュ —
+    /// 読む側 (follow ループ・plan サーバ) は従来どおり latest_pose だけを見る。
+    localizer: Mutex<Box<dyn Localizer>>,
     scan_queue: Mutex<Vec<ViLaserScan>>,
     cmd_pub: Publisher<geometry_msgs::msg::Twist>,
     viz: Option<Viz>,
@@ -618,6 +656,7 @@ impl Handles {
         FollowCtx {
             core: &self.core,
             latest_pose: &self.latest_pose,
+            localizer: &self.localizer,
             scan_queue: &self.scan_queue,
             cmd_pub: &self.cmd_pub,
             plan_pub: if with_plan { self.plan_pub.as_ref() } else { None },
@@ -650,7 +689,8 @@ fn run_follow(
     cancel: &AtomicBool,
     report: &dyn Fn(&FollowProgress),
 ) -> Outcome {
-    let FollowCtx { core, latest_pose, scan_queue, cmd_pub, plan_pub, viz, tuning } = *ctx;
+    let FollowCtx { core, latest_pose, localizer, scan_queue, cmd_pub, plan_pub, viz, tuning } =
+        *ctx;
     // ── 1. 価値関数の用意 (広域側が既に解いていれば何もしない) ──
     {
         let mut core = core.lock().unwrap();
@@ -841,6 +881,16 @@ fn run_follow(
                 tw.linear.x = fw;
                 tw.angular.z = rot_deg.to_radians();
                 let _ = cmd_pub.publish(tw);
+                // 自分が出した指令がそのまま推定器の動作モデル (external では
+                // no-op)。dt は制御周期 — 実際の適用時間との差は motion ノイズが
+                // 吸収する。停止指令は動きゼロなので predict しない。
+                {
+                    let mut l = lock(localizer);
+                    l.predict(fw, rot_deg, tuning.period.as_secs_f64());
+                    if let Some(p) = l.pose() {
+                        *lock(latest_pose) = Some(p);
+                    }
+                }
                 speed = fw as f32;
                 failure_ticks = 0;
             }
@@ -1073,6 +1123,33 @@ fn main() -> Result<()> {
             ))
         }
     };
+    // 自己位置推定器。grid は native 解像度の占有格子から尤度場を起こすので、
+    // ダウンサンプル前の binary_grid をここで使い切ってから捨てる。
+    let localizer: Box<dyn Localizer> = match params.localizer.as_str() {
+        "grid" => {
+            let bc = BeliefConfig {
+                half_m: params.belief_radius.max(0.5),
+                sensor_sigma_m: params.belief_sensor_sigma.max(0.01),
+                beam_step: params.belief_beam_step.max(1) as usize,
+                max_range_m: params.belief_max_range.max(0.1),
+                motion_sigma_xy_m: params.belief_motion_sigma_xy.max(0.0),
+                motion_sigma_theta_deg: params.belief_motion_sigma_theta_deg.max(0.0),
+                ..BeliefConfig::default()
+            };
+            let g = GridLocalizer::new(&binary_grid, params.theta_cell_num as i32, bc);
+            eprintln!(
+                "vi_planner: localizer = grid ({}m window @{}m x{} theta, {:.1} MB belief; \
+                 seed it via {} — e.g. remap to initialpose)",
+                params.belief_radius * 2.0,
+                binary_grid.resolution,
+                params.theta_cell_num,
+                g.belief_mb(),
+                params.pose_topic
+            );
+            Box::new(g)
+        }
+        _ => Box::new(ExternalLocalizer::default()),
+    };
     drop(binary_grid);
     let nstates =
         vi_grid.width as usize * vi_grid.height as usize * params.theta_cell_num as usize;
@@ -1254,6 +1331,7 @@ fn main() -> Result<()> {
     let handles = Arc::new(Handles {
         core: Mutex::new(core),
         latest_pose: Mutex::new(None),
+        localizer: Mutex::new(localizer),
         scan_queue: Mutex::new(Vec::new()),
         cmd_pub: node.create_publisher::<geometry_msgs::msg::Twist>("cmd_vel".keep_last(1))?,
         viz: if params.publish_value_function {
@@ -1286,30 +1364,43 @@ fn main() -> Result<()> {
             .transpose()?,
     });
 
-    // 6a. 自己位置トピック購読 (tf2 代替)。
+    // 6a. 自己位置トピック購読 (tf2 代替)。external ではそのまま採用、grid では
+    //     belief の手動シード (どちらも Localizer::set_pose 経由)。
     let _pose_sub = {
         let h = Arc::clone(&handles);
         node.create_subscription::<geometry_msgs::msg::PoseWithCovarianceStamped, _>(
             params.pose_topic.as_str().keep_last(1),
             move |msg: geometry_msgs::msg::PoseWithCovarianceStamped| {
-                *lock(&h.latest_pose) = Some(pose_view_from(&msg.pose.pose));
+                let mut l = lock(&h.localizer);
+                l.set_pose(pose_view_from(&msg.pose.pose));
+                *lock(&h.latest_pose) = l.pose();
             },
         )?
     };
 
     // 6b. スキャン購読 (sensor QoS = best effort)。tick 間に届いた分を貯めて
-    //     制御ループが順に消化する。
+    //     制御ループが順に消化する。同じスキャンが自己位置推定の補正にも入る
+    //     (external では no-op。grid の補正は belief の広がりに比例したコストで、
+    //     収束後は数百セル × 数十ビーム — エグゼキュータスレッドで足りる)。
     let _scan_sub = {
         let h = Arc::clone(&handles);
         node.create_subscription::<sensor_msgs::msg::LaserScan, _>(
             params.scan_topic.as_str().best_effort().keep_last(5),
             move |msg: sensor_msgs::msg::LaserScan| {
+                let scan = vi_scan_from(&msg);
+                {
+                    let mut l = lock(&h.localizer);
+                    l.observe(&scan);
+                    if let Some(p) = l.pose() {
+                        *lock(&h.latest_pose) = Some(p);
+                    }
+                }
                 let mut q = lock(&h.scan_queue);
                 // 制御ループが止まっていても際限なく溜めない (最新を優先)。
                 if q.len() >= 10 {
                     q.remove(0);
                 }
-                q.push(vi_scan_from(&msg));
+                q.push(scan);
             },
         )?
     };
