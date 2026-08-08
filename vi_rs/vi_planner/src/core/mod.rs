@@ -36,13 +36,13 @@
 
 mod compact;
 mod follow;
-mod localizer;
 mod prefetch;
 #[cfg(test)]
 mod tests;
 
 pub use follow::{DwaController, FollowController, FollowKind, GreedyController, MppiController};
-pub use localizer::{BeliefConfig, ExternalLocalizer, GridLocalizer, Localizer};
+// Localizer 本体は vi_lib::localize (アルゴリズムは vi_lib、配線はノードの分担)。
+pub use vi_lib::localize::{BeliefConfig, ExternalLocalizer, GridLocalizer, Localizer};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
