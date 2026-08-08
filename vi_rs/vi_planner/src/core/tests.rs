@@ -1882,3 +1882,31 @@ fn discard_truncated_leaves_a_converged_field_alone() {
     assert!(!core.discard_truncated());
     assert!(core.is_cached_goal(goal), "捨てられていないこと");
 }
+
+/// 能動的再定位: 多目標場が解けて QMDP が乗ること。キャッシュは本来のゴールと
+/// 一致しない (復帰後の最初の要求が解き直す)。compact 構成は Unsupported。
+#[test]
+fn prepare_reloc_goal_serves_qmdp_toward_targets() {
+    let cancel = AtomicBool::new(false);
+    let mut core = PlannerCore::new(build(64), cfg());
+    let targets = [(0.8, 0.8), (2.4, 2.4)];
+    let stats = core.prepare_reloc_goal(&targets, &cancel).expect("reloc field");
+    assert!(stats.solved_now);
+    assert!(!core.is_cached_goal(pose(1.6, 1.6, 0.0)), "本来のゴールとは不一致のはず");
+
+    // 2 仮説 QMDP: どちらの仮説にも行動が出る (多目標場の上の走行)。
+    let hyps = [(pose(0.5, 0.5, 0.0), 0.5), (pose(2.7, 2.7, 0.0), 0.5)];
+    match core.decide_qmdp(&hyps) {
+        Decision::Action { .. } => {}
+        d => panic!("expected Action, got {d:?}"),
+    }
+    // 両仮説とも判別点圏内なら Goal (final_state は全 θ)。
+    let at = [(pose(0.8, 0.8, 1.0), 0.5), (pose(2.4, 2.4, 2.0), 0.5)];
+    assert_eq!(core.decide_qmdp(&at), Decision::Goal);
+
+    let mut compact = PlannerCore::new(build(64), cfg_compact());
+    assert!(matches!(
+        compact.prepare_reloc_goal(&targets, &cancel),
+        Err(PlanError::Unsupported(_))
+    ));
+}

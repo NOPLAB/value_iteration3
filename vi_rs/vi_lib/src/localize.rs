@@ -66,6 +66,14 @@ pub trait Localizer: Send {
     fn top_cells(&self, _k: usize) -> Vec<(PoseView, f64)> {
         Vec::new()
     }
+    /// ロスト中の能動的再定位の行き先候補 (世界座標、仮説ごとに 1 点)。
+    /// 空 = 提案なし (非ロスト / 単峰 / どこへ行っても判別不能)。呼び出し側は
+    /// この集合を多目標 VI (`ValueIterator::set_goal_region`) のゴールにして
+    /// QMDP で走る — どの仮説が真でも、その仮説にとっての判別点へ向かう。
+    /// 多峰 belief を持つ推定器 ([`AdaptiveLocalizer`]) だけが実装する。
+    fn reloc_targets(&self) -> Vec<(f64, f64)> {
+        Vec::new()
+    }
 }
 
 /// 現行動作: `pose_topic` の推定を素通しする (既定)。
@@ -708,6 +716,13 @@ const MIN_DWELL: u32 = 3;
 const ESS_CONTRACT: f64 = 50.0;
 /// expansion で free 一様分布と混ぜる質量比 (EMCL の resetting 相当)。
 const MIX_UNIFORM: f32 = 0.5;
+/// 能動的再定位 ([`Localizer::reloc_targets`]): 判別に使う上位モード数、候補変位の
+/// 半径 [m]、ロボット系方位の分割数、署名リングの半径 [m]。
+// ponytail: 定数 4 個 — 実地図でスケール調整が要るなら BeliefConfig へ昇格。
+const RELOC_MODES: usize = 4;
+const RELOC_RADII: [f64; 2] = [1.5, 3.0];
+const RELOC_HEADINGS: usize = 12;
+const RELOC_SIG_R: f64 = 1.0;
 
 /// 1 レベルぶんの幾何。belief 本体は持たない (バッファは最大レベル分を共用し、
 /// 一度にアクティブなレベルは 1 つ — メモリと CPU を最大レベルで頭打ちにする)。
@@ -1611,6 +1626,71 @@ impl Localizer for AdaptiveLocalizer {
         self.quality
     }
 
+    /// ロスト中の判別変位の選択。上位モード仮説 {pᵢ} はオドメトリ共有で
+    /// 「同じロボット系変位 δ で一緒に動く」ので、δ 先の地図が仮説間で最も
+    /// 違う δ* を選べば、そこへ走るだけで観測が仮説を判別する:
+    ///
+    ///   δ* = argmax_δ Σ_{i<j} ‖sig_i(δ) − sig_j(δ)‖₁
+    ///
+    /// sig は δ 先周りの尤度場リング標本 (仮説の向きに合わせて回す = 擬似的な
+    /// 期待スキャン)。全仮説の δ 先が free な δ だけ許す (どの仮説が真でも
+    /// 行ける行き先)。スコア 0 (完全対称) は空 — 受動復帰に任せる。
+    fn reloc_targets(&self) -> Vec<(f64, f64)> {
+        use std::f64::consts::PI;
+        if !self.initialized || self.cur == 0 {
+            return Vec::new();
+        }
+        let modes = self.top_modes(RELOC_MODES, 2);
+        if modes.len() < 2 {
+            return Vec::new();
+        }
+        let displaced = |p: &PoseView, dr: f64, dphi: f64| {
+            let a = p.yaw_rad + dphi;
+            (p.x + dr * a.cos(), p.y + dr * a.sin())
+        };
+        let mut best: Option<(f64, f64, f64)> = None; // (score, dr, dphi)
+        for &dr in &RELOC_RADII {
+            for k in 0..RELOC_HEADINGS {
+                let dphi = k as f64 * (2.0 * PI / RELOC_HEADINGS as f64);
+                if !modes.iter().all(|p| {
+                    let (x, y) = displaced(p, dr, dphi);
+                    self.field.free_at(x, y)
+                }) {
+                    continue;
+                }
+                let sigs: Vec<[f64; 8]> = modes
+                    .iter()
+                    .map(|p| {
+                        let (x, y) = displaced(p, dr, dphi);
+                        let mut s = [0.0; 8];
+                        for (j, sv) in s.iter_mut().enumerate() {
+                            let a = p.yaw_rad + j as f64 * (2.0 * PI / 8.0);
+                            *sv = self.field.at(x + RELOC_SIG_R * a.cos(), y + RELOC_SIG_R * a.sin());
+                        }
+                        s
+                    })
+                    .collect();
+                let mut score = 0.0;
+                for i in 0..sigs.len() {
+                    for j in (i + 1)..sigs.len() {
+                        for m in 0..8 {
+                            score += (sigs[i][m] - sigs[j][m]).abs();
+                        }
+                    }
+                }
+                if best.map_or(true, |(bs, ..)| score > bs) {
+                    best = Some((score, dr, dphi));
+                }
+            }
+        }
+        match best {
+            Some((score, dr, dphi)) if score > 0.0 => {
+                modes.iter().map(|p| displaced(p, dr, dphi)).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// 現レベルの上位仮説。ロスト中 (粗レベル) も返す — pose() と違い多峰の
     /// まま渡せるのが QMDP の意義なので、レベルでは絞らない。
     fn top_cells(&self, k: usize) -> Vec<(PoseView, f64)> {
@@ -2012,6 +2092,58 @@ mod tests {
             }
         }
         assert!(ok.is_some(), "大域初期化から再定位できない (level={})", loc.level());
+    }
+
+    /// reloc_targets: 対称な 2 仮説から「地図が仮説間で違って見える方向」への
+    /// 変位を選ぶこと (能動的再定位の行き先)。北側の一方にだけ障害物クラスタが
+    /// ある地図で、両仮説とも北向きの行き先が返るはず。
+    #[test]
+    fn reloc_targets_point_toward_disambiguating_terrain() {
+        // 20m×10m @0.1、開けた空間 + 仮説 A の北にだけ障害物クラスタ。
+        let (w, h) = (200, 100);
+        let mut g = OccupancyGrid {
+            width: w,
+            height: h,
+            resolution: 0.1,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            data: vec![0i8; (w * h) as usize],
+        };
+        for y in 90..96 {
+            for x in 40..70 {
+                g.data[(y * w + x) as usize] = 100;
+            }
+        }
+        let mut loc = AdaptiveLocalizer::new(&g, 36, BeliefConfig::default());
+        assert!(loc.reloc_targets().is_empty(), "未初期化は空");
+
+        // ロスト状態を直接組む: 全域レベルで (5.2, 5.2) と (15.2, 5.2) の 2 仮説。
+        let last = loc.levels.len() - 1;
+        loc.cur = last;
+        loc.initialized = true;
+        loc.wx0 = 0;
+        loc.wy0 = 0;
+        let (nx, ny) = (loc.levels[last].nx, loc.levels[last].ny);
+        let n = loc.n_active();
+        loc.b[..n].fill(0.0);
+        let res = loc.levels[last].res;
+        let cell = |wx: f64, wy: f64| ((wx / res) as i32, (wy / res) as i32);
+        let (ax, ay) = cell(5.2, 5.2);
+        let (bx, by) = cell(15.2, 5.2);
+        loc.b[bidx2(nx, ny, ax, ay, 0)] = 0.6;
+        loc.b[bidx2(nx, ny, bx, by, 0)] = 0.4;
+
+        let t = loc.reloc_targets();
+        assert_eq!(t.len(), 2, "仮説ごとに 1 点");
+        for &(x, y) in &t {
+            assert!(y > 6.0, "行き先 ({x:.1}, {y:.1}) が判別地形 (北) を向いていない");
+        }
+        // 同じロボット系変位 δ (両仮説とも yaw ビン 0) — 世界系でも同じずれ。
+        assert!(
+            ((t[1].0 - t[0].0) - 10.0).abs() < 0.5,
+            "2 つの行き先は同じ δ で結ばれるはず: {t:?}"
+        );
     }
 
     /// top_cells: シード直後の最大重み仮説がシード姿勢のセルで、重みが降順なこと

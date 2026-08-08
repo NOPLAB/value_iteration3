@@ -252,6 +252,8 @@ pub enum PlanError {
     Sink(String),
     /// compact 経路の追従用パッチを構成できなかった (幾何が破綻している)。
     Patch(String),
+    /// この構成では提供できない機能 (compact での能動的再定位など)。
+    Unsupported(&'static str),
 }
 
 impl std::fmt::Display for PlanError {
@@ -262,6 +264,7 @@ impl std::fmt::Display for PlanError {
             PlanError::Rollout(s) => write!(f, "policy rollout failed: {s:?}"),
             PlanError::Sink(e) => write!(f, "compact output sink unavailable: {e}"),
             PlanError::Patch(e) => write!(f, "follow patch cannot be built: {e}"),
+            PlanError::Unsupported(e) => write!(f, "unsupported in this configuration: {e}"),
         }
     }
 }
@@ -749,6 +752,76 @@ impl PlannerCore {
             return Err(PlanError::NotConverged);
         }
         Ok(Field::Dense(Box::new(vi)))
+    }
+
+    /// 能動的再定位の多目標場を用意する: ロスト中の仮説集合の判別点
+    /// ([`Localizer::reloc_targets`]) を**全 θ** の final_state にマークして
+    /// (`ValueIterator::set_goal_region`) 収束まで解き、キャッシュに載せる。
+    /// 以後の [`Self::decide_qmdp`] はこの場を読む — どの仮説が真でも、その仮説に
+    /// とっての判別点へ向かう行動になる。
+    ///
+    /// - キャッシュのゴールは**意図的に本来のゴールと一致しない** (先頭の判別点):
+    ///   復帰後の最初の `prepare_goal` / 計画要求がキャッシュミスで本来のゴールを
+    ///   解き直すので、専用の後始末は要らない。
+    /// - 密経路のみ。compact の sink ソルバは単一ゴール前提なので `Unsupported`
+    ///   を返す — 呼び出し側は受動復帰 (expansion resetting のみ) に任せること。
+    // ponytail: compact 対応は多シードの frontier finalize が要る — 必要になったら。
+    pub fn prepare_reloc_goal(
+        &mut self,
+        targets: &[(f64, f64)],
+        cancel: &AtomicBool,
+    ) -> Result<SolveStats, PlanError> {
+        if self.cfg.use_compact() {
+            return Err(PlanError::Unsupported("active relocalization needs the dense path"));
+        }
+        if targets.is_empty() {
+            return Err(PlanError::Unsupported("no relocalization targets"));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PlanError::Cancelled);
+        }
+        let mut stats =
+            SolveStats { solved_now: false, iters: 0, adopted: false, truncated: false };
+        self.cached = None; // 旧キャッシュを先に解放 (prepare_goal と同じ規律)
+        if let Some(ov) = self.penalty.as_mut() {
+            ov.clear();
+        }
+        self.dirty = false;
+
+        let mut vi = ValueIteratorLocal::new(self.build.actions.clone(), 1);
+        vi.set_map_with_occupancy_grid(
+            &self.build.grid,
+            self.build.theta_cell_num,
+            self.build.safety_radius,
+            self.build.safety_radius_penalty,
+            self.build.goal_margin_radius,
+            self.build.goal_margin_theta,
+        );
+        vi.set_local_xy_range(self.build.local_xy_range);
+        // 半径はゴール margin と同じ、ただし最低 1 セルは確実にマークする。
+        let radius = self.build.goal_margin_radius.max(vi.base.xy_resolution);
+        vi.base.set_goal_region(targets, radius);
+
+        let mut director =
+            SolveDirector { cfg: &self.cfg, cancel, from: None, on_progress: &mut |_| {} };
+        let out =
+            solve_observed(&mut vi.base, self.cfg.solver, self.cfg.max_solve_iter, &mut director);
+        stats.iters = out.iters;
+        if out.cancelled {
+            return Err(PlanError::Cancelled);
+        }
+        if !out.converged {
+            return Err(PlanError::NotConverged);
+        }
+        self.cached = Some(CachedGoal {
+            goal_x: targets[0].0,
+            goal_y: targets[0].1,
+            goal_t_deg: 0,
+            field: Field::Dense(Box::new(vi)),
+            truncated: false,
+        });
+        stats.solved_now = true;
+        Ok(stats)
     }
 
     // ──────────────────────────────────────────────────────────────────────

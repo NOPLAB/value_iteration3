@@ -321,6 +321,39 @@ impl ValueIterator {
         }
     }
 
+    /// 能動的再定位用の多目標版 `setGoal`: 世界座標点集合の周囲 `radius` [m]
+    /// (セル中心距離) の free セルを**全 θ** で final_state にし、値を初期化する。
+    /// 本家忠実版 (`set_goal` / `set_state_values`) はゴール 1 点 + 方位条件 —
+    /// こちらは再定位の行き先マーキング専用で、本家の角 2 点判定・θ 量子化 quirk
+    /// は再現しない。`goal_x/goal_y` は先頭の点を指す (rollout の終端表示用)。
+    pub fn set_goal_region(&mut self, points: &[(f64, f64)], radius: f64) {
+        self.goal_x = points.first().map_or(0.0, |p| p.0);
+        self.goal_y = points.first().map_or(0.0, |p| p.1);
+        self.goal_t = 0;
+        self.thread_status.clear();
+        let (xy_res, ox, oy) = (self.xy_resolution, self.map_origin_x, self.map_origin_y);
+        let r2 = radius * radius;
+        let (nx, nt) = (self.cell_num_x, self.cell_num_t);
+        for iy in 0..self.cell_num_y {
+            let cy = (iy as f64 + 0.5) * xy_res + oy;
+            for ix in 0..nx {
+                let cx = (ix as f64 + 0.5) * xy_res + ox;
+                let near = points.iter().any(|&(px, py)| {
+                    let (dx, dy) = (cx - px, cy - py);
+                    dx * dx + dy * dy <= r2
+                });
+                for it in 0..nt {
+                    let s = &mut self.states[to_index_raw(ix, iy, it, nx, nt) as usize];
+                    s.final_state = near && s.free;
+                    s.total_cost = if s.final_state { 0 } else { MAX_COST };
+                    s.local_penalty = 0;
+                    s.optimal_action = None;
+                }
+            }
+        }
+        self.status = "calculating".to_string();
+    }
+
     /// 本家 `valueFunctionWriter`。各 θ 層に `total_cost_/prob_base_`。
     /// ★本家は uint64/uint64 の **整数除算** で小数を切り捨てる
     /// (`map.at(...) = s.total_cost_/prob_base_;`)。`make_value_function_map` 側の

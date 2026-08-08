@@ -796,6 +796,30 @@ mod tests {
         )
     }
 
+    /// set_goal_region: 2 点ゴールの多目標場が収束し、どちらの側からの貪欲降下も
+    /// ゴールに入ること (能動的再定位の行き先マーキング)。
+    #[test]
+    fn set_goal_region_solves_a_multi_goal_field() {
+        let grid = OccupancyGrid {
+            width: 64,
+            height: 64,
+            resolution: RES,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            data: empty_map(64),
+        };
+        let mut vi = ValueIterator::new(actions(), 1);
+        vi.set_map_with_occupancy_grid(&grid, NT, 0.1, 30.0, 0.2, 180);
+        vi.set_goal_region(&[(0.8, 0.8), (2.4, 2.4)], 0.2);
+        let stats = solve(&mut vi, U64Solver::Frontier3D, 100_000);
+        assert!(stats.converged);
+        for start in [(0.5, 0.5), (2.7, 2.7)] {
+            let r = rollout_path_on(&vi, start.0, start.1, 0.0, 10_000, 0);
+            assert!(r.reached_goal(), "start {start:?}: {:?}", r.status);
+        }
+    }
+
     #[test]
     fn qmdp_single_hypothesis_matches_greedy() {
         let vi = solved_vi(64, 64, empty_map(64), (2.0, 2.0, 0), U64Solver::Frontier3D);
