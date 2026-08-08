@@ -14,6 +14,10 @@ pub struct ValueIteratorLocal {
     pub local_iy_max: i32,
     pub local_ixy_range: i32,
     pub local_xy_range: f64,
+    /// 地図帰属サプレッションの半径 [セル] (0 = 無効 = 本家挙動)。ヒット点から
+    /// この距離以内に静的な非 free セル (障害物・未知) があるとき、そのヒットは
+    /// 「地図の壁の再投影 (pose 誤差ぶんずれたゴースト)」とみなして注入しない。
+    pub scan_attribution_cells: i32,
 }
 
 impl ValueIteratorLocal {
@@ -27,6 +31,7 @@ impl ValueIteratorLocal {
             local_iy_max: 0,
             local_ixy_range: 0,
             local_xy_range: 0.0,
+            scan_attribution_cells: 0,
         }
     }
 
@@ -65,6 +70,50 @@ impl ValueIteratorLocal {
         self.local_iy_min = 0;
         self.local_ix_max = self.local_ixy_range * 2;
         self.local_iy_max = self.local_ixy_range * 2;
+    }
+
+    /// 地図帰属サプレッションの半径 [m] を設定 (0 以下で無効 = 本家挙動)。
+    /// `set_map_with_occupancy_grid` の後に呼ぶこと (解像度を読む)。
+    pub fn set_scan_attribution_range(&mut self, range_m: f64) {
+        self.scan_attribution_cells = if range_m > 0.0 {
+            (range_m / self.base.xy_resolution).ceil() as i32
+        } else {
+            0
+        };
+    }
+
+    /// (ix,iy) の周囲 `scan_attribution_cells` セル以内に静的な非 free セル
+    /// (障害物・未知) があるか。free は xy にのみ依存するので θ=0 だけ見る。
+    fn near_static_obstacle(&self, ix: i32, iy: i32) -> bool {
+        let a = self.scan_attribution_cells;
+        let (nx, ny) = (self.base.cell_num_x, self.base.cell_num_y);
+        for iix in (ix - a).max(0)..=(ix + a).min(nx - 1) {
+            for iiy in (iy - a).max(0)..=(iy + a).min(ny - 1) {
+                if !self.base.states[self.base.to_index(iix, iiy, 0) as usize].free {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// (x,y) を中心とする半径 `radius_m` の正方形の local_penalty を 0 にする
+    /// (footprint クリア、本家に無い)。ロボットが現にいる場所は free という
+    /// 反証不能な証拠 — スキャンのゴースト壁が機体の真上で閉じるのを防ぐ。
+    pub fn clear_local_penalty_around(&mut self, x: f64, y: f64, radius_m: f64) {
+        let res = self.base.xy_resolution;
+        let cx = ((x - self.base.map_origin_x) / res).floor() as i32;
+        let cy = ((y - self.base.map_origin_y) / res).floor() as i32;
+        let r = (radius_m / res).ceil() as i32;
+        let nt = self.base.cell_num_t;
+        for ix in (cx - r).max(0)..=(cx + r).min(self.base.cell_num_x - 1) {
+            for iy in (cy - r).max(0)..=(cy + r).min(self.base.cell_num_y - 1) {
+                for it in 0..nt {
+                    let idx = self.base.to_index(ix, iy, it) as usize;
+                    self.base.states[idx].local_penalty = 0;
+                }
+            }
+        }
     }
 
     /// 本家 `inLocalArea`。
@@ -138,6 +187,15 @@ impl ValueIteratorLocal {
                     }
                 }
                 d += 0.1;
+            }
+
+            // 地図帰属: ヒットが既知障害物の近傍なら、それは地図の壁の再投影
+            // (pose 誤差ぶんずれたゴースト) とみなして注入しない — 静的 penalty が
+            // 既にその壁を守っている。オープンスペースのヒット (人・箱 = 地図に
+            // 無い障害物) だけが注入に残る。通過セルの半減 (上) はそのまま —
+            // ビームが通った事実は姿勢がずれていても free の証拠になる。
+            if self.scan_attribution_cells > 0 && self.near_static_obstacle(ix, iy) {
+                continue;
             }
 
             for iix in (ix - 2)..=(ix + 2) {
@@ -259,6 +317,54 @@ mod tests {
         // クランプ: shift が大きくても 0 にはならず 1<<bit で止まる。
         vi.set_local_cost_attenuated(&scan, 0.0, 0.0, 0.0, 99);
         assert_eq!(vi.base.states[hit].local_penalty, 1u64 << PROB_BASE_BIT);
+    }
+
+    #[test]
+    fn map_attributed_hits_are_not_injected() {
+        let mut vi = ValueIteratorLocal::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
+        let mut map = free_grid(60, 60);
+        // (20, 0) 付近に地図障害物の列。ヒット (10, 0) はそこから 10 セル =
+        // 0.5m 離れている。
+        for iy in 0..5 {
+            map.data[(iy * 60 + 20) as usize] = 100;
+        }
+        vi.set_map_with_occupancy_grid(&map, 60, 0.05, 30.0, 0.2, 10);
+        let scan = LaserScan {
+            angle_min: 0.0,
+            angle_increment: 0.0,
+            ranges: vec![0.5], // ヒット点 (10, 0)
+        };
+        let hit = vi.base.to_index(10, 0, 0) as usize;
+
+        // 帰属半径 0.6m (12 セル) — 障害物列が圏内なので注入しない。
+        vi.set_scan_attribution_range(0.6);
+        vi.set_local_cost(&scan, 0.0, 0.0, 0.0);
+        assert_eq!(vi.base.states[hit].local_penalty, 0);
+
+        // 帰属半径 0.3m — 圏外なのでオープンスペースの新規障害物として注入する。
+        vi.set_scan_attribution_range(0.3);
+        vi.set_local_cost(&scan, 0.0, 0.0, 0.0);
+        assert_eq!(vi.base.states[hit].local_penalty, 2048u64 << PROB_BASE_BIT);
+    }
+
+    #[test]
+    fn clear_local_penalty_around_erases_footprint() {
+        let mut vi = ValueIteratorLocal::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
+        let map = free_grid(60, 60);
+        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.2, 10);
+        let scan = LaserScan {
+            angle_min: 0.0,
+            angle_increment: 0.0,
+            ranges: vec![0.1], // ヒット点 (2, 0) — ±2 ブロックがロボットのセルを覆う
+        };
+        vi.set_local_cost(&scan, 0.0, 0.0, 0.0);
+        let robot = vi.base.to_index(0, 0, 0) as usize;
+        assert_eq!(vi.base.states[robot].local_penalty, 2048u64 << PROB_BASE_BIT);
+        vi.clear_local_penalty_around(0.0, 0.0, 0.1);
+        assert_eq!(vi.base.states[robot].local_penalty, 0);
+        // クリア半径の外 (ヒット点の右端) は残る。
+        let outside = vi.base.to_index(4, 0, 0) as usize;
+        assert_eq!(vi.base.states[outside].local_penalty, 2048u64 << PROB_BASE_BIT);
     }
 
     #[test]

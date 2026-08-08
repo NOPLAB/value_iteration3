@@ -37,6 +37,7 @@ fn build(size: i32) -> BuildParams {
         goal_margin_radius: 0.2,
         goal_margin_theta: 180,
         local_xy_range: 1.0,
+        scan_attribution_m: 0.0,
         patch_slack_cells: 2,
         repair_interior_cells: 16,
     }
@@ -54,6 +55,7 @@ fn cfg() -> PlanConfig {
         path_spacing: RES,
         action_tolerance_cells: 4,
         follow_controller: FollowKind::Greedy,
+        footprint_clear_m: 0.0,
         dwa_tick_s: 0.1,
         dwa_horizon_s: 1.0,
         dwa_n_v: 7,
@@ -762,6 +764,57 @@ fn observe_scan_gated_attenuates_injection() {
     let (hx, hy, _) = pose_to_cell(&vi.base, 1.5, 1.0, 0.0);
     let hit = vi.base.to_index(hx, hy, 0) as usize;
     assert_eq!(vi.base.states[hit].local_penalty, 256u64 << PROB_BASE_BIT);
+}
+
+/// 地図帰属サプレッションの半径が dense / compact 両経路の追従側 vi に
+/// 届いていること (生成箇所が 2 つあるので配線をピン留めする)。
+#[test]
+fn scan_attribution_threads_to_both_paths() {
+    let build_attr = BuildParams { scan_attribution_m: 0.3, ..build(64) };
+    let cancel = AtomicBool::new(false);
+    // RES = 0.05 → ceil(0.3 / 0.05) = 6 セル。
+    let mut dense = PlannerCore::new(build_attr.clone(), cfg());
+    dense.prepare_goal(pose(2.5, 1.0, 0.0), &cancel).expect("solve");
+    dense.set_window(pose(1.0, 1.0, 0.0));
+    assert_eq!(dense.local().unwrap().scan_attribution_cells, 6);
+
+    let mut compact = PlannerCore::new(build_attr, cfg_compact());
+    compact.prepare_goal(pose(2.5, 1.0, 0.0), &cancel).expect("solve");
+    compact.set_window(pose(1.0, 1.0, 0.0));
+    assert_eq!(compact.local().unwrap().scan_attribution_cells, 6);
+}
+
+/// footprint クリア: 機体の真上に塗られたゴースト壁が注入のたびに消えること。
+#[test]
+fn footprint_clear_erases_penalty_under_robot() {
+    let cancel = AtomicBool::new(false);
+    let robot = pose(1.0, 1.0, 0.0);
+    // 正面 0.1m のヒットは ±2 セルのブロックが機体のセルまで覆う。
+    let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.1] };
+
+    // クリア無効 (既定 0): 機体のセルに 2048 が残る = 閉じ込めの型。
+    let mut core = PlannerCore::new(build(64), cfg());
+    core.prepare_goal(pose(2.5, 1.0, 0.0), &cancel).expect("solve");
+    core.set_window(robot);
+    core.observe_scan(&scan, robot);
+    let (rx, ry, _) = {
+        let vi = core.local().unwrap();
+        pose_to_cell(&vi.base, 1.0, 1.0, 0.0)
+    };
+    {
+        let vi = core.local().unwrap();
+        let idx = vi.base.to_index(rx, ry, 0) as usize;
+        assert_eq!(vi.base.states[idx].local_penalty, 2048u64 << PROB_BASE_BIT);
+    }
+
+    // クリア有効: 同じ注入でも機体の周囲 0.2m は 0 に戻る。
+    let mut core = PlannerCore::new(build(64), PlanConfig { footprint_clear_m: 0.2, ..cfg() });
+    core.prepare_goal(pose(2.5, 1.0, 0.0), &cancel).expect("solve");
+    core.set_window(robot);
+    core.observe_scan(&scan, robot);
+    let vi = core.local().unwrap();
+    let idx = vi.base.to_index(rx, ry, 0) as usize;
+    assert_eq!(vi.base.states[idx].local_penalty, 0);
 }
 
 /// penalty 表が `set_local_cost` の書く値を**丸めずに**持てること

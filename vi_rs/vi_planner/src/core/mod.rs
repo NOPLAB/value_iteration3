@@ -108,6 +108,10 @@ pub struct BuildParams {
     pub goal_margin_theta: i32,
     /// 追従のローカルウィンドウ半径 [m] (本家 `ValueIteratorLocal` は 1.0 固定)。
     pub local_xy_range: f64,
+    /// 地図帰属サプレッションの半径 [m] (0 以下で無効)。ヒット点からこの距離以内に
+    /// 地図障害物があるスキャンヒットは「壁の再投影 (pose 誤差のゴースト)」と
+    /// みなして注入しない。pose 誤差の許容幅そのもの。
+    pub scan_attribution_m: f64,
     /// compact パッチの寸法スラック [セル] (`half = 2*win + reach + slack`)。
     pub patch_slack_cells: i32,
     /// 修復タイルの interior の 1 辺 [セル]。大きいほど 1 訪問あたりの halo の
@@ -158,6 +162,10 @@ pub struct PlanConfig {
     /// [`FollowKind::Dwa`] / [`FollowKind::Mppi`] = 連続行動)。詳細は
     /// [`follow`] モジュールの doc。
     pub follow_controller: FollowKind,
+    /// footprint クリアの半径 [m] (0 以下で無効)。スキャン注入のたびに機体位置の
+    /// 周囲の local_penalty を消す — ロボットが現にいる場所は free という反証
+    /// 不能な証拠で、ゴースト壁が機体の真上で閉じて完全停止するのを防ぐ。
+    pub footprint_clear_m: f64,
     /// DWA/MPPI: 制御周期 [s] (= 1/control_frequency)。候補評価の時間刻みの上限。
     pub dwa_tick_s: f64,
     /// DWA/MPPI: 前方シミュレーション時間 [s]。
@@ -737,6 +745,7 @@ impl PlannerCore {
             self.build.goal_margin_theta,
         );
         vi.set_local_xy_range(self.build.local_xy_range);
+        vi.set_scan_attribution_range(self.build.scan_attribution_m);
         vi.base.set_goal(goal.x, goal.y, goal_t_deg);
 
         let mut director =
@@ -798,6 +807,7 @@ impl PlannerCore {
             self.build.goal_margin_theta,
         );
         vi.set_local_xy_range(self.build.local_xy_range);
+        vi.set_scan_attribution_range(self.build.scan_attribution_m);
         // 半径はゴール margin と同じ、ただし最低 1 セルは確実にマークする。
         let radius = self.build.goal_margin_radius.max(vi.base.xy_resolution);
         vi.base.set_goal_region(targets, radius);
@@ -1005,8 +1015,14 @@ impl PlannerCore {
     /// 塗るとゴースト壁がロボットを global 勾配との間に挟んで止める。shift は
     /// [`quality_shift`] で quality から量子化する。0 は `observe_scan` と同一。
     pub fn observe_scan_gated(&mut self, scan: &LaserScan, pose: PoseView, shift: u32) {
+        let clear = self.cfg.footprint_clear_m;
         if let Some(vi) = self.local_mut() {
             vi.set_local_cost_attenuated(scan, pose.x, pose.y, pose.yaw_rad, shift);
+            // 注入の後に footprint を消す — 機体の真上に塗られたゴーストが勝たない
+            // ように (harvest より前なので compact の penalty 表にも 0 が写る)。
+            if clear > 0.0 {
+                vi.clear_local_penalty_around(pose.x, pose.y, clear);
+            }
         }
         self.harvest_penalties();
     }

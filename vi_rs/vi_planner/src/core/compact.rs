@@ -326,6 +326,9 @@ pub(super) fn new_patch(build: &BuildParams) -> Result<Patch, PlanError> {
         build.goal_margin_theta,
     );
     vi.set_local_xy_range(build.local_xy_range);
+    // パッチの free は hydrate が静的地図から埋めるので、地図帰属サプレッションは
+    // dense と同じ条件で効く。
+    vi.set_scan_attribution_range(build.scan_attribution_m);
 
     // 凍結境界の成立条件: ウィンドウ内のセルの遷移先がパッチに収まること。
     // 解析上界ではなく遷移表の実測で確かめる (1 セル足りないと、ある方位でだけ
