@@ -8,7 +8,9 @@
 # 起動後:
 #   - belief は spawn 位置 (-2, -0.5, 0°) に自動シード済み。ずらしたいときは
 #     RViz の「2D Pose Estimate」で撃ち直す (pose_topic = initialpose)。
-#   - ゴールは RViz の「Nav2 Goal」ツールで投入 (navigate_to_pose)。CLI なら:
+#   - ゴールは RViz の「Nav2 Goal」(または素の「2D Goal Pose」) で投入 —
+#     どちらも /goal_pose に出るだけなので、standalone の vi_planner が直接
+#     受けて navigate_to_pose と同じ経路で走らせる。CLI なら:
 #       ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
 #         '{pose: {header: {frame_id: map}, pose: {position: {x: 2.0, y: 0.5}}}}'
 #   - map→odom の static TF は表示専用 (spawn 位置で固定)。VIOLA 自体は TF を

@@ -1857,6 +1857,38 @@ fn main() -> Result<()> {
         )?)
     };
 
+    // 6e′. /goal_pose 購読 (bt_navigator の goal_pose→NavigateToPose 変換の
+    //      置き換え)。RViz の「Nav2 Goal」も「2D Goal Pose」も PoseStamped を
+    //      このトピックへ出すだけで、アクションに変換するのは bt_navigator
+    //      だった — standalone はそれも置き換えているのでここで直接受ける。
+    //      経路はアクションと同じ run_goal、違いは feedback/result の宛先が
+    //      無いことだけ (プリエンプトの席も同じ 1 つを使う)。
+    let _goal_pose_sub = if !params.standalone {
+        None
+    } else {
+        let handles = Arc::clone(&handles);
+        let follow_cancel = Arc::clone(&follow_cancel);
+        Some(node.create_subscription::<geometry_msgs::msg::PoseStamped, _>(
+            "goal_pose".keep_last(1),
+            move |msg: geometry_msgs::msg::PoseStamped| {
+                let goal = pose_view_from(&msg.pose);
+                eprintln!("vi_planner: goal_pose ({:.2}, {:.2})", goal.x, goal.y);
+                let my_cancel = preempt(&follow_cancel);
+                let h = Arc::clone(&handles);
+                std::thread::spawn(move || {
+                    let ctx = h.follow_ctx(tuning, true);
+                    match run_goal(&ctx, goal, &my_cancel, retry, &AtomicU64::new(0), &|_| {}) {
+                        Outcome::Reached => eprintln!("vi_planner: goal reached"),
+                        Outcome::Preempted => {
+                            eprintln!("vi_planner: preempted by a newer goal")
+                        }
+                        Outcome::Failed(reason) => eprintln!("ERROR: vi_planner: {reason}"),
+                    }
+                });
+            },
+        )?)
+    };
+
     // 6f. follow_waypoints action サーバ (nav2_waypoint_follower の置き換え)。
     //     **順路は配列の順**に回る (距離で並べ替えたりはしない。nav2 側も同じ)。
     //
