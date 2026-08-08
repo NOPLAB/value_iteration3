@@ -32,6 +32,10 @@ pub mod planner;
 
 pub use planner::{PathPose, Rollout, RolloutStatus};
 
+// 解けた場を連続に読む制御層 (V̂ 補間 + DWA 型軌道サンプリング)。ソルバの
+// bit-exact 検証体制の外側にあり、方策の意味論には触れない。
+pub mod ctrl;
+
 // ROS メッセージ「ビュー」と vi_reference 型の変換層 (ROS 非依存)。
 // vi_ros2/vi_node と vi_ros2/vi_global_planner が共有する (旧 vi_node/src/bridge.rs)。
 pub mod bridge;
