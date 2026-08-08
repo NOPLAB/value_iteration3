@@ -180,12 +180,6 @@ fn priority_solve_inner(
     (PrioStats { iters, updates, converged: true, repops }, SolveFlow::Continue)
 }
 
-/// (A1) Priority Label-Setting（近似・最速）。`solve()` 用の軽量タプル。
-pub fn prio_ls_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    let st = priority_solve(vi, max_iter, true);
-    (st.iters.min(u32::MAX as u64) as u32, st.updates, st.converged)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,8 +240,8 @@ mod tests {
         collapse_to_deterministic(&mut a);
         collapse_to_deterministic(&mut b);
         run_reference_to_fixed_point(&mut a);
-        let (_i, _u, conv) = super::prio_ls_solve(&mut b, 3000);
-        assert!(conv, "prio_ls must converge");
+        let st = priority_solve(&mut b, 3000, true);
+        assert!(st.converged, "prio_ls must converge");
 
         let mut n_reach = 0u64;
         for i in 0..a.states.len() {
@@ -263,28 +257,14 @@ mod tests {
         assert!(n_reach > 0, "決定論グラフでも到達可能セルが存在するはず");
     }
 
-    fn standard_occ() -> Vec<(&'static str, Vec<i8>)> {
-        let empty = vec![0i8; 64];
-        let mut wall = vec![0i8; 64];
-        for iy in 0..8 {
-            wall[(iy * 8 + 5) as usize] = 100;
-        }
-        wall[5] = 0;
-        let mut sentinel = vec![0i8; 64];
-        sentinel[(1 * 8 + 2) as usize] = 100;
-        sentinel[(3 * 8 + 2) as usize] = 100;
-        sentinel[(2 * 8 + 1) as usize] = 100;
-        vec![("empty", empty), ("obstacle", wall), ("sentinel", sentinel)]
-    }
-
     #[test]
     fn prio_ls_characterization_vs_reference() {
         // prio_ls の近似度を実測（RMSE/方策一致）。ゆるい上限で回帰ガード（厳密値は出力で観察）。
-        for (name, occ) in standard_occ() {
-            let mut a = make_vi(8, 8, occ.clone());
-            let mut b = make_vi(8, 8, occ);
+        for (name, w, h, occ) in crate::solvers::test_support::standard_maps() {
+            let mut a = make_vi(w, h, occ.clone());
+            let mut b = make_vi(w, h, occ);
             run_reference_to_fixed_point(&mut a);
-            super::prio_ls_solve(&mut b, 3000);
+            priority_solve(&mut b, 3000, true);
 
             let (mut se, mut n, mut agree) = (0f64, 0u64, 0u64);
             for i in 0..a.states.len() {

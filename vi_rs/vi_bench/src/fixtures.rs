@@ -129,9 +129,7 @@ pub fn build_vi(size: u32, map: BenchMap) -> ValueIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vi_reference::params::PROB_BASE;
-
-    const REACH: u64 = 1_000_000u64 * PROB_BASE;
+    use vi_reference::solvers::REACH_THRESH as REACH;
 
     #[test]
     fn build_vi_has_requested_dimensions() {

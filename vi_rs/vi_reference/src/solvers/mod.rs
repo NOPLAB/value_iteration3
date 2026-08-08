@@ -30,10 +30,8 @@ pub mod pyramid;
 pub mod stack;
 pub mod stream;
 pub mod priority;
-pub mod prio_lc;
 
 pub use observe::{NullObserver, SolveFlow, SolveObserver, SolveOutcome, SolveProbe};
-use observe::{BoundaryPacer, InPlaceProbe};
 
 /// dilation 変位 `(mx, my, mt)` を `actions` の全遷移から算出する。`dit` は絶対 θ なので、
 /// 各 (action, source theta `t`) について循環距離 `min(|dit-t|, nt-|dit-t|)` を取り `mt` とする。
@@ -75,109 +73,6 @@ pub(crate) fn seed_frontier_2d(vi: &ValueIterator) -> Bitboard2D {
         }
     }
     bb
-}
-
-/// 3D フロンティア反復の共通ドライバ (`frontier3d` の骨格)。
-/// 「seed → (膨張 → 候補走査 → 減少セルを次フロンティアへ) を収束まで」をまとめ、
-/// 差分は候補セルごとの処理 `update(vi, ix, iy, it)` のみ。
-///
-/// `update` は候補セル `(ix,iy,it)` を評価し、値を下げた（=次フロンティアへ伝播すべき）なら
-/// `true` を返す。ドライバは `true` のセルだけを次フロンティアに入れ、`updates` を 1 加算する
-/// （この「更新 ⟺ 伝播」は全 frontier3d 系ソルバで成り立つ不変条件）。
-///
-/// ラウンド境界ごとに `obs.boundary` を呼ぶ (in-place なので観測は無料)。
-pub(crate) fn frontier3d_driver<F>(
-    vi: &mut ValueIterator,
-    max_iter: u32,
-    obs: &mut dyn SolveObserver,
-    mut update: F,
-) -> SolveOutcome
-where
-    F: FnMut(&mut ValueIterator, u32, u32, u32) -> bool,
-{
-    let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
-    let (mx, my, mt) = displacement(vi);
-    let (dx, dy, dt) = (mx as u32, my as u32, mt as u32);
-    let mut pacer = BoundaryPacer::new(obs);
-    let mut frontier = seed_frontier(vi);
-    let mut updates: u64 = 0;
-    let mut iters: u32 = 0;
-    while frontier.popcount() > 0 && iters < max_iter {
-        iters += 1;
-        let candidates = frontier.dilate(dx, dy, dt);
-        let mut new_frontier = Bitboard3D::new(nx as u32, ny as u32, nt as u32);
-        for (ix, iy, it) in candidates.enumerate() {
-            if update(vi, ix, iy, it) {
-                updates += 1;
-                new_frontier.set(ix, iy, it);
-            }
-        }
-        frontier = new_frontier;
-        if frontier.popcount() > 0 && pacer.due(iters as u64) {
-            let mut probe = InPlaceProbe { vi, iters, updates };
-            match obs.boundary(&mut probe) {
-                SolveFlow::Continue => {}
-                SolveFlow::Stop => return SolveOutcome::stopped(iters, updates),
-                SolveFlow::Cancel => return SolveOutcome::cancelled(iters, updates),
-            }
-        }
-    }
-    SolveOutcome::running(iters, updates, frontier.popcount() == 0)
-}
-
-/// 2D フロンティア反復の共通ドライバ。frontier2d の「seed →
-/// (空間膨張 → 候補 (ix,iy) ごとに全 θ 層を再評価 → 更新があれば次フロンティアへ) を収束まで」
-/// の骨格をまとめる。差分は候補セルごとの処理 `cell(ix, iy)` のみ。
-///
-/// `M::cell` は候補セル `(ix,iy)` の全 θ 層を再評価し、**減少した θ 層の数**を返す（0 なら不変）。
-/// ドライバは戻り値が 1 以上のセルだけを次フロンティアに入れ、その数を `updates` に加算する。
-/// per-cell が読む状態 (vi / SoA 配列 / Padded) はモデル側が持ち、ドライバ自身は `vi` を
-/// 借用しない（seed / displacement は呼び出し側が事前計算して渡す）。
-///
-/// 境界プローブの具現化はモデルが知っている (in-place は無料、SoA/Pad は要求時 write_back)
-/// ので、境界呼び出しは `M::boundary` へ委譲する。cell と boundary が同じ内部状態を可変借用
-/// するため、クロージャ 2 つではなく 1 オブジェクト 2 メソッドにしてある。
-pub(crate) trait Frontier2DSweep {
-    fn cell(&mut self, ix: u32, iy: u32) -> u64;
-    fn boundary(&mut self, obs: &mut dyn SolveObserver, iters: u32, updates: u64) -> SolveFlow;
-}
-
-/// 2D フロンティア反復の共通ドライバ本体。ラウンド境界ごとに `model.boundary` を呼ぶ。
-pub(crate) fn frontier2d_driver<M: Frontier2DSweep>(
-    nx: i32,
-    ny: i32,
-    seed: Bitboard2D,
-    dx: u32,
-    dy: u32,
-    max_iter: u32,
-    obs: &mut dyn SolveObserver,
-    model: &mut M,
-) -> SolveOutcome {
-    let mut pacer = BoundaryPacer::new(obs);
-    let mut frontier = seed;
-    let mut updates: u64 = 0;
-    let mut iters: u32 = 0;
-    while frontier.popcount() > 0 && iters < max_iter {
-        iters += 1;
-        let candidates = frontier.dilate(dx, dy);
-        let mut new_frontier = Bitboard2D::new(nx as u32, ny as u32);
-        for (ix, iy) in candidates.enumerate() {
-            let u = model.cell(ix, iy);
-            if u > 0 {
-                updates += u;
-                new_frontier.set(ix, iy);
-            }
-        }
-        frontier = new_frontier;
-        if frontier.popcount() > 0 && pacer.due(iters as u64) {
-            match model.boundary(obs, iters, updates) {
-                SolveFlow::Continue => {}
-                SolveFlow::Stop => return SolveOutcome::stopped(iters, updates),
-                SolveFlow::Cancel => return SolveOutcome::cancelled(iters, updates),
-            }
-        }
-    }
-    SolveOutcome::running(iters, updates, frontier.popcount() == 0)
 }
 
 /// 収束後の最終 argmin パス（並列・読み取り専用）の共通実装。frontier2d_par /
@@ -443,7 +338,7 @@ where
 }
 
 /// 到達可能とみなす total_cost 上限（compare.py の value>=1e6 境界と整合）。
-pub(crate) const REACH_THRESH: u64 = 1_000_000u64 * crate::params::PROB_BASE;
+pub const REACH_THRESH: u64 = 1_000_000u64 * crate::params::PROB_BASE;
 
 /// u64 高速ソルバの種別。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -613,10 +508,9 @@ pub fn solve_observed(
 pub(crate) mod test_support {
     use crate::action::Action;
     use crate::msg::OccupancyGrid;
-    use crate::params::PROB_BASE;
     use crate::value_iterator::ValueIterator;
 
-    pub(crate) const REACH: u64 = 1_000_000u64 * PROB_BASE;
+    pub(crate) use super::REACH_THRESH as REACH;
 
     pub(crate) fn actions() -> Vec<Action> {
         vec![
@@ -692,59 +586,44 @@ pub(crate) mod test_support {
         assert!(n_reach > 0, "到達可能セルが存在するはず");
     }
 
+    /// 標準の 3 マップ (empty / obstacle: x=5 の縦壁に隙間 / sentinel: goal を 3 方向で囲む)。
+    /// `(name, w, h, occupancy)`。conformance / priority / parity テストの共通データ。
+    pub(crate) fn standard_maps() -> Vec<(&'static str, i32, i32, Vec<i8>)> {
+        let empty = vec![0i8; 64];
+        let mut obstacle = vec![0i8; 64];
+        for iy in 0..8 {
+            obstacle[(iy * 8 + 5) as usize] = 100;
+        }
+        obstacle[5] = 0;
+        let mut sentinel = vec![0i8; 64];
+        sentinel[8 + 2] = 100;
+        sentinel[3 * 8 + 2] = 100;
+        sentinel[2 * 8 + 1] = 100;
+        vec![
+            ("empty", 8, 8, empty),
+            ("obstacle", 8, 8, obstacle),
+            ("sentinel", 8, 8, sentinel),
+        ]
+    }
+
     /// 標準の3マップ (empty / obstacle / sentinel) で parity を検証する共通テスト本体。
     pub(crate) fn parity_standard_maps<F>(solve_fn: F)
     where
         F: Fn(&mut ValueIterator) -> (u32, u64, bool) + Copy,
     {
-        // empty 8x8
-        assert_parity(8, 8, vec![0i8; 64], solve_fn);
-        // obstacle: x=5 の縦壁 (隙間あり)
-        let mut occ = vec![0i8; 64];
-        for iy in 0..8 {
-            occ[(iy * 8 + 5) as usize] = 100;
+        for (_name, w, h, occ) in standard_maps() {
+            assert_parity(w, h, occ, solve_fn);
         }
-        occ[5] = 0;
-        assert_parity(8, 8, occ, solve_fn);
-        // sentinel: goal(2,2) を3方向で囲む
-        let mut occ = vec![0i8; 64];
-        occ[(1 * 8 + 2) as usize] = 100;
-        occ[(3 * 8 + 2) as usize] = 100;
-        occ[(2 * 8 + 1) as usize] = 100;
-        assert_parity(8, 8, occ, solve_fn);
     }
 }
 
 #[cfg(test)]
 mod helper_tests {
     use super::*;
-    use crate::action::Action;
-    use crate::msg::OccupancyGrid;
     use crate::value_iterator::ValueIterator;
 
     fn small_vi() -> ValueIterator {
-        let actions = vec![
-            Action::new("forward", 0.3, 0.0, 0),
-            Action::new("back", -0.2, 0.0, 1),
-            Action::new("right", 0.0, -20.0, 2),
-            Action::new("rightfw", 0.2, -20.0, 3),
-            Action::new("left", 0.0, 20.0, 4),
-            Action::new("leftfw", 0.2, 20.0, 5),
-        ];
-        let mut vi = ValueIterator::new(actions, 1);
-        let map = OccupancyGrid {
-            width: 5,
-            height: 5,
-            resolution: 0.05,
-            origin_x: 0.0,
-            origin_y: 0.0,
-            origin_quat: Default::default(),
-            data: vec![0i8; 25],
-        };
-        // theta_cell_num=60 (production と同じ)。粗いと goal の向き判定が成立しない。
-        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.3, 15);
-        vi.set_goal(0.10, 0.10, 0);
-        vi
+        test_support::make_vi(5, 5, vec![0i8; 25])
     }
 
     #[test]

@@ -15,8 +15,6 @@
 //! occupancy view into a `vi_reference::OccupancyGrid` the iterator can ingest,
 //! and (b) renders a value slice to an `OccupancyGrid` `data[]` for publishing.
 
-use ndarray::Array2;
-
 use crate::msg::{OccupancyGrid, Quaternion};
 use crate::params::{MAX_COST, PROB_BASE};
 
@@ -40,9 +38,7 @@ pub struct PoseView {
 /// `yaw_rad` → goal heading in degrees, wrapped into `[0, 360)`, truncated to an
 /// `i32` for `ValueIterator::set_goal` (本家 `executeVi`: `int t = yaw*180/π`).
 pub fn yaw_to_goal_theta_deg(yaw_rad: f64) -> i32 {
-    let mut deg = yaw_rad.to_degrees();
-    deg = ((deg % 360.0) + 360.0) % 360.0;
-    deg as i32
+    yaw_rad.to_degrees().rem_euclid(360.0) as i32
 }
 
 /// Build a `vi_reference::OccupancyGrid` from an occupancy view.
@@ -96,43 +92,7 @@ pub fn occupancy_view_to_vi_grid(
 /// 障害物優先なので通路は片側最大 `(scale-1)·resolution` 細る。ロボット半径・安全半径に対して
 /// 通路が細すぎないかは適用時に確認すること。
 pub fn downsample_occupancy(grid: &OccupancyGrid, scale: i32) -> OccupancyGrid {
-    if scale <= 1 {
-        return grid.clone();
-    }
-    let (w, h, s) = (grid.width as usize, grid.height as usize, scale as usize);
-    let (ow, oh) = (w.div_ceil(s), h.div_ceil(s));
-    let mut data = vec![0i8; ow * oh];
-    for oy in 0..oh {
-        for ox in 0..ow {
-            let mut blocked = false;
-            'blk: for dy in 0..s {
-                let iy = oy * s + dy;
-                if iy >= h {
-                    break;
-                }
-                for dx in 0..s {
-                    let ix = ox * s + dx;
-                    if ix >= w {
-                        break;
-                    }
-                    if grid.data[iy * w + ix] != 0 {
-                        blocked = true;
-                        break 'blk;
-                    }
-                }
-            }
-            data[oy * ow + ox] = if blocked { 100 } else { 0 };
-        }
-    }
-    OccupancyGrid {
-        width: ow as i32,
-        height: oh as i32,
-        resolution: grid.resolution * scale as f64,
-        origin_x: grid.origin_x,
-        origin_y: grid.origin_y,
-        origin_quat: grid.origin_quat.clone(),
-        data,
-    }
+    downsample(grid, scale, false)
 }
 
 /// `downsample_occupancy` の楽観版。ブロック内に 1 つでも free があれば出力セルを free にする。
@@ -145,15 +105,21 @@ pub fn downsample_occupancy(grid: &OccupancyGrid, scale: i32) -> OccupancyGrid {
 /// 安全余裕を地図に焼き込んではいけない。VI の `safety_radius` は硬い壁ではなく秒/セルのソフトな
 /// ペナルティで、膨張として焼き込むと scale 3 でも波が死ぬ (実測)。ここでは通路を開けるだけにする。
 pub fn downsample_occupancy_optimistic(grid: &OccupancyGrid, scale: i32) -> OccupancyGrid {
+    downsample(grid, scale, true)
+}
+
+/// 両ダウンサンプルの共通本体。ブロック内に述語 (`optimistic`: free==0 が 1 つでも /
+/// 保守: 非 free が 1 つでも) を満たすセルがあるかで出力セルを決める。
+fn downsample(grid: &OccupancyGrid, scale: i32, optimistic: bool) -> OccupancyGrid {
     if scale <= 1 {
         return grid.clone();
     }
     let (w, h, s) = (grid.width as usize, grid.height as usize, scale as usize);
     let (ow, oh) = (w.div_ceil(s), h.div_ceil(s));
-    let mut data = vec![100i8; ow * oh];
+    let mut data = vec![0i8; ow * oh];
     for oy in 0..oh {
         for ox in 0..ow {
-            let mut free = false;
+            let mut hit = false;
             'blk: for dy in 0..s {
                 let iy = oy * s + dy;
                 if iy >= h {
@@ -164,13 +130,15 @@ pub fn downsample_occupancy_optimistic(grid: &OccupancyGrid, scale: i32) -> Occu
                     if ix >= w {
                         break;
                     }
-                    if grid.data[iy * w + ix] == 0 {
-                        free = true;
+                    let free = grid.data[iy * w + ix] == 0;
+                    if free == optimistic {
+                        hit = true;
                         break 'blk;
                     }
                 }
             }
-            data[oy * ow + ox] = if free { 0 } else { 100 };
+            // optimistic: hit(free あり) → 0。保守: hit(障害物あり) → 100。
+            data[oy * ow + ox] = if hit == optimistic { 0 } else { 100 };
         }
     }
     OccupancyGrid {
@@ -184,7 +152,8 @@ pub fn downsample_occupancy_optimistic(grid: &OccupancyGrid, scale: i32) -> Occu
     }
 }
 
-/// total_cost slice → `OccupancyGrid` `data[]` (length `width*height`).
+/// total_cost slice (row-major `value[iy*width + ix]`, length `width*height`) →
+/// `OccupancyGrid` `data[]` (same length/order).
 ///
 /// - `total_cost == MAX_COST` (never reached) → `-1` (unknown).
 /// - cost `0` → `0` (free / goal).
@@ -193,14 +162,17 @@ pub fn downsample_occupancy_optimistic(grid: &OccupancyGrid, scale: i32) -> Occu
 ///
 /// `threshold_steps` is `cost_drawing_threshold` in step (≈second) units, the
 /// same unit 本家 `valueFunctionWriter` uses after dividing by PROB_BASE.
-pub fn value_slice_to_occupancy(value: &Array2<u64>, threshold_steps: u64) -> Vec<i8> {
-    let h = value.shape()[0];
-    let w = value.shape()[1];
-    let mut out = vec![0i8; w * h];
-    for iy in 0..h {
-        for ix in 0..w {
-            let c = value[[iy, ix]];
-            out[iy * w + ix] = if c >= MAX_COST {
+pub fn value_slice_to_occupancy(
+    value: &[u64],
+    width: usize,
+    height: usize,
+    threshold_steps: u64,
+) -> Vec<i8> {
+    assert_eq!(value.len(), width * height, "value slice length mismatch");
+    value
+        .iter()
+        .map(|&c| {
+            if c >= MAX_COST {
                 -1
             } else {
                 let display = c / PROB_BASE;
@@ -218,10 +190,9 @@ pub fn value_slice_to_occupancy(value: &Array2<u64>, threshold_steps: u64) -> Ve
                         scaled as i8
                     }
                 }
-            };
-        }
-    }
-    out
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -278,34 +249,27 @@ mod tests {
 
     #[test]
     fn value_max_cost_renders_as_minus_one() {
-        let mut v = Array2::<u64>::zeros((1, 1));
-        v[[0, 0]] = MAX_COST;
-        let d = value_slice_to_occupancy(&v, 60);
+        let d = value_slice_to_occupancy(&[MAX_COST], 1, 1, 60);
         assert_eq!(d[0], -1);
     }
 
     #[test]
     fn value_zero_renders_zero() {
-        let v = Array2::<u64>::zeros((2, 3));
-        let d = value_slice_to_occupancy(&v, 60);
+        let d = value_slice_to_occupancy(&[0u64; 6], 3, 2, 60);
         assert!(d.iter().all(|&x| x == 0));
     }
 
     #[test]
     fn value_above_threshold_clamps_to_100() {
-        let mut v = Array2::<u64>::zeros((1, 1));
         // display = 100 steps, threshold 60 -> scaled 166 -> clamp 100.
-        v[[0, 0]] = 100 * PROB_BASE;
-        let d = value_slice_to_occupancy(&v, 60);
+        let d = value_slice_to_occupancy(&[100 * PROB_BASE], 1, 1, 60);
         assert_eq!(d[0], 100);
     }
 
     #[test]
     fn value_mid_scales_linearly() {
-        let mut v = Array2::<u64>::zeros((1, 1));
         // display = 30 steps, threshold 60 -> 30*100/60 = 50.
-        v[[0, 0]] = 30 * PROB_BASE;
-        let d = value_slice_to_occupancy(&v, 60);
+        let d = value_slice_to_occupancy(&[30 * PROB_BASE], 1, 1, 60);
         assert_eq!(d[0], 50);
     }
 }

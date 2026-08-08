@@ -61,13 +61,11 @@ use vi_reference::params::{MAX_COST, PROB_BASE};
 use vi_reference::solvers::frontier2d_sparse_compact::{
     default_threads, mapped_goal_cell_count, solve_compact_mapped, CompactSink, MmapSink, RamSink,
 };
-use vi_reference::solvers::{solve, U64SolveStats, U64Solver};
+use vi_reference::solvers::{solve, U64SolveStats, U64Solver, REACH_THRESH as REACH};
 use vi_reference::{Action, OccupancyGrid, Quaternion, State, ValueIterator};
 
 /// Canonical theta cell count (本家 launch / data contract)。
 const THETA_CELL_NUM: i32 = N_THETA;
-/// 到達可能とみなす total_cost 上限（compare.py の value>=1e6 境界と整合）。
-const REACH: u64 = 1_000_000u64 * PROB_BASE;
 
 /// `canonical_actions()` の前進量だけを `scale` 倍した行動集合。回転量と名前は不変なので
 /// θ 遷移表は変わらず、「1 手で何セル進むか」だけがセルサイズに追従する。
@@ -223,7 +221,7 @@ fn default_map_path() -> PathBuf {
 fn occupancy_fractions(map: &PgmMap) -> (f64, f64, f64) {
     let (mut obs, mut free, mut unk) = (0u64, 0u64, 0u64);
     for &p in &map.pixels {
-        match pgm::classify(p, map.negate, map.occupied_thresh, map.free_thresh) {
+        match pgm::classify(p, map.meta.negate, map.meta.occupied_thresh, map.meta.free_thresh) {
             Occupancy::Obstacle => obs += 1,
             Occupancy::Free => free += 1,
             Occupancy::Unknown => unk += 1,
@@ -231,48 +229,6 @@ fn occupancy_fractions(map: &PgmMap) -> (f64, f64, f64) {
     }
     let n = map.pixels.len().max(1) as f64;
     (obs as f64 / n, free as f64 / n, unk as f64 / n)
-}
-
-/// Build a downsampled occupancy grid (row-major, `data[x + ow*y]`, y=0 at world
-/// origin). The vertical flip puts grid row `iy = 0` at world `y = origin_y`
-/// (ROS stores occupancy bottom-up; PGM rows run top-down).
-/// Each output cell is `100` (blocked) if ANY source cell in its `scale×scale`
-/// block is an obstacle (conservative pooling), else `0` (free).
-fn build_occupancy(map: &PgmMap, scale: usize, unknown_as_obstacle: bool) -> (Vec<i8>, i32, i32) {
-    let w = map.width;
-    let h = map.height;
-    let ow = w.div_ceil(scale);
-    let oh = h.div_ceil(scale);
-    let mut occ = vec![0i8; ow * oh];
-
-    for oy in 0..oh {
-        for ox in 0..ow {
-            let mut blocked = false;
-            'blk: for dy in 0..scale {
-                let iy = oy * scale + dy; // grid row (world bottom-up)
-                if iy >= h {
-                    break;
-                }
-                let src_row = h - 1 - iy; // vertical flip (PGM top-down)
-                for dx in 0..scale {
-                    let ix = ox * scale + dx;
-                    if ix >= w {
-                        break;
-                    }
-                    let pixel = map.pixels[src_row * w + ix];
-                    let c = pgm::classify(pixel, map.negate, map.occupied_thresh, map.free_thresh);
-                    let is_obs = matches!(c, Occupancy::Obstacle)
-                        || (matches!(c, Occupancy::Unknown) && unknown_as_obstacle);
-                    if is_obs {
-                        blocked = true;
-                        break 'blk;
-                    }
-                }
-            }
-            occ[oy * ow + ox] = if blocked { 100 } else { 0 };
-        }
-    }
-    (occ, ow as i32, oh as i32)
 }
 
 /// Find the nearest free cell (`occ == 0`) to `(gx, gy)` by expanding chessboard
@@ -345,12 +301,12 @@ fn main() -> ExitCode {
     };
 
     let (obs_f, free_f, unk_f) = occupancy_fractions(&map);
-    let full_res = map.resolution;
+    let full_res = map.meta.resolution;
     let res = full_res * args.scale as f64;
     let unknown_as_obstacle = args.unknown == UnknownMode::Obstacle;
 
     // --- Downsampled occupancy grid ---
-    let (occ, ow, oh) = build_occupancy(&map, args.scale, unknown_as_obstacle);
+    let (occ, ow, oh) = pgm::build_occupancy(&map, args.scale, unknown_as_obstacle);
     let states = (ow as u64) * (oh as u64) * (THETA_CELL_NUM as u64);
     let free_cells = occ.iter().filter(|&&c| c == 0).count() as u64;
     let free_states = free_cells * THETA_CELL_NUM as u64;
@@ -358,12 +314,12 @@ fn main() -> ExitCode {
     // --- Goal: default to physical centre of the map, snap to nearest free ---
     let extent_x = map.width as f64 * full_res;
     let extent_y = map.height as f64 * full_res;
-    let goal_x = args.goal_x.unwrap_or(map.origin_x + extent_x / 2.0);
-    let goal_y = args.goal_y.unwrap_or(map.origin_y + extent_y / 2.0);
+    let goal_x = args.goal_x.unwrap_or(map.meta.origin_x + extent_x / 2.0);
+    let goal_y = args.goal_y.unwrap_or(map.meta.origin_y + extent_y / 2.0);
     let goal_radius_m = args.goal_radius_m.unwrap_or((2.0 * res).max(0.5));
 
-    let req_gx = (((goal_x - map.origin_x) / res).floor() as i32).clamp(0, ow - 1);
-    let req_gy = (((goal_y - map.origin_y) / res).floor() as i32).clamp(0, oh - 1);
+    let req_gx = (((goal_x - map.meta.origin_x) / res).floor() as i32).clamp(0, ow - 1);
+    let req_gy = (((goal_y - map.meta.origin_y) / res).floor() as i32).clamp(0, oh - 1);
     let snap_radius = ow.max(oh).min(2000);
     let (gx, gy) = match snap_to_free(&occ, ow, oh, req_gx, req_gy, snap_radius) {
         Some(c) => c,
@@ -375,8 +331,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let goal_wx = map.origin_x + (gx as f64 + 0.5) * res;
-    let goal_wy = map.origin_y + (gy as f64 + 0.5) * res;
+    let goal_wx = map.meta.origin_x + (gx as f64 + 0.5) * res;
+    let goal_wy = map.meta.origin_y + (gy as f64 + 0.5) * res;
     let goal_t = args.goal_theta_deg as i32;
 
     // --- Occupancy grid message (built once; reused across solver rebuilds) ---
@@ -384,8 +340,8 @@ fn main() -> ExitCode {
         width: ow,
         height: oh,
         resolution: res,
-        origin_x: map.origin_x,
-        origin_y: map.origin_y,
+        origin_x: map.meta.origin_x,
+        origin_y: map.meta.origin_y,
         origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
         data: occ,
     };
@@ -434,7 +390,7 @@ fn main() -> ExitCode {
     // --- Banner ---
     eprintln!(
         "map: {}x{} px, full-res {:.3} m/cell, origin ({:.1}, {:.1})",
-        map.width, map.height, full_res, map.origin_x, map.origin_y
+        map.width, map.height, full_res, map.meta.origin_x, map.meta.origin_y
     );
     eprintln!(
         "occupancy (raw): obstacle {:.2}%  free {:.2}%  unknown {:.2}%  (unknown -> {})",

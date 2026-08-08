@@ -190,22 +190,6 @@ impl Bitboard3D {
         ops::dilate3d(self, dx, dy, dt)
     }
 
-    /// Bitwise AND (in-place): `self &= other`.
-    pub fn and_inplace(&mut self, other: &Self) {
-        debug_assert_eq!(self.map_x, other.map_x);
-        debug_assert_eq!(self.map_y, other.map_y);
-        debug_assert_eq!(self.n_theta, other.n_theta);
-        ops::and_slice(&mut self.data, &other.data);
-    }
-
-    /// Bitwise OR (in-place): `self |= other`.
-    pub fn or_inplace(&mut self, other: &Self) {
-        debug_assert_eq!(self.map_x, other.map_x);
-        debug_assert_eq!(self.map_y, other.map_y);
-        debug_assert_eq!(self.n_theta, other.n_theta);
-        ops::or_slice(&mut self.data, &other.data);
-    }
-
     /// Lazy iterator over `(ix, iy, it)` of every set bit.
     pub fn enumerate(&self) -> Bitboard3DIter<'_> {
         Bitboard3DIter::new(self)

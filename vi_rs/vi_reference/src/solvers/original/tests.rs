@@ -21,17 +21,7 @@ fn free_grid(w: i32, h: i32) -> OccupancyGrid {
 #[test]
 fn single_thread_converges_on_small_free_map() {
     // 5x5 free マップ、goal を中央セルに。十分スイープして goal 隣接が確定する。
-    let mut vi = ValueIterator::new(
-        vec![
-            Action::new("forward", 0.3, 0.0, 0),
-            Action::new("back", -0.2, 0.0, 1),
-            Action::new("right", 0.0, -20.0, 2),
-            Action::new("rightfw", 0.2, -20.0, 3),
-            Action::new("left", 0.0, 20.0, 4),
-            Action::new("leftfw", 0.2, 20.0, 5),
-        ],
-        1,
-    );
+    let mut vi = ValueIterator::new(crate::solvers::test_support::actions(), 1);
     let map = free_grid(5, 5);
     vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.2, 10);
     vi.set_goal(0.1, 0.1, 0); // セル (2,2) 付近

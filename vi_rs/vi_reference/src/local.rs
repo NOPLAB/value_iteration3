@@ -1,8 +1,6 @@
 //! 本家 `ValueIteratorLocal` 忠実移植。`ValueIterator` を内包 (合成) し override を再定義。
 //! local の `actionCostLocal` は本家 `actionCost` と完全同一なので base 経由で計算する。
 
-
-
 use crate::action::Action;
 use crate::msg::{LaserScan, OccupancyGrid};
 use crate::params::PROB_BASE_BIT;

@@ -279,13 +279,7 @@ impl ValueIterator {
 
     /// 本家 `setGoal`。goal_t を [0,360) に正規化し、final_state を再計算。
     pub fn set_goal(&mut self, goal_x: f64, goal_y: f64, goal_t: i32) {
-        let mut gt = goal_t;
-        while gt < 0 {
-            gt += 360;
-        }
-        while gt >= 360 {
-            gt -= 360;
-        }
+        let gt = goal_t.rem_euclid(360);
         self.goal_x = goal_x;
         self.goal_y = goal_y;
         self.goal_t = gt;
@@ -402,31 +396,11 @@ impl ValueIterator {
         }
     }
 
-    /// 本家 `posToAction`。
-    pub fn pos_to_action(&mut self, x: f64, y: f64, t_rad: f64) -> Option<usize> {
-        let ix = ((x - self.map_origin_x) / self.xy_resolution).floor() as i32;
-        let iy = ((y - self.map_origin_y) / self.xy_resolution).floor() as i32;
-        let t = (180.0 * t_rad / PI) as i32;
-        let it = (((t + 360 * 100) % 360) as f64 / self.t_resolution).floor() as i32;
-        let index = self.to_index(ix, iy, it) as usize;
-        if self.states[index].final_state {
-            self.status = "goal".to_string();
-            None
-        } else if self.states[index].optimal_action.is_some() {
-            self.states[index].optimal_action
-        } else {
-            None
-        }
-    }
-
     pub fn set_cancel(&mut self) {
         self.status = "canceled".to_string();
     }
     pub fn end_of_trial(&self) -> bool {
         self.status == "canceled" || self.status == "goal"
-    }
-    pub fn arrived(&self) -> bool {
-        self.status == "goal"
     }
     pub fn set_calculated(&mut self) {
         if self.status != "canceled" {

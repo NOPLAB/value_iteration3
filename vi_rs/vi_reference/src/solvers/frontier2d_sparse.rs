@@ -32,14 +32,16 @@ use super::frontier2d_fused::{
     write_back_fused_on, Fused, Geom, UNREACHED,
 };
 use crate::solvers::observe::{
-    MaterializeProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
+    MaterializeProbe, SolveFlow, SolveObserver, SolveOutcome,
 };
 use super::frontier2d_par::n_threads;
 use super::{displacement, seed_frontier_2d, Bitboard2D};
 
-/// θ マスクを円環 (周期 `nt`) で ±k 膨張する。
+/// θ マスクを円環 (周期 `nt`) で ±k 膨張する。回転アクションは dix=diy=0 で自セルも
+/// 窓に含むため、変化 θ から `circ(θ′−θ) ≤ mt` の θ を再評価対象に広げる
+/// (`frontier2d_sparse_compact` と共有)。
 #[inline]
-fn rot_dilate(m: u64, k: i32, nt: i32) -> u64 {
+pub(crate) fn rot_dilate(m: u64, k: i32, nt: i32) -> u64 {
     let full: u64 = if nt >= 64 { u64::MAX } else { (1u64 << nt) - 1 };
     let nt = nt as u32;
     let mut acc = m;
@@ -466,25 +468,4 @@ pub fn frontier2d_sparse_solve_observed(
     }
 
     out
-}
-
-/// 従来 API (observer なし)。`(iters, updates, converged)`。
-pub fn frontier2d_sparse_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    frontier2d_sparse_solve_observed(vi, max_iter, &mut NullObserver).tuple()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::frontier2d_sparse_solve;
-    use crate::solvers::test_support::{assert_parity, parity_standard_maps};
-
-    #[test]
-    fn parity_standard_maps_frontier2d_sparse() {
-        parity_standard_maps(|vi| frontier2d_sparse_solve(vi, 2000));
-    }
-
-    #[test]
-    fn parity_larger_empty_frontier2d_sparse() {
-        assert_parity(32, 24, vec![0i8; 32 * 24], |vi| frontier2d_sparse_solve(vi, 2000));
-    }
 }

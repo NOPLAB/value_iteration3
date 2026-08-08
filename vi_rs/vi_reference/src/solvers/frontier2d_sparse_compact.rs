@@ -27,9 +27,10 @@ use crate::value_iterator::ValueIterator;
 
 use super::frontier2d_fused::{action_cost_fused, CpCells, Geom, UNREACHED};
 use super::frontier2d_par::n_threads;
+use super::frontier2d_sparse::rot_dilate;
 use super::{displacement, Bitboard2D};
 use crate::planner::{CompactPolicy, PolicyView};
-use crate::solvers::observe::{SolveFlow, SolveObserver, SolveProbe};
+use crate::solvers::observe::{NullObserver, SolveFlow, SolveObserver, SolveProbe};
 
 /// compact が per-state に読む情報の抽象源。O(total) の `states` 配列を常駐させる `SliceSource` と、
 /// マップから 2D の free/penalty（θ 非依存）＋ ゴール近傍の final 集合だけを保持する `MapSource` を
@@ -296,22 +297,6 @@ fn compute_finals(vi: &ValueIterator, free_at: impl Fn(i32, i32) -> bool) -> Has
         }
     }
     set
-}
-
-/// θ マスクを円環（周期 `nt`）で ±k 膨張する（`frontier2d_sparse::rot_dilate` と同一）。回転アクション
-/// は dix=diy=0 で自セルも窓に含むため、変化 θ から `circ(θ′−θ) ≤ mt` の θ を再評価対象に広げる。
-#[inline]
-fn rot_dilate(m: u64, k: i32, nt: i32) -> u64 {
-    let full: u64 = if nt >= 64 { u64::MAX } else { (1u64 << nt) - 1 };
-    let nt = nt as u32;
-    let mut acc = m;
-    let (mut l, mut r) = (m, m);
-    for _ in 0..k {
-        l = ((l << 1) | (l >> (nt - 1))) & full;
-        r = ((r >> 1) | (r << (nt - 1))) & full;
-        acc |= l | r;
-    }
-    acc
 }
 
 /// 1 ブロック = この本数のパディング行。複数ブロックに跨る gather を刺激しつつ、退避粒度を保つ。
@@ -936,8 +921,8 @@ pub struct CompactStats {
     /// `converged == false` の内訳: `cancel` フラグで中断されたなら true、
     /// `max_iter` 打ち切りなら false。中断時の `sink` の内容は未完成なので使えない。
     pub cancelled: bool,
-    /// `converged == false` のもう 1 つの内訳: `stop` コールバックが打ち切ったなら true
-    /// （`solve_compact_mapped_stopping` を使ったときだけ立つ）。**`cancelled` と違い
+    /// `converged == false` のもう 1 つの内訳: observer の `Stop` が打ち切ったなら true
+    /// （observed 系入口を使ったときだけ立つ）。**`cancelled` と違い
     /// `sink` はそのまま使える** — 書いてあるのは finalize 済みの列だけで、それらは
     /// 定義から v* 到達済み＝収束解と bit-exact に同じ値。未 finalize の列が
     /// `(MAX_COST, -1)` のまま残っているだけ。
@@ -1185,42 +1170,14 @@ fn converge_band_async(
     outcome
 }
 
-/// セット済み `ValueIterator` をブロックタイル・アウトオブコアで解く。
-/// `(iters, updates, converged)`。到達可能セルの収束値・方策は本家と bit-exact。
-pub fn frontier2d_sparse_compact_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    let s = solve_compact(vi, max_iter, None);
-    (s.iters, s.updates, s.converged)
-}
-
-/// 本体（値バンド閾値スキャン + during-solve ウォーターマーク finalization + 遅延確保 + 退避、
-/// 単一スレッド）。`band` 可変（`--mem-budget` の土台）。`band ≥ 結合深さ` なら本家と bit-exact。
-pub fn solve_compact(
-    vi: &mut ValueIterator,
-    max_iter: u32,
-    band_override: Option<u64>,
-) -> CompactStats {
-    // 既定は RAM 出力（states 数 = nx·ny·nt）。
-    let mut sink = RamSink::new(vi.states.len());
-    solve_compact_into(vi, max_iter, band_override, &mut sink)
-}
-
-/// `solve_compact` の出力 sink 差し替え版。確定出力（value/policy）を `sink`（RAM or ディスク
-/// mmap）へ書き、write_back も sink から読む。これで出力の O(total) RAM をディスクへ外せる。
-/// スレッド数は `n_threads()`（環境変数 `VI_THREADS` で上書き可）。
-pub fn solve_compact_into(
-    vi: &mut ValueIterator,
-    max_iter: u32,
-    band_override: Option<u64>,
-    sink: &mut dyn CompactSink,
-) -> CompactStats {
-    solve_compact_into_nthreads(vi, max_iter, band_override, sink, n_threads())
-}
-
-/// `solve_compact_into` のスレッド数明示版。`nthreads == 1` は直列 G-S、`>= 2` は波内 relax を
+/// 値バンド閾値スキャン + during-solve ウォーターマーク finalization + 遅延確保 + 退避の
+/// slice (states あり) 入口、スレッド数明示版。`nthreads == 1` は直列 G-S、`>= 2` は波内 relax を
 /// 並列非同期 G-S（`converge_band_async`、cp を in-place 原子書き込み）で回す。固定点は単調降下で
 /// 一意なので、収束値・方策はスレッド数に依らず本家と bit-exact（iters は非決定的）。テストが
-/// nthreads 1/4 両方を固定して value+policy parity を検証する。
-pub(crate) fn solve_compact_into_nthreads(
+/// nthreads 1/4 両方を固定して value+policy parity を検証する
+/// (現在の呼び出し元はテストのみ — 実行系の slice 入口は `solve_compact_observed`)。
+#[cfg(test)]
+fn solve_compact_into_nthreads(
     vi: &mut ValueIterator,
     max_iter: u32,
     band_override: Option<u64>,
@@ -1276,11 +1233,40 @@ impl SolveProbe for CompactProbe<'_> {
     }
 }
 
-/// `solve_compact` の observer 付き版 (`U64Solver::Frontier2DSparseCompact` の
-/// `solve_observed` 経路)。既存の `stop`/`cancel` フックを [`SolveObserver`] へアダプトする:
+/// observer を core の `stop` クロージャへ写すアダプタ (observed 系入口の共通部)。
 /// 境界はバンド finalize ごと (compact の自然な粒度で、`interval` ヒントより粗い)。
-/// observer が `Cancel` を返したら core を止め、`cancelled=true` を返す
-/// (このとき sink / states は未完成なので write_back しない)。`Stop` は sink がそのまま
+/// [`SolveFlow::Cancel`] は `obs_cancel` に立てて打ち切る (呼び出し側が `cancelled` へ写す)。
+fn observer_stop<'a>(
+    vi: &'a ValueIterator,
+    obs: &'a mut dyn SolveObserver,
+    obs_cancel: &'a AtomicBool,
+) -> impl FnMut(&dyn CompactSink) -> bool + 'a {
+    let cell_num = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
+    let res = vi.xy_resolution;
+    let origin = (vi.map_origin_x, vi.map_origin_y);
+    let goal = (vi.goal_x, vi.goal_y, vi.goal_t);
+    let actions = &vi.actions;
+    let mut boundaries = 0u32;
+    move |sink: &dyn CompactSink| -> bool {
+        boundaries += 1;
+        let mut probe = CompactProbe {
+            policy: CompactPolicy::new(sink, actions, cell_num, res, origin, goal),
+            iters: boundaries,
+        };
+        match obs.boundary(&mut probe) {
+            SolveFlow::Continue => false,
+            SolveFlow::Stop => true,
+            SolveFlow::Cancel => {
+                obs_cancel.store(true, Ordering::Relaxed);
+                true
+            }
+        }
+    }
+}
+
+/// slice (states あり) 入口の observer 付き版 (`U64Solver::Frontier2DSparseCompact` の
+/// `solve_observed` 経路)。observer が `Cancel` を返したら core を止め、`cancelled=true` を
+/// 返す (このとき sink / states は未完成なので write_back しない)。`Stop` は sink がそのまま
 /// 使えるので、確定分を states へ書き戻して返す。
 pub fn solve_compact_observed(
     vi: &mut ValueIterator,
@@ -1292,30 +1278,10 @@ pub fn solve_compact_observed(
     let g = Geom::build(vi);
     let mt = displacement(vi).2;
     let obs_cancel = AtomicBool::new(false);
+    let never = AtomicBool::new(false); // slice 経路に外部中断フラグはない。
     let mut stats = {
         let src = SliceSource::new(&vi.states, g.nx, g.nt);
-        let cell_num = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
-        let res = vi.xy_resolution;
-        let origin = (vi.map_origin_x, vi.map_origin_y);
-        let goal = (vi.goal_x, vi.goal_y, vi.goal_t);
-        let actions = &vi.actions;
-        let mut boundaries = 0u32;
-        let mut stop = |sink: &dyn CompactSink| -> bool {
-            boundaries += 1;
-            let mut probe = CompactProbe {
-                policy: CompactPolicy::new(sink, actions, cell_num, res, origin, goal),
-                iters: boundaries,
-            };
-            match obs.boundary(&mut probe) {
-                SolveFlow::Continue => false,
-                SolveFlow::Stop => true,
-                SolveFlow::Cancel => {
-                    obs_cancel.store(true, Ordering::Relaxed);
-                    true
-                }
-            }
-        };
-        let never = AtomicBool::new(false);
+        let mut stop = observer_stop(vi, obs, &obs_cancel);
         solve_compact_core(
             &g,
             mt,
@@ -1342,9 +1308,13 @@ pub fn solve_compact_observed(
     stats
 }
 
-/// `solve_compact_mapped_stopping` の observer 付き版 (vi_planner の統一入口)。
-/// `cancel` (外部プリエンプトフラグ、バンド内ラウンド境界で観測) はそのまま生かし、
-/// observer の `Cancel` はバンド finalize 境界で `cancelled=true` に写す。
+/// マップ + ゴールから **states を構築せず**解く mapped 入口の observer 付き版
+/// (vi_planner の統一入口)。geometry/transitions だけの `ValueIterator` と `MapSource` を
+/// 組み、出力は `sink` に確定する (write_back なし)。`cancel` (外部プリエンプトフラグ、
+/// バンド内ラウンド境界で観測) はそのまま生かし、observer の `Cancel` はバンド finalize
+/// 境界で `cancelled=true` に写す。observer の `Stop` で打ち切った sink はそのまま使える
+/// (finalize は値の昇順に進み、確定列は v* 到達済みで bit-exact — 未確定列は
+/// `(MAX_COST, -1)` のまま)。
 #[allow(clippy::too_many_arguments)]
 pub fn solve_compact_mapped_observed(
     actions: Vec<Action>,
@@ -1366,34 +1336,16 @@ pub fn solve_compact_mapped_observed(
     obs: &mut dyn SolveObserver,
 ) -> CompactStats {
     let mut vi = ValueIterator::new(actions, thread_num);
+    // geometry + transitions のみ（states / sweep_orders は作らない = O(total) 確保なし）。
     vi.set_map_geometry_no_states(map, theta_cell_num, goal_margin_radius, goal_margin_theta);
+    // ゴール設定（states は空なので set_state_values は no-op、goal フィールドだけ更新）。
     vi.set_goal(goal_x, goal_y, goal_t);
     let g = Geom::build(&vi);
     let mt = displacement(&vi).2;
     let src = MapSource::build(map, &vi, safety_radius, safety_radius_penalty);
     let obs_cancel = AtomicBool::new(false);
     let mut stats = {
-        let cell_num = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
-        let res = vi.xy_resolution;
-        let origin = (vi.map_origin_x, vi.map_origin_y);
-        let goal = (vi.goal_x, vi.goal_y, vi.goal_t);
-        let actions = &vi.actions;
-        let mut boundaries = 0u32;
-        let mut stop = |sink: &dyn CompactSink| -> bool {
-            boundaries += 1;
-            let mut probe = CompactProbe {
-                policy: CompactPolicy::new(sink, actions, cell_num, res, origin, goal),
-                iters: boundaries,
-            };
-            match obs.boundary(&mut probe) {
-                SolveFlow::Continue => false,
-                SolveFlow::Stop => true,
-                SolveFlow::Cancel => {
-                    obs_cancel.store(true, Ordering::Relaxed);
-                    true
-                }
-            }
-        };
+        let mut stop = observer_stop(&vi, obs, &obs_cancel);
         solve_compact_core(
             &g, mt, &src, max_iter, band_override, sink, nthreads, cancel, &mut stop,
         )
@@ -1415,8 +1367,8 @@ pub fn solve_compact_mapped_observed(
 /// 呼び出し側は `&AtomicBool::new(false)` を渡す。ROS プランナがゴール変更でプリエンプトする
 /// ために必要（solve は巨大マップで数十秒〜数分ブロックする）。
 ///
-/// **途中まで解けた出力を使いたい**（走り出しを早める等）なら
-/// [`solve_compact_mapped_stopping`] のほう。`cancel` で止めた `sink` は使えないが、
+/// **途中まで解けた出力を使いたい**（走り出しを早める等）なら observer で `Stop` を返す
+/// [`solve_compact_mapped_observed`] のほう。`cancel` で止めた `sink` は使えないが、
 /// あちらで止めた `sink` は使える。
 #[allow(clippy::too_many_arguments)]
 pub fn solve_compact_mapped(
@@ -1437,7 +1389,7 @@ pub fn solve_compact_mapped(
     nthreads: usize,
     cancel: &AtomicBool,
 ) -> CompactStats {
-    solve_compact_mapped_stopping(
+    solve_compact_mapped_observed(
         actions,
         thread_num,
         map,
@@ -1454,49 +1406,8 @@ pub fn solve_compact_mapped(
         sink,
         nthreads,
         cancel,
-        &mut |_| false,
+        &mut NullObserver,
     )
-}
-
-/// `solve_compact_mapped` の**途中打ち切り**版。`stop` は波の finalize が終わるたびに、
-/// その時点の `sink`（= finalize 済みの確定出力）を添えて呼ばれ、`true` を返すとそこで
-/// 解くのをやめて `converged=false, stopped=true` で戻る。
-///
-/// `cancel` による中断と違い、**このとき `sink` はそのまま使える**。finalize は値の
-/// 昇順で進み、finalize 済みの列は v* 到達済み（以後不変）だからで、書いてある値は
-/// 最後まで解いたときと bit-exact に同じ。未 finalize の列が `(MAX_COST, -1)` のまま
-/// 残っているだけになる。「ロボットの現在地からゴールまで方策が繋がったらそこで
-/// 止めて走り出す」のような使い方のための入口で、`stop` の中で `sink` を読んで
-/// 判定する（値の閾値でも、ロールアウトが通るかでもよい）。
-#[allow(clippy::too_many_arguments)]
-pub fn solve_compact_mapped_stopping(
-    actions: Vec<Action>,
-    thread_num: i32,
-    map: &OccupancyGrid,
-    theta_cell_num: i32,
-    safety_radius: f64,
-    safety_radius_penalty: f64,
-    goal_margin_radius: f64,
-    goal_margin_theta: i32,
-    goal_x: f64,
-    goal_y: f64,
-    goal_t: i32,
-    max_iter: u32,
-    band_override: Option<u64>,
-    sink: &mut dyn CompactSink,
-    nthreads: usize,
-    cancel: &AtomicBool,
-    stop: &mut dyn FnMut(&dyn CompactSink) -> bool,
-) -> CompactStats {
-    let mut vi = ValueIterator::new(actions, thread_num);
-    // geometry + transitions のみ（states / sweep_orders は作らない = O(total) 確保なし）。
-    vi.set_map_geometry_no_states(map, theta_cell_num, goal_margin_radius, goal_margin_theta);
-    // ゴール設定（states は空なので set_state_values は no-op、goal フィールドだけ更新）。
-    vi.set_goal(goal_x, goal_y, goal_t);
-    let g = Geom::build(&vi);
-    let mt = displacement(&vi).2;
-    let src = MapSource::build(map, &vi, safety_radius, safety_radius_penalty);
-    solve_compact_core(&g, mt, &src, max_iter, band_override, sink, nthreads, cancel, stop)
 }
 
 /// 既定スレッド数（環境変数 `VI_THREADS` 上書き可）。`solve_compact_mapped` にスレッド数を渡すための
@@ -1743,19 +1654,23 @@ fn write_back_sink(vi: &mut ValueIterator, g: &Geom, sink: &dyn CompactSink) {
 mod tests {
     use super::*;
 
-    /// parity ゲート: 標準3マップ (empty/obstacle/sentinel) で reference 固定点と bit-exact。
-    #[test]
-    fn parity_standard_maps_compact() {
-        crate::solvers::test_support::parity_standard_maps(|vi| {
-            frontier2d_sparse_compact_solve(vi, 4000)
-        });
+    /// 旧 pub `solve_compact` 相当のテスト用ラッパ (RAM sink + 既定スレッド数)。
+    fn solve_compact(
+        vi: &mut ValueIterator,
+        max_iter: u32,
+        band_override: Option<u64>,
+    ) -> CompactStats {
+        let mut sink = RamSink::new(vi.states.len());
+        solve_compact_into_nthreads(vi, max_iter, band_override, &mut sink, n_threads())
     }
 
     /// 多数の行ブロックに跨る大きめ空マップで遅延 gather + 値バンドを刺激する。
+    /// (標準3マップの parity は conformance が全ソルバ横断でゲートする。)
     #[test]
     fn parity_larger_empty_compact() {
         crate::solvers::test_support::assert_parity(32, 24, vec![0i8; 32 * 24], |vi| {
-            frontier2d_sparse_compact_solve(vi, 4000)
+            let s = solve_compact(vi, 4000, None);
+            (s.iters, s.updates, s.converged)
         });
     }
 
@@ -1938,20 +1853,10 @@ mod tests {
     /// 集合が全 (ix,iy,it) で SliceSource と一致する。
     #[test]
     fn mapsource_matches_materialized_states() {
-        use crate::action::Action;
         use crate::msg::OccupancyGrid;
+        use crate::solvers::test_support::actions;
         use crate::value_iterator::ValueIterator;
 
-        let actions = || {
-            vec![
-                Action::new("forward", 0.3, 0.0, 0),
-                Action::new("back", -0.2, 0.0, 1),
-                Action::new("right", 0.0, -20.0, 2),
-                Action::new("rightfw", 0.2, -20.0, 3),
-                Action::new("left", 0.0, 20.0, 4),
-                Action::new("leftfw", 0.2, 20.0, 5),
-            ]
-        };
         // 障害物入りマップ（penalty margin / free を非自明にする）。
         let (w, h) = (10i32, 8i32);
         let mut data = vec![0i8; (w * h) as usize];

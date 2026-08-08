@@ -20,7 +20,7 @@
 use crate::params::MAX_COST;
 use crate::planner::rollout_path_on;
 use crate::solvers::observe::{SolveFlow, SolveObserver, SolveProbe};
-use crate::solvers::test_support::{make_vi, run_reference_to_fixed_point, REACH};
+use crate::solvers::test_support::{make_vi, run_reference_to_fixed_point, standard_maps, REACH};
 use crate::solvers::{solve, solve_observed, Partiality, U64Solver};
 use crate::value_iterator::ValueIterator;
 
@@ -42,25 +42,6 @@ fn all_solvers() -> Vec<(&'static str, U64Solver)> {
         ("stream_mimic", StreamMimic),
         ("prio_ls", PriorityLabelSetting),
         ("prio_lc", PriorityLabelCorrecting),
-    ]
-}
-
-/// 標準 3 マップ (test_support::parity_standard_maps と同じ構成)。
-fn standard_maps() -> Vec<(&'static str, i32, i32, Vec<i8>)> {
-    let empty = vec![0i8; 64];
-    let mut obstacle = vec![0i8; 64];
-    for iy in 0..8 {
-        obstacle[(iy * 8 + 5) as usize] = 100;
-    }
-    obstacle[5] = 0;
-    let mut sentinel = vec![0i8; 64];
-    sentinel[(1 * 8 + 2) as usize] = 100;
-    sentinel[(3 * 8 + 2) as usize] = 100;
-    sentinel[(2 * 8 + 1) as usize] = 100;
-    vec![
-        ("empty", 8, 8, empty),
-        ("obstacle", 8, 8, obstacle),
-        ("sentinel", 8, 8, sentinel),
     ]
 }
 

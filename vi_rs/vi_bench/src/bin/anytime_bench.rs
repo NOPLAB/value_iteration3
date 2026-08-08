@@ -32,15 +32,13 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 
 use vi_bench::params::canonical_actions;
-use vi_bench::pgm::{self, Occupancy, PgmMap};
+use vi_bench::pgm;
 use vi_reference::params::PROB_BASE;
-use vi_reference::planner::{rollout_path, RolloutStatus};
-use vi_reference::solvers::{solve, U64Solver};
+use vi_reference::planner::{rollout_path_on, RolloutStatus};
+use vi_reference::solvers::{solve, U64Solver, REACH_THRESH as REACH};
 use vi_reference::{OccupancyGrid, Quaternion, ValueIterator};
 
 const THETA_CELL_NUM: i32 = 60;
-/// 到達可能とみなす total_cost 上限（bench_map / compare.py と同一境界）。
-const REACH: u64 = 1_000_000u64 * PROB_BASE;
 /// ロールアウトの打ち切り歩数（1 歩 = 1 s）。
 const MAX_ROLLOUT_STEPS: usize = 20_000;
 
@@ -116,22 +114,6 @@ struct Sample {
     opt_steps: usize,
 }
 
-fn build_occupancy(map: &PgmMap) -> (Vec<i8>, i32, i32) {
-    let (w, h) = (map.width, map.height);
-    let mut occ = vec![0i8; w * h];
-    for iy in 0..h {
-        let src_row = h - 1 - iy; // PGM は上下反転（world y は下から上）
-        for ix in 0..w {
-            let pixel = map.pixels[src_row * w + ix];
-            let c = pgm::classify(pixel, map.negate, map.occupied_thresh, map.free_thresh);
-            // 未知セルは障害物扱い（論文条件）。
-            let blocked = matches!(c, Occupancy::Obstacle | Occupancy::Unknown);
-            occ[iy * w + ix] = if blocked { 100 } else { 0 };
-        }
-    }
-    (occ, w as i32, h as i32)
-}
-
 /// V\* から開始姿勢を決定的にサンプルする（再現性のため RNG ではなく等間隔ストライド）。
 fn pick_samples(vi: &ValueIterator, vstar: &[u64], n: usize) -> Vec<Sample> {
     let mut cand: Vec<usize> = Vec::new();
@@ -159,7 +141,7 @@ fn pick_samples(vi: &ValueIterator, vstar: &[u64], n: usize) -> Vec<Sample> {
         );
         let yaw_rad = (s.it as f64 * vi.t_resolution).to_radians();
         // 収束済み `vi` (= V*) の方策で辿った歩数が基準値。辿れない開始点は捨てる。
-        let r = rollout_path(vi, x, y, yaw_rad, MAX_ROLLOUT_STEPS, 0);
+        let r = rollout_path_on(vi, x, y, yaw_rad, MAX_ROLLOUT_STEPS, 0);
         if let (RolloutStatus::ReachedGoal, steps) = (r.status, rollout_steps(&r.poses, true)) {
             if steps > 0 {
                 out.push(Sample { x, y, yaw_rad, opt_steps: steps });
@@ -219,7 +201,7 @@ fn measure(
 
     let (mut reached, mut excess_sum) = (0usize, 0.0f64);
     for sp in samples {
-        let r = rollout_path(vi, sp.x, sp.y, sp.yaw_rad, MAX_ROLLOUT_STEPS, 0);
+        let r = rollout_path_on(vi, sp.x, sp.y, sp.yaw_rad, MAX_ROLLOUT_STEPS, 0);
         if matches!(r.status, RolloutStatus::ReachedGoal) {
             reached += 1;
             let steps = rollout_steps(&r.poses, true) as f64;
@@ -261,20 +243,21 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (occ, ow, oh) = build_occupancy(&map);
+    // 未知セルは障害物扱い（論文条件）、scale=1 (等倍)。
+    let (occ, ow, oh) = pgm::build_occupancy(&map, 1, true);
     let free_cells = occ.iter().filter(|&&c| c == 0).count();
     eprintln!(
         "map {}x{} res {:.3} m, free cells {}, states {}",
-        ow, oh, map.resolution, free_cells,
+        ow, oh, map.meta.resolution, free_cells,
         (ow as u64) * (oh as u64) * THETA_CELL_NUM as u64
     );
 
     let grid = OccupancyGrid {
         width: ow,
         height: oh,
-        resolution: map.resolution,
-        origin_x: map.origin_x,
-        origin_y: map.origin_y,
+        resolution: map.meta.resolution,
+        origin_x: map.meta.origin_x,
+        origin_y: map.meta.origin_y,
         origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
         data: occ,
     };

@@ -28,7 +28,7 @@ use std::time::Instant;
 use clap::Parser;
 
 use vi_bench::params::{canonical_actions, N_THETA};
-use vi_bench::pgm::{self, Occupancy, PgmMap};
+use vi_bench::pgm;
 use vi_reference::ctrl::{dwa_decide, mppi_decide, unicycle_step, CostView, DwaConfig, MppiConfig, MppiState};
 use vi_reference::params::MAX_COST;
 use vi_reference::planner::{pose_to_cell, PolicyView};
@@ -152,43 +152,6 @@ enum UnknownMode {
 
 fn default_map_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/map_tsudanuma.yaml")
-}
-
-/// bench_map と同じダウンサンプル占有格子 (`data[x + ow*y]`, 縦反転、obstacle 支配)。
-fn build_occupancy(map: &PgmMap, scale: usize, unknown_as_obstacle: bool) -> (Vec<i8>, i32, i32) {
-    let w = map.width;
-    let h = map.height;
-    let ow = w.div_ceil(scale);
-    let oh = h.div_ceil(scale);
-    let mut occ = vec![0i8; ow * oh];
-    for oy in 0..oh {
-        for ox in 0..ow {
-            let mut blocked = false;
-            'blk: for dy in 0..scale {
-                let iy = oy * scale + dy;
-                if iy >= h {
-                    break;
-                }
-                let src_row = h - 1 - iy;
-                for dx in 0..scale {
-                    let ix = ox * scale + dx;
-                    if ix >= w {
-                        break;
-                    }
-                    let pixel = map.pixels[src_row * w + ix];
-                    let c = pgm::classify(pixel, map.negate, map.occupied_thresh, map.free_thresh);
-                    let is_obs = matches!(c, Occupancy::Obstacle)
-                        || (matches!(c, Occupancy::Unknown) && unknown_as_obstacle);
-                    if is_obs {
-                        blocked = true;
-                        break 'blk;
-                    }
-                }
-            }
-            occ[oy * ow + ox] = if blocked { 100 } else { 0 };
-        }
-    }
-    (occ, ow as i32, oh as i32)
 }
 
 /// bench_map と同じ「最寄りの free セルへスナップ」。
@@ -498,22 +461,22 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let full_res = map.resolution;
+    let full_res = map.meta.resolution;
     let res = full_res * args.scale as f64;
-    let (occ, ow, oh) = build_occupancy(&map, args.scale, args.unknown == UnknownMode::Obstacle);
+    let (occ, ow, oh) = pgm::build_occupancy(&map, args.scale, args.unknown == UnknownMode::Obstacle);
     eprintln!("grid: {ow}x{oh}x{N_THETA} @ {res:.3} m/cell ({} states)", (ow as u64) * (oh as u64) * N_THETA as u64);
 
     // ゴール: bench_map と同じ「中心既定 + free スナップ」。
-    let goal_x = args.goal_x.unwrap_or(map.origin_x + map.width as f64 * full_res / 2.0);
-    let goal_y = args.goal_y.unwrap_or(map.origin_y + map.height as f64 * full_res / 2.0);
-    let req_gx = (((goal_x - map.origin_x) / res).floor() as i32).clamp(0, ow - 1);
-    let req_gy = (((goal_y - map.origin_y) / res).floor() as i32).clamp(0, oh - 1);
+    let goal_x = args.goal_x.unwrap_or(map.meta.origin_x + map.width as f64 * full_res / 2.0);
+    let goal_y = args.goal_y.unwrap_or(map.meta.origin_y + map.height as f64 * full_res / 2.0);
+    let req_gx = (((goal_x - map.meta.origin_x) / res).floor() as i32).clamp(0, ow - 1);
+    let req_gy = (((goal_y - map.meta.origin_y) / res).floor() as i32).clamp(0, oh - 1);
     let Some((gx, gy)) = snap_to_free(&occ, ow, oh, req_gx, req_gy, ow.max(oh)) else {
         eprintln!("error: no free cell near goal");
         return ExitCode::from(2);
     };
-    let goal_wx = map.origin_x + (gx as f64 + 0.5) * res;
-    let goal_wy = map.origin_y + (gy as f64 + 0.5) * res;
+    let goal_wx = map.meta.origin_x + (gx as f64 + 0.5) * res;
+    let goal_wy = map.meta.origin_y + (gy as f64 + 0.5) * res;
     let goal_radius = args.goal_radius_m.unwrap_or((2.0 * res).max(0.5));
     eprintln!("goal: ({goal_wx:.2}, {goal_wy:.2}) r={goal_radius:.2} m theta={} deg", args.goal_theta_deg);
 
@@ -521,8 +484,8 @@ fn main() -> ExitCode {
         width: ow,
         height: oh,
         resolution: res,
-        origin_x: map.origin_x,
-        origin_y: map.origin_y,
+        origin_x: map.meta.origin_x,
+        origin_y: map.meta.origin_y,
         origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
         data: occ.clone(),
     };
@@ -578,8 +541,8 @@ fn main() -> ExitCode {
         if occ[(iy * ow + ix) as usize] != 0 || chamfer[(iy * ow + ix) as usize] < 6 {
             continue;
         }
-        let x = map.origin_x + (ix as f64 + 0.5) * res;
-        let y = map.origin_y + (iy as f64 + 0.5) * res;
+        let x = map.meta.origin_x + (ix as f64 + 0.5) * res;
+        let y = map.meta.origin_y + (iy as f64 + 0.5) * res;
         let dist = ((x - goal_wx).powi(2) + (y - goal_wy).powi(2)).sqrt();
         if dist < args.min_start_m || dist > args.max_start_m {
             continue;

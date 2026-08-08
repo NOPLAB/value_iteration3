@@ -4,7 +4,7 @@
 //! `timing_<solver>.json` を出力する。本家 u64 モデルなので compare.py で ros1 と直接比較でき、
 //! 厳密ソルバは bit-exact（RMSE 0）になるはず。
 //!
-//! 入力 occupancy は別途 Python (u64_bench.py) が ros2 bench_client / ref_bench と同一の
+//! 入力 occupancy は別途 Python (u64_bench.py) が ros1 bench_client / ref_bench と同一の
 //! `to_occupancy` で生成した raw i8 (h*w, row-major) を渡す。vi_ref_bench と同型で、先頭に
 //! `<solver>` 引数を追加し、末尾の `delta_threshold` を除いたもの。
 //!

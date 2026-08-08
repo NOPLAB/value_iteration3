@@ -4,28 +4,21 @@
 //!
 //!   cargo run --release -p vi_reference --bin vi_prio_measure
 
+// 正典 6 アクションほか (vi_ref_bench / vi_u64_bench と同じ include)。
+// この bin は default_actions しか使わないので未使用ヘルパの警告は落とす。
+#[allow(dead_code)]
+#[path = "bench_common/mod.rs"]
+mod bench_common;
+
 use std::time::Instant;
 
-use vi_reference::params::PROB_BASE;
+use bench_common::default_actions;
 use vi_reference::solvers::priority::priority_solve;
-use vi_reference::solvers::{solve, U64Solver};
-use vi_reference::{Action, OccupancyGrid, Quaternion, ValueIterator};
-
-const REACH: u64 = 1_000_000 * PROB_BASE;
-
-fn actions() -> Vec<Action> {
-    vec![
-        Action::new("forward", 0.3, 0.0, 0),
-        Action::new("back", -0.2, 0.0, 1),
-        Action::new("right", 0.0, -20.0, 2),
-        Action::new("rightfw", 0.2, -20.0, 3),
-        Action::new("left", 0.0, 20.0, 4),
-        Action::new("leftfw", 0.2, 20.0, 5),
-    ]
-}
+use vi_reference::solvers::{solve, U64Solver, REACH_THRESH as REACH};
+use vi_reference::{OccupancyGrid, Quaternion, ValueIterator};
 
 fn build(w: i32, h: i32) -> ValueIterator {
-    let mut vi = ValueIterator::new(actions(), 1);
+    let mut vi = ValueIterator::new(default_actions(), 1);
     let map = OccupancyGrid {
         width: w,
         height: h,

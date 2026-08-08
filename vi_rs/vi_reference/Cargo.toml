@@ -5,8 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# bridge の値場スライス (Array2) 用。忠実移植本体 (ValueIterator 等) は使わない。
-ndarray = { workspace = true }
 # frontier2d_sparse_compact::MmapSink (確定出力のディスク mmap) 用。
 memmap2 = { workspace = true }
 

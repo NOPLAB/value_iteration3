@@ -47,13 +47,9 @@ pub struct MapMeta {
 pub struct PgmMap {
     pub width: usize,
     pub height: usize,
-    pub resolution: f64,
-    pub origin_x: f64,
-    pub origin_y: f64,
-    pub occupied_thresh: f64,
-    pub free_thresh: f64,
-    pub negate: bool,
     pub pixels: Vec<u8>,
+    /// YAML metadata (resolution / origin / thresholds / negate)。
+    pub meta: MapMeta,
 }
 
 /// Parse the `key: value` subset of a `map_server` YAML document.
@@ -205,17 +201,55 @@ pub fn load(yaml_path: &Path) -> Result<PgmMap, String> {
     let raw = std::fs::read(&resolved).map_err(|e| format!("read {}: {e}", resolved.display()))?;
     let (width, height, pixels) = parse_pgm_p5(&raw)?;
 
-    Ok(PgmMap {
-        width,
-        height,
-        resolution: meta.resolution,
-        origin_x: meta.origin_x,
-        origin_y: meta.origin_y,
-        occupied_thresh: meta.occupied_thresh,
-        free_thresh: meta.free_thresh,
-        negate: meta.negate,
-        pixels,
-    })
+    Ok(PgmMap { width, height, pixels, meta })
+}
+
+/// Build a downsampled occupancy grid (row-major, `data[x + ow*y]`, y=0 at world
+/// origin) from a loaded map. The vertical flip puts grid row `iy = 0` at world
+/// `y = origin_y` (ROS stores occupancy bottom-up; PGM rows run top-down).
+/// Each output cell is `100` (blocked) if ANY source cell in its `scale×scale`
+/// block is an obstacle (conservative pooling), else `0` (free). `scale == 1`
+/// is a plain (unpooled) conversion. Returns `(occ, out_width, out_height)`.
+pub fn build_occupancy(map: &PgmMap, scale: usize, unknown_as_obstacle: bool) -> (Vec<i8>, i32, i32) {
+    let w = map.width;
+    let h = map.height;
+    let ow = w.div_ceil(scale);
+    let oh = h.div_ceil(scale);
+    let mut occ = vec![0i8; ow * oh];
+
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let mut blocked = false;
+            'blk: for dy in 0..scale {
+                let iy = oy * scale + dy; // grid row (world bottom-up)
+                if iy >= h {
+                    break;
+                }
+                let src_row = h - 1 - iy; // vertical flip (PGM top-down)
+                for dx in 0..scale {
+                    let ix = ox * scale + dx;
+                    if ix >= w {
+                        break;
+                    }
+                    let pixel = map.pixels[src_row * w + ix];
+                    let c = classify(
+                        pixel,
+                        map.meta.negate,
+                        map.meta.occupied_thresh,
+                        map.meta.free_thresh,
+                    );
+                    let is_obs = matches!(c, Occupancy::Obstacle)
+                        || (matches!(c, Occupancy::Unknown) && unknown_as_obstacle);
+                    if is_obs {
+                        blocked = true;
+                        break 'blk;
+                    }
+                }
+            }
+            occ[oy * ow + ox] = if blocked { 100 } else { 0 };
+        }
+    }
+    (occ, ow as i32, oh as i32)
 }
 
 /// Classify one pixel using the `map_server` rule.

@@ -89,10 +89,6 @@ impl SolveOutcome {
     pub(crate) fn cancelled(iters: u32, updates: u64) -> Self {
         Self { iters, updates, converged: false, stopped: false, cancelled: true }
     }
-    /// 従来のタプル形 (iters, updates, converged)。
-    pub fn tuple(&self) -> (u32, u64, bool) {
-        (self.iters, self.updates, self.converged)
-    }
 }
 
 /// `interval` 刻みの境界呼び出しを管理するカウンタ。ラウンド粒度のソルバが

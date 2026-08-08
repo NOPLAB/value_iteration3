@@ -23,24 +23,8 @@ use std::time::Instant;
 
 use clap::Parser;
 use vi_bench::fixtures::{build_vi, BenchMap};
-use vi_reference::params::PROB_BASE;
-use vi_reference::solvers::{solve, U64Solver};
+use vi_reference::solvers::{solve, U64Solver, REACH_THRESH as REACH};
 use vi_reference::ValueIterator;
-
-/// 到達可能とみなす total_cost 上限（compare.py の value>=1e6 境界と整合）。
-const REACH: u64 = 1_000_000u64 * PROB_BASE;
-
-/// 全ソルバが Reference と bit-exact であるべき。
-/// いずれかで mismatch>0 なら非ゼロ終了。
-const EXACT_SOLVERS: &[&str] = &[
-    "reference",
-    "frontier2d",
-    "frontier3d",
-    "frontier_stack",
-    "block_refine",
-    "pyramid_sweep",
-    "stream_mimic",
-];
 
 #[derive(Parser)]
 #[command(
@@ -74,7 +58,6 @@ struct Args {
     /// CI smoke mode: override sizes to [8], types to [empty], budgets to 1.
     #[arg(long, default_value_t = false)]
     smoke: bool,
-
 }
 
 /// A single (case, solver) measurement.
@@ -123,20 +106,24 @@ fn value_mismatch(ref_costs: &[u64], vi: &ValueIterator) -> u64 {
         .count() as u64
 }
 
+/// 1 行分の整形済みフィールド (markdown / CSV 共通)。
+fn row_fields(r: &CaseRow) -> [String; 7] {
+    [
+        r.case_label.clone(),
+        r.solver.to_string(),
+        r.iters.to_string(),
+        r.updates.to_string(),
+        format!("{:.3}", r.total_ms),
+        (if r.converged { "Y" } else { "N" }).to_string(),
+        r.mismatch.to_string(),
+    ]
+}
+
 fn print_markdown(rows: &[CaseRow]) {
     println!("| case | solver | iters | updates | total_ms | converged | mismatch |");
     println!("|------|--------|-------|---------|----------|-----------|----------|");
     for r in rows {
-        println!(
-            "| {} | {} | {} | {} | {:.3} | {} | {} |",
-            r.case_label,
-            r.solver,
-            r.iters,
-            r.updates,
-            r.total_ms,
-            if r.converged { "Y" } else { "N" },
-            r.mismatch,
-        );
+        println!("| {} |", row_fields(r).join(" | "));
     }
 }
 
@@ -149,17 +136,7 @@ fn write_csv(path: &Path, rows: &[CaseRow]) -> std::io::Result<()> {
     let mut f = fs::File::create(path)?;
     writeln!(f, "case,solver,iters,updates,total_ms,converged,mismatch")?;
     for r in rows {
-        writeln!(
-            f,
-            "{},{},{},{},{:.3},{},{}",
-            r.case_label,
-            r.solver,
-            r.iters,
-            r.updates,
-            r.total_ms,
-            if r.converged { "Y" } else { "N" },
-            r.mismatch,
-        )?;
+        writeln!(f, "{}", row_fields(r).join(","))?;
     }
     Ok(())
 }
@@ -192,35 +169,18 @@ fn main() -> ExitCode {
             let case_label = format!("{size}x{size}_{type_str}");
             let map = parse_map_type(type_str).expect("validated above");
 
-            // Oracle: Reference に対して到達可能セルの total_cost を控える。
-            let mut ref_vi = build_vi(size, map);
-            let t0 = Instant::now();
-            let ref_stats = solve(&mut ref_vi, U64Solver::Reference, args.max_sweeps);
-            let ref_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let ref_costs: Vec<u64> = ref_vi.states.iter().map(|s| s.total_cost).collect();
-            drop(ref_vi);
-
-            eprintln!(
-                "  {case_label} solver=reference iters={} updates={} ms={:.2} mismatch=0",
-                ref_stats.iters, ref_stats.updates, ref_ms,
-            );
-            rows.push(CaseRow {
-                case_label: case_label.clone(),
-                solver: "reference",
-                iters: ref_stats.iters,
-                updates: ref_stats.updates,
-                total_ms: ref_ms,
-                converged: ref_stats.converged,
-                mismatch: 0,
-            });
-
-            // 残りのソルバ。毎回フレッシュな ValueIterator を構築して走らせる。
-            for &(name, solver) in reg.iter().skip(1) {
+            // 全ソルバを同一ケースで走らせる。毎回フレッシュな ValueIterator を構築。
+            // 先頭 (Reference) の結果がオラクル表になる — 自分自身との mismatch は自明に 0。
+            let mut ref_costs: Vec<u64> = Vec::new();
+            for &(name, solver) in &reg {
                 let budget = budget_for(name, args.max_sweeps, args.max_iters);
                 let mut vi = build_vi(size, map);
                 let t0 = Instant::now();
                 let stats = solve(&mut vi, solver, budget);
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                if name == "reference" {
+                    ref_costs = vi.states.iter().map(|s| s.total_cost).collect();
+                }
                 let mismatch = value_mismatch(&ref_costs, &vi);
 
                 eprintln!(
@@ -252,10 +212,10 @@ fn main() -> ExitCode {
         print_markdown(&rows);
     }
 
-    // 厳密性ゲート: smoke 以外で、bit-exact 期待のソルバに mismatch があれば失敗。
+    // 厳密性ゲート: smoke 以外で mismatch があれば失敗 (registry の 7 ソルバは全て bit-exact 期待)。
     let mut any_exact_mismatch = false;
     for r in &rows {
-        if r.mismatch > 0 && EXACT_SOLVERS.contains(&r.solver) {
+        if r.mismatch > 0 {
             eprintln!("WARNING: {} {} mismatch={}", r.case_label, r.solver, r.mismatch);
             any_exact_mismatch = true;
         }

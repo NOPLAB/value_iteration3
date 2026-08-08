@@ -3,51 +3,56 @@
 //! 安い代わりに per-cell 仕事量が N_THETA 倍。収束値・方策は Reference = 本家と bit-exact。
 
 use crate::solvers::observe::{
-    InPlaceProbe, SolveFlow, SolveObserver, SolveOutcome,
+    BoundaryPacer, InPlaceProbe, SolveFlow, SolveObserver, SolveOutcome,
 };
-use crate::solvers::{displacement, frontier2d_driver, seed_frontier_2d, Frontier2DSweep};
+use crate::solvers::{displacement, seed_frontier_2d, Bitboard2D};
 use crate::value_iterator::{value_iteration_raw, ValueIterator};
-
-/// in-place モデル: 候補セルの全 θ 層を `value_iteration_raw` で直接更新する。
-struct Sweep<'a> {
-    vi: &'a mut ValueIterator,
-}
-
-impl Frontier2DSweep for Sweep<'_> {
-    fn cell(&mut self, ix: u32, iy: u32) -> u64 {
-        let vi = &mut *self.vi;
-        let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
-        let mut updates = 0u64;
-        for it in 0..nt {
-            let idx = vi.to_index(ix as i32, iy as i32, it) as usize;
-            let before = vi.states[idx].total_cost;
-            value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt);
-            if vi.states[idx].total_cost < before {
-                updates += 1;
-            }
-        }
-        updates
-    }
-
-    fn boundary(&mut self, obs: &mut dyn SolveObserver, iters: u32, updates: u64) -> SolveFlow {
-        let mut probe = InPlaceProbe { vi: self.vi, iters, updates };
-        obs.boundary(&mut probe)
-    }
-}
 
 /// セット済み `ValueIterator` を Frontier2D で収束まで解く。
 ///
-/// 反復骨格は [`frontier2d_driver`] が担う。候補 (ix,iy) の全 θ 層を `value_iteration_raw` で
-/// 更新し、減少した θ 層数を返す（1 以上なら次フロンティアへ）。
+/// 「seed → (空間膨張 → 候補 (ix,iy) ごとに全 θ 層を `value_iteration_raw` で再評価 →
+/// 減少があれば次フロンティアへ) を収束まで」。ラウンド境界ごとに `obs.boundary` を呼ぶ
+/// (in-place なので観測は無料)。
 pub fn frontier2d_solve_observed(
     vi: &mut ValueIterator,
     max_iter: u32,
     obs: &mut dyn SolveObserver,
 ) -> SolveOutcome {
-    let (nx, ny) = (vi.cell_num_x, vi.cell_num_y);
+    let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
     let (mx, my, _mt) = displacement(vi);
-    let seed = seed_frontier_2d(vi);
-    let mut model = Sweep { vi };
-    frontier2d_driver(nx, ny, seed, mx as u32, my as u32, max_iter, obs, &mut model)
+    let (dx, dy) = (mx as u32, my as u32);
+    let mut pacer = BoundaryPacer::new(obs);
+    let mut frontier = seed_frontier_2d(vi);
+    let mut updates: u64 = 0;
+    let mut iters: u32 = 0;
+    while frontier.popcount() > 0 && iters < max_iter {
+        iters += 1;
+        let candidates = frontier.dilate(dx, dy);
+        let mut new_frontier = Bitboard2D::new(nx as u32, ny as u32);
+        for (ix, iy) in candidates.enumerate() {
+            let mut u = 0u64;
+            for it in 0..nt {
+                let idx = vi.to_index(ix as i32, iy as i32, it) as usize;
+                let before = vi.states[idx].total_cost;
+                value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt);
+                if vi.states[idx].total_cost < before {
+                    u += 1;
+                }
+            }
+            if u > 0 {
+                updates += u;
+                new_frontier.set(ix, iy);
+            }
+        }
+        frontier = new_frontier;
+        if frontier.popcount() > 0 && pacer.due(iters as u64) {
+            let mut probe = InPlaceProbe { vi, iters, updates };
+            match obs.boundary(&mut probe) {
+                SolveFlow::Continue => {}
+                SolveFlow::Stop => return SolveOutcome::stopped(iters, updates),
+                SolveFlow::Cancel => return SolveOutcome::cancelled(iters, updates),
+            }
+        }
+    }
+    SolveOutcome::running(iters, updates, frontier.popcount() == 0)
 }
-

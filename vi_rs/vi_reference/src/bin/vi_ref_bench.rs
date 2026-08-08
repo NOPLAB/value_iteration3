@@ -4,7 +4,7 @@
 //! `timing_ref.json` を出力する。ros1 (本家) と同じ数値モデルなので compare.py で ros1 と
 //! 直接比較できる。
 //!
-//! 入力 occupancy は別途 Python (ref_bench.py) が ros2 bench_client と同一の `to_occupancy`
+//! 入力 occupancy は別途 Python (ref_bench.py) が ros1 bench_client と同一の `to_occupancy`
 //! (occ_prob=(255-p)/255, free/occ 閾値, flipud) で生成した raw i8 (h*w, row-major) を渡す。
 //!
 //! 使い方 (位置引数, ref_bench.py が組み立てる):
@@ -22,7 +22,7 @@ use std::io::Write;
 use std::time::Instant;
 
 use bench_common::{arg, default_actions, extract_value_policy, load_map, write_npy_f64};
-use vi_reference::params::PROB_BASE;
+use vi_reference::solvers::{solve, U64Solver};
 use vi_reference::ValueIterator;
 
 fn main() {
@@ -75,33 +75,18 @@ fn main() {
     // 収束ループ: 本家 bench_client と同じく、各スイープの reported delta (=max_delta>>18) を
     // 監視し、delta<=threshold で converged、max_sweeps で打ち切り。単スレッド order-0。
     // delta_threshold < 0 → strict モード: 到達可能セル (total_cost < REACH_THRESH) が
-    // 1 スイープで全く変化しなくなる「真の固定点」まで回す。本家の soft 収束 (delta>>18==0)
-    // は確率的アクションのサブステップ精細化を収束後も残すため、bit 一致比較には不向き。
-    // 到達不能セルは overflow-wrap で振動し得るので REACH_THRESH 以上は判定から除外する
-    // (compare.py の到達不能閾値 value>=1e6 と同じ境界)。
-    const REACH_THRESH: u64 = 1_000_000u64 * PROB_BASE; // value < 1e6 step を到達可能とみなす
+    // 1 スイープで全く変化しなくなる「真の固定点」まで回す (= `U64Solver::Reference`
+    // = `solvers::original::original_solve_observed` の停止基準そのもの)。本家の soft 収束
+    // (delta>>18==0) は確率的アクションのサブステップ精細化を収束後も残すため、
+    // bit 一致比較には不向き。
     let strict = delta_threshold < 0.0;
     let t0 = Instant::now();
     let mut sweeps: i32 = 0;
     let converged;
     if strict {
-        let mut prev: Vec<u64> = vi.states.iter().map(|s| s.total_cost).collect();
-        loop {
-            vi.value_iteration_worker(1, 0);
-            sweeps += 1;
-            let mut changed = false;
-            for (i, s) in vi.states.iter().enumerate() {
-                let tc = s.total_cost;
-                if tc < REACH_THRESH && tc != prev[i] {
-                    changed = true;
-                }
-                prev[i] = tc;
-            }
-            if !changed || sweeps >= max_sweeps {
-                converged = !changed;
-                break;
-            }
-        }
+        let stats = solve(&mut vi, U64Solver::Reference, max_sweeps.max(0) as u32);
+        sweeps = stats.iters as i32;
+        converged = stats.converged;
     } else {
         loop {
             vi.value_iteration_worker(1, 0);
