@@ -20,3 +20,6 @@ __pycache__/
 
 # vi_compare 本家 catkin ビルドの永続キャッシュ (compare-bench で再コンパイル回避)
 /vi_compare/.cache/
+
+# 実験出力 (bench_map --compact-out-dir / render_compact.py などの再生成可能物)
+/out/

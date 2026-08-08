@@ -55,8 +55,7 @@ edf-build:
 
 # ---------- MATLAB (HDL Coder) ----------
 
-.PHONY: matlab-sim matlab-hdl matlab-cosim matlab-bitstream \
-        matlab-bench matlab-bench-codegen matlab-codegen-build matlab-codegen-clean
+.PHONY: matlab-sim matlab-hdl matlab-bitstream matlab-bench
 
 matlab-sim:
 	cd vi_matlab && matlab -batch "run_matlab_tests"
@@ -64,31 +63,15 @@ matlab-sim:
 matlab-hdl:
 	cd vi_matlab && matlab -batch "setup_matlab_paths('fpga-export'); export_repo_ip"
 
-matlab-cosim:
-	cd vi_matlab && matlab -batch "setup_matlab_paths('validation','tests'); cosim_tb"
-
 matlab-bitstream: matlab-hdl
 	vivado -mode batch -source "vi_fpga/tcl/build_vivado.tcl" -tclargs matlab "vi_fpga/build"
 
 matlab-bench:
 	cd vi_matlab && matlab -batch "setup_matlab_paths('src','tests','bench'); benchmark_vi"
 
-# MATLAB Coder C-generation benchmark: builds MEX from vi_full_reference and
-# vi_sweep_stream_algo, then compares MATLAB vs codegen-C timings on bench_cases.
-# Pass REBUILD=1 to force a clean rebuild of the MEX artifacts.
-REBUILD ?= 0
-matlab-bench-codegen:
-	cd vi_matlab && matlab -batch "setup_matlab_paths('src','tests','bench'); benchmark_vi_codegen('rebuild', logical($(REBUILD)))"
-
-matlab-codegen-build:
-	cd vi_matlab && matlab -batch "setup_matlab_paths('src','tests','bench'); codegen_build('rebuild', logical($(REBUILD)))"
-
-matlab-codegen-clean:
-	rm -rf vi_matlab/artifacts/benchmarks/codegen_build
-
 # ---------- Rust (vi_rs workspace) ----------
 
-.PHONY: rs-test rs-bench rs-bench-summary rs-bench-parallel
+.PHONY: rs-test rs-bench rs-bench-summary
 
 rs-test:
 	cd vi_rs && cargo test --workspace
@@ -100,11 +83,6 @@ rs-bench-summary:
 	cd vi_rs && cargo run --release -p vi_bench --bin bench_summary -- \
 	    --sizes 8,16,32,64 --types empty,obstacle,sentinel,random \
 	    --markdown --out target/bench_results/summary_$(shell date +%Y%m%d_%H%M%S).csv
-
-rs-bench-parallel:
-	cd vi_rs && cargo run --release -p vi_bench --features parallel \
-	    --bin bench_summary -- --parallel --markdown \
-	    --out target/bench_results/summary_parallel_$(shell date +%Y%m%d_%H%M%S).csv
 
 # ---------- Clean ----------
 
@@ -155,38 +133,6 @@ VI_ORIG ?= $(abspath $(PWD)/../value_iteration)
 compare-build: ros2-docker
 	docker build -t $(VI_COMPARE_ROS1_IMG) -f vi_compare/docker/Dockerfile.ros1 vi_compare/docker
 
-compare-ros1:
-	mkdir -p $(PWD)/vi_compare/.cache/catkin_ws
-	docker run --rm \
-	  -v $(VI_ORIG):/src_value_iteration:ro \
-	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
-	  -v $(PWD)/vi_compare/.cache/catkin_ws:/catkin_ws \
-	  $(VI_COMPARE_ROS1_IMG) bash /workspace/vi_compare/benches/house/ros1/run_ros1_bench.sh
-
-compare-ros2:
-	docker run --rm \
-	  -v $(VI_ORIG):/src_value_iteration:ro \
-	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
-	  $(VI_ROS2_DOCKER_IMG) bash /workspace/vi_compare/benches/house/ros2/run_ros2_bench.sh
-
-compare-report:
-	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
-	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/benches/house/compare && python3 compare.py /results"
-
-# vi_reference (本家 u64 忠実移植) を vi_ros2_dev イメージ内でビルド・実行して
-# value_ref.npy 等を生成 (ROS 非依存・cargo のみ)。
-compare-ref:
-	mkdir -p $(PWD)/vi_compare/results/house_oracle
-	docker run --rm \
-	  -v $(VI_ORIG):/src_value_iteration:ro \
-	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
-	  $(VI_ROS2_DOCKER_IMG) bash /workspace/vi_compare/benches/house/vi_rs/run_ref_bench.sh
-
-# 本家(ros1) vs ref の比較レポート (report_ref.md)。既存の value_ros1.npy を使う。
-compare-ref-report:
-	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
-	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/benches/house/compare && python3 compare.py /results ref"
-
 # vi_reference の u64 高速ソルバ群 (frontier/block を本家 u64 モデルで) を vi_ros2_dev
 # イメージ内でビルド・実行し value_<solver>.npy 等を生成。SOLVERS で集合を上書き可。
 compare-u64:
@@ -196,11 +142,6 @@ compare-u64:
 	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
 	  -e SOLVERS="$(SOLVERS)" \
 	  $(VI_ROS2_DOCKER_IMG) bash /workspace/vi_compare/benches/house/vi_rs/run_u64_bench.sh
-
-# 本家(ros1) vs 各 u64 ソルバの比較レポート (report_u64_<solver>.md)。SIDES で集合を上書き可。
-compare-u64-report:
-	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results/house_oracle:/results \
-	  $(VI_COMPARE_ROS1_IMG) bash -lc 'cd /workspace/vi_compare/benches/house/compare && for s in $(SIDES); do python3 compare.py /results $$s; done'
 
 # 全 u64 ソルバ vs 本家の一覧レポート report_u64.md (bit-exact & 速度) を生成。
 compare-u64-summary:
@@ -214,4 +155,4 @@ compare-strict:
 compare-bench: compare-build
 	VI_ORIG=$(VI_ORIG) bash scripts/compare_bench.sh
 
-.PHONY: compare-build compare-ros1 compare-ros2 compare-report compare-ref compare-ref-report compare-u64 compare-u64-report compare-u64-summary compare-strict compare-bench
+.PHONY: compare-build compare-u64 compare-u64-summary compare-strict compare-bench
