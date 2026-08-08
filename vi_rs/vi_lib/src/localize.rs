@@ -16,6 +16,9 @@
 //!   誘拐 (持ち上げ移動) からも復帰でき、未シードなら大域初期化で立ち上がる。
 //!   ロスト中 (粗レベル滞在中) は `pose()` が `None` — 呼び出し側は既存の
 //!   「pose なし」停止経路に乗る。
+//! - `viterbi` ([`BeliefConfig::viterbi`] = AdaptiveLocalizer の min-plus モード) —
+//!   全域レベルの推定だけを sum-product から max-product (Viterbi / MAP) に替える
+//!   (localize/viterbi.rs の doc)。窓レベルの追跡・レベル遷移機構は共通。
 //!
 //! # 設計上の要点
 //!
@@ -30,6 +33,9 @@
 
 use crate::bridge::PoseView;
 use crate::msg::{LaserScan, OccupancyGrid};
+
+mod viterbi;
+use viterbi::VitState;
 
 /// 自己位置の出どころ。follow ループ・plan サーバは [`Localizer::pose`] の結果
 /// (`latest_pose`) だけを見るので、実装を替えても走行側のコードは変わらない。
@@ -111,6 +117,10 @@ pub struct BeliefConfig {
     /// 粗いレベルへ広げる (EMCL の expansion resetting 相当)。0 以下で多重解像度を
     /// 無効化 (L0 のみ = GridLocalizer と同じ固定窓)。GridLocalizer は無視する。
     pub expand_quality: f64,
+    /// [`AdaptiveLocalizer`] 用: 全域レベルを min-plus (Viterbi / MAP) で回す
+    /// (localize/viterbi.rs の doc)。窓レベルの追跡は sum-product のままで、
+    /// ロスト中の全域推定だけが max-product に替わる。GridLocalizer は無視する。
+    pub viterbi: bool,
 }
 
 impl Default for BeliefConfig {
@@ -127,6 +137,7 @@ impl Default for BeliefConfig {
             z_min: 0.05,
             weight_skip_ratio: 1e-4,
             expand_quality: 0.25,
+            viterbi: false,
         }
     }
 }
@@ -784,6 +795,9 @@ pub struct AdaptiveLocalizer {
     q_ewma: f64,
     /// 直近のレベル遷移からの observe 回数。
     dwell: u32,
+    /// min-plus (Viterbi) モードの全域レベル状態 ([`BeliefConfig::viterbi`] の
+    /// ときだけ Some)。実装は localize/viterbi.rs。
+    vit: Option<VitState>,
 }
 
 impl AdaptiveLocalizer {
@@ -842,6 +856,7 @@ impl AdaptiveLocalizer {
             }
         }
         let nmax = levels.iter().map(|l| (l.nx * l.ny * l.nt) as usize).max().unwrap();
+        let vit = (cfg.viterbi && levels.len() > 1).then(|| VitState::new(&levels));
         Self {
             cfg,
             field,
@@ -855,6 +870,7 @@ impl AdaptiveLocalizer {
             quality: 0.0,
             q_ewma: 0.0,
             dwell: 0,
+            vit,
         }
     }
 
@@ -1051,6 +1067,9 @@ impl AdaptiveLocalizer {
             }
         }
         self.normalize();
+        if self.vit_on() {
+            self.vit_enter();
+        }
         self.q_ewma = self.cfg.expand_quality;
         self.dwell = 0;
     }
@@ -1162,6 +1181,9 @@ impl AdaptiveLocalizer {
         self.wx0 = nwx0;
         self.wy0 = nwy0;
         self.normalize();
+        if self.vit_on() {
+            self.vit_enter();
+        }
         self.q_ewma = self.cfg.expand_quality;
         self.dwell = 0;
     }
@@ -1374,7 +1396,11 @@ impl AdaptiveLocalizer {
 
 impl Localizer for AdaptiveLocalizer {
     fn name(&self) -> &'static str {
-        "adaptive"
+        if self.vit.is_some() {
+            "viterbi"
+        } else {
+            "adaptive"
+        }
     }
 
     /// 手動シード: L0 に降りて pose 中心のガウスで張り直す。
@@ -1395,8 +1421,16 @@ impl Localizer for AdaptiveLocalizer {
     }
 
     /// 予測: 現レベル上での連続シフト + ぼかし (GridLocalizer と同じ演算)。
+    /// min-plus モードの全域レベルでは移動量を溜めるだけ O(1) (シフト・緩和は
+    /// 次の observe がまとめて適用する)。
     fn predict(&mut self, v: f64, w_deg: f64, dt: f64) {
         if !self.initialized {
+            return;
+        }
+        if self.vit_on() {
+            let s = self.vit.as_mut().unwrap();
+            s.pend_f += v * dt;
+            s.pend_dt_deg += w_deg * dt;
             return;
         }
         let (nx, ny, nt, res, t_res) = {
@@ -1504,46 +1538,52 @@ impl Localizer for AdaptiveLocalizer {
         if beams.is_empty() {
             return;
         }
-        let n = (nx * ny * nt) as usize;
-        let maxw = self.b[..n].iter().cloned().fold(0.0f32, f32::max);
-        let thr = maxw * self.cfg.weight_skip_ratio;
-        let z_min = self.cfg.z_min;
-        let (ox, oy) = (self.field.ox, self.field.oy);
-        let (wx0, wy0) = (self.wx0, self.wy0);
-        let lvl = &self.levels[self.cur];
-        let mut quality = 0.0f64;
-        for it in 0..nt {
-            let th = ((it as f64 + 0.5) * t_res).to_radians();
-            for iy in 0..ny {
-                let cy = oy + (wy0 + iy) as f64 * res + res * 0.5;
-                for ix in 0..nx {
-                    let i = bidx2(nx, ny, ix, iy, it);
-                    let w = self.b[i];
-                    if w <= thr {
-                        self.b[i] = 0.0;
-                        continue;
+        let quality = if self.vit_on() {
+            // min-plus (Viterbi) モード: δ の更新 + b の実体化 (localize/viterbi.rs)。
+            self.vit_observe(&beams)
+        } else {
+            let n = (nx * ny * nt) as usize;
+            let maxw = self.b[..n].iter().cloned().fold(0.0f32, f32::max);
+            let thr = maxw * self.cfg.weight_skip_ratio;
+            let z_min = self.cfg.z_min;
+            let (ox, oy) = (self.field.ox, self.field.oy);
+            let (wx0, wy0) = (self.wx0, self.wy0);
+            let lvl = &self.levels[self.cur];
+            let mut quality = 0.0f64;
+            for it in 0..nt {
+                let th = ((it as f64 + 0.5) * t_res).to_radians();
+                for iy in 0..ny {
+                    let cy = oy + (wy0 + iy) as f64 * res + res * 0.5;
+                    for ix in 0..nx {
+                        let i = bidx2(nx, ny, ix, iy, it);
+                        let w = self.b[i];
+                        if w <= thr {
+                            self.b[i] = 0.0;
+                            continue;
+                        }
+                        // 物理拘束: 壁・未知の中の仮説はビーム評価するまでもなく棄却。
+                        if !level_free(&self.field, lvl, wx0, wy0, ix, iy) {
+                            self.b[i] = 0.0;
+                            continue;
+                        }
+                        let cx = ox + (wx0 + ix) as f64 * res + res * 0.5;
+                        let mut prod = 1.0f64;
+                        for &(ba, r) in &beams {
+                            let a = th + ba;
+                            let l = self.field.at(cx + r * a.cos(), cy + r * a.sin());
+                            prod *= z_min + (1.0 - z_min) * l;
+                        }
+                        // 観測一致度はビームの**幾何**平均 (= prod^(1/M))。算術平均だと
+                        // ミスマッチでも「たまたま障害物帯に乗った端点」の寄与で 0.3 台に
+                        // 浮き、ロスト検出のしきい値と分離できない。幾何平均は外れビームに
+                        // 引きずられて z_min 側へ落ちるので、整合 (~0.5+) と乖離する。
+                        quality += w as f64 * prod.powf(1.0 / beams.len() as f64);
+                        self.b[i] = (w as f64 * prod) as f32;
                     }
-                    // 物理拘束: 壁・未知の中の仮説はビーム評価するまでもなく棄却。
-                    if !level_free(&self.field, lvl, wx0, wy0, ix, iy) {
-                        self.b[i] = 0.0;
-                        continue;
-                    }
-                    let cx = ox + (wx0 + ix) as f64 * res + res * 0.5;
-                    let mut prod = 1.0f64;
-                    for &(ba, r) in &beams {
-                        let a = th + ba;
-                        let l = self.field.at(cx + r * a.cos(), cy + r * a.sin());
-                        prod *= z_min + (1.0 - z_min) * l;
-                    }
-                    // 観測一致度はビームの**幾何**平均 (= prod^(1/M))。算術平均だと
-                    // ミスマッチでも「たまたま障害物帯に乗った端点」の寄与で 0.3 台に
-                    // 浮き、ロスト検出のしきい値と分離できない。幾何平均は外れビームに
-                    // 引きずられて z_min 側へ落ちるので、整合 (~0.5+) と乖離する。
-                    quality += w as f64 * prod.powf(1.0 / beams.len() as f64);
-                    self.b[i] = (w as f64 * prod) as f32;
                 }
             }
-        }
+            quality
+        };
         self.quality = quality;
         self.q_ewma = (1.0 - EWMA_BETA) * self.q_ewma + EWMA_BETA * quality;
         self.normalize();
@@ -1901,6 +1941,77 @@ mod tests {
         al.set_pose(block_center);
         let p = al.pose().expect("マスク後も free 側に質量が残ること");
         assert!(free_at(p), "adaptive: 推定 ({:.2}, {:.2}) が free でない", p.x, p.y);
+    }
+
+    /// viterbi (min-plus 全域レベル): 誘拐から復帰すること — adaptive の
+    /// sum-product L2 を再帰 MAP に替えても同じ復帰性が保たれる回帰。
+    #[test]
+    fn viterbi_localizer_recovers_from_kidnap() {
+        let g = tenm_grid();
+        let bc =
+            BeliefConfig { half_m: 1.0, beam_step: 4, viterbi: true, ..BeliefConfig::default() };
+        let mut loc = AdaptiveLocalizer::new(&g, 36, bc);
+        assert_eq!(loc.name(), "viterbi");
+
+        let a = pose(2.5, 2.0, 0.4);
+        loc.set_pose(a);
+        let scan_a = cast_scan(&g, a, 180, 12.0);
+        for _ in 0..5 {
+            loc.observe(&scan_a);
+        }
+        assert_eq!(loc.level(), 0);
+
+        let b = pose(8.0, 8.0, 2.0);
+        let scan_b = cast_scan(&g, b, 180, 12.0);
+        let (mut lost, mut recovered) = (false, None);
+        for i in 0..150 {
+            loc.observe(&scan_b);
+            match loc.pose() {
+                None => lost = true,
+                Some(p) => {
+                    if lost
+                        && (p.x - b.x).abs() < 0.4
+                        && (p.y - b.y).abs() < 0.4
+                        && wrap_rad(p.yaw_rad - b.yaw_rad).abs() < 0.4
+                    {
+                        recovered = Some(i);
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(lost, "誘拐でロスト (pose None) を検出すること");
+        assert!(
+            recovered.is_some(),
+            "150 スキャン以内に再定位すること (level={}, q={:.3})",
+            loc.level(),
+            loc.quality()
+        );
+    }
+
+    /// viterbi: 未シードの大域初期化 (enter_uniform → δ 一様) でも立ち上がること。
+    #[test]
+    fn viterbi_localizer_global_init_without_seed() {
+        let g = tenm_grid();
+        let bc =
+            BeliefConfig { half_m: 1.0, beam_step: 4, viterbi: true, ..BeliefConfig::default() };
+        let mut loc = AdaptiveLocalizer::new(&g, 36, bc);
+        assert!(loc.pose().is_none());
+        let truth = pose(8.0, 8.0, 2.0);
+        let scan = cast_scan(&g, truth, 180, 12.0);
+        let mut ok = None;
+        for i in 0..150 {
+            loc.observe(&scan);
+            // ロスト中の predict は移動量の記録だけ (O(1)) — 静止でも落ちないこと。
+            loc.predict(0.0, 0.0, 0.1);
+            if let Some(p) = loc.pose() {
+                if (p.x - truth.x).abs() < 0.4 && (p.y - truth.y).abs() < 0.4 {
+                    ok = Some(i);
+                    break;
+                }
+            }
+        }
+        assert!(ok.is_some(), "大域初期化から再定位できない (level={})", loc.level());
     }
 
     /// top_cells: シード直後の最大重み仮説がシード姿勢のセルで、重みが降順なこと
