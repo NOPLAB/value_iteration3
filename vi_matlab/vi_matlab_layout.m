@@ -8,10 +8,8 @@ function layout = vi_matlab_layout()
 
     layout.src = fullfile(root, 'src');
 
-    layout.workflows = fullfile(root, 'workflows');
-    layout.workflows_benchmarks = fullfile(layout.workflows, 'benchmarks');
-    layout.workflows_validation = fullfile(layout.workflows, 'validation');
-    layout.workflows_validation_tests = fullfile(layout.workflows_validation, 'tests');
+    layout.workflows_benchmarks = fullfile(root, 'workflows', 'benchmarks');
+    layout.workflows_validation_tests = fullfile(root, 'workflows', 'validation', 'tests');
 
     layout.platforms = fullfile(root, 'platforms');
     layout.platforms_fpga = fullfile(layout.platforms, 'fpga');

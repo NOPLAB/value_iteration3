@@ -5,9 +5,7 @@ function [value_table, action_table, sweeps, final_delta] = vi_full_reference( .
     p = vi_params();
     MV = double(p.MAX_VALUE);
     OB = double(p.PENALTY_OBSTACLE);
-    PB = double(p.PROB_BASE);
     NT = p.N_THETA;
-    NA = p.N_ACTIONS;
     trans_model = coerce_transition_model(transitions);
 
     final_delta = MV;
@@ -28,8 +26,8 @@ function [value_table, action_table, sweeps, final_delta] = vi_full_reference( .
                     end
 
                     old_val = value_table(iy, ix, it);
-                    best = best_action_cost(value_table, penalty_table, ...
-                        trans_model, ix, iy, it, map_x, map_y, MV, PB, NT, NA);
+                    best = vi_frontier_bellman(value_table, penalty_table, ...
+                        trans_model, ix, iy, it, map_x, map_y);
                     value_table(iy, ix, it) = best;
 
                     d = abs(best - old_val);
@@ -50,53 +48,4 @@ function [value_table, action_table, sweeps, final_delta] = vi_full_reference( .
     value_table(goal_mask) = 0;
     action_table = compute_action_table_reference(value_table, penalty_table, ...
         goal_mask, trans_model, map_x, map_y);
-end
-
-function best = best_action_cost(value_table, penalty_table, trans_model, ...
-    ix, iy, it, map_x, map_y, MV, PB, NT, NA)
-
-    best = MV;
-    for a = 1:NA
-        c = action_cost(value_table, penalty_table, trans_model, ...
-            ix, iy, it, map_x, map_y, a, MV, PB, NT);
-        if c < best
-            best = c;
-        end
-    end
-end
-
-function c = action_cost(value_table, penalty_table, trans_model, ...
-    ix, iy, it, map_x, map_y, a, MV, PB, NT)
-
-    accum = 0;
-    n_out = trans_model.n_outcomes(a, it);
-    for k = 1:n_out
-        nx = ix + trans_model.dix(a, it, k);
-        ny = iy + trans_model.diy(a, it, k);
-        nt = it + trans_model.dit(a, it, k);
-
-        if nt < 1
-            nt = nt + NT;
-        elseif nt > NT
-            nt = nt - NT;
-        end
-
-        if nx < 1 || nx > map_x || ny < 1 || ny > map_y
-            c = MV;
-            return;
-        end
-
-        step_cost = cost_of(value_table(ny, nx, nt), penalty_table(ny, nx));
-        if step_cost == MV
-            c = MV;
-            return;
-        end
-
-        accum = accum + step_cost * trans_model.prob(a, it, k);
-    end
-
-    c = floor(accum / PB);
-    if c >= MV
-        c = MV - 1;
-    end
 end

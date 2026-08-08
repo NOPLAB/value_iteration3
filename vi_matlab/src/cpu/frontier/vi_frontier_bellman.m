@@ -1,8 +1,10 @@
-function v_new = vi_frontier_bellman(value_table, penalty_table, trans_model, ...
+function [v_new, best_a] = vi_frontier_bellman(value_table, penalty_table, trans_model, ...
     ix, iy, it, map_x, map_y)
 %VI_FRONTIER_BELLMAN Bit-exact Bellman backup for a single (ix, iy, it) state.
-%   Mirrors the action_cost / best_action_cost logic in vi_full_reference so
-%   the frontier-VI variants converge to identical fixed points.
+%   The single shared implementation of the paper's per-state backup; the
+%   full-reference sweep and the frontier-VI variants all call it, so they
+%   converge to identical fixed points.
+%   Second output: 0-based argmin action (0 when no action beats MAX_VALUE).
 
     p = vi_params();
     MV = double(p.MAX_VALUE);
@@ -11,6 +13,7 @@ function v_new = vi_frontier_bellman(value_table, penalty_table, trans_model, ..
     NA = p.N_ACTIONS;
 
     v_new = MV;
+    best_a = 0;
     for a = 1:NA
         accum = 0;
         n_out = trans_model.n_outcomes(a, it);
@@ -52,6 +55,7 @@ function v_new = vi_frontier_bellman(value_table, penalty_table, trans_model, ..
         end
         if c < v_new
             v_new = c;
+            best_a = a - 1;
         end
     end
 end

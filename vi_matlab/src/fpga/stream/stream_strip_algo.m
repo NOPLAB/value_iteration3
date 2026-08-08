@@ -6,7 +6,6 @@ function [value_table, strip_max_delta] = stream_strip_algo(value_table, ...
 
     p = vi_params();
     local_max = 0;
-    trans_model = coerce_transition_model(trans_model);
 
     val_buf = zeros(p.WINDOW_ROWS, p.BUF_W, p.N_THETA);
     pen_buf = zeros(p.WINDOW_ROWS, p.BUF_W);

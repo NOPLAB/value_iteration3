@@ -11,39 +11,19 @@
 # Compiled MEX files
 *.mex*
 
-# Packaged app and toolbox files
-*.mlappinstall
-*.mltbx
-
-# Deployable archives
-*.ctf
-
-# Generated helpsearch folders
-helpsearch*/
-
 # Code generation folders
 slprj/
 sccprj/
 codegen/
 hdlsrc/
 build/
-b/
-opcount_build/
-soc/opcount_build/
-bench/codegen_build/
-artifacts/benchmarks/codegen_build/
 artifacts/benchmarks/results/
 artifacts/build/
-artifacts/cosim/
-artifacts/derived/
-artifacts/opcount_build/
 artifacts/slprj/
-artifacts/soc/
 artifacts/simulink_cache/
 
 # Simulink temp / project artifacts
 tmp_*.slx
-myproj/
 
 # Cache files
 *.slxc
@@ -55,5 +35,4 @@ myproj/
 .buildtool/
 
 # SimBiology backup files
-*.sbproj.backup
 *.sbproj.bak

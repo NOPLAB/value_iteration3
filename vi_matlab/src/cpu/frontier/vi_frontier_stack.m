@@ -27,7 +27,7 @@ function [value_table, iters, total_updates] = vi_frontier_stack( ...
     total_updates = 0;
     iters = 0;
 
-    while stack_popcount(frontier) > 0 && iters < max_iters
+    while any(cellfun(@(b) any(b(:)), frontier)) && iters < max_iters
         iters = iters + 1;
 
         dilated_self = cell(NT, 1);
@@ -68,12 +68,5 @@ function [value_table, iters, total_updates] = vi_frontier_stack( ...
         end
 
         frontier = new_frontier;
-    end
-end
-
-function n = stack_popcount(frontier_cell)
-    n = 0;
-    for it = 1:numel(frontier_cell)
-        n = n + bb_popcount(frontier_cell{it});
     end
 end

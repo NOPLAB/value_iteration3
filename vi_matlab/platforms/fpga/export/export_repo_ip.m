@@ -1,28 +1,14 @@
-function export_repo_ip(varargin)
+function export_repo_ip()
 %EXPORT_REPO_IP Generate MATLAB HDL Coder IP for the repo Vivado flow.
 %   EXPORT_REPO_IP() regenerates the Simulink model, runs HDL Coder IP core
 %   generation, and exports the packaged IP into fpga/build/matlab_ip_repo.
-%
-%   EXPORT_REPO_IP(OUTPUT_REPO) overrides the destination repository path.
 
     layout = vi_matlab_layout();
     repo_root = fileparts(layout.root);
-    model_dir = layout.platforms_fpga_model;
     build_root = layout.artifacts_build_repo_ip;
-    default_output_repo = fullfile(repo_root, 'fpga', 'build', 'matlab_ip_repo');
-    default_header = fullfile(repo_root, 'driver', 'uio', 'generated', ...
-                              'xalgorithm_ip_addr.h');
-
-    if nargin >= 1 && ~isempty(varargin{1})
-        output_repo = char(string(varargin{1}));
-    else
-        output_repo = default_output_repo;
-    end
-    if nargin >= 2 && ~isempty(varargin{2})
-        output_header = char(string(varargin{2}));
-    else
-        output_header = default_header;
-    end
+    output_repo = fullfile(repo_root, 'fpga', 'build', 'matlab_ip_repo');
+    output_header = fullfile(repo_root, 'driver', 'uio', 'generated', ...
+                             'xalgorithm_ip_addr.h');
 
     fprintf('=== MATLAB HDL Coder IP export ===\n');
     fprintf('Repo root: %s\n', repo_root);
@@ -93,7 +79,6 @@ function export_repo_ip(varargin)
     end
 
     clear cleanup
-    close_system_if_loaded('vi_sweep_stream_matlab');
 end
 
 function configure_ip_workflow_target(model_name)
@@ -165,29 +150,11 @@ function ensure_safe_generated_path(target_dir)
 end
 
 function ip_root = resolve_generated_ip_root(project_folder)
-    candidates = {fullfile(project_folder, 'ipcore', 'Algorithm_ip_v1_0')};
-
-    for idx = 1:numel(candidates)
-        candidate = candidates{idx};
-        if exist(candidate, 'dir')
-            ip_root = candidate;
-            return;
-        end
+    ip_root = fullfile(project_folder, 'ipcore', 'Algorithm_ip_v1_0');
+    if ~exist(ip_root, 'dir')
+        error('export_repo_ip:IpNotFound', ...
+              'Could not locate packaged IP under `%s`.', project_folder);
     end
-
-    entries = dir(fullfile(project_folder, '**', 'vivado_ip_package.tcl'));
-    for idx = 1:numel(entries)
-        candidate = fileparts(entries(idx).folder);
-        if strcmp(char(string(candidate)), ...
-                  char(string(fullfile(project_folder, 'ipcore', ...
-                                        'Algorithm_ip_v1_0'))))
-            ip_root = candidate;
-            return;
-        end
-    end
-
-    error('export_repo_ip:IpNotFound', ...
-          'Could not locate packaged IP under `%s`.', project_folder);
 end
 
 function ensure_ip_is_packaged(ip_root)
@@ -216,9 +183,8 @@ function run_vivado_packager(package_tcl, working_dir)
     layout = vi_matlab_layout();
     repo_root = fileparts(layout.root);
     vivado_state_root = fullfile(repo_root, 'fpga', 'build', '.vivado_user_data');
-    ensure_dir(vivado_state_root);
-    ensure_dir(fullfile(vivado_state_root, 'AppData'));
-    ensure_dir(fullfile(vivado_state_root, 'LocalAppData'));
+    [~, ~] = mkdir(fullfile(vivado_state_root, 'AppData'));
+    [~, ~] = mkdir(fullfile(vivado_state_root, 'LocalAppData'));
 
     original_appdata = getenv('APPDATA');
     original_localappdata = getenv('LOCALAPPDATA');
@@ -239,19 +205,6 @@ function run_vivado_packager(package_tcl, working_dir)
     end
 
     clear restore_env
-    restore_vivado_env(original_appdata, original_localappdata);
-end
-
-function ensure_dir(target_dir)
-    if exist(target_dir, 'dir')
-        return;
-    end
-
-    [ok, msg, msgid] = mkdir(target_dir);
-    if ~ok
-        error('export_repo_ip:MkdirFailed', ...
-              'Failed to create `%s` (%s: %s).', target_dir, msgid, msg);
-    end
 end
 
 function restore_vivado_env(original_appdata, original_localappdata)
@@ -260,7 +213,6 @@ function restore_vivado_env(original_appdata, original_localappdata)
 end
 
 function message = sanitize_message(message)
-    message = strrep(message, newline, ' ');
     message = regexprep(message, '\s+', ' ');
 end
 

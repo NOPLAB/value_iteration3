@@ -1,6 +1,6 @@
 function c = cost_of(nv, np_raw)
 %COST_OF Compute traversal cost for one neighbor.
-%   Matches fpga/hls/stream/src/compute_row.cpp:cost_of().
+%   Matches vi_fpga/hls/stream/src/compute_row.cpp:cost_of().
 %   All arithmetic in double (Phase A). HDL Coder target.
 
     MAX_VALUE        = 65535;

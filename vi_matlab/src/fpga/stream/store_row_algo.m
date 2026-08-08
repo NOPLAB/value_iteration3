@@ -1,7 +1,7 @@
 function value_table = store_row_algo(val_row, value_table, ...
                                        gy, strip_x0, strip_w, map_x)
 %STORE_ROW_ALGO Store one row (inner cells, no halo) back to value table.
-%   Matches fpga/hls/stream/src/load_store_row.cpp:store_row().
+%   Matches vi_fpga/hls/stream/src/load_store_row.cpp:store_row().
 %   Modifies and returns value_table.
 
     p = vi_params();

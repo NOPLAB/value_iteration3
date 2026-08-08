@@ -2,7 +2,7 @@ function [val_row, pen_row, goal_row] = load_row_algo(value_table, penalty_table
                                                        goal_mask, gy, strip_x0, ...
                                                        strip_w, map_x, map_y)
 %LOAD_ROW_ALGO Load one row with halo from value/penalty tables.
-%   Matches fpga/hls/stream/src/load_store_row.cpp:load_row().
+%   Matches vi_fpga/hls/stream/src/load_store_row.cpp:load_row().
 %   gy: 0-indexed global Y coordinate.
 %   strip_x0: 0-indexed X start of strip.
 %   All arrays are double (Phase A).

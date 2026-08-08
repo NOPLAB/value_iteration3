@@ -65,12 +65,12 @@ vi_matlab/
 ### Phase D: Bitstream and Hardware
 
 1. Run `make matlab-bitstream` from the repository root
-2. This regenerates the MATLAB HDL IP and builds `fpga/build/vi_matlab`
+2. This regenerates the MATLAB HDL IP and builds `vi_fpga/build/vi_matlab`
 3. The `matlab` Vivado variant runs with `jobs=1` by default because the
    MATLAB-generated IP uses enough memory to fail on typical hosts when OOC
    synthesis is launched in parallel
 4. Deploy the resulting `.bit` + `.hwh` from
-   `fpga/build/vi_matlab/vi_matlab.runs/impl_1/` to Ultra96-V2
+   `vi_fpga/build/vi_matlab/vi_matlab.runs/impl_1/` to Ultra96-V2
 
 ## Makefile Targets
 
@@ -78,7 +78,7 @@ From project root:
 
 ```bash
 make matlab-sim        # Run matlab.unittest suite
-make matlab-hdl        # Export MATLAB HDL IP into fpga/build/matlab_ip_repo
+make matlab-hdl        # Export MATLAB HDL IP into vi_fpga/build/matlab_ip_repo
 make matlab-bitstream  # Build Ultra96-V2 bitstream from the exported IP
 make matlab-bench      # Compare reference/frontier/fpga-mimic CPU paths
 ```
@@ -86,5 +86,4 @@ make matlab-bench      # Compare reference/frontier/fpga-mimic CPU paths
 ## Constants
 
 All constants are defined in `src/common/vi_params.m` and match
-`fpga/hls/stream/src/vi_stream_types.h`. See the design spec at
-`docs/superpowers/specs/2026-04-13-matlab-hdl-coder-streaming-design.md`.
+`vi_fpga/hls/stream/src/vi_stream_types.h`.

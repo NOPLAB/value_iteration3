@@ -23,7 +23,7 @@ function [value_table, iters, total_updates] = vi_frontier_2d( ...
     total_updates = 0;
     iters = 0;
 
-    while bb_popcount(frontier) > 0 && iters < max_iters
+    while any(frontier(:)) && iters < max_iters
         iters = iters + 1;
 
         candidates = bitand(bb_dilate2d(frontier, map_x, mx, my), passable_bb);

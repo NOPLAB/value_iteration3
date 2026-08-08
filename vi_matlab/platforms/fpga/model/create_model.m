@@ -62,28 +62,27 @@ end
 
 function add_top_ports(model_name)
     ports = { ...
-        struct('name', 'gmem2_rdData',   'kind', 'In1',  'pos', [50 70 80 90],   'type', 'uint32')
-        struct('name', 'gmem2_rdCtrlIn', 'kind', 'In1',  'pos', [50 120 80 140], 'type', 'Bus: ReadControlS2MBusObj')
-        struct('name', 'gmem1_rdData',   'kind', 'In1',  'pos', [50 190 80 210], 'type', 'uint32')
-        struct('name', 'gmem1_rdCtrlIn', 'kind', 'In1',  'pos', [50 240 80 260], 'type', 'Bus: ReadControlS2MBusObj')
-        struct('name', 'gmem0_wrCtrlIn', 'kind', 'In1',  'pos', [50 310 80 330], 'type', 'Bus: WriteControlS2MBusObj')
-        struct('name', 'start',          'kind', 'In1',  'pos', [50 390 80 410], 'type', 'boolean')
-        struct('name', 'map_x',          'kind', 'In1',  'pos', [50 440 80 460], 'type', 'uint32')
-        struct('name', 'map_y',          'kind', 'In1',  'pos', [50 490 80 510], 'type', 'uint32')
-        struct('name', 'cu_id',          'kind', 'In1',  'pos', [50 540 80 560], 'type', 'uint32')
-        struct('name', 'gmem2_rdCtrlOut','kind', 'Out1', 'pos', [980 100 1010 120], 'type', 'Bus: ReadControlM2SBusObj')
-        struct('name', 'gmem1_rdCtrlOut','kind', 'Out1', 'pos', [980 180 1010 200], 'type', 'Bus: ReadControlM2SBusObj')
-        struct('name', 'gmem0_wrData',   'kind', 'Out1', 'pos', [980 260 1010 280], 'type', 'uint32')
-        struct('name', 'gmem0_wrCtrlOut','kind', 'Out1', 'pos', [980 320 1010 340], 'type', 'Bus: WriteControlM2SBusObj')
-        struct('name', 'done',           'kind', 'Out1', 'pos', [980 420 1010 440], 'type', 'boolean')
-        struct('name', 'max_delta',      'kind', 'Out1', 'pos', [980 470 1010 490], 'type', 'uint16')
+        struct('name', 'gmem2_rdData',   'kind', 'simulink/Sources/In1', 'pos', [50 70 80 90],   'type', 'uint32')
+        struct('name', 'gmem2_rdCtrlIn', 'kind', 'simulink/Sources/In1', 'pos', [50 120 80 140], 'type', 'Bus: ReadControlS2MBusObj')
+        struct('name', 'gmem1_rdData',   'kind', 'simulink/Sources/In1', 'pos', [50 190 80 210], 'type', 'uint32')
+        struct('name', 'gmem1_rdCtrlIn', 'kind', 'simulink/Sources/In1', 'pos', [50 240 80 260], 'type', 'Bus: ReadControlS2MBusObj')
+        struct('name', 'gmem0_wrCtrlIn', 'kind', 'simulink/Sources/In1', 'pos', [50 310 80 330], 'type', 'Bus: WriteControlS2MBusObj')
+        struct('name', 'start',          'kind', 'simulink/Sources/In1', 'pos', [50 390 80 410], 'type', 'boolean')
+        struct('name', 'map_x',          'kind', 'simulink/Sources/In1', 'pos', [50 440 80 460], 'type', 'uint32')
+        struct('name', 'map_y',          'kind', 'simulink/Sources/In1', 'pos', [50 490 80 510], 'type', 'uint32')
+        struct('name', 'cu_id',          'kind', 'simulink/Sources/In1', 'pos', [50 540 80 560], 'type', 'uint32')
+        struct('name', 'gmem2_rdCtrlOut','kind', 'simulink/Sinks/Out1',  'pos', [980 100 1010 120], 'type', 'Bus: ReadControlM2SBusObj')
+        struct('name', 'gmem1_rdCtrlOut','kind', 'simulink/Sinks/Out1',  'pos', [980 180 1010 200], 'type', 'Bus: ReadControlM2SBusObj')
+        struct('name', 'gmem0_wrData',   'kind', 'simulink/Sinks/Out1',  'pos', [980 260 1010 280], 'type', 'uint32')
+        struct('name', 'gmem0_wrCtrlOut','kind', 'simulink/Sinks/Out1',  'pos', [980 320 1010 340], 'type', 'Bus: WriteControlM2SBusObj')
+        struct('name', 'done',           'kind', 'simulink/Sinks/Out1',  'pos', [980 420 1010 440], 'type', 'boolean')
+        struct('name', 'max_delta',      'kind', 'simulink/Sinks/Out1',  'pos', [980 470 1010 490], 'type', 'uint16')
     };
 
     for i = 1:numel(ports)
         p = ports{i};
         path = [model_name '/' p.name];
-        add_block(['simulink/' ternary(strcmp(p.kind, 'In1'), 'Sources', 'Sinks') '/' p.kind], ...
-                  path, 'Position', p.pos);
+        add_block(p.kind, path, 'Position', p.pos);
         set_param(path, 'OutDataTypeStr', p.type);
     end
 end
@@ -316,41 +315,25 @@ function configure_hdl(model_name)
                      'gmem0/Output Write Channel', 'gmem0 Write', ...
                      'wrCtrlIn', 'Write Master to Slave Bus');
 
-    set_named_axi_reg(model_name, dut_name, 'start', 'axi4', 'AXI4-Lite', 'x"0100"');
-    set_named_axi_reg(model_name, dut_name, 'map_x', 'axi4', 'AXI4-Lite', 'x"0110"');
-    set_named_axi_reg(model_name, dut_name, 'map_y', 'axi4', 'AXI4-Lite', 'x"0120"');
-    set_named_axi_reg(model_name, dut_name, 'cu_id', 'axi4', 'AXI4-Lite', 'x"0130"');
-    set_named_axi_reg(model_name, dut_name, 'done', 'axi4', 'AXI4-Lite', 'x"0140"');
-    set_named_axi_reg(model_name, dut_name, 'max_delta', 'axi4', 'AXI4-Lite', 'x"0150"');
-end
-
-function set_mem_if(block_path, interface_name, mapping)
-    hdlset_param(block_path, 'IOInterface', interface_name);
-    hdlset_param(block_path, 'IOInterfaceMapping', mapping);
-end
-
-function set_axi_reg(block_path, mapping)
-    hdlset_param(block_path, 'IOInterface', 'axi4');
-    hdlset_param(block_path, 'IOInterfaceMapping', mapping);
+    set_named_axi_reg(model_name, dut_name, 'start', 'x"0100"');
+    set_named_axi_reg(model_name, dut_name, 'map_x', 'x"0110"');
+    set_named_axi_reg(model_name, dut_name, 'map_y', 'x"0120"');
+    set_named_axi_reg(model_name, dut_name, 'cu_id', 'x"0130"');
+    set_named_axi_reg(model_name, dut_name, 'done', 'x"0140"');
+    set_named_axi_reg(model_name, dut_name, 'max_delta', 'x"0150"');
 end
 
 function set_named_mem_if(model_name, dut_name, block_name, model_interface, dut_interface, ...
                           model_mapping, dut_mapping)
-    set_mem_if([model_name '/' block_name], model_interface, model_mapping);
-    set_mem_if([dut_name '/' block_name], dut_interface, dut_mapping);
-end
-
-function set_named_axi_reg(model_name, dut_name, block_name, model_interface, dut_interface, mapping)
     hdlset_param([model_name '/' block_name], 'IOInterface', model_interface);
-    hdlset_param([model_name '/' block_name], 'IOInterfaceMapping', mapping);
+    hdlset_param([model_name '/' block_name], 'IOInterfaceMapping', model_mapping);
     hdlset_param([dut_name '/' block_name], 'IOInterface', dut_interface);
-    hdlset_param([dut_name '/' block_name], 'IOInterfaceMapping', mapping);
+    hdlset_param([dut_name '/' block_name], 'IOInterfaceMapping', dut_mapping);
 end
 
-function out = ternary(cond, a, b)
-    if cond
-        out = a;
-    else
-        out = b;
-    end
+function set_named_axi_reg(model_name, dut_name, block_name, mapping)
+    hdlset_param([model_name '/' block_name], 'IOInterface', 'axi4');
+    hdlset_param([model_name '/' block_name], 'IOInterfaceMapping', mapping);
+    hdlset_param([dut_name '/' block_name], 'IOInterface', 'AXI4-Lite');
+    hdlset_param([dut_name '/' block_name], 'IOInterfaceMapping', mapping);
 end

@@ -31,7 +31,6 @@ function goal_mask = make_goal_mask(map_x, map_y, spec)
             for it = 0:p.N_THETA-1
                 t0 = it * t_resolution;
                 t1 = (it + 1) * t_resolution;
-                wrapped_goal = spec.goal_theta_deg;
                 if spec.goal_theta_deg > 180
                     wrapped_goal = spec.goal_theta_deg - 360;
                 else

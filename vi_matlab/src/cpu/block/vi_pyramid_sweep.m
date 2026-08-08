@@ -1,16 +1,10 @@
-function [value_table, sweeps, visited_states, final_delta, stats] = vi_pyramid_sweep( ...
+function [value_table, sweeps, visited_states, final_delta] = vi_pyramid_sweep( ...
     value_table, penalty_table, goal_mask, transitions, map_x, map_y, ...
     threshold, max_sweeps, min_size, coarse_sweeps, refine_sweeps, descend_tau)
 %VI_PYRAMID_SWEEP Coarse-to-fine VI over a 2x2 spatial pyramid.
 %   Starts from the coarsest 2x2-reduced map, sweeps only active regions,
 %   then descends into the children of changed coarse blocks.
 
-    if nargin < 9 || isempty(min_size)
-        min_size = 4;
-    end
-    if nargin < 10 || isempty(coarse_sweeps)
-        coarse_sweeps = 8;
-    end
     if nargin < 11 || isempty(refine_sweeps)
         refine_sweeps = max_sweeps;
     end
@@ -54,7 +48,6 @@ function [value_table, sweeps, visited_states, final_delta, stats] = vi_pyramid_
     sweeps = 0;
     visited_states = 0;
     final_delta = MV;
-    stats = repmat(empty_stat(), 1, n_levels);
     remaining = max(0, floor(max_sweeps));
 
     for level = n_levels:-1:1
@@ -90,19 +83,14 @@ function [value_table, sweeps, visited_states, final_delta, stats] = vi_pyramid_
         candidate_mask = dilate_spatial_mask(active_masks{level}, mx, my, ...
             level_mx(level), level_my(level));
 
-        [values{level}, done, changed, final_delta, descend_mask] = run_masked_sweeps( ...
+        [values{level}, done, ~, final_delta, descend_mask] = run_masked_sweeps( ...
             values{level}, penalties{level}, goals{level}, trans_model, ...
             level_mx(level), level_my(level), threshold, cap, OB, NT, ...
             candidate_mask, descend_tau);
 
         sweeps = sweeps + done;
         remaining = remaining - done;
-        visited = nnz(candidate_mask) * NT * done;
-        visited_states = visited_states + visited;
-        stats(level) = struct('level', level, 'map_x', level_mx(level), ...
-            'map_y', level_my(level), 'scale', scale, 'sweeps', done, ...
-            'changed_states', changed, 'visited_states', visited, ...
-            'final_delta', final_delta);
+        visited_states = visited_states + nnz(candidate_mask) * NT * done;
 
         if level > 1
             descend_mask = descend_mask | any(goals{level}, 3);
@@ -117,12 +105,6 @@ function [value_table, sweeps, visited_states, final_delta, stats] = vi_pyramid_
 
     value_table = values{1};
     value_table(goal_mask) = 0;
-end
-
-function stat = empty_stat()
-    stat = struct('level', 0, 'map_x', 0, 'map_y', 0, 'scale', 0, ...
-        'sweeps', 0, 'changed_states', 0, 'visited_states', 0, ...
-        'final_delta', 0);
 end
 
 function [coarse_value, coarse_penalty, coarse_goal] = coarsen_level( ...

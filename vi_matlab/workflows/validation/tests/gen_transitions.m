@@ -1,36 +1,28 @@
-function trans = gen_transitions(mode, varargin)
+function trans = gen_transitions(mode)
 %GEN_TRANSITIONS Generate packed transition table as uint32 column vector.
 %   mode:
 %     'trivial'  - deterministic 1-step test transitions
-%     'full'     - deterministic paper action set
 %     'paper_mc' - Monte Carlo transitions from the paper/ROS implementation
-%
-%   Optional name/value arguments:
-%     'xy_resolution' - cell resolution in meters (default 0.05)
 
     persistent cache
 
-    p = vi_params();
-    opts.xy_resolution = 0.05;
-    opts = parse_opts(opts, varargin{:});
-
     if isempty(cache)
-        cache = containers.Map('KeyType', 'char', 'ValueType', 'any');
+        cache = struct();
     end
-    cache_key = sprintf('%s_%.8f', mode, opts.xy_resolution);
-    if isKey(cache, cache_key)
-        trans = cache(cache_key);
+    if isfield(cache, mode)
+        trans = cache.(mode);
         return;
     end
 
-    model.n_outcomes = zeros(p.N_ACTIONS, p.N_THETA);
-    model.dix = zeros(p.N_ACTIONS, p.N_THETA, p.MAX_OUTCOMES);
-    model.diy = zeros(p.N_ACTIONS, p.N_THETA, p.MAX_OUTCOMES);
-    model.dit = zeros(p.N_ACTIONS, p.N_THETA, p.MAX_OUTCOMES);
-    model.prob = zeros(p.N_ACTIONS, p.N_THETA, p.MAX_OUTCOMES);
+    p = vi_params();
 
     switch mode
         case 'trivial'
+            model.n_outcomes = zeros(p.N_ACTIONS, p.N_THETA);
+            model.dix = zeros(p.N_ACTIONS, p.N_THETA, p.MAX_OUTCOMES);
+            model.diy = zeros(p.N_ACTIONS, p.N_THETA, p.MAX_OUTCOMES);
+            model.dit = zeros(p.N_ACTIONS, p.N_THETA, p.MAX_OUTCOMES);
+            model.prob = zeros(p.N_ACTIONS, p.N_THETA, p.MAX_OUTCOMES);
             for it = 1:p.N_THETA
                 model.n_outcomes(1, it) = 1;
                 model.dix(1, it, 1) = 1;
@@ -46,50 +38,15 @@ function trans = gen_transitions(mode, varargin)
                 end
             end
 
-        case 'full'
-            t_resolution = 360 / p.N_THETA;
-            for a = 1:p.N_ACTIONS
-                for it = 1:p.N_THETA
-                    theta_deg = (it - 1) * t_resolution + 0.5 * t_resolution;
-                    theta_rad = theta_deg * pi / 180;
-                    dx = p.ACTION_FW(a) * cos(theta_rad);
-                    dy = p.ACTION_FW(a) * sin(theta_rad);
-                    dix = floor(dx / opts.xy_resolution);
-                    diy = floor(dy / opts.xy_resolution);
-
-                    new_theta = theta_deg + p.ACTION_ROT(a);
-                    while new_theta < 0
-                        new_theta = new_theta + 360;
-                    end
-                    while new_theta >= 360
-                        new_theta = new_theta - 360;
-                    end
-                    new_it = floor(new_theta / t_resolution);
-                    dit = new_it - (it - 1);
-                    if dit > p.N_THETA / 2
-                        dit = dit - p.N_THETA;
-                    end
-                    if dit < -p.N_THETA / 2
-                        dit = dit + p.N_THETA;
-                    end
-
-                    model.n_outcomes(a, it) = 1;
-                    model.dix(a, it, 1) = dix;
-                    model.diy(a, it, 1) = diy;
-                    model.dit(a, it, 1) = dit;
-                    model.prob(a, it, 1) = p.PROB_BASE;
-                end
-            end
-
         case 'paper_mc'
-            model = build_monte_carlo_model(p, opts.xy_resolution);
+            model = build_monte_carlo_model(p, 0.05);
 
         otherwise
             error('Unknown mode: %s', mode);
     end
 
     trans = pack_model(model, p);
-    cache(cache_key) = trans;
+    cache.(mode) = trans;
 end
 
 function model = build_monte_carlo_model(p, xy_resolution)
@@ -155,7 +112,7 @@ function trans = pack_model(model, p)
 
     for a = 1:p.N_ACTIONS
         for it = 1:p.N_THETA
-            base = transition_base_index(p, a, it);
+            base = ((a - 1) * p.N_THETA + (it - 1)) * p.TRANS_WORD_STRIDE + 1;
             trans(base) = uint32(model.n_outcomes(a, it));
             for k = 1:model.n_outcomes(a, it)
                 word0 = pack_delta(model.dix(a, it, k), ...
@@ -169,23 +126,9 @@ function trans = pack_model(model, p)
     end
 end
 
-function idx = transition_base_index(p, a, it)
-    idx = ((a - 1) * p.N_THETA + (it - 1)) * p.TRANS_WORD_STRIDE + 1;
-end
-
 function w = pack_delta(dix, diy, dit)
     b0 = typecast(int8(dix), 'uint8');
     b1 = typecast(int8(diy), 'uint8');
     b2 = typecast(int8(dit), 'uint8');
     w = uint32(b0) + bitshift(uint32(b1), 8) + bitshift(uint32(b2), 16);
-end
-
-function opts = parse_opts(opts, varargin)
-    if mod(numel(varargin), 2) ~= 0
-        error('Optional arguments must be name/value pairs.');
-    end
-    for i = 1:2:numel(varargin)
-        name = varargin{i};
-        opts.(name) = varargin{i + 1};
-    end
 end

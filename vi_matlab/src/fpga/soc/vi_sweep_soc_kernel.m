@@ -188,7 +188,7 @@ function [gmem2_rd_addr, gmem2_rd_len, gmem2_rd_avalid, gmem2_rd_dready, ...
             else
                 sx = selected_strip(compute_si, num_strips, active_cu);
                 strip_x0 = sx * uint32(p.STRIP_W_MAX);
-                strip_w = min_u32(uint32(p.STRIP_W_MAX), active_map_x - strip_x0);
+                strip_w = min(uint32(p.STRIP_W_MAX), active_map_x - strip_x0);
                 gx = strip_x0 + compute_x;
                 gy = compute_y;
                 theta = compute_t;
@@ -251,14 +251,6 @@ function q = ceil_div(a, b)
     q = idivide(a + b - 1, b, 'floor');
 end
 
-function m = min_u32(a, b)
-    if a < b
-        m = a;
-    else
-        m = b;
-    end
-end
-
 function sx = selected_strip(si, num_strips, cu_id)
     if cu_id == 0
         sx = si;
@@ -312,7 +304,7 @@ function [best_val, delta_val] = compute_state_value(gx, gy, theta, map_x, map_y
 
     if cell_pen == p.PENALTY_GOAL
         best_val = uint16(0);
-        delta_val = abs_u16(best_val, old_val);
+        delta_val = max(best_val, old_val) - min(best_val, old_val);
         return;
     end
 
@@ -386,7 +378,7 @@ function [best_val, delta_val] = compute_state_value(gx, gy, theta, map_x, map_y
     end
 
     best_val = best_cost;
-    delta_val = abs_u16(best_val, old_val);
+    delta_val = max(best_val, old_val) - min(best_val, old_val);
 end
 
 function c = cost_of_neighbor(nv, np_raw, p)
@@ -406,14 +398,6 @@ function c = cost_of_neighbor(nv, np_raw, p)
         c = uint16(p.MAX_VALUE - 1);
     else
         c = uint16(sum_val);
-    end
-end
-
-function d = abs_u16(a, b)
-    if a >= b
-        d = a - b;
-    else
-        d = b - a;
     end
 end
 

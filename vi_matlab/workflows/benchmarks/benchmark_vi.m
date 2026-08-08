@@ -21,7 +21,6 @@ function rows = benchmark_vi()
     transitions = gen_transitions('paper_mc');
 
     cases = bench_cases();
-    rows = repmat(empty_row(), 1, numel(cases));
     n_cases = numel(cases);
     n_impls = 6;
 
@@ -84,7 +83,7 @@ function rows = benchmark_vi()
         m_fstack = compute_bench_metrics(v_ref, v_fstack, a_ref, [],       goal_mask, penalty, p);
         m_pyramid = compute_bench_metrics(v_ref, v_pyramid, a_ref, [],     goal_mask, penalty, p);
 
-        rows(k) = struct( ...
+        row = struct( ...
             'name',                c.name, ...
             'map_x',               c.map_x, ...
             'map_y',               c.map_y, ...
@@ -121,19 +120,20 @@ function rows = benchmark_vi()
             'pyramid_total_ms',           t_pyramid_ms, ...
             'pyramid_per_state_us',       1000 * t_pyramid_ms / max(visit_pyramid, 1), ...
             'pyramid_value_mismatch_pct', m_pyramid.value_mismatch_pct);
+        rows(k) = row; %#ok<AGROW>
 
         fprintf('    %-15s M=%7.1fms (%4d sw)\n', ...
             'reference', t_ref_ms, sw_ref);
         fprintf('    %-15s M=%7.1fms (%4d sw)%s\n', ...
-            'fpga_mimic', t_fpga_ms, sw_fpga, accuracy_flag(m_fpga, true));
+            'fpga_mimic', t_fpga_ms, sw_fpga, accuracy_flag(m_fpga));
         fprintf('    %-15s M=%7.1fms (%4d it)%s\n', ...
-            'frontier_2d', t_f2d_ms, it_f2d, accuracy_flag(m_f2d, false));
+            'frontier_2d', t_f2d_ms, it_f2d, accuracy_flag(m_f2d));
         fprintf('    %-15s M=%7.1fms (%4d it)%s\n', ...
-            'frontier_3d', t_f3d_ms, it_f3d, accuracy_flag(m_f3d, false));
+            'frontier_3d', t_f3d_ms, it_f3d, accuracy_flag(m_f3d));
         fprintf('    %-15s M=%7.1fms (%4d it)%s\n', ...
-            'frontier_stack', t_fstack_ms, it_fstack, accuracy_flag(m_fstack, false));
+            'frontier_stack', t_fstack_ms, it_fstack, accuracy_flag(m_fstack));
         fprintf('    %-15s M=%7.1fms (%4d it)%s\n', ...
-            'pyramid_sweep', t_pyramid_ms, it_pyramid, accuracy_flag(m_pyramid, false));
+            'pyramid_sweep', t_pyramid_ms, it_pyramid, accuracy_flag(m_pyramid));
 
         % Regression guard: exact variants must be bit-exact to oracle.
         for tag = {'f2d', 'f3d', 'fstack', 'pyramid'}
@@ -151,29 +151,11 @@ function rows = benchmark_vi()
     if ~exist(results_dir, 'dir'); mkdir(results_dir); end
     csv_path = fullfile(results_dir, ...
         sprintf('benchmark_%s.csv', datestr(now, 'yyyymmdd_HHMMSS'))); %#ok<TNOW1,DATST>
-    write_csv(rows, csv_path);
+    writetable(struct2table(rows), csv_path);
     fprintf('\nCSV written to %s\n', csv_path);
 end
 
 % ---------------------------------------------------------------------------
-
-function row = empty_row()
-    row = struct( ...
-        'name', '', 'map_x', 0, 'map_y', 0, 'type', '', ...
-        'ref_sweeps', 0, 'ref_total_ms', 0, 'ref_per_sweep_ms', 0, ...
-        'ref_final_delta', 0, 'ref_converged', false, ...
-        'fpga_sweeps', 0, 'fpga_total_ms', 0, 'fpga_per_sweep_ms', 0, ...
-        'fpga_final_delta', 0, 'fpga_converged', false, ...
-        'fpga_value_mismatch_pct', 0, 'fpga_action_mismatch_pct', 0, ...
-        'f2d_iters', 0, 'f2d_total_updates', 0, 'f2d_total_ms', 0, ...
-        'f2d_per_update_us', 0, 'f2d_value_mismatch_pct', 0, ...
-        'f3d_iters', 0, 'f3d_total_updates', 0, 'f3d_total_ms', 0, ...
-        'f3d_per_update_us', 0, 'f3d_value_mismatch_pct', 0, ...
-        'fstack_iters', 0, 'fstack_total_updates', 0, 'fstack_total_ms', 0, ...
-        'fstack_per_update_us', 0, 'fstack_value_mismatch_pct', 0, ...
-        'pyramid_iters', 0, 'pyramid_visited_states', 0, 'pyramid_total_ms', 0, ...
-        'pyramid_per_state_us', 0, 'pyramid_value_mismatch_pct', 0);
-end
 
 function warmup(value, penalty, goal_mask, transitions, map_x, map_y)
     % One scratch run per implementation to amortize MATLAB JIT warm-up.
@@ -212,8 +194,7 @@ function m = compute_bench_metrics(v_ref, v_other, a_ref, a_other, goal_mask, pe
     total = nnz(free_mask);
 
     if total == 0
-        m = struct('value_mismatch_pct', 0, 'action_mismatch_pct', 0, ...
-            'mean_abs_value_pct', 0, 'max_abs_value', 0);
+        m = struct('value_mismatch_pct', 0, 'action_mismatch_pct', 0);
         return;
     end
 
@@ -228,20 +209,17 @@ function m = compute_bench_metrics(v_ref, v_other, a_ref, a_other, goal_mask, pe
         amiss = 0;
     end
 
-    denom = max(double(v_ref_f), 1);
     m = struct( ...
         'value_mismatch_pct',  100 * nnz(v_ref_f ~= v_other_f) / total, ...
-        'action_mismatch_pct', amiss, ...
-        'mean_abs_value_pct',  100 * mean(abs(double(v_other_f) - double(v_ref_f)) ./ denom), ...
-        'max_abs_value',       max(abs(double(v_other_f) - double(v_ref_f))));
+        'action_mismatch_pct', amiss);
 end
 
-function flag = accuracy_flag(metrics, include_action)
+function flag = accuracy_flag(metrics)
     flags = {};
     if metrics.value_mismatch_pct ~= 0
         flags{end + 1} = sprintf('vmiss=%.2f%%', metrics.value_mismatch_pct);
     end
-    if include_action && metrics.action_mismatch_pct ~= 0
+    if metrics.action_mismatch_pct ~= 0
         flags{end + 1} = sprintf('amiss=%.2f%%', metrics.action_mismatch_pct);
     end
 
@@ -270,34 +248,5 @@ function print_markdown_table(rows)
             r.f3d_total_ms,    r.f3d_iters,    r.f3d_total_updates, ...
             r.fstack_total_ms, r.fstack_iters, r.fstack_total_updates, ...
             r.pyramid_total_ms, r.pyramid_iters, r.pyramid_visited_states);
-    end
-end
-
-function write_csv(rows, path)
-    fid = fopen(path, 'w');
-    if fid < 0
-        error('benchmark_vi:csv', 'cannot open %s for writing', path);
-    end
-    cleanup = onCleanup(@() fclose(fid));
-
-    field_names = fieldnames(rows(1));
-    fprintf(fid, '%s\n', strjoin(field_names, ','));
-
-    for k = 1:numel(rows)
-        r = rows(k);
-        parts = cell(1, numel(field_names));
-        for f = 1:numel(field_names)
-            v = r.(field_names{f});
-            if ischar(v) || isstring(v)
-                parts{f} = char(v);
-            elseif islogical(v)
-                parts{f} = sprintf('%d', v);
-            elseif isinteger(v) || mod(v, 1) == 0
-                parts{f} = sprintf('%g', v);
-            else
-                parts{f} = sprintf('%.6f', v);
-            end
-        end
-        fprintf(fid, '%s\n', strjoin(parts, ','));
     end
 end
