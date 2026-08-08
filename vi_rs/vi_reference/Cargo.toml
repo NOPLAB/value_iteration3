@@ -5,9 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# bitboard モジュール (旧 vi_algorithm から取り込み) が ndarray⇔bitboard 変換に使う。
-# 忠実移植本体 (ValueIterator 等) は ndarray を使わず、bitboard プリミティブ専用。
+# bridge の値場スライス (Array2) 用。忠実移植本体 (ValueIterator 等) は使わない。
 ndarray = { workspace = true }
+# frontier2d_sparse_compact::MmapSink (確定出力のディスク mmap) 用。
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 # bitboard の property test を駆動する (旧 vi_algorithm の dev-dep から移設)。

@@ -4,7 +4,7 @@
 //! 詳細は値に影響しないため、本家全走査（`solvers::original` の行優先 sweep =
 //! `sweep_orders[0]` = y,x,t 順 = 行ストリーミング順）にそのまま委譲する。
 
-use crate::solvers::observe::{NullObserver, SolveObserver, SolveOutcome};
+use crate::solvers::observe::{SolveObserver, SolveOutcome};
 use crate::solvers::original::original_solve_observed;
 use crate::value_iterator::ValueIterator;
 
@@ -17,7 +17,3 @@ pub fn stream_mimic_solve_observed(
     original_solve_observed(vi, max_iter, obs)
 }
 
-/// 従来 API (observer なし)。
-pub fn stream_mimic_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    stream_mimic_solve_observed(vi, max_iter, &mut NullObserver).tuple()
-}

@@ -12,7 +12,7 @@
 
 use crate::params::MAX_COST;
 use crate::solvers::observe::{
-    BoundaryPacer, MaterializeProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
+    BoundaryPacer, MaterializeProbe, SolveFlow, SolveObserver, SolveOutcome,
 };
 use crate::value_iterator::ValueIterator;
 
@@ -144,11 +144,6 @@ pub fn frontier2d_par_solve_observed(
         return SolveOutcome::stopped(iters, updates);
     }
     SolveOutcome::running(iters, updates, converged)
-}
-
-/// 従来 API (observer なし)。`(iters, updates, converged)`。
-pub fn frontier2d_par_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    frontier2d_par_solve_observed(vi, max_iter, &mut NullObserver).tuple()
 }
 
 /// 収束した `hot` から全 free・非 final セルの optimal_action を計算 (並列・読み取り専用)。

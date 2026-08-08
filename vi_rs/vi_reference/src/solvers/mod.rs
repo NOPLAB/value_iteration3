@@ -14,28 +14,21 @@ use crate::value_iterator::ValueIterator;
 pub(crate) use crate::bitboard::{Bitboard2D, Bitboard3D};
 
 pub mod block;
-pub mod coarse_theta;
 #[cfg(test)]
 mod conformance;
 pub mod frontier2d;
 pub mod frontier2d_pad;
 pub mod frontier2d_par;
 pub mod frontier2d_fused;
-pub mod compact_zip;
 pub mod frontier2d_sparse;
 pub mod frontier2d_sparse_compact;
 pub mod frontier2d_par_unsafe;
-pub mod frontier2d_soa;
-#[cfg(test)]
-mod measure;
 pub mod frontier3d;
 pub mod observe;
 pub mod original;
 pub mod pyramid;
 pub mod stack;
 pub mod stream;
-pub mod tau;
-pub mod topk;
 pub mod priority;
 pub mod prio_lc;
 
@@ -84,9 +77,9 @@ pub(crate) fn seed_frontier_2d(vi: &ValueIterator) -> Bitboard2D {
     bb
 }
 
-/// 3D フロンティア反復の共通ドライバ。frontier3d / tau / topk / coarse_theta が共有する
-/// 「seed → (膨張 → 候補走査 → 減少セルを次フロンティアへ) を収束まで」という骨格を1箇所に
-/// まとめる。差分は候補セルごとの処理 `update(vi, ix, iy, it)` のみ。
+/// 3D フロンティア反復の共通ドライバ (`frontier3d` の骨格)。
+/// 「seed → (膨張 → 候補走査 → 減少セルを次フロンティアへ) を収束まで」をまとめ、
+/// 差分は候補セルごとの処理 `update(vi, ix, iy, it)` のみ。
 ///
 /// `update` は候補セル `(ix,iy,it)` を評価し、値を下げた（=次フロンティアへ伝播すべき）なら
 /// `true` を返す。ドライバは `true` のセルだけを次フロンティアに入れ、`updates` を 1 加算する
@@ -132,7 +125,7 @@ where
     SolveOutcome::running(iters, updates, frontier.popcount() == 0)
 }
 
-/// 2D フロンティア反復の共通ドライバ。frontier2d / soa / pad が共有する「seed →
+/// 2D フロンティア反復の共通ドライバ。frontier2d の「seed →
 /// (空間膨張 → 候補 (ix,iy) ごとに全 θ 層を再評価 → 更新があれば次フロンティアへ) を収束まで」
 /// の骨格をまとめる。差分は候補セルごとの処理 `cell(ix, iy)` のみ。
 ///
@@ -452,15 +445,12 @@ where
 /// 到達可能とみなす total_cost 上限（compare.py の value>=1e6 境界と整合）。
 pub(crate) const REACH_THRESH: u64 = 1_000_000u64 * crate::params::PROB_BASE;
 
-/// u64 高速ソルバの種別。近似ソルバは no-op パラメータ（tau=0 / k=全 outcome / step=1）で
-/// Frontier3D と等価（bit-exact）になり、移植の正しさを検証できる。
+/// u64 高速ソルバの種別。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum U64Solver {
     Reference,
     Frontier3D,
     Frontier2D,
-    Frontier2DSoA,
-    Frontier2DPad,
     Frontier2DPar,
     Frontier2DParUnsafe,
     Frontier2DFused,
@@ -470,9 +460,6 @@ pub enum U64Solver {
     FrontierStack,
     BlockRefine,
     PyramidSweep,
-    Frontier3DTau { tau: u64 },
-    Frontier3DTopK { k: u32 },
-    Frontier3DCoarseTheta { step: u32 },
     StreamMimic,
     PriorityLabelSetting,
     PriorityLabelCorrecting,
@@ -484,8 +471,6 @@ impl U64Solver {
             "reference" => U64Solver::Reference,
             "frontier3d" => U64Solver::Frontier3D,
             "frontier2d" => U64Solver::Frontier2D,
-            "frontier2d_soa" => U64Solver::Frontier2DSoA,
-            "frontier2d_pad" => U64Solver::Frontier2DPad,
             "frontier2d_par" => U64Solver::Frontier2DPar,
             "frontier2d_par_unsafe" => U64Solver::Frontier2DParUnsafe,
             "frontier2d_fused" => U64Solver::Frontier2DFused,
@@ -494,10 +479,6 @@ impl U64Solver {
             "frontier_stack" => U64Solver::FrontierStack,
             "block_refine" => U64Solver::BlockRefine,
             "pyramid_sweep" => U64Solver::PyramidSweep,
-            // 近似ソルバ: 既定は no-op（= Frontier3D 等価）。実用近似は param 指定で。
-            "frontier3d_tau" => U64Solver::Frontier3DTau { tau: 0 },
-            "frontier3d_topk" => U64Solver::Frontier3DTopK { k: u32::MAX },
-            "frontier3d_coarse_theta" => U64Solver::Frontier3DCoarseTheta { step: 1 },
             "stream_mimic" => U64Solver::StreamMimic,
             "prio_ls" => U64Solver::PriorityLabelSetting,
             "prio_lc" => U64Solver::PriorityLabelCorrecting,
@@ -524,9 +505,6 @@ pub enum Partiality {
     /// 確定済みセルは v* に bit-exact、未確定セルは `(MAX_COST, 方策なし)`
     /// (compact: finalize は値の昇順に進むため)。
     ExactPrefix,
-    /// 近似オペレータ (outcome 枝刈りなど) のため上の不変条件を保証しない。
-    /// 境界観測・cancel・stop は使えるが、途中の場の性質には頼らないこと。
-    Heuristic,
 }
 
 /// ソルバの能力宣言。プランナ側のハードコード
@@ -548,21 +526,10 @@ impl U64Solver {
     /// このソルバ (パラメタ込み) の能力。
     pub fn caps(&self) -> SolverCaps {
         use U64Solver::*;
-        let exact = match *self {
-            // tau>0: 改善が tau 以下の更新を捨てる → 値は上界のまま止まる (非 exact)。
-            Frontier3DTau { tau } => tau == 0,
-            // k が全 outcome 数以上なら枝刈りなしで exact。全 outcome 数は地図・行動に
-            // 依存して分からないので、保証できるのは「枝刈りが起き得ない」u32::MAX のみ。
-            Frontier3DTopK { k } => k == u32::MAX,
-            // settle-once (Dijkstra 流) は確率遷移では早すぎる確定があり得る → 近似。
-            PriorityLabelSetting => false,
-            // coarse_theta は refine が完全収束するので step に依らず exact。
-            _ => true,
-        };
+        // settle-once (Dijkstra 流) は確率遷移では早すぎる確定があり得る → 近似。
+        let exact = !matches!(*self, PriorityLabelSetting);
         let partial = match *self {
             Frontier2DSparseCompact { .. } => Partiality::ExactPrefix,
-            // 枝刈りは期待コストを下げる方向にも外し得る → 上界不変条件なし。
-            Frontier3DTopK { k } if k != u32::MAX => Partiality::Heuristic,
             _ => Partiality::UpperBound,
         };
         SolverCaps {
@@ -601,12 +568,6 @@ pub fn solve_observed(
         U64Solver::Reference => original::original_solve_observed(vi, max_iter, obs),
         U64Solver::Frontier3D => frontier3d::frontier3d_solve_observed(vi, max_iter, obs),
         U64Solver::Frontier2D => frontier2d::frontier2d_solve_observed(vi, max_iter, obs),
-        U64Solver::Frontier2DSoA => {
-            frontier2d_soa::frontier2d_soa_solve_observed(vi, max_iter, obs)
-        }
-        U64Solver::Frontier2DPad => {
-            frontier2d_pad::frontier2d_pad_solve_observed(vi, max_iter, obs)
-        }
         U64Solver::Frontier2DPar => {
             frontier2d_par::frontier2d_par_solve_observed(vi, max_iter, obs)
         }
@@ -637,15 +598,6 @@ pub fn solve_observed(
         U64Solver::FrontierStack => stack::frontier_stack_solve_observed(vi, max_iter, obs),
         U64Solver::BlockRefine => block::block_refine_solve_observed(vi, max_iter, obs),
         U64Solver::PyramidSweep => pyramid::pyramid_sweep_solve_observed(vi, max_iter, obs),
-        U64Solver::Frontier3DTau { tau } => {
-            tau::frontier3d_tau_solve_observed(vi, tau, max_iter, obs)
-        }
-        U64Solver::Frontier3DTopK { k } => {
-            topk::frontier3d_topk_solve_observed(vi, k, max_iter, obs)
-        }
-        U64Solver::Frontier3DCoarseTheta { step } => {
-            coarse_theta::frontier3d_coarse_theta_solve_observed(vi, step, max_iter, obs)
-        }
         U64Solver::StreamMimic => stream::stream_mimic_solve_observed(vi, max_iter, obs),
         U64Solver::PriorityLabelSetting => {
             priority::priority_solve_observed(vi, max_iter, true, obs)

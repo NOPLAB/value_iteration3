@@ -14,67 +14,16 @@
 //!                <goal_margin_radius> <goal_margin_theta>
 //!                <max_sweeps> <delta_threshold> <out_dir>
 
+#[path = "bench_common/mod.rs"]
+mod bench_common;
+
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::Write;
 use std::time::Instant;
 
+use bench_common::{arg, default_actions, extract_value_policy, load_map, write_npy_f64};
 use vi_reference::params::PROB_BASE;
-use vi_reference::{Action, OccupancyGrid, Quaternion, ValueIterator};
-
-fn arg<T: std::str::FromStr>(args: &[String], i: usize, name: &str) -> T
-where
-    <T as std::str::FromStr>::Err: std::fmt::Display,
-{
-    args.get(i)
-        .unwrap_or_else(|| panic!("missing arg {i} ({name})"))
-        .parse::<T>()
-        .unwrap_or_else(|e| panic!("bad arg {i} ({name}): {e}"))
-}
-
-/// 最小の `.npy` ライタ (float64 '<f8', C-order)。numpy が np.load で読める。
-fn write_npy_f64(path: &str, shape: &[usize], data: &[f64]) -> io::Result<()> {
-    let shape_str = shape
-        .iter()
-        .map(|d| d.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    // 1要素タプルでも trailing comma を付ける (numpy 慣例)。
-    let dict = format!(
-        "{{'descr': '<f8', 'fortran_order': False, 'shape': ({},), }}",
-        shape_str
-    );
-    let prefix = 10usize; // magic(6) + version(2) + header_len(2)
-    let mut header = dict;
-    let unpadded = prefix + header.len() + 1; // +1 for trailing '\n'
-    let pad = (64 - (unpadded % 64)) % 64;
-    for _ in 0..pad {
-        header.push(' ');
-    }
-    header.push('\n');
-    let hlen = header.len() as u16;
-    let mut f = File::create(path)?;
-    f.write_all(b"\x93NUMPY")?;
-    f.write_all(&[0x01, 0x00])?;
-    f.write_all(&hlen.to_le_bytes())?;
-    f.write_all(header.as_bytes())?;
-    let mut bytes = Vec::with_capacity(data.len() * 8);
-    for &v in data {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    f.write_all(&bytes)
-}
-
-fn default_actions() -> Vec<Action> {
-    // vi_compare の正典 6 アクション (本家 launch と ID 順まで一致)。
-    vec![
-        Action::new("forward", 0.3, 0.0, 0),
-        Action::new("back", -0.2, 0.0, 1),
-        Action::new("right", 0.0, -20.0, 2),
-        Action::new("rightfw", 0.2, -20.0, 3),
-        Action::new("left", 0.0, 20.0, 4),
-        Action::new("leftfw", 0.2, 20.0, 5),
-    ]
-}
+use vi_reference::ValueIterator;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -107,26 +56,7 @@ fn main() {
     let delta_threshold: f64 = arg(&args, 16, "delta_threshold");
     let out_dir: String = arg(&args, 17, "out_dir");
 
-    // occupancy (raw i8, len=width*height, row-major, ros2 bench_client の to_occupancy と同一)
-    let raw = std::fs::read(&occ_raw).expect("read occ_raw");
-    let n = (width as usize) * (height as usize);
-    assert_eq!(raw.len(), n, "occ_raw size {} != width*height {}", raw.len(), n);
-    let data: Vec<i8> = raw.iter().map(|&b| b as i8).collect();
-
-    let map = OccupancyGrid {
-        width,
-        height,
-        resolution,
-        origin_x,
-        origin_y,
-        origin_quat: Quaternion {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-            w: 1.0,
-        },
-        data,
-    };
+    let map = load_map(&occ_raw, width, height, resolution, origin_x, origin_y);
 
     // 本家 executeVi: int t = (int)(yaw_rad*180/M_PI) = (int)goal_yaw_deg。
     let goal_t = goal_yaw_deg as i32;
@@ -185,29 +115,8 @@ fn main() {
     }
     let elapsed = t0.elapsed().as_secs_f64();
 
-    // 価値・方策を (H=cell_num_y, W=cell_num_x, theta) C-order で取り出す (ros2 と同一の向き)。
-    let nx = vi.cell_num_x;
-    let ny = vi.cell_num_y;
-    let nt = vi.cell_num_t;
-    let mut value = Vec::with_capacity((nx * ny * nt) as usize);
-    let mut policy = Vec::with_capacity((nx * ny * nt) as usize);
-    for iy in 0..ny {
-        for ix in 0..nx {
-            for it in 0..nt {
-                let s = &vi.states[vi.to_index(ix, iy, it) as usize];
-                // ★本家 valueFunctionWriter は total_cost_/prob_base_ を **整数除算** (uint64/uint64)
-                //   してから float 化する (/value サービス出力)。サブステップの小数は切り捨てられる。
-                value.push((s.total_cost / PROB_BASE) as f64);
-                let pol = match s.optimal_action {
-                    Some(ai) => vi.actions[ai].id as f64,
-                    None => -1.0,
-                };
-                policy.push(pol);
-            }
-        }
-    }
+    let (value, policy, shape) = extract_value_policy(&vi);
 
-    let shape = [ny as usize, nx as usize, nt as usize];
     std::fs::create_dir_all(&out_dir).expect("mkdir out_dir");
     write_npy_f64(&format!("{out_dir}/value_ref.npy"), &shape, &value).expect("write value_ref");
     write_npy_f64(&format!("{out_dir}/policy_ref.npy"), &shape, &policy).expect("write policy_ref");

@@ -2,7 +2,7 @@
 //! 本家 u64 モデル（`value_iteration_raw`）へ移植。コスト数式は不変なので、到達可能セルの
 //! 収束値・方策は Reference (全走査) = 本家と bit-exact。
 
-use crate::solvers::observe::{NullObserver, SolveObserver, SolveOutcome};
+use crate::solvers::observe::{SolveObserver, SolveOutcome};
 use crate::solvers::frontier3d_driver;
 use crate::value_iterator::{value_iteration_raw, ValueIterator};
 
@@ -25,7 +25,3 @@ pub fn frontier3d_solve_observed(
     })
 }
 
-/// 従来 API (observer なし)。`(iters, updates, converged)`。
-pub fn frontier3d_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    frontier3d_solve_observed(vi, max_iter, &mut NullObserver).tuple()
-}

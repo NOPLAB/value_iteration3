@@ -46,7 +46,3 @@ pub fn original_solve_observed(
     SolveOutcome::running(iters, 0, converged)
 }
 
-/// 従来 API (observer なし)。`(iters, updates, converged)`。
-pub fn original_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    original_solve_observed(vi, max_iter, &mut crate::solvers::observe::NullObserver).tuple()
-}

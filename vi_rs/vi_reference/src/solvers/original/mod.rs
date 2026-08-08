@@ -14,7 +14,7 @@ pub mod solve;
 pub mod sweep_status;
 pub mod worker;
 
-pub use solve::{original_solve, original_solve_observed};
+pub use solve::original_solve_observed;
 pub use sweep_status::SweepWorkerStatus;
 
 #[cfg(test)]

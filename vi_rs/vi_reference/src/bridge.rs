@@ -135,6 +135,55 @@ pub fn downsample_occupancy(grid: &OccupancyGrid, scale: i32) -> OccupancyGrid {
     }
 }
 
+/// `downsample_occupancy` の楽観版。ブロック内に 1 つでも free があれば出力セルを free にする。
+///
+/// 本家の `downsample_occupancy` は障害物優先なので通路が片側最大 `(scale-1)·resolution` 細る。
+/// map_tsudanuma は unknown が 68% あり、`map_scale >= 4` では free **面積**は数 % しか減らないのに
+/// **通路のセル幅**が落ちる。VI の遷移はサブセルサンプリングによる約 2 セル幅の分布なので、
+/// 散り先に 1 つでも未到達セルがあると期待値が MAX_COST 側に張り付き、波がゴール近傍で止まる。
+///
+/// 安全余裕を地図に焼き込んではいけない。VI の `safety_radius` は硬い壁ではなく秒/セルのソフトな
+/// ペナルティで、膨張として焼き込むと scale 3 でも波が死ぬ (実測)。ここでは通路を開けるだけにする。
+pub fn downsample_occupancy_optimistic(grid: &OccupancyGrid, scale: i32) -> OccupancyGrid {
+    if scale <= 1 {
+        return grid.clone();
+    }
+    let (w, h, s) = (grid.width as usize, grid.height as usize, scale as usize);
+    let (ow, oh) = (w.div_ceil(s), h.div_ceil(s));
+    let mut data = vec![100i8; ow * oh];
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let mut free = false;
+            'blk: for dy in 0..s {
+                let iy = oy * s + dy;
+                if iy >= h {
+                    break;
+                }
+                for dx in 0..s {
+                    let ix = ox * s + dx;
+                    if ix >= w {
+                        break;
+                    }
+                    if grid.data[iy * w + ix] == 0 {
+                        free = true;
+                        break 'blk;
+                    }
+                }
+            }
+            data[oy * ow + ox] = if free { 0 } else { 100 };
+        }
+    }
+    OccupancyGrid {
+        width: ow as i32,
+        height: oh as i32,
+        resolution: grid.resolution * scale as f64,
+        origin_x: grid.origin_x,
+        origin_y: grid.origin_y,
+        origin_quat: grid.origin_quat.clone(),
+        data,
+    }
+}
+
 /// total_cost slice → `OccupancyGrid` `data[]` (length `width*height`).
 ///
 /// - `total_cost == MAX_COST` (never reached) → `-1` (unknown).

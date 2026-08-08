@@ -4,7 +4,7 @@
 
 use crate::params::MAX_COST;
 use crate::solvers::observe::{
-    BoundaryPacer, InPlaceProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
+    BoundaryPacer, InPlaceProbe, SolveFlow, SolveObserver, SolveOutcome,
 };
 use crate::value_iterator::{value_iteration_raw, ValueIterator};
 
@@ -47,11 +47,6 @@ pub fn block_refine_solve_observed(
     obs: &mut dyn SolveObserver,
 ) -> SolveOutcome {
     block_refine_sized(vi, BLOCK, LOCAL_SWEEPS, max_iter, obs)
-}
-
-/// 従来 API (observer なし)。`(iters, updates, converged)`。
-pub fn block_refine_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    block_refine_solve_observed(vi, max_iter, &mut NullObserver).tuple()
 }
 
 /// ブロックサイズ・inner sweep 数を指定した BlockRefine 一回分。PyramidSweep が

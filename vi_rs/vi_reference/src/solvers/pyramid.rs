@@ -9,7 +9,7 @@
 //! 事前伝播による加速のみを担う（coarse-to-fine の精神は保持）。
 
 use crate::solvers::block::block_refine_sized;
-use crate::solvers::observe::{NullObserver, SolveObserver, SolveOutcome};
+use crate::solvers::observe::{SolveObserver, SolveOutcome};
 use crate::value_iterator::ValueIterator;
 
 const FINEST: i32 = 8; // 最終レベルのブロックサイズ (= BlockRefine 既定)
@@ -65,7 +65,3 @@ pub fn pyramid_sweep_solve_observed(
     SolveOutcome::running(total_iters, total_updates, converged)
 }
 
-/// 従来 API (observer なし)。`(iters, updates, converged)`。
-pub fn pyramid_sweep_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    pyramid_sweep_solve_observed(vi, max_iter, &mut NullObserver).tuple()
-}

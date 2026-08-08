@@ -1,5 +1,6 @@
-//! A2: A1(SoA) にパディング + オフセット事前計算を重ねた frontier2d。A1 後の inner loop で
-//! 相対的に支配的になったインデックス演算 (2 乗算) と境界 2 分岐を除去する。
+//! パディング + オフセット事前計算の frontier2d 共有モデル (`Padded`)。
+//! ソルバ本体は `frontier2d_par` / `frontier2d_par_unsafe` / `frontier2d_fused` が
+//! このモデルの上に載る (単独の直列 pad ソルバは削除済み)。
 //!
 //! - **パディング**: グリッドを最大変位 (mx,my) 分だけ非 free セルで囲う。範囲外アクセスは
 //!   パディング (free=false) を読んで `!free → MAX_COST` となり、本家の「範囲外で即 MAX_COST」と
@@ -14,12 +15,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::params::{MAX_COST, PROB_BASE_BIT};
-use crate::solvers::observe::{
-    MaterializeProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
-};
 use crate::value_iterator::ValueIterator;
 
-use super::{displacement, frontier2d_driver, seed_frontier_2d, Frontier2DSweep};
+use super::displacement;
 
 /// `hot` 配列の読み出し抽象。直列/Jacobi 版は素の `[[u64; 2]]` スライス、非同期版
 /// (`frontier2d_par_unsafe`) は Relaxed atomic ビューを渡す。Relaxed load は
@@ -169,79 +167,4 @@ pub(crate) fn action_cost_pad<H: HotCells + ?Sized>(
         cost = cost.wrapping_add(h[0].wrapping_add(h[1]).wrapping_mul(prob));
     }
     cost >> PROB_BASE_BIT
-}
-
-/// pad モデル: `Padded` と opt を所有し、境界では要求時にだけ states へ書き戻す。
-struct PadSweep<'a> {
-    vi: &'a mut ValueIterator,
-    m: Padded,
-    opt: Vec<Option<usize>>,
-}
-
-impl Frontier2DSweep for PadSweep<'_> {
-    fn cell(&mut self, ixu: u32, iyu: u32) -> u64 {
-        let (nx, nt) = (self.m.nx, self.m.nt);
-        let (ix, iy) = (ixu as i32, iyu as i32);
-        let orig_col = (ix * nt + iy * (nt * nx)) as usize;
-        let pad_col = self.m.pad_col(ix, iy);
-        let mut upd = 0u64;
-        for it in 0..nt {
-            let pad_idx = (pad_col + it as i64) as usize;
-            if !self.m.free[pad_idx] || self.m.finals[pad_idx] {
-                continue;
-            }
-            let before = self.m.hot[pad_idx][0];
-            let mut min_cost = MAX_COST;
-            let mut min_action: Option<usize> = None;
-            for (ai, per_theta) in self.m.precomp.iter().enumerate() {
-                let c = action_cost_pad(
-                    self.m.hot.as_slice(),
-                    &self.m.free,
-                    &per_theta[it as usize],
-                    pad_col,
-                );
-                if c < min_cost {
-                    min_cost = c;
-                    min_action = Some(ai);
-                }
-            }
-            self.m.hot[pad_idx][0] = min_cost;
-            self.opt[orig_col + it as usize] = min_action;
-            if min_cost < before {
-                upd += 1;
-            }
-        }
-        upd
-    }
-
-    fn boundary(&mut self, obs: &mut dyn SolveObserver, iters: u32, updates: u64) -> SolveFlow {
-        let (m, opt, vi) = (&self.m, &self.opt, &mut *self.vi);
-        let mut mat = |vi: &mut ValueIterator| m.write_back(vi, Some(opt));
-        let mut probe = MaterializeProbe::new(vi, &mut mat, iters, updates);
-        obs.boundary(&mut probe)
-    }
-}
-
-/// セット済み `ValueIterator` を Frontier2D-pad で収束まで解く。
-pub fn frontier2d_pad_solve_observed(
-    vi: &mut ValueIterator,
-    max_iter: u32,
-    obs: &mut dyn SolveObserver,
-) -> SolveOutcome {
-    let m = Padded::build(vi);
-    let (nx, ny, mx, my) = (m.nx, m.ny, m.mx, m.my);
-
-    let opt: Vec<Option<usize>> = vi.states.iter().map(|s| s.optimal_action).collect();
-    let seed = seed_frontier_2d(vi);
-
-    let mut model = PadSweep { vi, m, opt };
-    let out = frontier2d_driver(nx, ny, seed, mx as u32, my as u32, max_iter, obs, &mut model);
-
-    model.m.write_back(model.vi, Some(&model.opt));
-    out
-}
-
-/// 従来 API (observer なし)。`(iters, updates, converged)`。
-pub fn frontier2d_pad_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    frontier2d_pad_solve_observed(vi, max_iter, &mut NullObserver).tuple()
 }

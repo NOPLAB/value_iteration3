@@ -1,13 +1,12 @@
 //! 全 `U64Solver` 変種の共通 conformance テスト。散在していた per-solver
-//! `parity_standard_maps_*` テストの置き換えで、**全ソルバ** (近似は実パラメタ付きでも)
-//! を同じ観点でゲートする:
+//! `parity_standard_maps_*` テストの置き換えで、**全ソルバ**を同じ観点でゲートする:
 //!
 //! 1. **収束**: 標準 3 マップ (empty / obstacle / sentinel) で `converged`。
 //! 2. **正しさ** (caps 駆動):
 //!    - `caps().exact` → Reference 固定点と bit-exact (値 + 方策)。
 //!    - 近似 (`exact == false`) → Reference が到達する全セルへ到達し、
 //!      `partial == UpperBound` なら全セルで V ≥ v* (妥当な Bellman 更新のみ =
-//!      上界不変条件)。`Heuristic` (topk 枝刈り) は到達被覆のみ。
+//!      上界不変条件)。
 //! 3. **境界観測**: `boundary` が少なくとも 1 回呼ばれ、`iters` が単調非減少で、
 //!    プローブの場が Partiality の不変条件 (UpperBound: V ≥ v* / ExactPrefix:
 //!    V ∈ {v*, MAX_COST}) を**solve の途中でも**満たす。
@@ -18,22 +17,20 @@
 //!
 //! Reference 固定点 (本家全走査) が全ソルバ共通のオラクル。
 
-use crate::params::{MAX_COST, PROB_BASE};
+use crate::params::MAX_COST;
 use crate::planner::rollout_path_on;
 use crate::solvers::observe::{SolveFlow, SolveObserver, SolveProbe};
 use crate::solvers::test_support::{make_vi, run_reference_to_fixed_point, REACH};
 use crate::solvers::{solve, solve_observed, Partiality, U64Solver};
 use crate::value_iterator::ValueIterator;
 
-/// テスト対象の全変種。近似ソルバは **実パラメタ付き** (近似経路を実際に踏む) でも並べる。
+/// テスト対象の全変種。
 fn all_solvers() -> Vec<(&'static str, U64Solver)> {
     use U64Solver::*;
     vec![
         ("reference", Reference),
         ("frontier3d", Frontier3D),
         ("frontier2d", Frontier2D),
-        ("frontier2d_soa", Frontier2DSoA),
-        ("frontier2d_pad", Frontier2DPad),
         ("frontier2d_par", Frontier2DPar),
         ("frontier2d_par_unsafe", Frontier2DParUnsafe),
         ("frontier2d_fused", Frontier2DFused),
@@ -43,11 +40,6 @@ fn all_solvers() -> Vec<(&'static str, U64Solver)> {
         ("block_refine", BlockRefine),
         ("pyramid_sweep", PyramidSweep),
         ("stream_mimic", StreamMimic),
-        ("tau0", Frontier3DTau { tau: 0 }),
-        ("tau_approx", Frontier3DTau { tau: PROB_BASE / 4 }),
-        ("topk_full", Frontier3DTopK { k: u32::MAX }),
-        ("topk3", Frontier3DTopK { k: 3 }),
-        ("coarse_theta4", Frontier3DCoarseTheta { step: 4 }),
         ("prio_ls", PriorityLabelSetting),
         ("prio_lc", PriorityLabelCorrecting),
     ]
@@ -208,9 +200,8 @@ impl SolveObserver for InvariantObserver<'_> {
         }
         self.prev_iters = iters;
 
-        // 場の不変条件は数回に 1 回だけ検証 (毎境界で具現化すると O(n·境界数) が嵩む
-        // だけでなく、Heuristic では検証自体が定義されない)。
-        if self.partial == Partiality::Heuristic || self.calls % 3 != 1 {
+        // 場の不変条件は数回に 1 回だけ検証 (毎境界で具現化すると O(n·境界数) が嵩む)。
+        if self.calls % 3 != 1 {
             return SolveFlow::Continue;
         }
         let p = probe.policy();
@@ -224,7 +215,6 @@ impl SolveObserver for InvariantObserver<'_> {
                     let ok = match self.partial {
                         Partiality::UpperBound => b >= a,
                         Partiality::ExactPrefix => b == MAX_COST || b == a,
-                        Partiality::Heuristic => true,
                     };
                     if !ok {
                         self.violations.push(format!(
@@ -367,12 +357,6 @@ fn conformance_stop_yields_rollout_ready_field() {
 fn caps_expectations() {
     use U64Solver::*;
     assert!(Reference.caps().exact);
-    assert!(Frontier3DTau { tau: 0 }.caps().exact);
-    assert!(!Frontier3DTau { tau: 1 }.caps().exact);
-    assert!(Frontier3DTopK { k: u32::MAX }.caps().exact);
-    assert!(!Frontier3DTopK { k: 3 }.caps().exact);
-    assert_eq!(Frontier3DTopK { k: 3 }.caps().partial, Partiality::Heuristic);
-    assert!(Frontier3DCoarseTheta { step: 4 }.caps().exact);
     assert!(!PriorityLabelSetting.caps().exact);
     assert!(PriorityLabelCorrecting.caps().exact);
     let compact = Frontier2DSparseCompact { band: 0 }.caps();

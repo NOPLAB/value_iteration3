@@ -10,13 +10,10 @@
 //! - 2D word flat index: `iy * words_per_row + wi`.
 //! - 3D word flat index: `it * map_y * words_per_row + iy * words_per_row + wi`.
 
-pub(crate) mod conv;
 pub(crate) mod enumerate;
 pub(crate) mod ops;
 
 pub use enumerate::{Bitboard2DIter, Bitboard3DIter};
-
-use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -116,24 +113,9 @@ impl Bitboard2D {
         ops::or_slice(&mut self.data, &other.data);
     }
 
-    /// Bitwise complement, masked to valid bits (out-of-range bits stay zero).
-    pub fn complement(&self) -> Self {
-        ops::complement2d(self)
-    }
-
     /// Lazy iterator over `(ix, iy)` of every set bit.
     pub fn enumerate(&self) -> Bitboard2DIter<'_> {
         Bitboard2DIter::new(self)
-    }
-
-    /// Convert from an `Array2<bool>` with shape `[map_y, map_x]`.
-    pub fn from_logical(mask: ArrayView2<bool>) -> Self {
-        conv::from_logical2d(mask)
-    }
-
-    /// Convert to `Array2<bool>` with shape `[map_y, map_x]`.
-    pub fn to_logical(&self) -> Array2<bool> {
-        conv::to_logical2d(self)
     }
 
     // --- internal accessors used by sibling modules ---
@@ -224,24 +206,9 @@ impl Bitboard3D {
         ops::or_slice(&mut self.data, &other.data);
     }
 
-    /// Bitwise complement, masked to valid bits.
-    pub fn complement(&self) -> Self {
-        ops::complement3d(self)
-    }
-
     /// Lazy iterator over `(ix, iy, it)` of every set bit.
     pub fn enumerate(&self) -> Bitboard3DIter<'_> {
         Bitboard3DIter::new(self)
-    }
-
-    /// Convert from an `Array3<bool>` with shape `[map_y, map_x, n_theta]`.
-    pub fn from_logical(mask: ArrayView3<bool>) -> Self {
-        conv::from_logical3d(mask)
-    }
-
-    /// Convert to `Array3<bool>` with shape `[map_y, map_x, n_theta]`.
-    pub fn to_logical(&self) -> Array3<bool> {
-        conv::to_logical3d(self)
     }
 
     // --- internal accessors ---
@@ -368,7 +335,6 @@ mod tests {
 #[cfg(test)]
 mod prop_tests {
     use super::*;
-    use ndarray::Array3;
     use proptest::prelude::*;
 
     // -----------------------------------------------------------------------
@@ -485,48 +451,6 @@ mod prop_tests {
             }
             let count = bb.enumerate().count() as u64;
             prop_assert_eq!(count, bb.popcount());
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // u. prop_logical_roundtrip_2d
-    // -----------------------------------------------------------------------
-    proptest! {
-        #[test]
-        fn prop_logical_roundtrip_2d(
-            map_x in 1u32..=20,
-            map_y in 1u32..=20,
-            bits in proptest::collection::vec(proptest::bool::ANY, 1..=400usize),
-        ) {
-            let total = (map_x * map_y) as usize;
-            let mut bb = Bitboard2D::new(map_x, map_y);
-            for (i, v) in bits.iter().enumerate().take(total) {
-                if *v { bb.set((i as u32) % map_x, (i as u32) / map_x % map_y); }
-            }
-            let logical = bb.to_logical();
-            let bb2 = Bitboard2D::from_logical(logical.view());
-            prop_assert_eq!(bb, bb2);
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // v. prop_logical_roundtrip_3d  (Minor #8)
-    // -----------------------------------------------------------------------
-    proptest! {
-        #[test]
-        fn prop_logical_roundtrip_3d(
-            map_x in 1u32..=10,
-            map_y in 1u32..=10,
-            n_theta in 1u32..=10,
-        ) {
-            // Deterministic pattern: set cell if (ix + iy + it) % 3 == 0
-            let mask = Array3::from_shape_fn(
-                (map_y as usize, map_x as usize, n_theta as usize),
-                |(iy, ix, it)| (ix + iy + it) % 3 == 0,
-            );
-            let bb = Bitboard3D::from_logical(mask.view());
-            let back = bb.to_logical();
-            prop_assert_eq!(mask, back);
         }
     }
 

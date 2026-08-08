@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["vi_core", "vi_bench", "vi_reference"]
+members = ["vi_bench", "vi_reference"]
 
 [workspace.package]
 edition = "2021"
@@ -9,8 +9,6 @@ rust-version = "1.75"
 [workspace.dependencies]
 ndarray   = "0.16"
 memmap2   = "0.9"
-rayon     = "1.10"
-thiserror = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
 clap      = { version = "4", features = ["derive"] }

@@ -312,46 +312,6 @@ pub(crate) fn dilate3d(bb: &Bitboard3D, dx: u32, dy: u32, dt: u32) -> Bitboard3D
     }
 }
 
-// ---------------------------------------------------------------------------
-// complement
-// ---------------------------------------------------------------------------
-
-/// In-place bitwise complement of every row, masked to valid bits via `rmask`.
-/// Row count is implied by `data.len() / wpr`, so this serves both 2-D
-/// (`map_y` rows) and 3-D (`n_theta * map_y` rows) boards.
-#[inline]
-pub(crate) fn complement_rows(data: &mut [u64], wpr: usize, rmask: &[u64]) {
-    for chunk in data.chunks_mut(wpr) {
-        for (w, word) in chunk.iter_mut().enumerate() {
-            *word = (!*word) & rmask[w];
-        }
-    }
-}
-
-pub(crate) fn complement2d(bb: &Bitboard2D) -> Bitboard2D {
-    let rmask = row_mask(bb.map_x());
-    let mut data = bb.data().to_vec();
-    complement_rows(&mut data, bb.words_per_row() as usize, &rmask);
-    Bitboard2D {
-        data,
-        map_x: bb.map_x(),
-        map_y: bb.map_y(),
-        words_per_row: bb.words_per_row(),
-    }
-}
-
-pub(crate) fn complement3d(bb: &Bitboard3D) -> Bitboard3D {
-    let rmask = row_mask(bb.map_x());
-    let mut data = bb.data().to_vec();
-    complement_rows(&mut data, bb.words_per_row() as usize, &rmask);
-    Bitboard3D {
-        data,
-        map_x: bb.map_x(),
-        map_y: bb.map_y(),
-        n_theta: bb.n_theta(),
-        words_per_row: bb.words_per_row(),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests for ops
@@ -478,29 +438,6 @@ mod tests {
         assert!(res.test(0, 0));
         assert!(res.test(3, 2));
         assert!(res.test(7, 4));
-    }
-
-    // -----------------------------------------------------------------------
-    // m. complement masks oob bits
-    // -----------------------------------------------------------------------
-    #[test]
-    fn unit_complement_masks_oob_bits() {
-        let map_x = 5u32;
-        let map_y = 3u32;
-        let bb = Bitboard2D::new(map_x, map_y);
-        let c = bb.complement();
-        // Only map_x * map_y bits should be set, not 64 * map_y
-        assert_eq!(c.popcount(), (map_x * map_y) as u64);
-    }
-
-    #[test]
-    fn unit_complement_3d_masks_oob_bits() {
-        let map_x = 5u32;
-        let map_y = 3u32;
-        let n_theta = 4u32;
-        let bb = Bitboard3D::new(map_x, map_y, n_theta);
-        let c = bb.complement();
-        assert_eq!(c.popcount(), (map_x * map_y * n_theta) as u64);
     }
 
     // -----------------------------------------------------------------------

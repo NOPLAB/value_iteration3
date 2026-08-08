@@ -31,10 +31,7 @@ impl ValueIterator {
             let order_len = self.sweep_orders[order_idx].len();
             for k in 0..order_len {
                 let i = self.sweep_orders[order_idx][k] as usize;
-                let d = self.value_iteration_at(i);
-                if d > max_delta {
-                    max_delta = d;
-                }
+                max_delta = max_delta.max(self.value_iteration_at(i));
             }
             if let Some(st) = self.thread_status.get_mut(&id) {
                 st.delta = (max_delta >> PROB_BASE_BIT) as f64; // ★二重シフト (報告用)

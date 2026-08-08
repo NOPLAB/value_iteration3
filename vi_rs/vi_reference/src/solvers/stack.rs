@@ -8,7 +8,7 @@
 
 use crate::params::MAX_COST;
 use crate::solvers::observe::{
-    BoundaryPacer, InPlaceProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
+    BoundaryPacer, InPlaceProbe, SolveFlow, SolveObserver, SolveOutcome,
 };
 use crate::solvers::{displacement, Bitboard2D};
 use crate::value_iterator::{value_iteration_raw, ValueIterator};
@@ -86,7 +86,3 @@ pub fn frontier_stack_solve_observed(
     SolveOutcome::running(iters, updates, stack_popcount(&frontier) == 0)
 }
 
-/// 従来 API (observer なし)。`(iters, updates, converged)`。
-pub fn frontier_stack_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    frontier_stack_solve_observed(vi, max_iter, &mut NullObserver).tuple()
-}

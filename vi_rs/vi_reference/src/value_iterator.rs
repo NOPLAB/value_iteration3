@@ -206,42 +206,6 @@ impl ValueIterator {
         self.states = states;
     }
 
-    /// 本家 `setMapWithCostGrid`。`margin` は本家にあるが未使用。
-    pub fn set_map_with_cost_grid(
-        &mut self,
-        map: &OccupancyGrid,
-        theta_cell_num: i32,
-        safety_radius: f64,
-        _safety_radius_penalty: f64,
-        goal_margin_radius: f64,
-        goal_margin_theta: i32,
-    ) {
-        self.cell_num_t = theta_cell_num;
-        self.goal_margin_radius = goal_margin_radius;
-        self.goal_margin_theta = goal_margin_theta;
-        self.cell_num_x = map.width;
-        self.cell_num_y = map.height;
-        self.xy_resolution = map.resolution;
-        self.t_resolution = (360 / self.cell_num_t) as f64;
-        self.map_origin_x = map.origin_x;
-        self.map_origin_y = map.origin_y;
-        self.map_origin_quat = map.origin_quat.clone();
-
-        self.states.clear();
-        let _margin = (safety_radius / self.xy_resolution).ceil() as i32; // 本家にあるが未使用
-        for y in 0..self.cell_num_y {
-            for x in 0..self.cell_num_x {
-                // 本家 `(unsigned int)(map.data[x + cell_num_x_*y] & 0xFF)`。
-                let cost = (map.data[(x + self.cell_num_x * y) as usize] as u8) as u32;
-                for t in 0..self.cell_num_t {
-                    self.states.push(State::from_cost(x, y, t, cost));
-                }
-            }
-        }
-        self.set_state_transition();
-        self.set_sweep_orders();
-    }
-
     /// 本家 `setSweepOrders`。6 種の走査順を生成。既に生成済みなら何もしない。
     /// ★[4]=[0]全体+[1]後半、[5]=[1]前半 というアンバランス/重複を逐語再現。
     pub(crate) fn set_sweep_orders(&mut self) {

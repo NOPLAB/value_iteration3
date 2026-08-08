@@ -3,7 +3,7 @@
 //! **固有バグ**を保持する。
 
 use crate::msg::OccupancyGrid;
-use crate::params::{MAX_COST, PROB_BASE, PROB_BASE_BIT};
+use crate::params::{MAX_COST, PROB_BASE};
 
 #[derive(Clone, Debug)]
 pub struct State {
@@ -62,22 +62,6 @@ impl State {
             }
         }
         s
-    }
-
-    /// 本家 `State(int x, int y, int theta, unsigned int cost)`。
-    pub fn from_cost(x: i32, y: i32, theta: i32, cost: u32) -> Self {
-        let free = cost != 255;
-        State {
-            ix: x,
-            iy: y,
-            it: theta,
-            total_cost: MAX_COST,
-            penalty: if free { (cost as u64) << PROB_BASE_BIT } else { 0 },
-            local_penalty: 0,
-            final_state: false,
-            optimal_action: None,
-            free,
-        }
     }
 }
 
@@ -146,15 +130,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn from_cost_free_and_obstacle() {
-        let free = State::from_cost(2, 3, 5, 100);
-        assert!(free.free);
-        assert_eq!(free.penalty, 100u64 << PROB_BASE_BIT);
-        assert_eq!(free.total_cost, MAX_COST);
-
-        let occ = State::from_cost(2, 3, 5, 255);
-        assert!(!occ.free);
-        assert_eq!(occ.penalty, 0);
-    }
 }

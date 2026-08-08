@@ -1,11 +1,11 @@
 //! 本家 `ValueIteratorLocal` 忠実移植。`ValueIterator` を内包 (合成) し override を再定義。
 //! local の `actionCostLocal` は本家 `actionCost` と完全同一なので base 経由で計算する。
 
-use std::f64::consts::PI;
+
 
 use crate::action::Action;
 use crate::msg::{LaserScan, OccupancyGrid};
-use crate::params::{PROB_BASE, PROB_BASE_BIT};
+use crate::params::PROB_BASE_BIT;
 use crate::value_iterator::ValueIterator;
 
 pub struct ValueIteratorLocal {
@@ -84,18 +84,6 @@ impl ValueIteratorLocal {
         }
     }
 
-    /// 本家 `localValueIterationWorker`。status が canceled/goal の間 executing に書き換え、
-    /// その後 status が canceled/goal になるまで local ループを回す (背景スレッド前提)。
-    /// 注: 決定的テストでは `local_value_iteration_loop` を直接呼ぶこと。
-    pub fn local_value_iteration_worker(&mut self, _id: i32) {
-        while self.base.status == "canceled" || self.base.status == "goal" {
-            self.base.status = "executing".to_string();
-        }
-        while self.base.status != "canceled" && self.base.status != "goal" {
-            self.local_value_iteration_loop();
-        }
-    }
-
     /// 本家 `setLocalCost`。レーザヒット点周辺に local_penalty を設定/半減。
     pub fn set_local_cost(&mut self, msg: &LaserScan, x: f64, y: f64, t: f64) {
         let start_angle = msg.angle_min;
@@ -159,61 +147,6 @@ impl ValueIteratorLocal {
         };
     }
 
-    /// 本家 `ValueIteratorLocal::posToAction` (override)。
-    pub fn pos_to_action(&mut self, x: f64, y: f64, t_rad: f64) -> Option<usize> {
-        let ix = ((x - self.base.map_origin_x) / self.base.xy_resolution).floor() as i32;
-        let iy = ((y - self.base.map_origin_y) / self.base.xy_resolution).floor() as i32;
-        let t = (180.0 * t_rad / PI) as i32;
-        let it = (((t + 360 * 100) % 360) as f64 / self.base.t_resolution).floor() as i32;
-        let index = self.base.to_index(ix, iy, it) as usize;
-        if self.base.states[index].final_state {
-            self.base.status = "goal".to_string();
-            None
-        } else if self.base.states[index].optimal_action.is_some() {
-            self.base.states[index].optimal_action
-        } else {
-            None
-        }
-    }
-
-    /// 本家 `makeLocalValueFunctionMap`。
-    pub fn make_local_value_function_map(
-        &self,
-        threshold: i32,
-        x: f64,
-        y: f64,
-        yaw_rad: f64,
-    ) -> OccupancyGrid {
-        let nx_local = self.local_ixy_range * 2 + 1;
-        let ny_local = self.local_ixy_range * 2 + 1;
-        let it = ((((yaw_rad / PI * 180.0) as i32 + 360 * 100) % 360) as f64
-            / self.base.t_resolution)
-            .floor() as i32;
-        let mut data: Vec<i8> = Vec::new();
-        for yy in self.local_iy_min..=self.local_iy_max {
-            for xx in self.local_ix_min..=self.local_ix_max {
-                let index = self.base.to_index(xx, yy, it) as usize;
-                let cost = self.base.states[index].total_cost as f64 / PROB_BASE as f64;
-                let val: i32 = if cost < threshold as f64 {
-                    (cost / threshold as f64 * 250.0) as i32
-                } else if self.base.states[index].free {
-                    250
-                } else {
-                    255
-                };
-                data.push(val as u8 as i8);
-            }
-        }
-        OccupancyGrid {
-            width: nx_local,
-            height: ny_local,
-            resolution: self.base.xy_resolution,
-            origin_x: x - self.local_xy_range,
-            origin_y: y - self.local_xy_range,
-            origin_quat: self.base.map_origin_quat.clone(),
-            data,
-        }
-    }
 }
 
 #[cfg(test)]

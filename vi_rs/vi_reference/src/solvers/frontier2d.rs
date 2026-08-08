@@ -3,7 +3,7 @@
 //! 安い代わりに per-cell 仕事量が N_THETA 倍。収束値・方策は Reference = 本家と bit-exact。
 
 use crate::solvers::observe::{
-    InPlaceProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
+    InPlaceProbe, SolveFlow, SolveObserver, SolveOutcome,
 };
 use crate::solvers::{displacement, frontier2d_driver, seed_frontier_2d, Frontier2DSweep};
 use crate::value_iterator::{value_iteration_raw, ValueIterator};
@@ -51,7 +51,3 @@ pub fn frontier2d_solve_observed(
     frontier2d_driver(nx, ny, seed, mx as u32, my as u32, max_iter, obs, &mut model)
 }
 
-/// 従来 API (observer なし)。`(iters, updates, converged)`。
-pub fn frontier2d_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    frontier2d_solve_observed(vi, max_iter, &mut NullObserver).tuple()
-}

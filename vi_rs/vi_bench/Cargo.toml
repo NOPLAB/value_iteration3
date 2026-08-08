@@ -10,16 +10,6 @@ rust-version.workspace = true
 vi_reference = { path = "../vi_reference" }
 criterion    = { workspace = true }
 clap         = { workspace = true }
-# bench_map の compact ソルバ用ディスク mmap 出力（CompactSink 実装 MmapSink）。
-memmap2      = { workspace = true }
-
-[features]
-default = []
-# criterion / bench_summary が回す既定ソルバはシリアル実装。マルチスレッド版
-# (frontier2d_par* 系) は bench_map から直接選ぶ運用で、この feature では切り替え
-# ない。`make rs-bench-parallel` が `--features parallel` を渡すので互換のため残すが、
-# bench_summary 側では no-op。
-parallel = []
 
 [[bench]]
 name = "reference"

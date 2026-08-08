@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::params::MAX_COST;
 use crate::solvers::observe::{
-    MaterializeProbe, NullObserver, SolveFlow, SolveObserver, SolveOutcome,
+    MaterializeProbe, SolveFlow, SolveObserver, SolveOutcome,
 };
 use crate::value_iterator::ValueIterator;
 
@@ -130,7 +130,3 @@ pub fn frontier2d_par_unsafe_solve_observed(
     out
 }
 
-/// 従来 API (observer なし)。`(iters, updates, converged)`。
-pub fn frontier2d_par_unsafe_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    frontier2d_par_unsafe_solve_observed(vi, max_iter, &mut NullObserver).tuple()
-}

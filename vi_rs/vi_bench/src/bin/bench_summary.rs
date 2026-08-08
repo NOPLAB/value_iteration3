@@ -13,9 +13,7 @@
 //! `--smoke` は単一 8×8 Empty・budget=1 に潰し、CI でワイヤリングだけ検証する
 //! （budget=1 では収束しないのでゲートはスキップ）。
 //!
-//! `--parallel`: bench_summary が回す既定ソルバはシリアル実装なのでフラグは no-op
-//! （`make rs-bench-parallel` 互換のため受け付けるだけ）。マルチスレッド版
-//! (frontier2d_par* 系, std::thread ベース) は bench_map から直接選ぶ。
+//! マルチスレッド版 (frontier2d_par* 系, std::thread ベース) は bench_map から直接選ぶ。
 
 use std::fs;
 use std::io::Write;
@@ -32,7 +30,7 @@ use vi_reference::ValueIterator;
 /// 到達可能とみなす total_cost 上限（compare.py の value>=1e6 境界と整合）。
 const REACH: u64 = 1_000_000u64 * PROB_BASE;
 
-/// 全ソルバが Reference と bit-exact であるべき（no-op パラメータ）。
+/// 全ソルバが Reference と bit-exact であるべき。
 /// いずれかで mismatch>0 なら非ゼロ終了。
 const EXACT_SOLVERS: &[&str] = &[
     "reference",
@@ -41,9 +39,6 @@ const EXACT_SOLVERS: &[&str] = &[
     "frontier_stack",
     "block_refine",
     "pyramid_sweep",
-    "frontier3d_tau",
-    "frontier3d_topk",
-    "frontier3d_coarse_theta",
     "stream_mimic",
 ];
 
@@ -80,11 +75,6 @@ struct Args {
     #[arg(long, default_value_t = false)]
     smoke: bool,
 
-    /// Accepted for `make rs-bench-parallel` compatibility. bench_summary's
-    /// solver set is serial, so this is a no-op (a note is printed when set).
-    /// The multithreaded solvers (frontier2d_par* ) are driven via bench_map.
-    #[arg(long, default_value_t = false)]
-    parallel: bool,
 }
 
 /// A single (case, solver) measurement.
@@ -99,8 +89,6 @@ struct CaseRow {
 }
 
 /// Solver registry. Reference MUST be first so it produces the oracle table.
-/// 近似ソルバは no-op パラメータ（tau=0 / k=全 outcome / step=1）で Frontier3D
-/// 等価 → Reference と bit-exact。
 fn registry() -> Vec<(&'static str, U64Solver)> {
     use U64Solver::*;
     vec![
@@ -110,9 +98,6 @@ fn registry() -> Vec<(&'static str, U64Solver)> {
         ("frontier_stack", FrontierStack),
         ("block_refine", BlockRefine),
         ("pyramid_sweep", PyramidSweep),
-        ("frontier3d_tau", Frontier3DTau { tau: 0 }),
-        ("frontier3d_topk", Frontier3DTopK { k: u32::MAX }),
-        ("frontier3d_coarse_theta", Frontier3DCoarseTheta { step: 1 }),
         ("stream_mimic", StreamMimic),
     ]
 }
@@ -181,10 +166,6 @@ fn write_csv(path: &Path, rows: &[CaseRow]) -> std::io::Result<()> {
 
 fn main() -> ExitCode {
     let mut args = Args::parse();
-
-    if args.parallel {
-        eprintln!("note: --parallel is a no-op here (bench_summary's solver set is serial); proceeding serial");
-    }
 
     if args.smoke {
         args.sizes = vec![8];

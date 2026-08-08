@@ -58,10 +58,8 @@ use clap::Parser;
 use vi_bench::params::{canonical_actions, MAX_ACTION_FW_M, N_THETA};
 use vi_bench::pgm::{self, Occupancy, PgmMap};
 use vi_reference::params::{MAX_COST, PROB_BASE};
-use memmap2::MmapMut;
-use vi_reference::solvers::compact_zip::CompressedRamSink;
 use vi_reference::solvers::frontier2d_sparse_compact::{
-    default_threads, mapped_goal_cell_count, solve_compact_mapped, CompactSink, RamSink,
+    default_threads, mapped_goal_cell_count, solve_compact_mapped, CompactSink, MmapSink, RamSink,
 };
 use vi_reference::solvers::{solve, U64SolveStats, U64Solver};
 use vi_reference::{Action, OccupancyGrid, Quaternion, State, ValueIterator};
@@ -156,11 +154,6 @@ struct Args {
     #[arg(long)]
     compact_out_dir: Option<PathBuf>,
 
-    /// compact の確定出力を可逆圧縮 RAM sink（`CompressedRamSink`、列単位 varint 符号化）に
-    /// 置く。生 RAM sink の ~12 B/state を ~1 B/state に落とす（--compact-out-dir と排他）。
-    #[arg(long, default_value_t = false, conflicts_with = "compact_out_dir")]
-    compact_zip: bool,
-
     /// Optional CSV output path (parent dirs created).
     #[arg(long)]
     out: Option<PathBuf>,
@@ -220,58 +213,6 @@ struct Row {
     updates: u64,
     total_ms: f64,
     converged: bool,
-}
-
-/// `frontier2d_sparse_compact` の確定出力をディスク mmap に置く `CompactSink` 実装。value (u64 LE)
-/// と policy (i32 LE) を 2 ファイルに分け、列連続で write、orig 単位で read する。これで出力の
-/// O(total) RAM をディスクへ外せる（巨大マップ対応）。未書き込み = 到達不能 → (MAX_COST, -1)。
-struct MmapSink {
-    value: MmapMut,  // nstates * 8 bytes
-    action: MmapMut, // nstates * 4 bytes
-}
-
-impl MmapSink {
-    fn new(dir: &std::path::Path, nstates: usize) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
-        let map = |name: &str, bytes: usize| -> std::io::Result<MmapMut> {
-            let f = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(dir.join(name))?;
-            f.set_len(bytes as u64)?;
-            unsafe { MmapMut::map_mut(&f) }
-        };
-        let mut value = map("compact_value.bin", nstates * 8)?;
-        let mut action = map("compact_action.bin", nstates * 4)?;
-        // 初期化: 未書き込み（到達不能）セルが (MAX_COST, None) と読めるように。
-        let le = MAX_COST.to_le_bytes();
-        for rec in value.chunks_exact_mut(8) {
-            rec.copy_from_slice(&le);
-        }
-        action.fill(0xFF); // i32 -1 = 全バイト 0xFF。
-        Ok(Self { value, action })
-    }
-}
-
-impl CompactSink for MmapSink {
-    fn write_column(&mut self, base: usize, values: &[u64], actions: &[i32]) {
-        let vb = &mut self.value[base * 8..(base + values.len()) * 8];
-        for (i, &v) in values.iter().enumerate() {
-            vb[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
-        }
-        let ab = &mut self.action[base * 4..(base + actions.len()) * 4];
-        for (i, &a) in actions.iter().enumerate() {
-            ab[i * 4..i * 4 + 4].copy_from_slice(&a.to_le_bytes());
-        }
-    }
-
-    fn read(&self, orig: usize) -> (u64, i32) {
-        let v = u64::from_le_bytes(self.value[orig * 8..orig * 8 + 8].try_into().unwrap());
-        let a = i32::from_le_bytes(self.action[orig * 4..orig * 4 + 4].try_into().unwrap());
-        (v, a)
-    }
 }
 
 fn default_map_path() -> PathBuf {
@@ -649,17 +590,6 @@ fn main() -> ExitCode {
                     );
                     let mut sink = MmapSink::new(dir, nstates).expect("create mmap output sink");
                     let st = run(&mut sink);
-                    (st, Box::new(sink))
-                } else if args.compact_zip {
-                    let mut sink = CompressedRamSink::new(nstates, THETA_CELL_NUM as usize);
-                    let st = run(&mut sink);
-                    eprintln!(
-                        "  output: compressed RAM sink arena={:.1} MB index={:.1} MB (raw {:.1} MB, {} cols written)",
-                        sink.arena_bytes() as f64 / (1024.0 * 1024.0),
-                        sink.index_bytes() as f64 / (1024.0 * 1024.0),
-                        sink.raw_bytes() as f64 / (1024.0 * 1024.0),
-                        sink.written_cols(),
-                    );
                     (st, Box::new(sink))
                 } else {
                     let mut sink = RamSink::new(nstates);

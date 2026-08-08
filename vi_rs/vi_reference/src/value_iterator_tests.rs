@@ -87,20 +87,6 @@ fn set_map_occupancy_populates_states_and_transitions() {
 }
 
 #[test]
-fn set_map_cost_grid_free_and_obstacle() {
-    let actions = vec![Action::new("forward", 0.3, 0.0, 0)];
-    let mut vi = ValueIterator::new(actions, 1);
-    let mut map = free_grid(2, 1);
-    map.data = vec![0, 255i32 as i8]; // 1 つ目 free(cost0), 2 つ目 255
-    vi.set_map_with_cost_grid(&map, 60, 0.2, 30.0, 0.2, 10);
-    // index (x=0): free。 (x=1): not free。
-    let s0 = &vi.states[vi.to_index(0, 0, 0) as usize];
-    let s1 = &vi.states[vi.to_index(1, 0, 0) as usize];
-    assert!(s0.free);
-    assert!(!s1.free);
-}
-
-#[test]
 fn sweep_orders_structure() {
     let actions = vec![Action::new("forward", 0.3, 0.0, 0)];
     let mut vi = ValueIterator::new(actions, 1);
