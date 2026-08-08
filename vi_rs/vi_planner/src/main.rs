@@ -60,9 +60,8 @@ use vi_lib::Action;
 // nav_msgs::msg::OccupancyGrid と名前が衝突するので別名で入れる。
 
 use vi_planner::core::{
-    lock, quality_shift, try_lock, value_grid_on, AdaptiveLocalizer, BeliefConfig, BuildParams,
-    Decision, ExternalLocalizer, FollowKind, GridLocalizer, Localizer, PlanConfig, PlanError,
-    PlanStats, PlannerCore, Prefetcher, SweepCursor,
+    lock, quality_shift, try_lock, value_grid_on, Belief, BeliefConfig, BeliefModel, BuildParams,
+    Decision, FollowKind, PlanConfig, PlanError, PlanStats, PlannerCore, Prefetcher, SweepCursor,
 };
 
 use rclrs::*;
@@ -108,20 +107,25 @@ struct Params {
     transform_tolerance: f64,
     /// publish_tf 用の odom 購読先 (T_odom→base の出どころ)。
     odom_topic: String,
-    // ── 自己位置推定 (core::Localizer) ──
-    /// 自己位置の出どころ ("external" | "grid" | "adaptive" | "viterbi")。
+    // ── 自己位置推定 (vi_lib::belief::Belief) ──
+    /// 自己位置の出どころ ("external" | "belief" | "viterbi")。
     localizer: String,
-    /// grid: belief 窓の半径 [m] / 尤度場の σ [m] / ビーム間引き / レンジ上限 [m]。
-    belief_radius: f64,
+    /// 尤度場の σ [m] / ビーム間引き / レンジ上限 [m]。
     belief_sensor_sigma: f64,
     belief_beam_step: i64,
     belief_max_range: f64,
-    /// grid: predict 1 tick あたりの動作ノイズ σ ([m] / [deg])。
+    /// predict 1 tick あたりの動作ノイズ σ ([m] / [deg])。
     belief_motion_sigma_xy: f64,
     belief_motion_sigma_theta_deg: f64,
-    /// grid: ビームごとの尤度の床 / 補正で読む重みの相対しきい値。
+    /// ビームごとの尤度の床 / 補正で読む重みの相対しきい値。
     belief_z_min: f64,
     belief_weight_skip_ratio: f64,
+    /// 観測一致度 EWMA がこれ未満なら free 一様を混合してリセット (EMCL 風)。
+    belief_reset_quality: f64,
+    /// ESS がこれ超でロスト (pose を返さない)。
+    belief_lost_ess: f64,
+    /// 価値関数へ足す belief 不確かさ次元 b の層数 (1 = 従来の 3D VI)。
+    belief_levels: i64,
     /// スキャン注入の品質ゲート: localizer の観測一致度がこれを割ると注入
     /// penalty を quality/gate に比例して減衰 (2 冪量子化)。0 で無効。
     scan_quality_gate: f64,
@@ -151,13 +155,8 @@ struct Params {
     /// follow 1 tick の判断器 ("greedy" = 本家 decision / "dwa"・"mppi" = 連続行動)。
     follow_controller: String,
     /// belief が多峰のとき QMDP (Q(b,a) = Σ w·Q(s,a) の argmin) で行動を選ぶ。
-    /// grid/adaptive localizer 用 (external は仮説を出さないので実質無効)。
+    /// belief/viterbi localizer 用 (external は仮説を出さないので実質無効)。
     qmdp: bool,
-    /// ロスト中に安全停止で待つ代わりに、仮説を判別する地点への多目標 VI を解いて
-    /// QMDP で走る (能動的再定位)。adaptive/viterbi localizer + 密ソルバ用。
-    active_reloc: bool,
-    /// 能動的再定位を諦めて通常の停止待ちに戻すまでの時間 [s]。
-    reloc_timeout_sec: f64,
     /// DWA/MPPI の前方シミュレーション時間 [s] と DWA の (v, ω) 候補数。
     dwa_horizon_s: f64,
     dwa_n_v: i64,
@@ -278,21 +277,18 @@ fn read_params(node: &Node) -> Result<Params> {
         odom_topic: p!("odom_topic", Arc<str>, "odom".into()).to_string(),
 
         // 自己位置の出どころ。"external" (既定) = pose_topic の推定をそのまま使う
-        // (mcl 等の外部推定器)。"grid" = 内蔵ヒストグラム MCL — pose_topic は
+        // (mcl 等の外部推定器)。"belief" = 内蔵の**全地図** belief (vi_lib::belief) —
+        // プランナと同じ格子の上に belief を全域で持つヒストグラム MCL。pose_topic は
         // **手動シード** (initialpose 等) として扱い、メッセージごとに belief を
-        // 初期化し直す。以後は scan_topic と自分の出した cmd_vel だけで推定する
-        // ので、"grid" のときは pose_topic を mcl の連続出力に向けないこと
-        // (毎メッセージでリセットされて素通しと変わらなくなる)。
-        // "viterbi" = adaptive の全域レベルを min-plus (MAP) で回す変種
-        // (vi_lib の localize/viterbi.rs — 運動整合性で偽仮説を削る)。
-        // "adaptive" = grid の多重解像度版 — 観測一致度が落ちると belief を粗い
-        // 広域レベルへ広げて再定位する (EMCL の expansion resetting 相当) ので、
-        // 誘拐 (持ち上げ移動) から復帰でき、未シードなら大域初期化で立ち上がる。
-        // ロスト中は pose を返さず follow ループが安全停止する。シード運用は grid と同じ。
+        // 張り直す。以後は scan_topic と自分の出した cmd_vel だけで推定するので、
+        // "belief" のときは pose_topic を mcl の連続出力に向けないこと
+        // (毎メッセージでリセットされて素通しと変わらなくなる)。未シードなら最初の
+        // スキャンで free 一様から立ち上がる (大域初期化)。観測が合わなくなれば
+        // 一様混合でリセットするので誘拐からも復帰でき、ロスト中は pose を返さず
+        // follow ループが安全停止する。
+        // "viterbi" = 同じ belief を min-plus (MAP) 半環で回す変種 (運動整合性で
+        // 偽仮説を削る)。窓つきの旧 "grid" / "adaptive" は "belief" に置き換わった。
         localizer: p!("localizer", Arc<str>, "external".into()).to_string(),
-        // belief 窓は native 解像度 (map_scale をかける前) の 2×radius 四方 × θ。
-        // 0.05 m/cell で radius 2.5 なら 100×100×60 = 60 万セル ≈ 5 MB。
-        belief_radius: p!("belief_radius", f64, 2.5),
         belief_sensor_sigma: p!("belief_sensor_sigma", f64, 0.2),
         belief_beam_step: p!("belief_beam_step", i64, 10),
         belief_max_range: p!("belief_max_range", f64, 25.0),
@@ -302,9 +298,18 @@ fn read_params(node: &Node) -> Result<Params> {
         // 読む belief 重みの相対しきい値 (max との比、小さいほど正確で遅い)。
         belief_z_min: p!("belief_z_min", f64, 0.05),
         belief_weight_skip_ratio: p!("belief_weight_skip_ratio", f64, 1e-4),
+        // 観測一致度 EWMA がこれを割ると free 一様を混ぜ直す (EMCL の resetting)。
+        belief_reset_quality: p!("belief_reset_quality", f64, 0.25),
+        // ESS (= 1/Σb²) がこれを超えたら「広がりすぎ」= ロスト扱いで pose を返さない。
+        belief_lost_ess: p!("belief_lost_ess", f64, 500.0),
+        // 価値関数へ足す belief 不確かさ次元 b の層数。**既定 1 = 従来の 3D VI と
+        // 構成的に同一**。2 以上にすると「不確かなままではゴールを終端にしない」
+        // (coastal navigation) が効く代わりに、states と sweep_orders が層数倍になり、
+        // 密経路 + caps().belief を持つソルバ (solver: frontier2d) が要る。
+        belief_levels: p!("belief_levels", i64, 1),
         // フィットが怪しいスキャンに満額 (2048) の壁を建てさせない。既定は
-        // adaptive の expansion しきい値 (expand_quality) と同じ 0.25。external
-        // localizer は quality 1.0 固定なので実質無効。
+        // belief_reset_quality と同じ 0.25。external localizer は quality 1.0 固定
+        // なので実質無効。
         scan_quality_gate: p!("scan_quality_gate", f64, 0.25),
         // ロボットが現にいる場所は free — 注入のたびに footprint を消し、
         // ゴースト壁が真上で閉じて完全停止する事態を構造的に防ぐ。
@@ -353,16 +358,11 @@ fn read_params(node: &Node) -> Result<Params> {
         mppi_lambda: p!("mppi_lambda", f64, 1.0),
         mppi_sigma_v: p!("mppi_sigma_v", f64, 0.0),
         mppi_sigma_w_deg: p!("mppi_sigma_w_deg", f64, 0.0),
-        // belief が多峰 (grid/adaptive の上位仮説が 2 個以上) の tick は
-        // QMDP: Q(b,a) = Σ w·Q(s,a) の argmin で「どの仮説でも悪くない行動」を
-        // 選び、有意な仮説が衝突と言う行動しか無ければ止まる。単峰の tick は
+        // belief が多峰 (上位仮説が 2 個以上) の tick は QMDP:
+        // Q(b,a) = Σ w·Q(s,a) の argmin で「どの仮説でも悪くない行動」を選び、
+        // 有意な仮説が衝突と言う行動しか無ければ止まる。単峰の tick は
         // 従来の follow_controller に退避するので、収束中の挙動だけが変わる。
         qmdp: p!("qmdp", bool, false),
-        // ロスト中の能動的再定位: 仮説集合を最も判別する地点 (reloc_targets) を
-        // 多目標 VI のゴールにして QMDP で走る。復帰したら本来のゴールを
-        // 解き直して走行に戻る (core::prepare_reloc_goal の doc 参照)。
-        active_reloc: p!("active_reloc", bool, false),
-        reloc_timeout_sec: p!("reloc_timeout_sec", f64, 30.0),
 
         // navigate_to_pose と follow_waypoints をこのノード自身が提供する
         // (= bt_navigator / behavior_server / waypoint_follower を立てない)。
@@ -479,14 +479,47 @@ fn validate(p: &Params) -> Result<U64Solver> {
             p.follow_controller
         ));
     }
-    if !matches!(p.localizer.as_str(), "external" | "grid" | "adaptive" | "viterbi") {
+    if !matches!(p.localizer.as_str(), "external" | "belief" | "viterbi") {
         return Err(anyhow!(
-            "unknown localizer: {} (expected \"external\", \"grid\", \"adaptive\" or \"viterbi\")",
+            "unknown localizer: {} (expected \"external\", \"belief\" or \"viterbi\").\n\
+             The windowed \"grid\" / \"adaptive\" localizers are gone — \"belief\" is the \
+             whole-map replacement (same grid as the planner, no window to recenter and no \
+             resolution levels), and \"viterbi\" is that same belief run in min-plus (MAP). \
+             belief_radius is gone with them.",
             p.localizer
         ));
     }
     let solver = U64Solver::from_name(&p.solver)
         .ok_or_else(|| anyhow!("unknown solver: {} (see U64Solver::from_name)", p.solver))?;
+    // belief 次元 (x,y,θ,b) の適用範囲。ここで落とさないと vi_lib の
+    // `solve_observed` が assert で落ちる (原因の分からない panic になる)。
+    if p.belief_levels > 1 {
+        if p.localizer == "external" {
+            return Err(anyhow!(
+                "belief_levels={} needs an internal belief estimator, but localizer is \
+                 \"external\" (an outside pose has no uncertainty level to read). Set \
+                 localizer:=belief (or viterbi), or leave belief_levels at 1.",
+                p.belief_levels
+            ));
+        }
+        if !solver.caps().belief {
+            return Err(anyhow!(
+                "belief_levels={} needs a solver that supports the belief dimension, and \
+                 solver={} does not (the default frontier2d_sparse is one of them). Use \
+                 solver:=frontier2d, or leave belief_levels at 1.",
+                p.belief_levels,
+                p.solver
+            ));
+        }
+        if solver.caps().out_of_core {
+            return Err(anyhow!(
+                "belief_levels={} needs the dense path, but solver={} is out-of-core (the \
+                 compact sink is 3D). Use solver:=frontier2d, or leave belief_levels at 1.",
+                p.belief_levels,
+                p.solver
+            ));
+        }
+    }
     Ok(solver)
 }
 
@@ -677,28 +710,72 @@ struct FollowTuning {
     qmdp: bool,
     /// スキャン注入の品質ゲート ([`quality_shift`] の gate)。0 で無効。
     scan_quality_gate: f64,
-    /// ロスト中に判別点へ走る能動的再定位 (`prepare_reloc_goal` + QMDP)。
-    active_reloc: bool,
-    /// 能動的再定位を諦めて通常の停止待ちに戻すまでの tick 数。
-    reloc_ticks_limit: u32,
+    /// 価値関数の belief 次元の層数 (`BeliefModel::nb_levels`)。`Belief::b_hat` の
+    /// 引数 = 追従が読む b̂ 層の分母。1 なら b̂ は常に 0 = 従来と同一。
+    belief_levels: i32,
 }
 
 /// QMDP に渡す belief 仮説の上限。ヒストグラムの上位セルだけで質量の大半を
 /// 覆える (それ以下は veto 判定も動かさない微小仮説)。
 const QMDP_TOP_K: usize = 64;
-/// 能動的再定位中の近接停止 [m]。姿勢が無く local_penalty を置けないので、
-/// 生の最近接レンジで守る。
-// ponytail: 定数 1 個 — 機体寸法に合わせるならパラメータへ昇格。
-const RELOC_STOP_RANGE: f64 = 0.35;
 
-/// 能動的再定位 (`active_reloc`) の段階 (run_follow のロスト分岐が使う)。
-enum Reloc {
-    /// ロストしていない / まだ再定位場を解いていない。
-    Idle,
-    /// 再定位場の上を QMDP で走行中 (このときキャッシュ = 再定位場)。
-    Driving,
-    /// この構成では使えない (compact 等) — このゴールでは以後試さない。
-    GaveUp,
+/// 自己位置推定。`External` = pose トピックの素通し、`Belief` = 全地図 belief
+/// ([`vi_planner::core::Belief`])。
+///
+/// **`PlannerCore` の外に置くこと。** 30 秒級の solve は核の `Mutex` を握りっぱなし
+/// にするが、belief はその間もスキャンコールバックから更新され続けなければならない。
+/// ロック順序は常に localizer → core (入れ子は作らない)。
+enum Loc {
+    External(Option<PoseView>),
+    Belief(Box<Belief>),
+}
+
+impl Loc {
+    /// 外部姿勢の取り込み。External = そのまま採用、Belief = 手動シード。
+    fn set_pose(&mut self, p: PoseView) {
+        match self {
+            Loc::External(o) => *o = Some(p),
+            Loc::Belief(b) => b.seed(p),
+        }
+    }
+    fn predict(&mut self, v: f64, w_deg: f64, dt: f64) {
+        if let Loc::Belief(b) = self {
+            b.predict(v, w_deg, dt);
+        }
+    }
+    fn observe(&mut self, scan: &ViLaserScan) {
+        if let Loc::Belief(b) = self {
+            b.observe(scan);
+        }
+    }
+    fn pose(&self) -> Option<PoseView> {
+        match self {
+            Loc::External(o) => *o,
+            Loc::Belief(b) => b.pose(),
+        }
+    }
+    /// 直近の補正の観測一致度 [0,1]。External は常に 1.0 (ゲートが実質無効)。
+    fn quality(&self) -> f64 {
+        match self {
+            Loc::External(_) => 1.0,
+            Loc::Belief(b) => b.quality(),
+        }
+    }
+    /// QMDP 用の上位仮説。External は単一仮説なので空 = 呼び出し側は点推定へ退避。
+    fn top_cells(&self, k: usize) -> Vec<(PoseView, f64)> {
+        match self {
+            Loc::External(_) => Vec::new(),
+            Loc::Belief(b) => b.top_cells(k),
+        }
+    }
+    /// b 不確かさレベルの推定値 (`nb` = 価値関数の層数)。External は常に 0 =
+    /// 「十分集中」— 外部推定の広がりはこちらからは見えないため。
+    fn b_hat(&self, nb: i32) -> i32 {
+        match self {
+            Loc::External(_) => 0,
+            Loc::Belief(b) => b.b_hat(nb),
+        }
+    }
 }
 
 enum Outcome {
@@ -738,7 +815,7 @@ struct PlanPub {
 struct FollowCtx<'a> {
     core: &'a Mutex<PlannerCore>,
     latest_pose: &'a Mutex<Option<PoseView>>,
-    localizer: &'a Mutex<Box<dyn Localizer>>,
+    localizer: &'a Mutex<Loc>,
     scan_queue: &'a Mutex<Vec<ViLaserScan>>,
     cmd_pub: &'a Publisher<geometry_msgs::msg::Twist>,
     /// 表示専用の経路。None なら出さない (`follow_path` 構成では BT 側の
@@ -754,9 +831,10 @@ struct FollowCtx<'a> {
 struct Handles {
     core: Mutex<PlannerCore>,
     latest_pose: Mutex<Option<PoseView>>,
-    /// 自己位置推定器 (core::Localizer)。`latest_pose` はこれの出力キャッシュ —
-    /// 読む側 (follow ループ・plan サーバ) は従来どおり latest_pose だけを見る。
-    localizer: Mutex<Box<dyn Localizer>>,
+    /// 自己位置推定 ([`Loc`])。`latest_pose` はこれの出力キャッシュ — 読む側
+    /// (follow ループ・plan サーバ) は従来どおり latest_pose だけを見る。
+    /// **核の Mutex とは別**: solve 中も scan から更新され続ける必要がある。
+    localizer: Mutex<Loc>,
     scan_queue: Mutex<Vec<ViLaserScan>>,
     cmd_pub: Publisher<geometry_msgs::msg::Twist>,
     viz: Option<Viz>,
@@ -940,8 +1018,6 @@ fn run_follow(
     // ロックを連続で取れなかった tick 数 (下の try_lock を参照)。
     let mut busy_ticks = 0u32;
     let mut last_viz: Option<Instant> = None;
-    let mut reloc = Reloc::Idle;
-    let mut reloc_ticks = 0u32;
     loop {
         let tick_start = Instant::now();
         if cancel.load(Ordering::Relaxed) {
@@ -950,134 +1026,30 @@ fn run_follow(
         }
 
         let pose = *latest_pose.lock().unwrap();
-        // 能動的再定位から復帰した直後: キャッシュには再定位場が載っている。
-        // 下の「goal replaced」プリエンプトと誤認する前に本来のゴールを解き直す
-        // (再定位中に本当に別の追従ゴールが来る形は cancel 経由で上で抜けている)。
-        if matches!(reloc, Reloc::Driving) {
-            if let Some(p) = pose {
-                let Some(mut core) = try_lock(core) else {
-                    if let Some(rest) = tuning.period.checked_sub(tick_start.elapsed()) {
-                        std::thread::sleep(rest);
-                    }
-                    continue;
-                };
-                stop_cmd(cmd_pub); // 解き直しの数秒、直前の指令で這わせない
-                if !core.is_cached_goal(goal) {
-                    eprintln!(
-                        "vi_planner: re-localized at ({:.2}, {:.2}) — re-solving the goal \
-                         [active_reloc]",
-                        p.x, p.y
-                    );
-                    if let Err(e) = core.prepare_goal(goal, cancel) {
-                        return match e {
-                            PlanError::Cancelled => Outcome::Preempted,
-                            e => Outcome::Failed(e.to_string()),
-                        };
-                    }
-                }
-                reloc = Reloc::Idle;
-                reloc_ticks = 0;
-                failure_ticks = 0;
-            }
-        }
         let Some(pose) = pose else {
-            // ── ロスト (pose なし)。既定は安全停止で受動復帰 (expansion resetting)
-            // を待つ。active_reloc なら仮説を判別する地点の多目標場を解き、
-            // QMDP で走って復帰を早める (core::prepare_reloc_goal の doc)。
-            let mut acted = false;
-            if tuning.active_reloc
-                && reloc_ticks < tuning.reloc_ticks_limit
-                && !matches!(reloc, Reloc::GaveUp)
-            {
-                reloc_ticks += 1;
-                acted = 'reloc: {
-                    // localizer → core の順 (入れ子ロックを作らない)。
-                    let (hyps, targets) = {
-                        let l = lock(localizer);
-                        (l.top_cells(QMDP_TOP_K), l.reloc_targets())
-                    };
-                    if hyps.len() < 2 {
-                        break 'reloc false;
-                    }
-                    // 近接ガード: 姿勢が無く local_penalty を置けないので、生の
-                    // 最近接レンジで守る (スキャンはコールバックで localizer に
-                    // 反映済みなので捨ててよい)。
-                    let scans = std::mem::take(&mut *scan_queue.lock().unwrap());
-                    if scans.last().is_some_and(|s| {
-                        s.ranges
-                            .iter()
-                            .filter(|r| r.is_finite() && **r > 0.0)
-                            .fold(f64::INFINITY, |a, &r| a.min(r))
-                            < RELOC_STOP_RANGE
-                    }) {
-                        stop_cmd(cmd_pub);
-                        break 'reloc true; // 止まって観測を待つのも再定位のうち
-                    }
-                    let Some(mut core) = try_lock(core) else { break 'reloc false };
-                    if matches!(reloc, Reloc::Idle) {
-                        if targets.is_empty() {
-                            break 'reloc false;
-                        }
-                        match core.prepare_reloc_goal(&targets, cancel) {
-                            Ok(_) => {
-                                eprintln!(
-                                    "vi_planner: lost — driving toward {} disambiguation \
-                                     target(s) [active_reloc]",
-                                    targets.len()
-                                );
-                                reloc = Reloc::Driving;
-                            }
-                            Err(PlanError::Cancelled) => break 'reloc false,
-                            Err(e) => {
-                                // compact 構成など — 受動復帰に任せる。
-                                eprintln!("vi_planner: active_reloc unavailable ({e})");
-                                reloc = Reloc::GaveUp;
-                                break 'reloc false;
-                            }
-                        }
-                    }
-                    match core.decide_qmdp(&hyps) {
-                        Decision::Action { fw, rot_deg, .. } => {
-                            drop(core); // localizer を取る前に手放す (ロック順序)
-                            let mut tw = geometry_msgs::msg::Twist::default();
-                            tw.linear.x = fw;
-                            tw.angular.z = rot_deg.to_radians();
-                            let _ = cmd_pub.publish(tw);
-                            let mut l = lock(localizer);
-                            l.predict(fw, rot_deg, tuning.period.as_secs_f64());
-                            *lock(latest_pose) = l.pose();
-                            true
-                        }
-                        // Goal = 判別点に到着 / NoAction — 止まって観測を待つ。
-                        _ => {
-                            stop_cmd(cmd_pub);
-                            true
-                        }
-                    }
-                };
-            }
-            if acted {
-                failure_ticks = 0;
-            } else {
-                stop_cmd(cmd_pub);
-                failure_ticks += 1;
-                if failure_ticks >= tuning.failure_ticks_limit {
-                    return Outcome::Failed("no robot pose for too long".into());
-                }
+            // ── ロスト (pose なし): 安全停止で受動復帰 (一様混合リセット) を待つ。
+            // belief が再集中すれば pose が戻り、戻らないままタイムアウトすれば失敗。
+            stop_cmd(cmd_pub);
+            failure_ticks += 1;
+            if failure_ticks >= tuning.failure_ticks_limit {
+                return Outcome::Failed("no robot pose for too long".into());
             }
             if let Some(rest) = tuning.period.checked_sub(tick_start.elapsed()) {
                 std::thread::sleep(rest);
             }
             continue;
         };
-        // QMDP 用の belief 仮説と、スキャン注入の品質ゲート (直近補正の観測
-        // 一致度 → 減衰段数)。core のロックの前に取る (localizer と core の
-        // 入れ子ロックを作らない)。external localizer は空 = 点推定へ退避。
-        let (hyps, scan_shift) = {
+        // 追従が belief から要るもの 3 つ — QMDP 用の上位仮説、スキャン注入の
+        // 品質ゲート (直近補正の観測一致度 → 減衰段数)、価値関数を読む b̂ 層 —
+        // を **1 回のロックで** まとめて取る。core のロックの前に取るので
+        // (localizer → core) 入れ子は作らない。external は仮説なし・quality 1.0・
+        // b̂ 0 = 従来と同じ挙動。
+        let (hyps, scan_shift, ib_hat) = {
             let l = lock(localizer);
             (
                 if tuning.qmdp { l.top_cells(QMDP_TOP_K) } else { Vec::new() },
                 quality_shift(l.quality(), tuning.scan_quality_gate),
+                l.b_hat(tuning.belief_levels),
             )
         };
 
@@ -1135,9 +1107,9 @@ fn run_follow(
             // 選び、有意な仮説が衝突と言う行動しか無ければ止まる。単峰は従来の
             // decide (follow_controller 経由) と一致するので点推定に退避。
             let decision = if hyps.len() >= 2 {
-                core.decide_qmdp(&hyps)
+                core.decide_qmdp(&hyps, ib_hat)
             } else {
-                core.decide(pose)
+                core.decide(pose, ib_hat)
             };
             (decision, core.goal_distance(pose.x, pose.y), window_grid)
         };
@@ -1174,7 +1146,7 @@ fn run_follow(
                 // 自分が出した指令がそのまま推定器の動作モデル (external では
                 // no-op)。dt は制御周期 — 実際の適用時間との差は motion ノイズが
                 // 吸収する。停止指令は動きゼロなので predict しない。代入は
-                // 無条件 — adaptive がロストしたら latest_pose ごと消え、次 tick
+                // 無条件 — belief がロストしたら latest_pose ごと消え、次 tick
                 // から「pose なし」の安全停止に入る。
                 {
                     let mut l = lock(localizer);
@@ -1415,50 +1387,42 @@ fn main() -> Result<()> {
             ))
         }
     };
-    // 自己位置推定器。grid は native 解像度の占有格子から尤度場を起こすので、
-    // ダウンサンプル前の binary_grid をここで使い切ってから捨てる。
-    let localizer: Box<dyn Localizer> = match params.localizer.as_str() {
-        kind @ ("grid" | "adaptive" | "viterbi") => {
+    // 自己位置推定。belief の**幾何と free マスクはプランナと同じ vi_grid**
+    // (map_scale 適用後) から、**尤度場だけは native 解像度の binary_grid** から
+    // 起こす — スキャン端点の評価は格子を粗くすると壊れるため。両方ここで
+    // 生きている必要があるので、binary_grid はこの後で捨てる。
+    let localizer = match params.localizer.as_str() {
+        kind @ ("belief" | "viterbi") => {
             let bc = BeliefConfig {
-                half_m: params.belief_radius.max(0.5),
                 sensor_sigma_m: params.belief_sensor_sigma.max(0.01),
                 beam_step: params.belief_beam_step.max(1) as usize,
                 max_range_m: params.belief_max_range.max(0.1),
                 motion_sigma_xy_m: params.belief_motion_sigma_xy.max(0.0),
                 motion_sigma_theta_deg: params.belief_motion_sigma_theta_deg.max(0.0),
                 z_min: params.belief_z_min.clamp(0.0, 1.0),
-                weight_skip_ratio: params.belief_weight_skip_ratio.max(0.0) as f32,
-                // "viterbi" = adaptive の全域レベルを min-plus (MAP) で回す変種。
+                weight_skip_ratio: params.belief_weight_skip_ratio.max(0.0),
+                reset_quality: params.belief_reset_quality.clamp(0.0, 1.0),
+                lost_ess: params.belief_lost_ess.max(1.0),
+                // "viterbi" = 同じ belief を min-plus (MAP) 半環で回す変種。
                 viterbi: kind == "viterbi",
                 ..BeliefConfig::default()
             };
-            if kind == "grid" {
-                let g = GridLocalizer::new(&binary_grid, params.theta_cell_num as i32, bc);
-                eprintln!(
-                    "vi_planner: localizer = grid ({}m window @{}m x{} theta, {:.1} MB belief; \
-                     seed it via {} — e.g. remap to initialpose)",
-                    params.belief_radius * 2.0,
-                    binary_grid.resolution,
-                    params.theta_cell_num,
-                    g.belief_mb(),
-                    params.pose_topic
-                );
-                Box::new(g)
-            } else {
-                let g = AdaptiveLocalizer::new(&binary_grid, params.theta_cell_num as i32, bc);
-                eprintln!(
-                    "vi_planner: localizer = {} ({} levels up to whole-map, {:.1} MB \
-                     belief; seed via {} or leave unseeded for global init; lost → pose \
-                     withheld until re-localized)",
-                    kind,
-                    g.num_levels(),
-                    g.belief_mb(),
-                    params.pose_topic
-                );
-                Box::new(g)
-            }
+            let b = Belief::new(&vi_grid, params.theta_cell_num as i32, &binary_grid, bc);
+            eprintln!(
+                "vi_planner: localizer = {} (whole-map belief on the planner grid: \
+                 {} free cells x{} theta, {:.1} MB; likelihood field from the native map \
+                 @{}m; seed via {} or leave unseeded for global init; lost -> pose withheld \
+                 until re-localized)",
+                kind,
+                b.free_cells(),
+                params.theta_cell_num,
+                b.belief_mb(),
+                binary_grid.resolution,
+                params.pose_topic
+            );
+            Loc::Belief(Box::new(b))
         }
-        _ => Box::new(ExternalLocalizer::default()),
+        _ => Loc::External(None),
     };
     drop(binary_grid);
     let nstates =
@@ -1469,7 +1433,10 @@ fn main() -> Result<()> {
     // `[5]` 0.5×total = 合わせて 6.0×total の i32) ので +24 B/state。
     // 19F を map_scale 2 で解いたときの実測は 654.8 MB (states 444.7 + orders 210.1) で、
     // 56 B/state だけで見積もると 4 割以上足りない。compact は確定出力 12 B/state だけ。
-    let states_gb = nstates as f64 * 80.0 / 1e9;
+    // belief 次元は states も sweep_orders も層数ぶん増やす (b は最も遅い次元で、
+    // どちらも 4D 全体を持つ)。compact は belief 次元を持てないので sink は 3D のまま。
+    let nb_levels = params.belief_levels.max(1) as f64;
+    let states_gb = nstates as f64 * 80.0 * nb_levels / 1e9;
     let sink_gb = nstates as f64 * 12.0 / 1e9;
     // 先読みは価値関数を 2 本持つ (走っている点のと、次の点の)。密ならメモリ、
     // compact ならディスクがそのぶん要る。見積もりは常に 2 倍で語ること。
@@ -1512,16 +1479,21 @@ fn main() -> Result<()> {
     // 先読みを入れると場が 2 本になるので、限度と突き合わせるのも 2 本ぶん。
     if !use_compact && states_gb * fields * 1000.0 > params.dense_limit_mb.max(0) as f64 {
         return Err(anyhow!(
-            "the dense value function needs {:.2} GB (states + sweep_orders) for {} states{}, over \
-             dense_limit_mb={}.\n\
-             Raise map_scale (halving the resolution quarters this), raise dense_limit_mb if the \
-             machine really has the room, or switch to solver: frontier2d_sparse_compact \
-             (+ compact_sink_dir), which keeps only {:.2} GB of finalized output and hydrates a \
-             small patch around the robot for following. The local -> global feedback \
-             (global_sweep) works there too — it repairs the sink tile by tile instead of \
-             sweeping a full `states` array.",
+            "the dense value function needs {:.2} GB (states + sweep_orders) for {} states{}{}, \
+             over dense_limit_mb={}.\n\
+             Raise map_scale (halving the resolution quarters this), lower belief_levels (both \
+             states and sweep_orders scale with it), raise dense_limit_mb if the machine really \
+             has the room, or switch to solver: frontier2d_sparse_compact (+ compact_sink_dir), \
+             which keeps only {:.2} GB of finalized output and hydrates a small patch around the \
+             robot for following. The local -> global feedback (global_sweep) works there too — \
+             it repairs the sink tile by tile instead of sweeping a full `states` array.",
             states_gb * fields,
             nstates,
+            if nb_levels > 1.0 {
+                format!(" x{nb_levels:.0} belief levels (belief_levels)")
+            } else {
+                String::new()
+            },
             if params.waypoint_prefetch {
                 " x2 value functions (waypoint_prefetch: true)"
             } else {
@@ -1599,7 +1571,26 @@ fn main() -> Result<()> {
         prefetch_poll_ms: params.waypoint_prefetch_poll_ms.max(1) as u64,
         global_sweep: params.global_sweep,
         early_start: params.early_start,
+        // 価値関数の belief 次元。既定 (nb_levels: 1) は従来の 3D VI と構成的に同一。
+        // 適用範囲は validate() が既に確かめてある (核の側にも同じベルトがある)。
+        // 私有フィールド (info/nx/layer — set_map が埋める) があるので struct update
+        // 構文はクレート外から使えない。
+        belief: {
+            let mut m = BeliefModel::default();
+            m.nb_levels = params.belief_levels.max(1) as i32;
+            m
+        },
     };
+    if params.belief_levels > 1 {
+        eprintln!(
+            "vi_planner: belief dimension on — the value function is 4D (x, y, theta, b) with \
+             {} uncertainty levels; the goal is only terminal at b <= {} (staying uncertain \
+             does not count as arriving), and following reads the b-hat layer the localizer \
+             reports every tick",
+            params.belief_levels,
+            BeliefModel::default().ib_goal
+        );
+    }
     if params.early_start {
         eprintln!(
             "vi_planner: early start on — a solve stops as soon as the policy reaches the goal \
@@ -1690,8 +1681,8 @@ fn main() -> Result<()> {
             .transpose()?,
     });
 
-    // 6a. 自己位置トピック購読 (tf2 代替)。external ではそのまま採用、grid では
-    //     belief の手動シード (どちらも Localizer::set_pose 経由)。
+    // 6a. 自己位置トピック購読 (tf2 代替)。external ではそのまま採用、belief では
+    //     belief の手動シード (どちらも Loc::set_pose 経由)。
     let _pose_sub = {
         let h = Arc::clone(&handles);
         node.create_subscription::<geometry_msgs::msg::PoseWithCovarianceStamped, _>(
@@ -1732,8 +1723,9 @@ fn main() -> Result<()> {
 
     // 6b. スキャン購読 (sensor QoS = best effort)。tick 間に届いた分を貯めて
     //     制御ループが順に消化する。同じスキャンが自己位置推定の補正にも入る
-    //     (external では no-op。grid の補正は belief の広がりに比例したコストで、
-    //     収束後は数百セル × 数十ビーム — エグゼキュータスレッドで足りる)。
+    //     (external では no-op。belief の補正はアクティブ集合 = belief の広がりに
+    //     比例したコストで、収束後は数百セル × 数十ビーム — エグゼキュータ
+    //     スレッドで足りる)。
     let _scan_sub = {
         let h = Arc::clone(&handles);
         let invalid_range_m = params.invalid_range_m;
@@ -1745,9 +1737,9 @@ fn main() -> Result<()> {
                     let mut l = lock(&h.localizer);
                     l.observe(&scan);
                     let p = l.pose();
-                    // 無条件代入: adaptive はロスト中 None を返すので、latest_pose
+                    // 無条件代入: belief はロスト中 None を返すので、latest_pose
                     // ごと消して follow ループを「pose なし」停止経路に乗せる
-                    // (external / grid は observe 後も Some のままで従来どおり)。
+                    // (external は observe が no-op で Some のまま = 従来どおり)。
                     *lock(&h.latest_pose) = p;
                     p
                 };
@@ -1940,9 +1932,7 @@ fn main() -> Result<()> {
         busy_ticks_before_stop: params.busy_ticks_before_stop.max(1) as u32,
         qmdp: params.qmdp,
         scan_quality_gate: params.scan_quality_gate,
-        active_reloc: params.active_reloc,
-        reloc_ticks_limit: (params.reloc_timeout_sec.max(0.0) * params.control_frequency)
-            .ceil() as u32,
+        belief_levels: params.belief_levels.max(1) as i32,
     };
     let retry = RetryTuning {
         limit: params.goal_retry_limit,

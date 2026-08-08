@@ -41,10 +41,10 @@ mod prefetch;
 mod tests;
 
 pub use follow::{DwaController, FollowController, FollowKind, GreedyController, MppiController};
-// Localizer 本体は vi_lib::localize (アルゴリズムは vi_lib、配線はノードの分担)。
-pub use vi_lib::localize::{
-    AdaptiveLocalizer, BeliefConfig, ExternalLocalizer, GridLocalizer, Localizer,
-};
+// 自己位置推定は vi_lib::belief の全地図 Belief (アルゴリズムは vi_lib、配線は
+// ノードの分担)。窓つきの旧 localize::* はもう使わない。
+pub use vi_lib::belief::{Belief, BeliefConfig};
+pub use vi_lib::value_iterator::BeliefModel;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
@@ -53,8 +53,8 @@ use std::time::{Duration, Instant};
 use vi_lib::bridge::{value_slice_to_occupancy, yaw_to_goal_theta_deg, PoseView};
 use vi_lib::msg::{LaserScan, OccupancyGrid};
 use vi_lib::planner::{
-    densify, optimal_action_at, pose_to_cell, qmdp_decide, rollout_path_on, PathPose, PolicyView,
-    QmdpDecision, Rollout, RolloutStatus,
+    densify, pose_to_cell, qmdp_decide, rollout_path_on, PathPose, PolicyView, QmdpDecision,
+    Rollout, RolloutStatus,
 };
 use vi_lib::solvers::{solve_observed, SolveFlow, SolveObserver, SolveProbe, U64Solver};
 use vi_lib::value_iterator::ValueIterator;
@@ -204,6 +204,12 @@ pub struct PlanConfig {
     /// 打ち切りには起点が要るので、`from: None` で呼ばれた solve は
     /// これが true でも最後まで解く。
     pub early_start: bool,
+
+    // ── belief 次元 (x, y, θ, b) ──
+    /// 価値関数へ足す belief 不確かさ次元。既定 (`nb_levels: 1`) は従来の 3D VI と
+    /// 構成的に同一。`nb_levels > 1` は密経路 + `caps().belief` のソルバ限定
+    /// ([`PlannerCore::prepare_goal_with_progress`] が `Unsupported` で弾く)。
+    pub belief: BeliefModel,
 }
 
 impl PlanConfig {
@@ -256,7 +262,7 @@ pub enum PlanError {
     Sink(String),
     /// compact 経路の追従用パッチを構成できなかった (幾何が破綻している)。
     Patch(String),
-    /// この構成では提供できない機能 (compact での能動的再定位など)。
+    /// この構成では提供できない機能 (compact / Group B ソルバでの belief 次元など)。
     Unsupported(&'static str),
 }
 
@@ -415,22 +421,18 @@ impl SolveObserver for SolveDirector<'_> {
     }
 }
 
-/// `(ix, iy, it)` に方策があれば Decision::Action を返す (読み取り専用)。
-fn action_at(vi: &ValueIterator, ix: i32, iy: i32, it: i32) -> Option<Decision> {
-    let id = optimal_action_at(vi, ix, iy, it);
-    if id < 0 {
-        return None;
-    }
-    let a = vi.actions.iter().find(|a| a.id == id)?;
-    Some(Decision::Action { id: Some(id as usize), fw: a.delta_fw, rot_deg: a.delta_rot })
+/// `(ix, iy, it)` を `ib` 層で見て方策があれば Decision::Action を返す (読み取り専用)。
+/// `nb_levels == 1` では `ib` は常に 0 = 従来と同一。
+fn action_at(vi: &ValueIterator, ix: i32, iy: i32, it: i32, ib: i32) -> Option<Decision> {
+    let ai = PolicyView::action_index_b(vi, ix, iy, it, ib)?;
+    let a = &vi.actions[ai];
+    Some(Decision::Action { id: Some(a.id as usize), fw: a.delta_fw, rot_deg: a.delta_rot })
 }
 
-/// 範囲内で final_state か (境界チェック込み)。
-fn is_final(vi: &ValueIterator, ix: i32, iy: i32, it: i32) -> bool {
-    vi.in_map_area(ix, iy)
-        && it >= 0
-        && it < vi.cell_num_t
-        && vi.states[vi.to_index(ix, iy, it) as usize].final_state
+/// 範囲内で final_state か (境界チェック込み)。`ib` 層で見たゴール圏 — b が
+/// `ib_goal` より不確かな層ではゴールが終端にならない (coastal navigation)。
+fn is_final(vi: &ValueIterator, ix: i32, iy: i32, it: i32, ib: i32) -> bool {
+    PolicyView::is_final_b(vi, ix, iy, it, ib)
 }
 
 /// solve 済み場の θ=0 全域スライスを可視化用 OccupancyGrid に描画する (0..=100、
@@ -603,6 +605,21 @@ impl PlannerCore {
         let mut stats =
             SolveStats { solved_now: false, iters: 0, adopted: false, truncated: false };
 
+        // belief 次元の適用範囲 (ノード側の起動時検証と同じ条件のベルト。素通しすると
+        // vi_lib の solve_observed が assert で落ちる)。
+        if self.cfg.belief.nb_levels > 1 {
+            if self.cfg.use_compact() {
+                return Err(PlanError::Unsupported(
+                    "belief_levels > 1 needs the dense path (the compact sink is 3D)",
+                ));
+            }
+            if !self.cfg.solver.caps().belief {
+                return Err(PlanError::Unsupported(
+                    "belief_levels > 1 needs a solver with caps().belief (solver: frontier2d)",
+                ));
+            }
+        }
+
         if self.cache_matches(&goal, goal_t_deg) {
             // ここも注文の入口。BT は追従中も 1Hz で計画を投げ直すので、最初の
             // 1 回で注文できていなくても (並びがまだ届いていない等) 次の tick で
@@ -732,6 +749,8 @@ impl PlannerCore {
             return Err(PlanError::Cancelled);
         }
         let mut vi = ValueIteratorLocal::new(self.build.actions.clone(), 1);
+        // **set_map より前**に入れること — states の層数と info はそこで確定する。
+        vi.base.belief = self.cfg.belief.clone();
         vi.set_map_with_occupancy_grid(
             &self.build.grid,
             self.build.theta_cell_num,
@@ -756,76 +775,6 @@ impl PlannerCore {
             return Err(PlanError::NotConverged);
         }
         Ok(Field::Dense(Box::new(vi)))
-    }
-
-    /// 能動的再定位の多目標場を用意する: ロスト中の仮説集合の判別点
-    /// ([`Localizer::reloc_targets`]) を**全 θ** の final_state にマークして
-    /// (`ValueIterator::set_goal_region`) 収束まで解き、キャッシュに載せる。
-    /// 以後の [`Self::decide_qmdp`] はこの場を読む — どの仮説が真でも、その仮説に
-    /// とっての判別点へ向かう行動になる。
-    ///
-    /// - キャッシュのゴールは**意図的に本来のゴールと一致しない** (先頭の判別点):
-    ///   復帰後の最初の `prepare_goal` / 計画要求がキャッシュミスで本来のゴールを
-    ///   解き直すので、専用の後始末は要らない。
-    /// - 密経路のみ。compact の sink ソルバは単一ゴール前提なので `Unsupported`
-    ///   を返す — 呼び出し側は受動復帰 (expansion resetting のみ) に任せること。
-    // ponytail: compact 対応は多シードの frontier finalize が要る — 必要になったら。
-    pub fn prepare_reloc_goal(
-        &mut self,
-        targets: &[(f64, f64)],
-        cancel: &AtomicBool,
-    ) -> Result<SolveStats, PlanError> {
-        if self.cfg.use_compact() {
-            return Err(PlanError::Unsupported("active relocalization needs the dense path"));
-        }
-        if targets.is_empty() {
-            return Err(PlanError::Unsupported("no relocalization targets"));
-        }
-        if cancel.load(Ordering::Relaxed) {
-            return Err(PlanError::Cancelled);
-        }
-        let mut stats =
-            SolveStats { solved_now: false, iters: 0, adopted: false, truncated: false };
-        self.cached = None; // 旧キャッシュを先に解放 (prepare_goal と同じ規律)
-        if let Some(ov) = self.penalty.as_mut() {
-            ov.clear();
-        }
-        self.dirty = false;
-
-        let mut vi = ValueIteratorLocal::new(self.build.actions.clone(), 1);
-        vi.set_map_with_occupancy_grid(
-            &self.build.grid,
-            self.build.theta_cell_num,
-            self.build.safety_radius,
-            self.build.safety_radius_penalty,
-            self.build.goal_margin_radius,
-            self.build.goal_margin_theta,
-        );
-        vi.set_local_xy_range(self.build.local_xy_range);
-        // 半径はゴール margin と同じ、ただし最低 1 セルは確実にマークする。
-        let radius = self.build.goal_margin_radius.max(vi.base.xy_resolution);
-        vi.base.set_goal_region(targets, radius);
-
-        let mut director =
-            SolveDirector { cfg: &self.cfg, cancel, from: None, on_progress: &mut |_| {} };
-        let out =
-            solve_observed(&mut vi.base, self.cfg.solver, self.cfg.max_solve_iter, &mut director);
-        stats.iters = out.iters;
-        if out.cancelled {
-            return Err(PlanError::Cancelled);
-        }
-        if !out.converged {
-            return Err(PlanError::NotConverged);
-        }
-        self.cached = Some(CachedGoal {
-            goal_x: targets[0].0,
-            goal_y: targets[0].1,
-            goal_t_deg: 0,
-            field: Field::Dense(Box::new(vi)),
-            truncated: false,
-        });
-        stats.solved_now = true;
-        Ok(stats)
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -940,6 +889,8 @@ impl PlannerCore {
     /// ローカルウィンドウ範囲だけを現在方位の θ スライスで描画した可視化グリッド。
     /// `set_window` 後に呼ぶこと。地図端ではクランプ後の実範囲を使うので、本家
     /// `makeLocalValueFunctionMap` と違い幅とデータ長が常に一致する。
+    // ponytail: 可視化は b=0 スライス固定 ([`value_grid_on`] も同じ)。b̂ 層を見たく
+    // なったら to_index4 に ib を通す。
     pub fn window_value_grid(
         &self,
         pose: PoseView,
@@ -1170,6 +1121,10 @@ impl PlannerCore {
     fn refine_pass_until(&mut self, should_stop: impl Fn() -> bool) -> (u64, bool) {
         let Some(vi) = self.local_mut() else { return (0, true) };
         let nt = vi.base.cell_num_t;
+        // b 層も舐める (本家 `local_value_iteration_loop` と同じ。nb_levels==1 では
+        // 1 周 = 従来と同一)。窓の中だけ 4D で精密化しないと、b̂ 層の値だけが
+        // スキャンの penalty を知らないまま残る。
+        let nb = vi.base.belief_levels();
         let mut delta = 0u64;
         for iix in vi.local_ix_min..=vi.local_ix_max {
             if should_stop() {
@@ -1177,8 +1132,10 @@ impl PlannerCore {
             }
             for iiy in vi.local_iy_min..=vi.local_iy_max {
                 for iit in 0..nt {
-                    let i = vi.base.to_index(iix, iiy, iit) as usize;
-                    delta = delta.saturating_add(vi.value_iteration_local(i));
+                    for ib in 0..nb {
+                        let i = vi.base.to_index4(iix, iiy, iit, ib);
+                        delta = delta.saturating_add(vi.value_iteration_local(i));
+                    }
                 }
             }
         }
@@ -1189,9 +1146,13 @@ impl PlannerCore {
     /// 選んだ [`FollowController`] — 既定の greedy は本家 `ViNode::decision` の
     /// `posToAction` 相当 (方策が無ければ近傍借用)、dwa は連続行動。
     /// compact 経路では `set_window` でパッチを起こしてから呼ぶこと。
-    pub fn decide(&self, pose: PoseView) -> Decision {
+    ///
+    /// `ib_hat` は belief 不確かさレベルの推定値 ([`Belief::b_hat`])。`nb_levels == 1`
+    /// では 0 を渡せば従来と同一。
+    pub fn decide(&self, pose: PoseView, ib_hat: i32) -> Decision {
         let Some(local) = self.local() else { return Decision::NoAction };
-        self.follow.decide(&local.base, &self.cfg, pose)
+        let ib = ib_hat.clamp(0, local.base.belief_levels() - 1);
+        self.follow.decide(&local.base, &self.cfg, pose, ib)
     }
 
     /// belief 仮説集合での判断 (QMDP — [`qmdp_decide`])。読む場は [`Self::decide`]
@@ -1200,9 +1161,9 @@ impl PlannerCore {
     /// 有意な仮説が衝突と言う行動しか無ければ `NoAction` (停止)。
     /// `follow_controller` (dwa/mppi) は経由しない — 多峰時は離散 QMDP が優先で、
     /// 単峰時は呼び出し側が [`Self::decide`] へフォールバックする分担。
-    pub fn decide_qmdp(&self, hyps: &[(PoseView, f64)]) -> Decision {
+    pub fn decide_qmdp(&self, hyps: &[(PoseView, f64)], ib_hat: i32) -> Decision {
         let Some(local) = self.local() else { return Decision::NoAction };
-        match qmdp_decide(&local.base, hyps) {
+        match qmdp_decide(&local.base, hyps, ib_hat) {
             QmdpDecision::Goal => Decision::Goal,
             QmdpDecision::Action(ai) => {
                 let a = &local.base.actions[ai];

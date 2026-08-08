@@ -70,6 +70,7 @@ fn cfg() -> PlanConfig {
         prefetch_poll_ms: 50,
         global_sweep: true,
         early_start: false,
+        belief: BeliefModel::default(), // nb_levels: 1 = 従来の 3D VI
     }
 }
 
@@ -103,7 +104,7 @@ fn plan_and_follow_share_a_single_solve() {
     // その価値関数のまま追従判断が下せる。
     let robot = pose(0.6, 0.6, 0.0);
     core.set_window(robot);
-    assert!(matches!(core.decide(robot), Decision::Action { .. }));
+    assert!(matches!(core.decide(robot, 0), Decision::Action { .. }));
 
     // 1Hz リプラン相当も solve なし (ロールアウトのみ)。
     let (_, s3) = core.plan(pose(0.8, 0.9, 0.3), goal, &cancel).expect("replan");
@@ -125,7 +126,7 @@ fn follows_policy_to_goal_on_empty_map() {
         let p = pose(x, y, yaw);
         core.set_window(p);
         core.refine_passes(1);
-        match core.decide(p) {
+        match core.decide(p, 0) {
             Decision::Goal => {
                 let d = core.goal_distance(x, y).unwrap();
                 assert!(d <= 0.3, "goal margin: d = {d}");
@@ -165,7 +166,7 @@ fn compact_follows_policy_to_goal() {
             last_at = at;
         }
         core.refine_passes(1);
-        match core.decide(p) {
+        match core.decide(p, 0) {
             Decision::Goal => {
                 let d = core.goal_distance(x, y).unwrap();
                 assert!(d <= 0.3, "goal margin: d = {d}");
@@ -227,7 +228,7 @@ fn compact_recenters_repeatedly_with_an_interior_patch() {
             }
         }
         core.refine_passes(1);
-        match core.decide(p) {
+        match core.decide(p, 0) {
             Decision::Goal => {
                 assert!(hydrations >= 3, "patch must move several times: {hydrations}");
                 assert!(
@@ -270,7 +271,7 @@ fn dwa_follows_to_goal_on_empty_map() {
     for _ in 0..3000 {
         let p = pose(x, y, yaw);
         core.set_window(p);
-        match core.decide(p) {
+        match core.decide(p, 0) {
             Decision::Goal => {
                 let d = core.goal_distance(x, y).unwrap();
                 assert!(d <= 0.3, "goal margin: d = {d}");
@@ -317,7 +318,7 @@ fn dwa_follows_to_goal_on_compact_patch() {
             last_at = at;
         }
         // refine はしない (スキャンを入れないので値は動かない)。decide だけを回す。
-        match core.decide(p) {
+        match core.decide(p, 0) {
             Decision::Goal => {
                 let d = core.goal_distance(x, y).unwrap();
                 assert!(d <= 0.3, "goal margin: d = {d}");
@@ -358,7 +359,7 @@ fn dwa_falls_back_to_greedy_on_unevaluable_cells() {
 
     // 障害物セルの上: DWA は評価不能 → greedy 借用が離散行動 (id: Some) を返す。
     let on_obstacle = pose(20.5 * RES, 20.5 * RES, 0.0);
-    assert!(matches!(core.decide(on_obstacle), Decision::Action { id: Some(_), .. }));
+    assert!(matches!(core.decide(on_obstacle, 0), Decision::Action { id: Some(_), .. }));
 }
 
 /// MPPI (連続行動) でも同じ場でゴール圏まで走り切れること。tick 間状態 (warm
@@ -379,7 +380,7 @@ fn mppi_follows_to_goal_on_empty_map() {
     for _ in 0..3000 {
         let p = pose(x, y, yaw);
         core.set_window(p);
-        match core.decide(p) {
+        match core.decide(p, 0) {
             Decision::Goal => {
                 let d = core.goal_distance(x, y).unwrap();
                 assert!(d <= 0.3, "goal margin: d = {d}");
@@ -417,7 +418,7 @@ fn mppi_falls_back_to_greedy_on_unevaluable_cells() {
     core.prepare_goal(pose(2.5, 2.5, 0.0), &cancel).expect("solve");
 
     let on_obstacle = pose(20.5 * RES, 20.5 * RES, 0.0);
-    assert!(matches!(core.decide(on_obstacle), Decision::Action { id: Some(_), .. }));
+    assert!(matches!(core.decide(on_obstacle, 0), Decision::Action { id: Some(_), .. }));
 }
 
 /// compact 経路の広域側が密経路と同じ経路を返すこと (ロールアウトは sink を読む)。
@@ -500,7 +501,7 @@ fn compact_with_mmap_sink_follows() {
     core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).expect("solve");
     let robot = pose(0.6, 0.6, 0.0);
     core.set_window(robot);
-    assert!(matches!(core.decide(robot), Decision::Action { .. }));
+    assert!(matches!(core.decide(robot, 0), Decision::Action { .. }));
     drop(core);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -557,9 +558,9 @@ fn compact_patch_is_invalidated_on_a_new_goal() {
 
     core.prepare_goal(pose(0.8, 2.4, 0.0), &cancel).expect("new goal");
     assert!(core.patch.as_ref().unwrap().at.is_none(), "stale patch must be dropped");
-    assert_eq!(core.decide(robot), Decision::NoAction, "no policy before set_window");
+    assert_eq!(core.decide(robot, 0), Decision::NoAction, "no policy before set_window");
     core.set_window(robot);
-    assert!(matches!(core.decide(robot), Decision::Action { .. }));
+    assert!(matches!(core.decide(robot, 0), Decision::Action { .. }));
 }
 
 #[test]
@@ -1096,7 +1097,7 @@ fn decide_borrows_action_from_neighbors() {
         solve_only: false,
         follow: strict_follow,
     };
-    assert_eq!(strict_core.decide(on_obstacle), Decision::NoAction);
+    assert_eq!(strict_core.decide(on_obstacle, 0), Decision::NoAction);
     // tolerance 4 (0.2m) なら近傍の行動を借りられる。
     let relaxed_follow = follow::make_controller(&cfg(), &strict_core.build.actions);
     let relaxed_core = PlannerCore {
@@ -1111,7 +1112,7 @@ fn decide_borrows_action_from_neighbors() {
         solve_only: false,
         follow: relaxed_follow,
     };
-    assert!(matches!(relaxed_core.decide(on_obstacle), Decision::Action { .. }));
+    assert!(matches!(relaxed_core.decide(on_obstacle, 0), Decision::Action { .. }));
 }
 
 #[test]
@@ -1645,7 +1646,7 @@ fn a_goal_adopted_as_the_first_one_can_still_be_followed() {
     let start = pose(1.0, 1.0, 0.0);
     fresh.set_window(start);
     assert!(
-        matches!(fresh.decide(start), Decision::Action { .. }),
+        matches!(fresh.decide(start, 0), Decision::Action { .. }),
         "受け取った場の上で方策が読めること"
     );
 }
@@ -1789,7 +1790,7 @@ fn early_start_cuts_the_dense_solve_once_the_path_exists() {
 
     // 打ち切った場でも追従の判断が下せる (方策は収束前でも書き戻されている)。
     early.set_window(start);
-    assert!(matches!(early.decide(start), Decision::Action { .. }));
+    assert!(matches!(early.decide(start, 0), Decision::Action { .. }));
 }
 
 /// 打ち切った密の場には「まだ伝播させる仕事がある」印を付ける。走りながら
@@ -1842,7 +1843,7 @@ fn early_start_cuts_the_compact_solve_and_leaves_the_far_side_unfinalized() {
         let p = pose(x, y, yaw);
         core.set_window(p);
         core.refine_passes(1);
-        match core.decide(p) {
+        match core.decide(p, 0) {
             Decision::Goal => {
                 assert!(core.goal_distance(x, y).unwrap() <= 0.3);
                 return;
@@ -1917,30 +1918,97 @@ fn discard_truncated_leaves_a_converged_field_alone() {
     assert!(core.is_cached_goal(goal), "捨てられていないこと");
 }
 
-/// 能動的再定位: 多目標場が解けて QMDP が乗ること。キャッシュは本来のゴールと
-/// 一致しない (復帰後の最初の要求が解き直す)。compact 構成は Unsupported。
-#[test]
-fn prepare_reloc_goal_serves_qmdp_toward_targets() {
-    let cancel = AtomicBool::new(false);
-    let mut core = PlannerCore::new(build(64), cfg());
-    let targets = [(0.8, 0.8), (2.4, 2.4)];
-    let stats = core.prepare_reloc_goal(&targets, &cancel).expect("reloc field");
-    assert!(stats.solved_now);
-    assert!(!core.is_cached_goal(pose(1.6, 1.6, 0.0)), "本来のゴールとは不一致のはず");
+// ──────────────────────────────────────────────────────────────────────────
+// belief 次元 (x, y, θ, b)
+// ──────────────────────────────────────────────────────────────────────────
 
-    // 2 仮説 QMDP: どちらの仮説にも行動が出る (多目標場の上の走行)。
-    let hyps = [(pose(0.5, 0.5, 0.0), 0.5), (pose(2.7, 2.7, 0.0), 0.5)];
-    match core.decide_qmdp(&hyps) {
-        Decision::Action { .. } => {}
-        d => panic!("expected Action, got {d:?}"),
+/// 外周を壁で囲った格子 (belief の尤度場が立つように — 全 free だとスキャンが
+/// 何も当たらず補正できない)。
+fn walled(size: i32) -> BuildParams {
+    let mut b = build(size);
+    for i in 0..size {
+        for (x, y) in [(i, 0), (i, size - 1), (0, i), (size - 1, i)] {
+            b.grid.data[(y * size + x) as usize] = 100;
+        }
     }
-    // 両仮説とも判別点圏内なら Goal (final_state は全 θ)。
-    let at = [(pose(0.8, 0.8, 1.0), 0.5), (pose(2.4, 2.4, 2.0), 0.5)];
-    assert_eq!(core.decide_qmdp(&at), Decision::Goal);
+    b
+}
 
-    let mut compact = PlannerCore::new(build(64), cfg_compact());
-    assert!(matches!(
-        compact.prepare_reloc_goal(&targets, &cancel),
-        Err(PlanError::Unsupported(_))
-    ));
+/// `nb_levels` だけを差し替えた [`BeliefModel`]。私有フィールド (info/nx/layer —
+/// set_map が埋める) があるので struct update 構文はクレート外から使えない。
+fn belief_model(nb: i32) -> BeliefModel {
+    let mut m = BeliefModel::default();
+    m.nb_levels = nb;
+    m
+}
+
+/// belief 次元つきの設定。`caps().belief` を持つ密ソルバが要る。
+fn cfg_belief(nb: i32) -> PlanConfig {
+    PlanConfig { solver: U64Solver::Frontier2D, belief: belief_model(nb), ..cfg() }
+}
+
+/// **belief は核の外で生きる**: ゴールを解き直しても推定は素通しで残ること。
+/// 核の中に入れると 30 秒級の solve がロックを握っている間だけ推定が止まり、
+/// 走り出しの瞬間に姿勢が古くなる (だから `Loc` はノード側の別 Mutex にある)。
+#[test]
+fn the_belief_survives_a_goal_re_solve() {
+    let bp = walled(60);
+    let bc = BeliefConfig { beam_step: 1, ..BeliefConfig::default() };
+    let mut belief = Belief::new(&bp.grid, 36, &bp.grid, bc);
+    let truth = pose(1.2, 1.5, 0.5);
+    belief.seed(truth);
+    belief.observe(&vi_lib::belief::cast_scan(&bp.grid, truth, 60, 10.0));
+    let (before, ess) = (belief.pose().expect("seeded"), belief.ess());
+
+    let cancel = AtomicBool::new(false);
+    let mut core = PlannerCore::new(bp.clone(), cfg());
+    core.prepare_goal(pose(2.4, 2.4, 0.0), &cancel).expect("goal A");
+    core.prepare_goal(pose(0.6, 2.4, 0.0), &cancel).expect("goal B");
+
+    let after = belief.pose().expect("still localized");
+    assert_eq!((after.x, after.y, after.yaw_rad), (before.x, before.y, before.yaw_rad));
+    assert_eq!(belief.ess(), ess);
+    // 生きたまま = 解き直しの後も補正が続けられる。
+    belief.observe(&vi_lib::belief::cast_scan(&bp.grid, truth, 60, 10.0));
+    let p = belief.pose().expect("still localized after another scan");
+    assert!((p.x - truth.x).hypot(p.y - truth.y) < 0.3);
+}
+
+/// `decide` は b̂ 層を読む: ゴール上でも「不確かなままでは着いたことにならない」
+/// (`ib_goal` より上の層では final_state ではない = coastal navigation の効き目)。
+#[test]
+fn decide_gates_the_goal_on_the_belief_layer() {
+    let cancel = AtomicBool::new(false);
+    let mut core = PlannerCore::new(walled(48), cfg_belief(3));
+    let goal = pose(1.2, 1.2, 0.0);
+    core.prepare_goal(goal, &cancel).expect("solve with the belief dimension");
+    core.set_window(goal);
+
+    // b̂ = 0 (十分集中) — ゴール圏。
+    assert_eq!(core.decide(goal, 0), Decision::Goal);
+    // 同じ姿勢で b̂ = 2 (ロスト相当) — ゴールにはならない。
+    assert_ne!(core.decide(goal, 2), Decision::Goal);
+}
+
+/// belief 次元を持てない構成は `Unsupported` で弾く (ノード側の起動時検証の
+/// ベルト。素通しすると vi_lib の solve_observed が assert で落ちる)。
+#[test]
+fn belief_levels_needs_a_dense_belief_capable_solver() {
+    let cancel = AtomicBool::new(false);
+    let goal = pose(1.2, 1.2, 0.0);
+
+    // compact (sink は 3D)。
+    let mut compact = PlannerCore::new(
+        build(48),
+        PlanConfig { belief: belief_model(3), ..cfg_compact() },
+    );
+    assert!(matches!(compact.prepare_goal(goal, &cancel), Err(PlanError::Unsupported(_))));
+
+    // Group B の密ソルバ (既定の frontier2d_sparse がこれ)。
+    assert!(!U64Solver::Frontier2DSparse.caps().belief);
+    let mut sparse = PlannerCore::new(
+        build(48),
+        PlanConfig { belief: belief_model(3), ..cfg() },
+    );
+    assert!(matches!(sparse.prepare_goal(goal, &cancel), Err(PlanError::Unsupported(_))));
 }
