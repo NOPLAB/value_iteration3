@@ -101,6 +101,13 @@ struct Params {
     goal_tolerance_deg: f64,
     pose_topic: String,
     global_frame: String,
+    /// map→odom TF を配信するか (AMCL の契約の置き換え)。外部 localizer が
+    /// map→odom を出す構成 (emcl2/AMCL) では off のまま — 出すのは常に 1 人。
+    publish_tf: bool,
+    /// TF スタンプの未来日付け [s] (AMCL の transform_tolerance 相当)。
+    transform_tolerance: f64,
+    /// publish_tf 用の odom 購読先 (T_odom→base の出どころ)。
+    odom_topic: String,
     // ── 自己位置推定 (core::Localizer) ──
     /// 自己位置の出どころ ("external" | "grid" | "adaptive")。
     localizer: String,
@@ -252,6 +259,9 @@ fn read_params(node: &Node) -> Result<Params> {
         goal_tolerance_deg: p!("goal_tolerance_deg", f64, 10.0),
         pose_topic: p!("pose_topic", Arc<str>, "mcl_pose".into()).to_string(),
         global_frame: p!("global_frame", Arc<str>, "map".into()).to_string(),
+        publish_tf: p!("publish_tf", bool, false),
+        transform_tolerance: p!("transform_tolerance", f64, 0.5),
+        odom_topic: p!("odom_topic", Arc<str>, "odom".into()).to_string(),
 
         // 自己位置の出どころ。"external" (既定) = pose_topic の推定をそのまま使う
         // (mcl 等の外部推定器)。"grid" = 内蔵ヒストグラム MCL — pose_topic は
@@ -694,10 +704,13 @@ struct Handles {
     /// 表示専用の経路 (`plan`)。standalone のときだけ Some。
     plan_pub: Option<PlanPub>,
     /// 推定姿勢の表示用出力 (`viola_pose`)。シードとスキャン補正のたびに出す。
-    /// TF は書かないので、RViz でロボット (真値の TF) と見比べられる。
     est_pub: Publisher<geometry_msgs::msg::PoseStamped>,
     est_frame: String,
     est_clock: Clock,
+    /// map→odom TF (`publish_tf`)。odom が届くたびに latest_pose と合成して出す
+    /// (odom レートで出すので、スキャン間も TF が新鮮なまま)。
+    tf_pub: Option<Publisher<tf2_msgs::msg::TFMessage>>,
+    tf_tolerance: Duration,
 }
 
 impl Handles {
@@ -713,6 +726,30 @@ impl Handles {
         msg.pose.orientation.z = (p.yaw_rad / 2.0).sin();
         msg.pose.orientation.w = (p.yaw_rad / 2.0).cos();
         let _ = self.est_pub.publish(msg);
+    }
+
+    /// map→odom = T_map→base(推定) · T_odom→base⁻¹ を `/tf` へ (AMCL の契約)。
+    /// スキャン時刻より新しい参照にも答えられるよう、スタンプは
+    /// transform_tolerance だけ未来へ日付ける (AMCL と同じ手当て)。
+    fn publish_tf(&self, est: PoseView, odo: PoseView, odom_frame: &str) {
+        let Some(tf_pub) = self.tf_pub.as_ref() else { return };
+        let th = est.yaw_rad - odo.yaw_rad;
+        let (s, c) = th.sin_cos();
+        let mut t = geometry_msgs::msg::TransformStamped::default();
+        t.header.frame_id = self.est_frame.as_str().into();
+        t.child_frame_id = odom_frame.into();
+        let (sec, nanosec) = self.est_clock.now().to_sec_nanosec().unwrap_or((0, 0));
+        let total =
+            sec as i64 * 1_000_000_000 + nanosec as i64 + self.tf_tolerance.as_nanos() as i64;
+        t.header.stamp.sec = (total / 1_000_000_000) as i32;
+        t.header.stamp.nanosec = (total % 1_000_000_000) as u32;
+        t.transform.translation.x = est.x - (c * odo.x - s * odo.y);
+        t.transform.translation.y = est.y - (s * odo.x + c * odo.y);
+        t.transform.rotation.z = (th / 2.0).sin();
+        t.transform.rotation.w = (th / 2.0).cos();
+        let mut msg = tf2_msgs::msg::TFMessage::default();
+        msg.transforms = vec![t];
+        let _ = tf_pub.publish(msg);
     }
 
     /// 追従ループ用の借用ビュー。`with_plan: false` は Nav2 構成の follow_path
@@ -1423,6 +1460,12 @@ fn main() -> Result<()> {
             .create_publisher::<geometry_msgs::msg::PoseStamped>("viola_pose".keep_last(1))?,
         est_frame: params.global_frame.clone(),
         est_clock: node.get_clock(),
+        tf_pub: if params.publish_tf {
+            Some(node.create_publisher::<tf2_msgs::msg::TFMessage>("/tf".keep_last(100))?)
+        } else {
+            None
+        },
+        tf_tolerance: Duration::from_secs_f64(params.transform_tolerance.max(0.0)),
         viz: if params.publish_value_function {
             Some(Viz {
                 vf_pub: node.create_publisher::<nav_msgs::msg::OccupancyGrid>(
@@ -1472,6 +1515,25 @@ fn main() -> Result<()> {
                 }
             },
         )?
+    };
+
+    // 6a″. odom 購読 (publish_tf のときだけ)。map→odom は推定と odom の合成で、
+    //      odom レートで出し直す (map→odom 自体はスキャン補正のときしか動かない
+    //      が、スタンプの新鮮さが TF 参照側の生死を分ける)。
+    let _odom_sub = if !params.publish_tf {
+        None
+    } else {
+        let h = Arc::clone(&handles);
+        Some(node.create_subscription::<nav_msgs::msg::Odometry, _>(
+            params.odom_topic.as_str().keep_last(1),
+            move |msg: nav_msgs::msg::Odometry| {
+                let est = match *lock(&h.latest_pose) {
+                    Some(p) => p,
+                    None => return, // シード前は map→odom を定義できない
+                };
+                h.publish_tf(est, pose_view_from(&msg.pose.pose), &msg.header.frame_id);
+            },
+        )?)
     };
 
     // 6b. スキャン購読 (sensor QoS = best effort)。tick 間に届いた分を貯めて

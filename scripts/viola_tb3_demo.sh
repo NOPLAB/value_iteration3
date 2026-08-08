@@ -13,9 +13,9 @@
 #     走らせる (nav2_rviz_plugins は不要)。CLI なら:
 #       ros2 topic pub --once /goal_pose geometry_msgs/msg/PoseStamped \
 #         '{header: {frame_id: map}, pose: {position: {x: 2.0, y: 0.5}}}'
-#   - map→odom の static TF は表示専用 (TB3 の diff_drive は odom をスポーンの
-#     ワールド座標で初期化するので恒等)。VIOLA 自体は TF を一切使わない —
-#     推定は scan + 自分の cmd_vel だけ。
+#   - map→odom TF は vi_planner が配信 (publish_tf、AMCL の契約の置き換え)。
+#     RViz のロボット・scan は推定姿勢に乗る (真値は Gazebo ウィンドウ)。
+#     ピンク矢印 (viola_pose) は推定そのもの — ロボットモデルと重なるのが正常。
 #
 # 各コンポーネントのログ: out/viola_demo_logs/*.log (無反応のときはまずここ)。
 set -euo pipefail
@@ -36,16 +36,13 @@ ros2 run nav2_map_server map_server --ros-args \
     -p yaml_filename:="$REPO_ROOT/assets/tb3_world/map.yaml" \
     -p use_sim_time:=true >"$LOG/map_server.log" 2>&1 &
 
-# 表示専用: 真値 (odom) を map に重ねる。
-ros2 run tf2_ros static_transform_publisher \
-    --frame-id map --child-frame-id odom >"$LOG/static_tf.log" 2>&1 &
-
 ros2 run vi_planner vi_planner --ros-args \
     -p localizer:=grid \
     -p standalone:=true \
     -p use_sim_time:=true \
     -p map_wait_sec:=120 \
     -p pose_topic:=initialpose \
+    -p publish_tf:=true \
     -p scan_topic:=scan >"$LOG/vi_planner.log" 2>&1 &
 
 rviz2 -d "$REPO_ROOT/assets/tb3_world/viola.rviz" >"$LOG/rviz.log" 2>&1 &

@@ -794,6 +794,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tf2_msgs"
+version = "0.25.20"
+dependencies = [
+ "action_msgs",
+ "builtin_interfaces",
+ "geometry_msgs",
+ "rosidl_runtime_rs",
+ "std_msgs",
+ "unique_identifier_msgs",
+]
+
+[[package]]
 name = "tokio"
 version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -900,6 +912,7 @@ dependencies = [
  "nav_msgs",
  "rclrs",
  "sensor_msgs",
+ "tf2_msgs",
  "vi_lib",
 ]
 
@@ -1083,10 +1096,6 @@ version = "4.9.1"
 [[patch.unused]]
 name = "stereo_msgs"
 version = "4.9.1"
-
-[[patch.unused]]
-name = "tf2_msgs"
-version = "0.25.20"
 
 [[patch.unused]]
 name = "trajectory_msgs"
