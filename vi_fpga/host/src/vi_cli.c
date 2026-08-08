@@ -8,7 +8,6 @@
 #include "vi_reference_c.h"
 
 #include <getopt.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,9 +26,6 @@ typedef struct {
     int         mock;
     int         verbose;
 } cli_args_t;
-
-static volatile sig_atomic_t g_interrupt = 0;
-static void on_sigint(int sig) { (void)sig; g_interrupt = 1; }
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -95,8 +91,6 @@ int main(int argc, char **argv) {
         }
     }
     if (!a.map_path) { usage(argv[0]); return 1; }
-
-    signal(SIGINT, on_sigint);
 
     /* --- Load map --- */
     pgm_map_t map = {0};
@@ -200,10 +194,6 @@ int main(int argc, char **argv) {
             write_bin(a.out_action, act, (size_t)map.w * map.h * VI_N_THETA);
         free(act);
     }
-
-    /* g_interrupt is wired but currently unused beyond the handler; reference
-       it so -Wunused-variable doesn't complain in non-verbose builds. */
-    (void)g_interrupt;
 
     vi_close(dev);
     if (a.mock) vi_mock_ctx_free(ctx);

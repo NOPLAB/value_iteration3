@@ -3,7 +3,7 @@
 CC      ?= gcc
 AR      ?= ar
 CFLAGS  := -std=c11 -Wall -Wextra -Werror -O2 -fPIC -Iinclude -I. -Igenerated
-LDFLAGS := -lpthread
+LDFLAGS :=
 
 SRC_COMMON := libvi_sweep.c vi_device_mock.c
 SRC_LINUX  := vi_device_linux.c

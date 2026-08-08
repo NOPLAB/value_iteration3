@@ -1,8 +1,6 @@
 #include "penalty.h"
 
 #include <math.h>
-#include <stdlib.h>
-#include <string.h>
 
 void penalty_build(const pgm_map_t *map, int safety_radius,
                    int gx, int gy, uint16_t *pen_out) {

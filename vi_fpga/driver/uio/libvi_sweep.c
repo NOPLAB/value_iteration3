@@ -5,7 +5,6 @@
 #include "libvi_sweep.h"
 #include "vi_device.h"
 
-#include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -213,17 +212,4 @@ int vi_compute_action_table(vi_device_t *dev, int map_x, int map_y,
         }
     }
     return VI_OK;
-}
-
-const char* vi_strerror(int code) {
-    switch (code) {
-    case VI_OK:           return "OK";
-    case VI_ERR_OPEN:     return "open failed";
-    case VI_ERR_MMAP:     return "mmap failed";
-    case VI_ERR_IRQ:      return "irq wait failed";
-    case VI_ERR_BUF_SIZE: return "buffer too small for map";
-    case VI_ERR_NOT_CONV: return "did not converge within max_sweeps";
-    case VI_ERR_BAD_ARG:  return "bad argument";
-    }
-    return "unknown";
 }

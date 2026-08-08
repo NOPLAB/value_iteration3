@@ -1,5 +1,8 @@
 # vi_sweep Device Tree overlay
 
+The dtsi lives in the EDF layer:
+`vi_fpga/petalinux/meta-vi-sweep/recipes-bsp/device-tree/files/vi_sweep.dtsi`.
+
 Include `vi_sweep.dtsi` from your Petalinux project's
 `project-spec/meta-user/recipes-bsp/device-tree/files/system-user.dtsi`:
 
@@ -47,8 +50,7 @@ the Vivado project, selecting the `zynq_ps` IP, and inspecting the interrupt
 report, or by reading the generated `<design>.xsa` file's interrupt table.
 
 Placeholder values in `vi_sweep.dtsi` are 89/90; update them if your build
-assigns different numbers. See `fpga/vivado/ultra96v2/irq_notes.txt` for a
-place to record the confirmed values alongside the Vivado project.
+assigns different numbers.
 
 ## Verification after boot
 

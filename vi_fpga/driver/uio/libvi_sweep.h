@@ -57,9 +57,6 @@ int vi_compute_action_table(vi_device_t *dev,
                             int map_x, int map_y,
                             uint8_t *action_out);
 
-/* --- Error helpers --- */
-const char* vi_strerror(int code);
-
 enum {
     VI_OK           =  0,
     VI_ERR_OPEN     = -1,

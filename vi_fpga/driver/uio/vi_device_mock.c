@@ -3,6 +3,7 @@
 
 #include "vi_device.h"
 #include "libvi_sweep.h"
+#include "vi_bellman_cell.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -10,9 +11,6 @@
 
 /* Register offsets (must match the layout libvi_sweep.c uses). */
 #define MOCK_AP_CTRL        0x00
-#define MOCK_GIE            0x04
-#define MOCK_IER            0x08
-#define MOCK_ISR            0x0C
 #define MOCK_ADDR_VALUE     0x10  /* 64-bit */
 #define MOCK_ADDR_PENALTY   0x1C
 #define MOCK_ADDR_TRANS     0x28
@@ -58,10 +56,6 @@ static void mock_run_sweep(mock_ctx_t *mc, int cu) {
         return;
     }
 
-    uint16_t *val = mc->value_buf;
-    const uint16_t *pen = mc->pen_buf;
-    const uint32_t *trans = mc->trans_buf;
-
     uint16_t local_max = 0;
 
     for (int ty = 0; ty < nty; ty++) {
@@ -73,42 +67,10 @@ static void mock_run_sweep(mock_ctx_t *mc, int cu) {
 
             for (int iy = y0; iy < y1; iy++) {
                 for (int ix = x0; ix < x1; ix++) {
-                    uint16_t cell_pen = pen[iy * map_x + ix];
-                    if (cell_pen >= 0xFFFE) continue;  /* obstacle or goal */
-
-                    for (int it = 0; it < VI_N_THETA; it++) {
-                        size_t idx = ((size_t)iy * map_x + ix) * VI_N_THETA + it;
-                        uint16_t old = val[idx];
-                        uint16_t best = 0xFFFF;
-
-                        for (int a = 0; a < VI_N_ACTIONS; a++) {
-                            uint32_t t = trans[a * VI_N_THETA + it];
-                            int8_t dix = (int8_t)(t & 0xFF);
-                            int8_t diy = (int8_t)((t >> 8) & 0xFF);
-                            int8_t dit = (int8_t)((t >> 16) & 0xFF);
-
-                            int nx = ix + dix;
-                            int ny = iy + diy;
-                            int nt = it + dit;
-                            if (nt < 0) nt += VI_N_THETA;
-                            if (nt >= VI_N_THETA) nt -= VI_N_THETA;
-                            if (nx < 0 || nx >= map_x || ny < 0 || ny >= map_y) continue;
-
-                            size_t nidx = ((size_t)ny * map_x + nx) * VI_N_THETA + nt;
-                            uint16_t nv = val[nidx];
-                            uint16_t np_raw = pen[ny * map_x + nx];
-                            if (nv == 0xFFFF || np_raw == 0xFFFF) continue;
-                            uint16_t np = (np_raw == 0xFFFE) ? 0 : np_raw;
-
-                            uint32_t sum = (uint32_t)nv + (uint32_t)np;
-                            uint16_t c = (sum >= 0xFFFF) ? 0xFFFE : (uint16_t)sum;
-                            if (c < best) best = c;
-                        }
-
-                        val[idx] = best;
-                        uint16_t d = (best > old) ? (best - old) : (old - best);
-                        if (d > local_max) local_max = d;
-                    }
+                    uint16_t d = vi_bellman_cell(mc->value_buf, mc->pen_buf,
+                                                 mc->trans_buf,
+                                                 map_x, map_y, ix, iy);
+                    if (d > local_max) local_max = d;
                 }
             }
         }
@@ -156,13 +118,6 @@ static void mock_write_reg(void *vctx, int cu, uint32_t off, uint32_t v) {
     mock_ctx_t *mc = (mock_ctx_t*)vctx;
     if (cu < 0 || cu >= VI_NUM_CU || off + 4 > MOCK_REG_BYTES) return;
 
-    /* ISR is W1C — read-modify-write based on the previous value. */
-    if (off == MOCK_ISR) {
-        uint32_t cur = rd32(mc->regs[cu], MOCK_ISR);
-        wr32(mc->regs[cu], MOCK_ISR, cur & ~v);
-        return;
-    }
-
     wr32(mc->regs[cu], off, v);
 
     /* ap_start: run one sweep synchronously. */
@@ -173,9 +128,6 @@ static void mock_write_reg(void *vctx, int cu, uint32_t off, uint32_t v) {
         ctrl &= ~0x1u;
         ctrl |= 0x6u;  /* done | idle */
         wr32(mc->regs[cu], MOCK_AP_CTRL, ctrl);
-        /* OR in ap_done bit on ISR. */
-        uint32_t isr = rd32(mc->regs[cu], MOCK_ISR);
-        wr32(mc->regs[cu], MOCK_ISR, isr | 0x1u);
     }
 }
 

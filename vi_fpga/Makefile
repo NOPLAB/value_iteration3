@@ -32,13 +32,16 @@ stream tile:
 
 # ---------- HLS source dependencies ----------
 
+HLS_COMMON     := $(wildcard $(FPGA_DIR)hls/common/*.cpp) \
+                  $(wildcard $(FPGA_DIR)hls/common/*.h)
+
 HLS_STREAM_SRC := $(wildcard $(FPGA_DIR)hls/stream/src/*.cpp) \
                   $(wildcard $(FPGA_DIR)hls/stream/src/*.h)
-HLS_STREAM_TB  := $(wildcard $(FPGA_DIR)hls/stream/tb/*.cpp)
+HLS_STREAM_TB  := $(wildcard $(FPGA_DIR)hls/stream/tb/*.cpp) $(HLS_COMMON)
 
 HLS_TILE_SRC   := $(wildcard $(FPGA_DIR)hls/tile/src/*.cpp) \
                   $(wildcard $(FPGA_DIR)hls/tile/src/*.h)
-HLS_TILE_TB    := $(wildcard $(FPGA_DIR)hls/tile/tb/*.cpp)
+HLS_TILE_TB    := $(wildcard $(FPGA_DIR)hls/tile/tb/*.cpp) $(HLS_COMMON)
 
 HLS_CSIM_STAMP  := $(BUILD_DIR).csim_$(KERNEL)_done
 HLS_SYNTH_STAMP := $(BUILD_DIR).hls_$(KERNEL)_done
