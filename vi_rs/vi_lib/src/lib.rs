@@ -40,11 +40,10 @@ pub mod ctrl;
 // vi_ros2/vi_node と vi_ros2/vi_global_planner が共有する (旧 vi_node/src/bridge.rs)。
 pub mod bridge;
 
-pub mod localize;
-
-pub use localize::{BeliefConfig, ExternalLocalizer, GridLocalizer, Localizer};
-
+// 全地図 belief 推定器 (VIOLA の推定側)。旧 窓つき localize::* の後継。
 pub mod belief;
+
+pub use belief::{Belief, BeliefConfig};
 
 // 旧 vi_algorithm から取り込んだ word 並列 bitboard プリミティブ。solvers のフロンティアが
 // 使い、vi_bench の bitboard マイクロベンチが `vi_lib::bitboard` として参照する。
