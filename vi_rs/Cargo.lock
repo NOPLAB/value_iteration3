@@ -1153,3 +1153,139 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[patch.unused]]
+name = "action_msgs"
+version = "1.2.2"
+
+[[patch.unused]]
+name = "action_tutorials_interfaces"
+version = "0.20.9"
+
+[[patch.unused]]
+name = "actionlib_msgs"
+version = "4.9.1"
+
+[[patch.unused]]
+name = "bond"
+version = "4.1.4"
+
+[[patch.unused]]
+name = "builtin_interfaces"
+version = "1.2.2"
+
+[[patch.unused]]
+name = "composition_interfaces"
+version = "1.2.2"
+
+[[patch.unused]]
+name = "diagnostic_msgs"
+version = "4.9.1"
+
+[[patch.unused]]
+name = "example_interfaces"
+version = "0.9.3"
+
+[[patch.unused]]
+name = "gazebo_msgs"
+version = "3.9.0"
+
+[[patch.unused]]
+name = "geometry_msgs"
+version = "4.9.1"
+
+[[patch.unused]]
+name = "lifecycle_msgs"
+version = "1.2.2"
+
+[[patch.unused]]
+name = "logging_demo"
+version = "0.20.9"
+
+[[patch.unused]]
+name = "map_msgs"
+version = "2.1.0"
+
+[[patch.unused]]
+name = "nav2_msgs"
+version = "1.1.20"
+
+[[patch.unused]]
+name = "nav_msgs"
+version = "4.9.1"
+
+[[patch.unused]]
+name = "pcl_msgs"
+version = "1.0.0"
+
+[[patch.unused]]
+name = "pendulum_msgs"
+version = "0.20.9"
+
+[[patch.unused]]
+name = "rcl_interfaces"
+version = "1.2.2"
+
+[[patch.unused]]
+name = "rclrs"
+version = "0.7.0"
+
+[[patch.unused]]
+name = "rmw_dds_common"
+version = "1.6.0"
+
+[[patch.unused]]
+name = "rosbag2_interfaces"
+version = "0.15.16"
+
+[[patch.unused]]
+name = "rosgraph_msgs"
+version = "1.2.2"
+
+[[patch.unused]]
+name = "rosidl_runtime_rs"
+version = "0.6.0"
+
+[[patch.unused]]
+name = "sensor_msgs"
+version = "4.9.1"
+
+[[patch.unused]]
+name = "shape_msgs"
+version = "4.9.1"
+
+[[patch.unused]]
+name = "statistics_msgs"
+version = "1.2.2"
+
+[[patch.unused]]
+name = "std_msgs"
+version = "4.9.1"
+
+[[patch.unused]]
+name = "std_srvs"
+version = "4.9.1"
+
+[[patch.unused]]
+name = "stereo_msgs"
+version = "4.9.1"
+
+[[patch.unused]]
+name = "tf2_msgs"
+version = "0.25.20"
+
+[[patch.unused]]
+name = "trajectory_msgs"
+version = "4.9.1"
+
+[[patch.unused]]
+name = "turtlesim"
+version = "1.4.3"
+
+[[patch.unused]]
+name = "unique_identifier_msgs"
+version = "2.2.1"
+
+[[patch.unused]]
+name = "visualization_msgs"
+version = "4.9.1"
