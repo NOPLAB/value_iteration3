@@ -46,5 +46,6 @@ colcon build --merge-install --packages-select vi_planner \
        --base-paths "$WS/src" \
        --build-base "$WS/build" \
        --install-base "$WS/install" \
+       --log-base "$WS/log" \
        --cargo-args --release \
        --cmake-args -DCMAKE_BUILD_TYPE=Release "$@"

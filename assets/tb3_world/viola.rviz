@@ -81,7 +81,9 @@ Visualization Manager:
       Covariance x: 0.25
       Covariance y: 0.25
       Covariance yaw: 0.068
-    - Class: nav2_rviz_plugins/GoalTool
+    - Class: rviz_default_plugins/SetGoal
+      Topic:
+        Value: /goal_pose
   Views:
     Current:
       Class: rviz_default_plugins/TopDownOrtho
