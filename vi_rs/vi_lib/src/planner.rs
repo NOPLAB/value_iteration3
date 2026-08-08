@@ -93,6 +93,29 @@ pub trait PolicyView {
         crate::msg::Quaternion::default()
     }
 
+    // ── belief 次元 (x,y,θ,b) — 既定は「b 次元なし」で、既存の実装は無改造で通る ──
+
+    /// b の層数。1 = belief 次元なし (既定)。
+    fn belief_levels(&self) -> i32 {
+        1
+    }
+    /// `(ix,iy,it)` を `ib` 層で見たときのゴール圏か。
+    fn is_final_b(&self, ix: i32, iy: i32, it: i32, _ib: i32) -> bool {
+        self.is_final(ix, iy, it)
+    }
+    /// `(ix,iy,it)` を `ib` 層で見たときの最適行動 index。
+    fn action_index_b(&self, ix: i32, iy: i32, it: i32, _ib: i32) -> Option<usize> {
+        self.action_index(ix, iy, it)
+    }
+    /// `(ix,iy,it)` を `ib` 層で見たときの値。
+    fn value_at_b(&self, ix: i32, iy: i32, it: i32, _ib: i32) -> u64 {
+        self.value_at(ix, iy, it)
+    }
+    /// 着地セル `(ix,iy)` での次の b (`BeliefModel::next_ib` と同じ規則)。
+    fn next_ib(&self, _ib: i32, _ix: i32, _iy: i32) -> i32 {
+        0
+    }
+
     /// 本家 `t_resolution_ = 360/cell_num_t_`（整数除算後に f64 化）。
     fn t_resolution(&self) -> f64 {
         (360 / self.cell_num().2) as f64
@@ -147,6 +170,39 @@ impl PolicyView for ValueIterator {
     }
     fn map_origin_quat(&self) -> crate::msg::Quaternion {
         self.map_origin_quat.clone()
+    }
+
+    // belief 次元。3 引数版 (上) は **b=0 スライス**を読む — nb_levels==1 では
+    // states 全体なので従来と同一。
+    // ponytail: dwa/mppi は b=0 スライスを読む — b̂ スライス評価が要るなら
+    // value_at_b を配線。
+    fn belief_levels(&self) -> i32 {
+        self.belief.nb_levels.max(1)
+    }
+    fn is_final_b(&self, ix: i32, iy: i32, it: i32, ib: i32) -> bool {
+        match self.idx4_checked(ix, iy, it, ib) {
+            Some(i) => self.states[i].final_state,
+            None => false,
+        }
+    }
+    fn action_index_b(&self, ix: i32, iy: i32, it: i32, ib: i32) -> Option<usize> {
+        let s = &self.states[self.idx4_checked(ix, iy, it, ib)?];
+        if !s.free || s.final_state {
+            return None;
+        }
+        s.optimal_action
+    }
+    fn value_at_b(&self, ix: i32, iy: i32, it: i32, ib: i32) -> u64 {
+        match self.idx4_checked(ix, iy, it, ib) {
+            Some(i) => self.states[i].total_cost,
+            None => MAX_COST,
+        }
+    }
+    fn next_ib(&self, ib: i32, ix: i32, iy: i32) -> i32 {
+        if !PolicyView::in_map_area(self, ix, iy) {
+            return ib; // 場外は次ステップの範囲判定で終わるので b は据え置く。
+        }
+        self.belief.next_ib(ib, ix, iy)
     }
 }
 
@@ -307,6 +363,7 @@ fn find_plannable_start(
     x: f64,
     y: f64,
     yaw_rad: f64,
+    ib: i32,
     tolerance_cells: i32,
 ) -> Option<(f64, f64)> {
     let (ix0, iy0, it) = pose_to_cell_on(p, x, y, yaw_rad);
@@ -314,9 +371,9 @@ fn find_plannable_start(
     for dy in -tolerance_cells..=tolerance_cells {
         for dx in -tolerance_cells..=tolerance_cells {
             let (ix, iy) = (ix0 + dx, iy0 + dy);
-            if p.action_index(ix, iy, it).is_none() {
+            if p.action_index_b(ix, iy, it, ib).is_none() {
                 // final_state セル (既にゴール圏内) も救済対象に含める。
-                if !p.is_final(ix, iy, it) {
+                if !p.is_final_b(ix, iy, it, ib) {
                     continue;
                 }
             }
@@ -351,18 +408,43 @@ pub fn rollout_path_on(
     max_steps: usize,
     start_tolerance_cells: i32,
 ) -> Rollout {
+    // 起点 b は**最不確か** (nb-1) を採る保守側の既定: ゴール開放は b が小さいほど
+    // 緩いので、最悪 b で着けるならどの b でも着ける。nb_levels==1 では 0 = 従来と同一。
+    rollout_path_on_b(
+        p,
+        start_x,
+        start_y,
+        start_yaw_rad,
+        p.belief_levels() - 1,
+        max_steps,
+        start_tolerance_cells,
+    )
+}
+
+/// [`rollout_path_on`] の belief 版: 起点の b レベルを明示する。b は着地セルごとに
+/// `PolicyView::next_ib` で更新され、ゴール判定・方策参照はその b 層で行う。
+pub fn rollout_path_on_b(
+    p: &dyn PolicyView,
+    start_x: f64,
+    start_y: f64,
+    start_yaw_rad: f64,
+    start_ib: i32,
+    max_steps: usize,
+    start_tolerance_cells: i32,
+) -> Rollout {
     let (mut x, mut y) = (start_x, start_y);
     // 内部では度で保持 (本家の遷移生成・セル変換が度基準のため)。
     let mut yaw_deg = normalize_deg(start_yaw_rad.to_degrees());
     let (nt, goal) = (p.cell_num().2, p.goal());
+    let mut ib = start_ib.clamp(0, p.belief_levels() - 1);
 
     // start 救済: 現セルに方策が無ければ近傍の計画可能セル中心へスナップ。
     {
         let (ix, iy, it) = pose_to_cell_on(p, x, y, start_yaw_rad);
-        let on_final = p.is_final(ix, iy, it);
-        if !on_final && p.action_index(ix, iy, it).is_none() && start_tolerance_cells > 0 {
+        let on_final = p.is_final_b(ix, iy, it, ib);
+        if !on_final && p.action_index_b(ix, iy, it, ib).is_none() && start_tolerance_cells > 0 {
             if let Some((sx, sy)) =
-                find_plannable_start(p, x, y, start_yaw_rad, start_tolerance_cells)
+                find_plannable_start(p, x, y, start_yaw_rad, ib, start_tolerance_cells)
             {
                 x = sx;
                 y = sy;
@@ -371,23 +453,23 @@ pub fn rollout_path_on(
     }
 
     let mut poses = vec![PathPose { x, y, yaw: yaw_deg.to_radians() }];
-    let mut visits: HashMap<(i32, i32, i32), u32> = HashMap::new();
+    let mut visits: HashMap<(i32, i32, i32, i32), u32> = HashMap::new();
 
     for _ in 0..max_steps {
         let (ix, iy, it) = pose_to_cell_on(p, x, y, yaw_deg.to_radians());
         if !p.in_map_area(ix, iy) || it < 0 || it >= nt {
             return Rollout { poses, status: RolloutStatus::OutOfMap };
         }
-        if p.is_final(ix, iy, it) {
+        if p.is_final_b(ix, iy, it, ib) {
             // ゴール圏に入った: 末尾を正確なゴール姿勢で締める。
             poses.push(PathPose { x: goal.0, y: goal.1, yaw: (goal.2 as f64).to_radians() });
             return Rollout { poses, status: RolloutStatus::ReachedGoal };
         }
-        let Some(ai) = p.action_index(ix, iy, it) else {
+        let Some(ai) = p.action_index_b(ix, iy, it, ib) else {
             return Rollout { poses, status: RolloutStatus::NoAction };
         };
 
-        let count = visits.entry((ix, iy, it)).or_insert(0);
+        let count = visits.entry((ix, iy, it, ib)).or_insert(0);
         *count += 1;
         if *count > REVISIT_LIMIT {
             return Rollout { poses, status: RolloutStatus::LoopDetected };
@@ -399,6 +481,9 @@ pub fn rollout_path_on(
         x += delta_fw * ang.cos();
         y += delta_fw * ang.sin();
         yaw_deg = normalize_deg(yaw_deg + delta_rot);
+        // b は**着地セル**で更新する (solve 側の `action_cost_raw` と同じ規則)。
+        let (nix, niy, _) = pose_to_cell_on(p, x, y, yaw_deg.to_radians());
+        ib = p.next_ib(ib, nix, niy);
         poses.push(PathPose { x, y, yaw: yaw_deg.to_radians() });
     }
 
@@ -469,8 +554,17 @@ pub enum QmdpDecision {
 ///   衝突ゼロの行動を選ぶ)。勝者の衝突質量が [`QMDP_VETO_MASS`] を超えたら
 ///   `NoAction` — 全行動が危険なら止まるのが正解。
 /// - 単峰 belief (仮説 1 個) では argmin_a Q(s,a) = 本家 greedy と同じ行動になる。
-pub fn qmdp_decide(vi: &ValueIterator, hyps: &[(crate::bridge::PoseView, f64)]) -> QmdpDecision {
+///
+/// `ib_hat` は belief 不確かさレベルの推定値 (`crate::belief::Belief::b_hat`)。仮説は
+/// その b 層で読むので `final_state` は b でゲートされたものになる。`nb_levels == 1`
+/// では 0 を渡せば従来と同一。
+pub fn qmdp_decide(
+    vi: &ValueIterator,
+    hyps: &[(crate::bridge::PoseView, f64)],
+    ib_hat: i32,
+) -> QmdpDecision {
     let n_act = vi.actions.len();
+    let ib = ib_hat.clamp(0, vi.belief_levels() - 1);
     let mut qb = vec![0.0f64; n_act];
     let mut veto = vec![0.0f64; n_act];
     let mut usable = 0.0f64;
@@ -483,7 +577,7 @@ pub fn qmdp_decide(vi: &ValueIterator, hyps: &[(crate::bridge::PoseView, f64)]) 
         if !vi.in_map_area(ix, iy) || it < 0 || it >= vi.cell_num_t {
             continue;
         }
-        let s = &vi.states[vi.to_index(ix, iy, it) as usize];
+        let s = &vi.states[vi.to_index4(ix, iy, it, ib)];
         if !s.free {
             continue;
         }
@@ -497,9 +591,11 @@ pub fn qmdp_decide(vi: &ValueIterator, hyps: &[(crate::bridge::PoseView, f64)]) 
                 &vi.states,
                 a,
                 s,
+                ib,
                 vi.cell_num_x,
                 vi.cell_num_y,
                 vi.cell_num_t,
+                &vi.belief,
             );
             qb[ai] += w * q as f64;
             if q == MAX_COST {
@@ -790,9 +886,11 @@ mod tests {
             &vi.states,
             &vi.actions[ai],
             s,
+            0,
             vi.cell_num_x,
             vi.cell_num_y,
             vi.cell_num_t,
+            &vi.belief,
         )
     }
 
@@ -820,12 +918,112 @@ mod tests {
         }
     }
 
+    // ═══ belief 次元 (coastal navigation) ═══
+
+    /// 情報探索の回り道が実際に出ること。
+    ///
+    /// 地図: 幅 3.6m × 高さ 1.2m の開けた場 (res 0.1)、東端 (ix=34,35) に縦壁。
+    /// info は壁からの距離で 2 (<=0.25m) / 1 (<=0.55m) / 0。ゴール (3.0,0.6) は
+    /// info=1 の帯にあり、ib_goal=2。
+    /// - b=0 なら 2 手で直行できる。
+    /// - b=3 (最不確か) では b を 2 まで落とさないと終端にならず、b を下げられるのは
+    ///   info=2 のセル (ix 32..33 = 壁の手前) だけ。つまりゴールを一旦通り越して
+    ///   壁際まで寄る**回り道が構造的に強制される**。
+    ///
+    /// 実測 (この地図): b=3 は 7 姿勢・最大 x=3.25 (ゴールを越えて壁へ)・壁まで
+    /// 0.200 m、nb=1 は 4 姿勢・最大 x=3.00・壁まで 0.453 m、V(b=3)/V(b=0) ≈ 2.0。
+    #[test]
+    fn belief_forces_info_seeking() {
+        use crate::value_iterator::BeliefModel;
+        const W: i32 = 36;
+        const H: i32 = 12;
+        const R: f64 = 0.1;
+        const NT: i32 = 18;
+        const NEAR: f64 = 0.25;
+        // 壁からこの距離以内に寄ったら「壁沿いを走った」とみなす (NEAR + ε)。
+        const HUG: f64 = 0.35;
+
+        let mut data = vec![0i8; (W * H) as usize];
+        for iy in 0..H {
+            for ix in 34..36 {
+                data[(iy * W + ix) as usize] = 100;
+            }
+        }
+        let grid = OccupancyGrid {
+            width: W,
+            height: H,
+            resolution: R,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            data: data.clone(),
+        };
+        let solved = |belief: BeliefModel| {
+            let mut vi = ValueIterator::new(actions(), 1);
+            vi.belief = belief;
+            // safety_radius=0 で膨張なし (壁際まで寄れる)。goal margin は 1 セル相当。
+            vi.set_map_with_occupancy_grid(&grid, NT, 0.0, 30.0, 0.15, 180);
+            vi.set_goal(3.0, 0.6, 0);
+            assert!(solve(&mut vi, U64Solver::Frontier2D, 5000).converged);
+            vi
+        };
+        // 姿勢から最寄りの壁セル中心までの距離。
+        let wall_dist = |p: &PathPose| -> f64 {
+            let mut best = f64::INFINITY;
+            for iy in 0..H {
+                for ix in 34..36 {
+                    let (cx, cy) = ((ix as f64 + 0.5) * R, (iy as f64 + 0.5) * R);
+                    best = best.min(((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt());
+                }
+            }
+            best
+        };
+        let closest = |r: &Rollout| r.poses.iter().map(wall_dist).fold(f64::INFINITY, f64::min);
+
+        let vi = solved(BeliefModel {
+            nb_levels: 4,
+            ib_goal: 2,
+            motion_gain: 1,
+            info_near_m: NEAR,
+            info_far_m: 0.55,
+            ..Default::default()
+        });
+        // (a) 最不確かな b から出発してもゴールへ着く。
+        let r3 = rollout_path_on_b(&vi, 2.35, 0.55, 0.0, 3, 10_000, 0);
+        assert!(r3.reached_goal(), "b=3 の経路: {:?}", r3.status);
+        // (b) その経路は壁際 (info=2 帯) を通る。
+        assert!(
+            closest(&r3) < HUG,
+            "b=3 の経路が壁へ寄っていない (最接近 {:.3} m)",
+            closest(&r3)
+        );
+
+        // (c) belief 次元なしの同じ地図・同じゴールでは壁へ寄らない (直行する)。
+        let plain = solved(BeliefModel::default());
+        let r1 = rollout_path_on(&plain, 2.35, 0.55, 0.0, 10_000, 0);
+        assert!(r1.reached_goal(), "nb=1 の経路: {:?}", r1.status);
+        assert!(
+            closest(&r1) > HUG,
+            "nb=1 の経路まで壁へ寄っている (最接近 {:.3} m) — 回り道の対照になっていない",
+            closest(&r1)
+        );
+
+        // (d) 不確かさの代償が値に出る。
+        let (ix, iy, it) = pose_to_cell(&vi, 2.35, 0.55, 0.0);
+        assert!(
+            vi.value_at_b(ix, iy, it, 3) > vi.value_at_b(ix, iy, it, 0),
+            "V(b=3)={} は V(b=0)={} より高いはず",
+            vi.value_at_b(ix, iy, it, 3),
+            vi.value_at_b(ix, iy, it, 0)
+        );
+    }
+
     #[test]
     fn qmdp_single_hypothesis_matches_greedy() {
         let vi = solved_vi(64, 64, empty_map(64), (2.0, 2.0, 0), U64Solver::Frontier3D);
         let p = hyp(0.6, 0.6, 0.0);
         let (ix, iy, it) = pose_to_cell(&vi, p.x, p.y, p.yaw_rad);
-        match qmdp_decide(&vi, &[(p, 1.0)]) {
+        match qmdp_decide(&vi, &[(p, 1.0)], 0) {
             QmdpDecision::Action(ai) => {
                 assert_eq!(vi.actions[ai].id, optimal_action_at(&vi, ix, iy, it))
             }
@@ -844,7 +1042,7 @@ mod tests {
         // 壁は x セル 32..40。3 セル手前から東向き → 前進 6 セルは壁の中。
         let b = hyp(1.475, 2.0, 0.0);
         assert_eq!(q_at(&vi, b, 0), MAX_COST, "premise: forward from B collides");
-        match qmdp_decide(&vi, &[(a, 0.5), (b, 0.5)]) {
+        match qmdp_decide(&vi, &[(a, 0.5), (b, 0.5)], 0) {
             QmdpDecision::Action(ai) => {
                 assert_ne!(q_at(&vi, a, ai), MAX_COST, "chosen action collides for A");
                 assert_ne!(q_at(&vi, b, ai), MAX_COST, "chosen action collides for B");
@@ -869,7 +1067,7 @@ mod tests {
         let vi = solved_vi(size, size, data, (2.0, 2.0, 0), U64Solver::Frontier3D);
         let p = hyp(0.575, 0.575, 0.0);
         assert_eq!(q_at(&vi, p, 0), MAX_COST, "premise: forward collides");
-        match qmdp_decide(&vi, &[(p, 1.0)]) {
+        match qmdp_decide(&vi, &[(p, 1.0)], 0) {
             QmdpDecision::Action(ai) => {
                 assert_ne!(q_at(&vi, p, ai), MAX_COST, "picked a colliding action");
                 assert_eq!(vi.actions[ai].delta_fw, 0.0, "only in-place turns are safe");
@@ -883,7 +1081,7 @@ mod tests {
         let vi = solved_vi(64, 64, empty_map(64), (2.0, 2.0, 0), U64Solver::Frontier3D);
         // ゴール中心の仮説 (final_state) が過半、残りは通常セル。
         let hyps = [(hyp(2.0, 2.0, 0.0), 0.6), (hyp(0.6, 0.6, 0.0), 0.4)];
-        assert_eq!(qmdp_decide(&vi, &hyps), QmdpDecision::Goal);
+        assert_eq!(qmdp_decide(&vi, &hyps, 0), QmdpDecision::Goal);
     }
 
     #[test]
@@ -891,7 +1089,7 @@ mod tests {
         let vi = solved_vi(32, 32, empty_map(32), (1.0, 1.0, 0), U64Solver::Frontier3D);
         // 地図外と重みゼロだけ → 評価できる質量なし。
         let hyps = [(hyp(-5.0, -5.0, 0.0), 1.0), (hyp(0.6, 0.6, 0.0), 0.0)];
-        assert_eq!(qmdp_decide(&vi, &hyps), QmdpDecision::NoAction);
-        assert_eq!(qmdp_decide(&vi, &[]), QmdpDecision::NoAction);
+        assert_eq!(qmdp_decide(&vi, &hyps, 0), QmdpDecision::NoAction);
+        assert_eq!(qmdp_decide(&vi, &[], 0), QmdpDecision::NoAction);
     }
 }

@@ -345,4 +345,58 @@ fn caps_expectations() {
     assert_eq!(compact.partial, Partiality::ExactPrefix);
     assert!(Frontier2DSparse.caps().parallel);
     assert!(!Frontier2D.caps().out_of_core);
+    // belief 次元に対応するのは vi.to_index / value_iteration_raw 経由の 3 種だけ。
+    // 相対オフセットを事前計算する pad/fused/sparse 系はセル依存の b′ を表現できない。
+    for s in [Reference, Frontier2D, StreamMimic] {
+        assert!(s.caps().belief, "{s:?} は belief 対応のはず");
+    }
+    for (name, s) in all_solvers() {
+        if matches!(s, Reference | Frontier2D | StreamMimic) {
+            continue;
+        }
+        assert!(!s.caps().belief, "{name} は belief 非対応のはず");
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// belief 次元 (nb_levels > 1): Reference 固定点が 4D でもオラクルであること
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// nb=3 の場で Frontier2D が Reference 全走査の固定点と bit-exact (全 b 層)。
+/// 上の全ソルバ conformance は nb=1 のまま — b 対応は caps でゲートされる。
+#[test]
+fn conformance_belief_reference_vs_frontier2d() {
+    use crate::solvers::test_support::make_vi_with;
+    use crate::value_iterator::BeliefModel;
+
+    // obstacle マップ (ix=5 の縦壁、iy=0 に隙間)。res=0.05 なので near=2 セル /
+    // far=4 セルで「壁際 (info=2) / 中間 (info=1) / 遠方 (info=0)」が全部現れる。
+    let (_, w, h, occ) = standard_maps().remove(1);
+    let belief = BeliefModel {
+        nb_levels: 3,
+        ib_goal: 0,
+        motion_gain: 1,
+        info_near_m: 0.1,
+        info_far_m: 0.2,
+        ..Default::default()
+    };
+    let mut exact = make_vi_with(w, h, occ.clone(), belief.clone());
+    run_reference_to_fixed_point(&mut exact);
+    let mut vi = make_vi_with(w, h, occ, belief);
+    assert!(solve(&mut vi, U64Solver::Frontier2D, MAX_ITER).converged);
+
+    let layer = (w * h * exact.cell_num_t) as usize;
+    assert_eq!(exact.states.len(), layer * 3);
+    let mut n_reach = [0u64; 3];
+    for (i, (a, b)) in exact.states.iter().zip(vi.states.iter()).enumerate() {
+        if a.total_cost >= REACH {
+            continue;
+        }
+        n_reach[i / layer] += 1;
+        assert_eq!(a.total_cost, b.total_cost, "value @ {i} (b 層 {})", i / layer);
+        assert_eq!(a.optimal_action, b.optimal_action, "policy @ {i} (b 層 {})", i / layer);
+    }
+    for (ib, n) in n_reach.iter().enumerate() {
+        assert!(*n > 0, "b 層 {ib} に到達可能セルが無い — テストが空回りしている");
+    }
 }

@@ -85,6 +85,7 @@ impl ValueIterator {
         let thread_num = self.thread_num;
         let actions = &self.actions;
         let sweep_orders = &self.sweep_orders;
+        let belief = &self.belief;
         // バッチ実行中は status は不変なので break 条件を bool (Copy) で先に確定し、
         // 各スレッドクロージャへ move キャプチャする (String を多重 move できないため)。
         let stop = self.status == "canceled" || self.status == "goal";
@@ -112,6 +113,7 @@ impl ValueIterator {
                                     cell_num_x,
                                     cell_num_y,
                                     cell_num_t,
+                                    belief,
                                 );
                                 if d > max_delta {
                                     max_delta = d;

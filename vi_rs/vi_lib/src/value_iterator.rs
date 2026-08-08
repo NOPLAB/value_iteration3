@@ -12,6 +12,79 @@ use crate::state::State;
 use crate::state_transition::StateTransition;
 use crate::solvers::original::SweepWorkerStatus;
 
+/// 状態空間へ足す belief 不確かさ次元 `b` のモデル (coastal navigation の augmented MDP)。
+///
+/// `b` は「自己位置がどれだけ不確かか」の離散レベル (0 = 十分集中 … `nb_levels-1` =
+/// ロスト)。実行時の推定値は `crate::belief::Belief::b_hat` が返す。VI 側は
+/// 「動けば不確かになり、情報のある場所へ行けば確かになる」という決定的な遷移だけを持つ:
+///
+/// ```text
+/// b' = clamp(b + motion_gain - info[着地セル], 0, nb_levels-1)
+/// ```
+///
+/// `info` は 0/1/2 (0 = 情報なし → b 増、1 = 据置き、2 = 情報リッチ → b 減)。**着地セルだけ**
+/// で決まる決定的な写像なので、遷移確率は分割されない (Σprob ≡ PROB_BASE を壊さない)。
+///
+/// `nb_levels == 1` (既定) では [`BeliefModel::next_ib`] が常に 0 を返し、`states` も
+/// 1 層しか作られないので、索引・数式ともに従来の 3 次元 (x,y,θ) VI と**構成的に同一**。
+#[derive(Clone, Debug)]
+pub struct BeliefModel {
+    /// b の離散レベル数。1 = 無効 (既定)。
+    pub nb_levels: i32,
+    /// `final_state` を許す最大 b。これより不確かな層ではゴールが終端にならない
+    /// (= 不確かなままではゴールを「達成」できない)。
+    pub ib_goal: i32,
+    /// 1 遷移あたりの b 増分 [level]。
+    pub motion_gain: i32,
+    /// 壁までこの距離以内 → info=2 (b が 1 下がる) [m]。
+    pub info_near_m: f64,
+    /// 壁までこの距離以内 → info=1 (b 据え置き) [m]。
+    pub info_far_m: f64,
+    /// `(iy*nx+ix)` → 0/1/2。`set_map_with_occupancy_grid` が構築 (nb_levels>1 のときだけ)。
+    pub(crate) info: Vec<u8>,
+    pub(crate) nx: i32,
+    /// b 1 層ぶんの状態数 `nx*ny*nt`。
+    pub(crate) layer: usize,
+}
+
+impl Default for BeliefModel {
+    fn default() -> Self {
+        Self {
+            nb_levels: 1,
+            ib_goal: 0,
+            motion_gain: 1,
+            info_near_m: 0.5,
+            info_far_m: 2.0,
+            info: Vec::new(),
+            nx: 0,
+            layer: 0,
+        }
+    }
+}
+
+impl BeliefModel {
+    /// 着地セル `(ix,iy)` での次の b。`nb_levels <= 1` なら常に 0 (従来経路)。
+    /// `(ix,iy)` は呼び出し側で地図内であることを保証すること。
+    #[inline]
+    pub fn next_ib(&self, ib: i32, ix: i32, iy: i32) -> i32 {
+        if self.nb_levels <= 1 {
+            return 0;
+        }
+        (ib + self.motion_gain - self.info[(iy * self.nx + ix) as usize] as i32)
+            .clamp(0, self.nb_levels - 1)
+    }
+
+    /// 4D 索引 → b 層番号。`nb_levels <= 1` は常に 0。
+    #[inline]
+    pub(crate) fn ib_of(&self, idx: usize) -> i32 {
+        if self.nb_levels <= 1 {
+            0
+        } else {
+            (idx / self.layer) as i32
+        }
+    }
+}
+
 pub struct ValueIterator {
     pub states: Vec<State>,
     pub actions: Vec<Action>,
@@ -34,6 +107,10 @@ pub struct ValueIterator {
     pub map_origin_x: f64,
     pub map_origin_y: f64,
     pub map_origin_quat: Quaternion,
+
+    /// belief 次元 `b` の設定。**`set_map_with_occupancy_grid` より前**に差し替えること
+    /// (`states` の層数と `info` はそこで確定する)。既定 (`nb_levels: 1`) は従来と同一。
+    pub belief: BeliefModel,
 }
 
 impl ValueIterator {
@@ -59,12 +136,49 @@ impl ValueIterator {
             map_origin_x: 0.0,
             map_origin_y: 0.0,
             map_origin_quat: Quaternion::default(),
+            belief: BeliefModel::default(),
         }
     }
 
     /// 本家 `toIndex(ix,iy,it) = it + ix*cell_num_t_ + iy*(cell_num_t_*cell_num_x_)`。
     pub fn to_index(&self, ix: i32, iy: i32, it: i32) -> i32 {
         to_index_raw(ix, iy, it, self.cell_num_x, self.cell_num_t)
+    }
+
+    /// belief 次元込みの索引。`b` は**最も遅い**次元なので 3D 索引 + `ib*layer`。
+    /// `nb_levels == 1` ではオフセットが literal 0 = [`ValueIterator::to_index`] と同一。
+    #[inline]
+    pub fn to_index4(&self, ix: i32, iy: i32, it: i32, ib: i32) -> usize {
+        to_index_raw(ix, iy, it, self.cell_num_x, self.cell_num_t) as usize
+            + ib as usize * self.belief.layer
+    }
+
+    /// b の層数 (>= 1)。
+    #[inline]
+    pub fn belief_levels(&self) -> i32 {
+        self.belief.nb_levels.max(1)
+    }
+
+    /// 範囲チェック付きの 4D 索引。地図外 / θ 外 / b 層外は `None`。
+    #[inline]
+    pub(crate) fn idx4_checked(&self, ix: i32, iy: i32, it: i32, ib: i32) -> Option<usize> {
+        if !self.in_map_area(ix, iy)
+            || it < 0
+            || it >= self.cell_num_t
+            || ib < 0
+            || ib >= self.belief_levels()
+        {
+            return None;
+        }
+        Some(self.to_index4(ix, iy, it, ib))
+    }
+
+    /// b 1 層ぶんの状態数 `nx*ny*nt` (`states` 長を超えない)。可視化系の writer は
+    /// この b=0 スライスだけを見る。
+    #[inline]
+    fn slice_len(&self) -> usize {
+        (self.cell_num_x as usize * self.cell_num_y as usize * self.cell_num_t as usize)
+            .min(self.states.len())
     }
 
     /// 本家 `inMapArea`。
@@ -132,9 +246,70 @@ impl ValueIterator {
         self.map_origin_y = map.origin_y;
         self.map_origin_quat = map.origin_quat.clone();
 
+        self.belief.nx = self.cell_num_x;
+        self.belief.layer =
+            self.cell_num_x as usize * self.cell_num_y as usize * self.cell_num_t as usize;
+        if self.belief.nb_levels > 1 {
+            self.build_info_map(map);
+        }
+
         self.set_state(map, safety_radius, safety_radius_penalty);
         self.set_state_transition();
         self.set_sweep_orders();
+    }
+
+    /// belief の `info` 場 (0/1/2) を静的地図から起こす。壁までの **city-block 距離**を
+    /// チャンファー 2 パスで求め、`info_near_m` / `info_far_m` で 3 値化する。
+    /// 地図の外周は障害物として扱わない (= 地図端は情報を与えない)。
+    // ponytail: 壁までの L1 距離の粗い代理 (視線も尤度場も見ない)。推定器の尤度場が
+    // できたらそれに差し替え。
+    fn build_info_map(&mut self, map: &OccupancyGrid) {
+        let (nx, ny) = (self.cell_num_x, self.cell_num_y);
+        let n = nx as usize * ny as usize;
+        let far = i32::MAX / 4;
+        let mut d: Vec<i32> = (0..n).map(|i| if map.data[i] != 0 { 0 } else { far }).collect();
+        let w = nx as usize;
+        for y in 0..ny as usize {
+            for x in 0..w {
+                let i = y * w + x;
+                let mut v = d[i];
+                if x > 0 {
+                    v = v.min(d[i - 1] + 1);
+                }
+                if y > 0 {
+                    v = v.min(d[i - w] + 1);
+                }
+                d[i] = v;
+            }
+        }
+        for y in (0..ny as usize).rev() {
+            for x in (0..w).rev() {
+                let i = y * w + x;
+                let mut v = d[i];
+                if x + 1 < w {
+                    v = v.min(d[i + 1] + 1);
+                }
+                if y + 1 < ny as usize {
+                    v = v.min(d[i + w] + 1);
+                }
+                d[i] = v;
+            }
+        }
+        let near_cells = self.belief.info_near_m / self.xy_resolution;
+        let far_cells = self.belief.info_far_m / self.xy_resolution;
+        self.belief.info = d
+            .into_iter()
+            .map(|dc| {
+                let dm = dc as f64;
+                if dm <= near_cells {
+                    2u8
+                } else if dm <= far_cells {
+                    1
+                } else {
+                    0
+                }
+            })
+            .collect();
     }
 
     /// geometry（cell_num_*/resolution/origin）と遷移テーブルだけを設定し、`states`（O(total)）も
@@ -203,6 +378,12 @@ impl ValueIterator {
         });
         // SAFETY: 各バンドが重複なく担当行を埋め、全 n 要素を一度ずつ初期化済み。
         unsafe { states.set_len(n) };
+        // belief 層の複製。b 層は map 由来のフィールド (ix/iy/it/free/penalty) が層 0 と
+        // 同一なので、層 0 をそのまま複製すれば足りる (層ごとに変わるのは値と final_state
+        // だけで、そちらは set_state_values が書く)。nb_levels==1 ならループは回らない。
+        for _ in 1..self.belief.nb_levels {
+            states.extend_from_within(..n);
+        }
         self.states = states;
     }
 
@@ -251,21 +432,36 @@ impl ValueIterator {
         self.sweep_orders.push(o1_first); // index 5 = [1]前半
         let o1_second: Vec<i32> = self.sweep_orders[1][half..].to_vec();
         self.sweep_orders[4].extend(o1_second); // [4] = [0]全体 + [1]後半
+
+        // belief 層への拡張: 各走査順を層 0 のまま先頭に置き、層ごとにオフセットを足して
+        // 後ろへ継ぎ足す。本家の 6 順 ([4]/[5] のアンバランスを含む) はそのまま保たれ、
+        // Reference / sweep_global は 4D 全体を無改造で舐める。nb_levels==1 は no-op。
+        if self.belief.nb_levels > 1 {
+            let layer = self.belief.layer as i32;
+            for order in self.sweep_orders.iter_mut() {
+                let base = order.clone();
+                for ib in 1..self.belief.nb_levels {
+                    order.extend(base.iter().map(|&i| i + ib * layer));
+                }
+            }
+        }
     }
 
-    /// 本家 `actionCost`。
+    /// 本家 `actionCost`。公開 3D 契約は据え置き (b=0 スライスで評価)。
     pub fn action_cost(&self, s: &State, a: &Action) -> u64 {
         action_cost_raw(
             &self.states,
             a,
             s,
+            0,
             self.cell_num_x,
             self.cell_num_y,
             self.cell_num_t,
+            &self.belief,
         )
     }
 
-    /// 本家 `valueIteration` (states[idx] を更新)。
+    /// 本家 `valueIteration` (states[idx] を更新)。`idx` は 4D 索引 (b 層込み)。
     pub fn value_iteration_at(&mut self, idx: usize) -> u64 {
         value_iteration_raw(
             &mut self.states,
@@ -274,6 +470,7 @@ impl ValueIterator {
             self.cell_num_x,
             self.cell_num_y,
             self.cell_num_t,
+            &self.belief,
         )
     }
 
@@ -314,6 +511,23 @@ impl ValueIterator {
             s.final_state = s.final_state && ok;
         }
 
+        // b 依存のゴール開放 — **これが b の唯一の物理効果**。ib_goal より不確かな層では
+        // ゴールが終端にならないので、V は先に info の多いセルを経由する経路へ回る
+        // (coastal navigation)。nb_levels==1 では範囲が空でループは回らない。
+        // ponytail: b 依存の margin 膨張は未実装 — 要るなら set_state の複製ループで
+        // 層ごとに penalty を書き分ける。
+        if self.belief.nb_levels > 1 {
+            let layer = self.belief.layer;
+            for ib in self.belief.ib_goal.clamp(-1, self.belief.nb_levels - 1) + 1
+                ..self.belief.nb_levels
+            {
+                let lo = ib as usize * layer;
+                for s in self.states[lo..lo + layer].iter_mut() {
+                    s.final_state = false;
+                }
+            }
+        }
+
         for s in self.states.iter_mut() {
             s.total_cost = if s.final_state { 0 } else { MAX_COST };
             s.local_penalty = 0;
@@ -334,6 +548,9 @@ impl ValueIterator {
         let (xy_res, ox, oy) = (self.xy_resolution, self.map_origin_x, self.map_origin_y);
         let r2 = radius * radius;
         let (nx, nt) = (self.cell_num_x, self.cell_num_t);
+        let (nb, layer) = (self.belief_levels(), self.belief.layer);
+        let (nb_levels, ib_goal) = (self.belief.nb_levels, self.belief.ib_goal);
+        let goal_allowed = |ib: i32| nb_levels <= 1 || ib <= ib_goal;
         for iy in 0..self.cell_num_y {
             let cy = (iy as f64 + 0.5) * xy_res + oy;
             for ix in 0..nx {
@@ -343,11 +560,16 @@ impl ValueIterator {
                     dx * dx + dy * dy <= r2
                 });
                 for it in 0..nt {
-                    let s = &mut self.states[to_index_raw(ix, iy, it, nx, nt) as usize];
-                    s.final_state = near && s.free;
-                    s.total_cost = if s.final_state { 0 } else { MAX_COST };
-                    s.local_penalty = 0;
-                    s.optimal_action = None;
+                    let base = to_index_raw(ix, iy, it, nx, nt) as usize;
+                    // b 層も同じゴール開放規則で初期化する (set_state_values と同じく
+                    // ib > ib_goal の層では final にしない)。nb_levels==1 は 1 周のみ。
+                    for ib in 0..nb {
+                        let s = &mut self.states[base + ib as usize * layer];
+                        s.final_state = near && s.free && goal_allowed(ib);
+                        s.total_cost = if s.final_state { 0 } else { MAX_COST };
+                        s.local_penalty = 0;
+                        s.optimal_action = None;
+                    }
                 }
             }
         }
@@ -361,9 +583,10 @@ impl ValueIterator {
     pub fn value_function_writer(&self) -> GridLayers {
         let (nx, ny, nt) = (self.cell_num_x, self.cell_num_y, self.cell_num_t);
         let mut layers = vec![vec![0f64; (nx * ny) as usize]; nt as usize];
+        let n0 = self.slice_len(); // b=0 スライスのみ (nb_levels==1 では states 全体)
         for t in 0..nt {
             let mut i = t;
-            while (i as usize) < self.states.len() {
+            while (i as usize) < n0 {
                 let s = &self.states[i as usize];
                 layers[t as usize][(s.iy * nx + s.ix) as usize] =
                     (s.total_cost / PROB_BASE) as f64;
@@ -377,9 +600,10 @@ impl ValueIterator {
     pub fn policy_writer(&self) -> GridLayers {
         let (nx, ny, nt) = (self.cell_num_x, self.cell_num_y, self.cell_num_t);
         let mut layers = vec![vec![0f64; (nx * ny) as usize]; nt as usize];
+        let n0 = self.slice_len(); // b=0 スライスのみ
         for t in 0..nt {
             let mut i = t;
-            while (i as usize) < self.states.len() {
+            while (i as usize) < n0 {
                 let s = &self.states[i as usize];
                 let v = match s.optimal_action {
                     None => -1.0,
@@ -406,7 +630,7 @@ impl ValueIterator {
         let mut data: Vec<i8> = Vec::with_capacity((nx * ny) as usize);
         for y in 0..ny {
             for x in 0..nx {
-                let index = self.to_index(x, y, it) as usize;
+                let index = self.to_index(x, y, it) as usize; // b=0 スライス
                 let cost = self.states[index].total_cost as f64 / PROB_BASE as f64;
                 let val: i32 = if cost < threshold as f64 {
                     (cost / threshold as f64 * 250.0) as i32
@@ -540,13 +764,20 @@ pub(crate) fn compute_theta_transitions(
 
 /// 本家 `actionCost`。★u64 オーバーフロー折り返しを `wrapping_*` で再現。
 /// `dit` は絶対 θ なので `(dit + nt) % nt` で wrap (s.it は足さない)。
+///
+/// `ib` は評価対象状態の belief レベル (`s` には持たせない — b は最も遅い次元なので
+/// 索引から導ける)。着地セルごとに `belief.next_ib` で b' を決めて 4D 索引を引く。
+/// `nb_levels == 1` では `next_ib` が 0 を返すのでオフセットは literal 0 = 従来と同一。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn action_cost_raw(
     states: &[State],
     a: &Action,
     s: &State,
+    ib: i32,
     cell_num_x: i32,
     cell_num_y: i32,
     cell_num_t: i32,
+    belief: &BeliefModel,
 ) -> u64 {
     let mut cost: u64 = 0;
     for tran in &a.state_transitions[s.it as usize] {
@@ -559,7 +790,9 @@ pub(crate) fn action_cost_raw(
             return MAX_COST;
         }
         let it = (tran.dit + cell_num_t) % cell_num_t;
-        let after = &states[to_index_raw(ix, iy, it, cell_num_x, cell_num_t) as usize];
+        let ib2 = belief.next_ib(ib, ix, iy);
+        let after = &states[to_index_raw(ix, iy, it, cell_num_x, cell_num_t) as usize
+            + ib2 as usize * belief.layer];
         if !after.free {
             return MAX_COST;
         }
@@ -577,6 +810,7 @@ pub(crate) fn action_cost_raw(
 /// 本家 `valueIteration`。free でない/final_state なら 0 を返し更新しない。
 /// `final_state`/非 `free` セルは `None`。それ以外は **書き込まずに** min over アクションの
 /// `(min_cost, optimal_action)` を返す。u64 高速ソルバの近似版（Tau の非書込閾値判定等）で使う。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn min_action_cost(
     states: &[State],
     actions: &[Action],
@@ -584,15 +818,17 @@ pub(crate) fn min_action_cost(
     cell_num_x: i32,
     cell_num_y: i32,
     cell_num_t: i32,
+    belief: &BeliefModel,
 ) -> Option<(u64, Option<usize>)> {
     if !states[idx].free || states[idx].final_state {
         return None;
     }
+    let ib = belief.ib_of(idx);
     let mut min_cost: u64 = MAX_COST;
     let mut min_action: Option<usize> = None;
     let s = &states[idx];
     for (ai, a) in actions.iter().enumerate() {
-        let c = action_cost_raw(states, a, s, cell_num_x, cell_num_y, cell_num_t);
+        let c = action_cost_raw(states, a, s, ib, cell_num_x, cell_num_y, cell_num_t, belief);
         if c < min_cost {
             min_cost = c;
             min_action = Some(ai);
@@ -601,6 +837,7 @@ pub(crate) fn min_action_cost(
     Some((min_cost, min_action))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn value_iteration_raw(
     states: &mut [State],
     actions: &[Action],
@@ -608,9 +845,10 @@ pub(crate) fn value_iteration_raw(
     cell_num_x: i32,
     cell_num_y: i32,
     cell_num_t: i32,
+    belief: &BeliefModel,
 ) -> u64 {
     let Some((min_cost, min_action)) =
-        min_action_cost(states, actions, idx, cell_num_x, cell_num_y, cell_num_t)
+        min_action_cost(states, actions, idx, cell_num_x, cell_num_y, cell_num_t, belief)
     else {
         return 0;
     };

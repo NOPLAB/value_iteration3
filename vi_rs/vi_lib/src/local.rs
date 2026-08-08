@@ -76,11 +76,15 @@ impl ValueIteratorLocal {
         let cy = ((y - self.base.map_origin_y) / res).floor() as i32;
         let r = (radius_m / res).ceil() as i32;
         let nt = self.base.cell_num_t;
+        let nb = self.base.belief_levels();
         for ix in (cx - r).max(0)..=(cx + r).min(self.base.cell_num_x - 1) {
             for iy in (cy - r).max(0)..=(cy + r).min(self.base.cell_num_y - 1) {
                 for it in 0..nt {
-                    let idx = self.base.to_index(ix, iy, it) as usize;
-                    self.base.states[idx].local_penalty = 0;
+                    // 壁はどの b でも壁 — 全 b 層に同じ local_penalty を書く。
+                    for ib in 0..nb {
+                        let idx = self.base.to_index4(ix, iy, it, ib);
+                        self.base.states[idx].local_penalty = 0;
+                    }
                 }
             }
         }
@@ -102,11 +106,15 @@ impl ValueIteratorLocal {
     /// 本家 `localValueIterationLoop`。local window 内を走査。
     pub fn local_value_iteration_loop(&mut self) {
         let nt = self.base.cell_num_t;
+        let nb = self.base.belief_levels();
         for iix in self.local_ix_min..=self.local_ix_max {
             for iiy in self.local_iy_min..=self.local_iy_max {
                 for iit in 0..nt {
-                    let i = self.base.to_index(iix, iiy, iit) as usize;
-                    self.value_iteration_local(i);
+                    // 窓の refine は全 b 層を掃く (b 層ごとに値が違う)。
+                    for ib in 0..nb {
+                        let i = self.base.to_index4(iix, iiy, iit, ib);
+                        self.value_iteration_local(i);
+                    }
                 }
             }
         }
@@ -133,6 +141,7 @@ impl ValueIteratorLocal {
         let inject = (2048u64 >> shift.min(11)) << PROB_BASE_BIT;
         let start_angle = msg.angle_min;
         let nt = self.base.cell_num_t;
+        let nb = self.base.belief_levels(); // レーザの壁はどの b でも壁。
         let (ox, oy, res) = (self.base.map_origin_x, self.base.map_origin_y, self.base.xy_resolution);
 
         for i in 0..msg.ranges.len() {
@@ -152,8 +161,10 @@ impl ValueIteratorLocal {
                 let half_iy = ((half_ly - oy) / res).floor() as i32;
                 if self.in_local_area(half_ix, half_iy) {
                     for it in 0..nt {
-                        let index = self.base.to_index(half_ix, half_iy, it) as usize;
-                        self.base.states[index].local_penalty /= 2;
+                        for ib in 0..nb {
+                            let index = self.base.to_index4(half_ix, half_iy, it, ib);
+                            self.base.states[index].local_penalty /= 2;
+                        }
                     }
                 }
                 d += 0.1;
@@ -165,8 +176,10 @@ impl ValueIteratorLocal {
                         continue;
                     }
                     for it in 0..nt {
-                        let index = self.base.to_index(iix, iiy, it) as usize;
-                        self.base.states[index].local_penalty = inject;
+                        for ib in 0..nb {
+                            let index = self.base.to_index4(iix, iiy, it, ib);
+                            self.base.states[index].local_penalty = inject;
+                        }
                     }
                 }
             }

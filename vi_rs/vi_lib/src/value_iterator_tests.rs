@@ -192,7 +192,7 @@ fn action_cost_deterministic_neighbor() {
     ];
     let a = single_action(1, 0, 0, nt);
     let s = states[0].clone();
-    let c = super::action_cost_raw(&states, &a, &s, nx, ny, nt as i32);
+    let c = super::action_cost_raw(&states, &a, &s, 0, nx, ny, nt as i32, &BeliefModel::default());
     assert_eq!(c, 6 * super::PROB_BASE);
 }
 
@@ -202,7 +202,7 @@ fn action_cost_out_of_map_returns_max() {
     let states = vec![mk_state(0, 0, 0, true, 0, 0)];
     let a = single_action(-1, 0, 0, nt); // dix=-1 → 範囲外
     let s = states[0].clone();
-    let c = super::action_cost_raw(&states, &a, &s, 1, 1, nt as i32);
+    let c = super::action_cost_raw(&states, &a, &s, 0, 1, 1, nt as i32, &BeliefModel::default());
     assert_eq!(c, super::MAX_COST);
 }
 
@@ -215,7 +215,7 @@ fn action_cost_obstacle_neighbor_returns_max() {
     ];
     let a = single_action(1, 0, 0, nt);
     let s = states[0].clone();
-    let c = super::action_cost_raw(&states, &a, &s, 2, 1, nt as i32);
+    let c = super::action_cost_raw(&states, &a, &s, 0, 2, 1, nt as i32, &BeliefModel::default());
     assert_eq!(c, super::MAX_COST);
 }
 
@@ -231,7 +231,7 @@ fn action_cost_overflow_wraps() {
     ];
     let a = single_action(1, 0, 0, nt);
     let s = states[0].clone();
-    let c = super::action_cost_raw(&states, &a, &s, 2, 1, nt as i32);
+    let c = super::action_cost_raw(&states, &a, &s, 0, 2, 1, nt as i32, &BeliefModel::default());
     // 手計算: term = (MAX_COST + PROB_BASE) wrapping_mul PROB_BASE; result = term >> 18。
     let term = (super::MAX_COST.wrapping_add(penalty)).wrapping_mul(super::PROB_BASE);
     let expected = term >> super::PROB_BASE_BIT;
@@ -255,7 +255,7 @@ fn value_iteration_picks_min_and_records_action() {
     let a1 = single_action(-1, 0, 0, nt); // → 左 (total=4)
     let actions = vec![a0, a1];
     let mid = 1usize;
-    let d = super::value_iteration_raw(&mut states, &actions, mid, nx, ny, nt as i32);
+    let d = super::value_iteration_raw(&mut states, &actions, mid, nx, ny, nt as i32, &BeliefModel::default());
     // 左 (4*PB + PB)*PB >>18 = 5*PB。右 = 10*PB。min = 5*PB、action1。
     assert_eq!(states[mid].total_cost, 5 * super::PROB_BASE);
     assert_eq!(states[mid].optimal_action, Some(1));
@@ -270,7 +270,7 @@ fn value_iteration_skips_final_and_obstacle() {
     s_final.final_state = true;
     let mut states = vec![s_final];
     let actions: Vec<Action> = vec![single_action(1, 0, 0, nt)];
-    let d = super::value_iteration_raw(&mut states, &actions, 0, 1, 1, nt as i32);
+    let d = super::value_iteration_raw(&mut states, &actions, 0, 1, 1, nt as i32, &BeliefModel::default());
     assert_eq!(d, 0);
     assert_eq!(states[0].total_cost, super::MAX_COST); // 未更新
 }
@@ -342,6 +342,113 @@ fn policy_writer_marks_unset_as_minus_one() {
     assert_eq!(pol.layers.len(), 60);
     // 未計算なので全 -1。
     assert!(pol.layers[0].iter().all(|&v| v == -1.0));
+}
+
+// ═══ belief 次元 (x,y,θ,b) ═══
+
+/// `nb_levels == 1` は**構成的に**従来と同一であること (他の belief パラメータが
+/// どんな値でも索引・数式に一切現れない)。これが「既定は bit-exact」の担保。
+#[test]
+fn belief_nb1_is_bit_identical() {
+    use crate::solvers::{solve, U64Solver};
+    let mut occ = vec![0i8; 8 * 8];
+    for iy in 0..8 {
+        occ[(iy * 8 + 5) as usize] = 100;
+    }
+    occ[5] = 0;
+
+    let mut plain = crate::solvers::test_support::make_vi(8, 8, occ.clone());
+    // nb_levels 以外はでたらめ。1 層なら一切効かないこと。
+    let junk = super::BeliefModel {
+        nb_levels: 1,
+        ib_goal: 7,
+        motion_gain: 3,
+        info_near_m: 1.5,
+        info_far_m: 9.0,
+        ..Default::default()
+    };
+    let mut belief = crate::solvers::test_support::make_vi_with(8, 8, occ, junk);
+    assert_eq!(plain.states.len(), belief.states.len());
+    solve(&mut plain, U64Solver::Frontier2D, 4000);
+    solve(&mut belief, U64Solver::Frontier2D, 4000);
+    for (i, (a, b)) in plain.states.iter().zip(belief.states.iter()).enumerate() {
+        assert_eq!(a.total_cost, b.total_cost, "total_cost @ {i}");
+        assert_eq!(a.optimal_action, b.optimal_action, "optimal_action @ {i}");
+        assert_eq!(a.final_state, b.final_state, "final_state @ {i}");
+    }
+}
+
+/// `info` 場は壁までの city-block 距離を near/far で 3 値化したもの。
+/// 地図の外周は壁扱いしない。
+#[test]
+fn belief_info_map_thresholds() {
+    let mut data = vec![0i8; 20 * 5];
+    for iy in 0..5 {
+        data[(iy * 20 + 10) as usize] = 100; // 縦壁 (ix=10)
+    }
+    let map = OccupancyGrid {
+        width: 20,
+        height: 5,
+        resolution: 0.05,
+        origin_x: 0.0,
+        origin_y: 0.0,
+        origin_quat: Default::default(),
+        data,
+    };
+    let mut vi = ValueIterator::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
+    vi.belief = super::BeliefModel {
+        nb_levels: 2,
+        info_near_m: 0.1,  // 2 セル
+        info_far_m: 0.25,  // 5 セル
+        ..Default::default()
+    };
+    vi.set_map_with_occupancy_grid(&map, 4, 0.0, 30.0, 0.2, 180);
+    let at = |ix: i32, iy: i32| vi.belief.info[(iy * 20 + ix) as usize];
+    assert_eq!(at(10, 2), 2, "壁セルそのもの (d=0)");
+    assert_eq!(at(8, 2), 2, "d=2 <= near");
+    assert_eq!(at(7, 2), 1, "d=3 は far のみ");
+    assert_eq!(at(5, 2), 1, "d=5 <= far");
+    assert_eq!(at(4, 2), 0, "d=6 > far");
+    assert_eq!(at(0, 0), 0, "地図の外周は壁ではない (d=10)");
+}
+
+#[test]
+fn belief_next_ib_clamps() {
+    // info = [0, 1, 2] を ix=0,1,2 に置いた 3x1 の場。
+    let bm = super::BeliefModel {
+        nb_levels: 4,
+        motion_gain: 1,
+        info: vec![0, 1, 2],
+        nx: 3,
+        ..Default::default()
+    };
+    assert_eq!(bm.next_ib(0, 0, 0), 1, "情報なし → b 増");
+    assert_eq!(bm.next_ib(3, 0, 0), 3, "上端クランプ");
+    assert_eq!(bm.next_ib(2, 1, 0), 2, "info=1 は据え置き");
+    assert_eq!(bm.next_ib(2, 2, 0), 1, "info=2 → b 減");
+    assert_eq!(bm.next_ib(0, 2, 0), 0, "下端クランプ");
+    // nb_levels == 1 では info も motion_gain も見ない。
+    let one = super::BeliefModel { nb_levels: 1, info: vec![0, 1, 2], nx: 3, ..Default::default() };
+    assert_eq!(one.next_ib(5, 0, 0), 0);
+}
+
+/// ゴール開放は `ib <= ib_goal` の層だけ。不確かな層ではゴールが終端にならない。
+#[test]
+fn belief_goal_gating() {
+    let mut vi = ValueIterator::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
+    vi.belief = super::BeliefModel { nb_levels: 3, ib_goal: 0, ..Default::default() };
+    let map = free_grid(20, 20);
+    vi.set_map_with_occupancy_grid(&map, 4, 0.2, 30.0, 0.08, 360);
+    assert_eq!(vi.states.len(), 20 * 20 * 4 * 3);
+    vi.set_goal(0.5, 0.5, 0);
+    let goal = vi.to_index4(10, 10, 0, 0);
+    assert!(vi.states[goal].final_state, "層 0 のゴールは終端");
+    assert_eq!(vi.states[goal].total_cost, 0);
+    for ib in 1..3 {
+        let i = vi.to_index4(10, 10, 0, ib);
+        assert!(!vi.states[i].final_state, "層 {ib} のゴールは終端でない");
+        assert_eq!(vi.states[i].total_cost, super::MAX_COST, "層 {ib} は MAX_COST から");
+    }
 }
 
 #[test]

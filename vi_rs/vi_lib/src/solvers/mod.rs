@@ -54,6 +54,8 @@ pub(crate) fn displacement(vi: &ValueIterator) -> (i32, i32, i32) {
 }
 
 /// 初期フロンティア種: `total_cost < MAX_COST` のセル（`set_goal` 後の `final_state` セル）。
+/// belief 次元があっても変更不要 — 全 b 層を (ix,iy[,it]) へ潰した種は正しい上位近似
+/// (フロンティアが広めに立つだけで、更新式が落とすものは無い)。
 pub(crate) fn seed_frontier(vi: &ValueIterator) -> Bitboard3D {
     let mut bb = Bitboard3D::new(vi.cell_num_x as u32, vi.cell_num_y as u32, vi.cell_num_t as u32);
     for s in &vi.states {
@@ -415,6 +417,12 @@ pub struct SolverCaps {
     pub out_of_core: bool,
     /// マルチスレッド (`VI_THREADS`) を使うか。
     pub parallel: bool,
+    /// belief 次元 (`BeliefModel::nb_levels > 1`) に対応するか。
+    ///
+    /// 対応できるのは `vi.to_index` / `value_iteration_raw` 経由で索引を引くソルバだけ。
+    /// pad / fused / sparse 系は **相対オフセットを事前計算**して隣接を引くので、
+    /// 「着地セルによって b′ が変わる」= セル依存のオフセットを表現できない。
+    pub belief: bool,
 }
 
 impl U64Solver {
@@ -439,6 +447,9 @@ impl U64Solver {
                     | Frontier2DSparse
                     | Frontier2DSparseCompact { .. }
             ),
+            // StreamMimic は original (sweep_orders 走査) への委譲なので、
+            // sweep_orders を b で拡張しただけで 4D を舐める。
+            belief: matches!(self, Reference | Frontier2D | StreamMimic),
         }
     }
 }
@@ -459,6 +470,10 @@ pub fn solve_observed(
     max_iter: u32,
     obs: &mut dyn SolveObserver,
 ) -> SolveOutcome {
+    assert!(
+        vi.belief.nb_levels <= 1 || solver.caps().belief,
+        "solver {solver:?} は belief 次元 (nb_levels>1) 非対応 — caps().belief を見て選ぶこと"
+    );
     match solver {
         U64Solver::Reference => original::original_solve_observed(vi, max_iter, obs),
         U64Solver::Frontier3D => frontier3d::frontier3d_solve_observed(vi, max_iter, obs),
@@ -524,7 +539,18 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn make_vi(w: i32, h: i32, occ: Vec<i8>) -> ValueIterator {
+        make_vi_with(w, h, occ, Default::default())
+    }
+
+    /// [`make_vi`] の belief 付き版 (`belief` は set_map より前に入れる必要がある)。
+    pub(crate) fn make_vi_with(
+        w: i32,
+        h: i32,
+        occ: Vec<i8>,
+        belief: crate::value_iterator::BeliefModel,
+    ) -> ValueIterator {
         let mut vi = ValueIterator::new(actions(), 1);
+        vi.belief = belief;
         let map = OccupancyGrid {
             width: w,
             height: h,
