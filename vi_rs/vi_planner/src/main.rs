@@ -109,7 +109,7 @@ struct Params {
     /// publish_tf 用の odom 購読先 (T_odom→base の出どころ)。
     odom_topic: String,
     // ── 自己位置推定 (core::Localizer) ──
-    /// 自己位置の出どころ ("external" | "grid" | "adaptive")。
+    /// 自己位置の出どころ ("external" | "grid" | "adaptive" | "viterbi")。
     localizer: String,
     /// grid: belief 窓の半径 [m] / 尤度場の σ [m] / ビーム間引き / レンジ上限 [m]。
     belief_radius: f64,
@@ -150,6 +150,11 @@ struct Params {
     /// belief が多峰のとき QMDP (Q(b,a) = Σ w·Q(s,a) の argmin) で行動を選ぶ。
     /// grid/adaptive localizer 用 (external は仮説を出さないので実質無効)。
     qmdp: bool,
+    /// ロスト中に安全停止で待つ代わりに、仮説を判別する地点への多目標 VI を解いて
+    /// QMDP で走る (能動的再定位)。adaptive/viterbi localizer + 密ソルバ用。
+    active_reloc: bool,
+    /// 能動的再定位を諦めて通常の停止待ちに戻すまでの時間 [s]。
+    reloc_timeout_sec: f64,
     /// DWA/MPPI の前方シミュレーション時間 [s] と DWA の (v, ω) 候補数。
     dwa_horizon_s: f64,
     dwa_n_v: i64,
@@ -275,6 +280,8 @@ fn read_params(node: &Node) -> Result<Params> {
         // 初期化し直す。以後は scan_topic と自分の出した cmd_vel だけで推定する
         // ので、"grid" のときは pose_topic を mcl の連続出力に向けないこと
         // (毎メッセージでリセットされて素通しと変わらなくなる)。
+        // "viterbi" = adaptive の全域レベルを min-plus (MAP) で回す変種
+        // (vi_lib の localize/viterbi.rs — 運動整合性で偽仮説を削る)。
         // "adaptive" = grid の多重解像度版 — 観測一致度が落ちると belief を粗い
         // 広域レベルへ広げて再定位する (EMCL の expansion resetting 相当) ので、
         // 誘拐 (持ち上げ移動) から復帰でき、未シードなら大域初期化で立ち上がる。
@@ -345,6 +352,11 @@ fn read_params(node: &Node) -> Result<Params> {
         // 選び、有意な仮説が衝突と言う行動しか無ければ止まる。単峰の tick は
         // 従来の follow_controller に退避するので、収束中の挙動だけが変わる。
         qmdp: p!("qmdp", bool, false),
+        // ロスト中の能動的再定位: 仮説集合を最も判別する地点 (reloc_targets) を
+        // 多目標 VI のゴールにして QMDP で走る。復帰したら本来のゴールを
+        // 解き直して走行に戻る (core::prepare_reloc_goal の doc 参照)。
+        active_reloc: p!("active_reloc", bool, false),
+        reloc_timeout_sec: p!("reloc_timeout_sec", f64, 30.0),
 
         // navigate_to_pose と follow_waypoints をこのノード自身が提供する
         // (= bt_navigator / behavior_server / waypoint_follower を立てない)。
@@ -461,9 +473,9 @@ fn validate(p: &Params) -> Result<U64Solver> {
             p.follow_controller
         ));
     }
-    if !matches!(p.localizer.as_str(), "external" | "grid" | "adaptive") {
+    if !matches!(p.localizer.as_str(), "external" | "grid" | "adaptive" | "viterbi") {
         return Err(anyhow!(
-            "unknown localizer: {} (expected \"external\", \"grid\" or \"adaptive\")",
+            "unknown localizer: {} (expected \"external\", \"grid\", \"adaptive\" or \"viterbi\")",
             p.localizer
         ));
     }
@@ -659,11 +671,29 @@ struct FollowTuning {
     qmdp: bool,
     /// スキャン注入の品質ゲート ([`quality_shift`] の gate)。0 で無効。
     scan_quality_gate: f64,
+    /// ロスト中に判別点へ走る能動的再定位 (`prepare_reloc_goal` + QMDP)。
+    active_reloc: bool,
+    /// 能動的再定位を諦めて通常の停止待ちに戻すまでの tick 数。
+    reloc_ticks_limit: u32,
 }
 
 /// QMDP に渡す belief 仮説の上限。ヒストグラムの上位セルだけで質量の大半を
 /// 覆える (それ以下は veto 判定も動かさない微小仮説)。
 const QMDP_TOP_K: usize = 64;
+/// 能動的再定位中の近接停止 [m]。姿勢が無く local_penalty を置けないので、
+/// 生の最近接レンジで守る。
+// ponytail: 定数 1 個 — 機体寸法に合わせるならパラメータへ昇格。
+const RELOC_STOP_RANGE: f64 = 0.35;
+
+/// 能動的再定位 (`active_reloc`) の段階 (run_follow のロスト分岐が使う)。
+enum Reloc {
+    /// ロストしていない / まだ再定位場を解いていない。
+    Idle,
+    /// 再定位場の上を QMDP で走行中 (このときキャッシュ = 再定位場)。
+    Driving,
+    /// この構成では使えない (compact 等) — このゴールでは以後試さない。
+    GaveUp,
+}
 
 enum Outcome {
     Reached,
@@ -904,6 +934,8 @@ fn run_follow(
     // ロックを連続で取れなかった tick 数 (下の try_lock を参照)。
     let mut busy_ticks = 0u32;
     let mut last_viz: Option<Instant> = None;
+    let mut reloc = Reloc::Idle;
+    let mut reloc_ticks = 0u32;
     loop {
         let tick_start = Instant::now();
         if cancel.load(Ordering::Relaxed) {
@@ -912,11 +944,120 @@ fn run_follow(
         }
 
         let pose = *latest_pose.lock().unwrap();
+        // 能動的再定位から復帰した直後: キャッシュには再定位場が載っている。
+        // 下の「goal replaced」プリエンプトと誤認する前に本来のゴールを解き直す
+        // (再定位中に本当に別の追従ゴールが来る形は cancel 経由で上で抜けている)。
+        if matches!(reloc, Reloc::Driving) {
+            if let Some(p) = pose {
+                let Some(mut core) = try_lock(core) else {
+                    if let Some(rest) = tuning.period.checked_sub(tick_start.elapsed()) {
+                        std::thread::sleep(rest);
+                    }
+                    continue;
+                };
+                stop_cmd(cmd_pub); // 解き直しの数秒、直前の指令で這わせない
+                if !core.is_cached_goal(goal) {
+                    eprintln!(
+                        "vi_planner: re-localized at ({:.2}, {:.2}) — re-solving the goal \
+                         [active_reloc]",
+                        p.x, p.y
+                    );
+                    if let Err(e) = core.prepare_goal(goal, cancel) {
+                        return match e {
+                            PlanError::Cancelled => Outcome::Preempted,
+                            e => Outcome::Failed(e.to_string()),
+                        };
+                    }
+                }
+                reloc = Reloc::Idle;
+                reloc_ticks = 0;
+                failure_ticks = 0;
+            }
+        }
         let Some(pose) = pose else {
-            stop_cmd(cmd_pub);
-            failure_ticks += 1;
-            if failure_ticks >= tuning.failure_ticks_limit {
-                return Outcome::Failed("no robot pose for too long".into());
+            // ── ロスト (pose なし)。既定は安全停止で受動復帰 (expansion resetting)
+            // を待つ。active_reloc なら仮説を判別する地点の多目標場を解き、
+            // QMDP で走って復帰を早める (core::prepare_reloc_goal の doc)。
+            let mut acted = false;
+            if tuning.active_reloc
+                && reloc_ticks < tuning.reloc_ticks_limit
+                && !matches!(reloc, Reloc::GaveUp)
+            {
+                reloc_ticks += 1;
+                acted = 'reloc: {
+                    // localizer → core の順 (入れ子ロックを作らない)。
+                    let (hyps, targets) = {
+                        let l = lock(localizer);
+                        (l.top_cells(QMDP_TOP_K), l.reloc_targets())
+                    };
+                    if hyps.len() < 2 {
+                        break 'reloc false;
+                    }
+                    // 近接ガード: 姿勢が無く local_penalty を置けないので、生の
+                    // 最近接レンジで守る (スキャンはコールバックで localizer に
+                    // 反映済みなので捨ててよい)。
+                    let scans = std::mem::take(&mut *scan_queue.lock().unwrap());
+                    if scans.last().is_some_and(|s| {
+                        s.ranges
+                            .iter()
+                            .filter(|r| r.is_finite() && **r > 0.0)
+                            .fold(f64::INFINITY, |a, &r| a.min(r))
+                            < RELOC_STOP_RANGE
+                    }) {
+                        stop_cmd(cmd_pub);
+                        break 'reloc true; // 止まって観測を待つのも再定位のうち
+                    }
+                    let Some(mut core) = try_lock(core) else { break 'reloc false };
+                    if matches!(reloc, Reloc::Idle) {
+                        if targets.is_empty() {
+                            break 'reloc false;
+                        }
+                        match core.prepare_reloc_goal(&targets, cancel) {
+                            Ok(_) => {
+                                eprintln!(
+                                    "vi_planner: lost — driving toward {} disambiguation \
+                                     target(s) [active_reloc]",
+                                    targets.len()
+                                );
+                                reloc = Reloc::Driving;
+                            }
+                            Err(PlanError::Cancelled) => break 'reloc false,
+                            Err(e) => {
+                                // compact 構成など — 受動復帰に任せる。
+                                eprintln!("vi_planner: active_reloc unavailable ({e})");
+                                reloc = Reloc::GaveUp;
+                                break 'reloc false;
+                            }
+                        }
+                    }
+                    match core.decide_qmdp(&hyps) {
+                        Decision::Action { fw, rot_deg, .. } => {
+                            drop(core); // localizer を取る前に手放す (ロック順序)
+                            let mut tw = geometry_msgs::msg::Twist::default();
+                            tw.linear.x = fw;
+                            tw.angular.z = rot_deg.to_radians();
+                            let _ = cmd_pub.publish(tw);
+                            let mut l = lock(localizer);
+                            l.predict(fw, rot_deg, tuning.period.as_secs_f64());
+                            *lock(latest_pose) = l.pose();
+                            true
+                        }
+                        // Goal = 判別点に到着 / NoAction — 止まって観測を待つ。
+                        _ => {
+                            stop_cmd(cmd_pub);
+                            true
+                        }
+                    }
+                };
+            }
+            if acted {
+                failure_ticks = 0;
+            } else {
+                stop_cmd(cmd_pub);
+                failure_ticks += 1;
+                if failure_ticks >= tuning.failure_ticks_limit {
+                    return Outcome::Failed("no robot pose for too long".into());
+                }
             }
             if let Some(rest) = tuning.period.checked_sub(tick_start.elapsed()) {
                 std::thread::sleep(rest);
@@ -1271,7 +1412,7 @@ fn main() -> Result<()> {
     // 自己位置推定器。grid は native 解像度の占有格子から尤度場を起こすので、
     // ダウンサンプル前の binary_grid をここで使い切ってから捨てる。
     let localizer: Box<dyn Localizer> = match params.localizer.as_str() {
-        kind @ ("grid" | "adaptive") => {
+        kind @ ("grid" | "adaptive" | "viterbi") => {
             let bc = BeliefConfig {
                 half_m: params.belief_radius.max(0.5),
                 sensor_sigma_m: params.belief_sensor_sigma.max(0.01),
@@ -1281,6 +1422,8 @@ fn main() -> Result<()> {
                 motion_sigma_theta_deg: params.belief_motion_sigma_theta_deg.max(0.0),
                 z_min: params.belief_z_min.clamp(0.0, 1.0),
                 weight_skip_ratio: params.belief_weight_skip_ratio.max(0.0) as f32,
+                // "viterbi" = adaptive の全域レベルを min-plus (MAP) で回す変種。
+                viterbi: kind == "viterbi",
                 ..BeliefConfig::default()
             };
             if kind == "grid" {
@@ -1298,9 +1441,10 @@ fn main() -> Result<()> {
             } else {
                 let g = AdaptiveLocalizer::new(&binary_grid, params.theta_cell_num as i32, bc);
                 eprintln!(
-                    "vi_planner: localizer = adaptive ({} levels up to whole-map, {:.1} MB \
+                    "vi_planner: localizer = {} ({} levels up to whole-map, {:.1} MB \
                      belief; seed via {} or leave unseeded for global init; lost → pose \
                      withheld until re-localized)",
+                    kind,
                     g.num_levels(),
                     g.belief_mb(),
                     params.pose_topic
@@ -1789,6 +1933,9 @@ fn main() -> Result<()> {
         busy_ticks_before_stop: params.busy_ticks_before_stop.max(1) as u32,
         qmdp: params.qmdp,
         scan_quality_gate: params.scan_quality_gate,
+        active_reloc: params.active_reloc,
+        reloc_ticks_limit: (params.reloc_timeout_sec.max(0.0) * params.control_frequency)
+            .ceil() as u32,
     };
     let retry = RetryTuning {
         limit: params.goal_retry_limit,
