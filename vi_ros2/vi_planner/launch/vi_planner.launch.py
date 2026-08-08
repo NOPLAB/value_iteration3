@@ -10,7 +10,7 @@ Expects /map (transient_local, e.g. nav2_map_server), a
 PoseWithCovarianceStamped pose topic (emcl2: mcl_pose, AMCL: amcl_pose) and a
 LaserScan topic to be provided by the surrounding bringup. In a full Nav2
 bringup, remap cmd_vel to cmd_vel_nav so velocity_smoother stays in the loop
-(vi_global_planner/launch/navigation_launch.py does this).
+(launch/navigation_launch.py does this).
 
 Both actions read the same ValueIterator::states, so the laser penalties the
 follow loop injects are visible to the global rollout -- but only once they are
@@ -64,45 +64,15 @@ def generate_launch_description():
             executable='vi_planner',
             name='vi_planner',
             output='screen',
+            # 上書きしたい値だけ書く — 未指定はノード既定 (read_params の
+            # default) が効く。行動集合も action_names/action_forward_m/
+            # action_rotation_deg でここから変えられる (3 本は同じ長さ)。
             parameters=[{
                 'use_sim_time': use_sim_time,
                 'solver': solver,
                 'pose_topic': pose_topic,
                 'scan_topic': scan_topic,
-                # ── 価値関数の定義 (広域・狭域で共有) ──
-                'theta_cell_num': 60,        # 360 を割り切る値であること (t_resolution が整数除算)
-                'safety_radius': 0.2,
-                'safety_radius_penalty': 30,
-                'goal_margin_radius': 0.3,   # [m] final_state = ゴール許容差
-                'goal_margin_theta': 15.0,   # [deg]
-                'map_wait_sec': 60,
-                'vi_threads': 0,             # 0 = 論理コア数 (VI_THREADS)
-                'solve_chunk': 64,           # cancel 観測間隔 (イテレーション)
-                'max_solve_iter': 1000000,
-                'goal_tolerance_xy': 0.25,   # [m] 価値関数キャッシュ再利用の許容ゴール差
-                'goal_tolerance_deg': 10.0,  # [deg]
-                'unknown_as_obstacle': True,
-                # ── 広域 (compute_path_to_pose) ──
-                'max_rollout_steps': 10000,
-                'start_tolerance': 0.5,      # [m] start が方策なしセルのときの近傍探索半径
-                'path_spacing': 0.05,        # [m] 経路補間間隔 (0 で無効)
-                # ── 狭域 (follow_path) ──
-                'control_frequency': 10.0,   # [Hz] 本家 ViNode::decision の 100ms
-                'refine_budget_ms': 40,      # [ms/tick] ウィンドウ価値反復の時間予算
-                'action_tolerance': 0.2,     # [m] 方策なしセルでの近傍行動探索半径
-                'no_action_timeout_sec': 3.0,
-                # ── 可視化 ──
-                'publish_value_function': True,
-                'value_publish_interval_ms': 500,
-                'cost_drawing_threshold': 60,         # value_function のスケール上限
-                'window_cost_drawing_threshold': 60,  # local_window_value のスケール上限
-                # ── 行動集合 (ここで決めた値がそのまま効く) ──
-                # 遷移表は起動時にこの値から作られるので、名前も歩幅も回転量も
-                # 好きに変えてよい (数も 6 でなくてよい)。3 本の配列は同じ長さで
-                # あること。既定は本家 launch と同じ 6 行動。
-                'action_names': ['forward', 'back', 'right', 'rightfw', 'left', 'leftfw'],
-                'action_forward_m': [0.3, -0.2, 0.0, 0.2, 0.0, 0.2],
-                'action_rotation_deg': [0.0, 0.0, -20.0, -20.0, 20.0, 20.0],
+                'map_wait_sec': 60,  # ノード既定 30 より長め (map_server 起動待ち)
             }],
         ),
     ])

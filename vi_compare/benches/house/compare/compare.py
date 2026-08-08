@@ -1,32 +1,25 @@
 #!/usr/bin/env python3
-"""Align ROS1 と 2nd-side (ros2=vi_node / ref=vi_reference) の value & policy を
+"""Align ROS1 と 2nd-side (ref=vi_reference / u64 各ソルバ) の value & policy を
 整列して比較レポートを出す。
 
-  compare.py <out_dir> [side]   # side: ros2 (既定) | ref
+  compare.py <out_dir> [side]   # side: ref (既定) | <u64 solver 名>
 """
 import sys, json, os
 import numpy as np
 
 ROS1_UNREACH = 1e6   # detection threshold; actual ROS1 sentinel is ~1e9 (max_cost_/prob_base_)
 
-# 2nd-side ごとの設定。ros2=vi_node(16bit), ref=vi_reference(u64 忠実移植)。
+# 2nd-side ごとの設定。ref=vi_reference(u64 忠実移植)。
 SIDES = {
-    'ros2': dict(vfile='value_ros2.npy', pfile='policy_ros2.npy', tfile='timing_ros2.json',
-                 unreach=65535, label='ROS2(vi_node)', report='report.md',
-                 model_note='ROS2 は 16bit 飽和で障害物のみ sentinel'),
     'ref':  dict(vfile='value_ref.npy', pfile='policy_ref.npy', tfile='timing_ref.json',
                  unreach=1e6, label='ref(vi_reference u64忠実)', report='report_ref.md',
                  model_note='ref は本家と同じ u64+sentinel(~1e9) モデル → 価値はほぼ一致するはず'),
-    'f3d':  dict(vfile='value_f3d.npy', pfile='policy_f3d.npy', tfile='timing_f3d.json',
-                 unreach=65535, label='f3d(Frontier3D 16bit)', report='report_f3d.md',
-                 model_note='f3d は vi_rs の Frontier3D ソルバ・16bit 飽和で障害物のみ sentinel'
-                            '（ros2 reference と同一の数値モデルで、ソルバのみ異なる実装）'),
 }
 
 # vi_u64_bench が出す u64 高速ソルバ群。本家と同一の u64 コストモデル上で frontier/block を
 # 走らせるため、厳密ソルバは本家と bit-exact（RMSE 0）になるはず。出力名は value_<solver>.npy。
-_U64_SOLVERS = ['reference', 'frontier3d', 'frontier2d', 'frontier2d_soa', 'frontier2d_pad',
-                'frontier2d_par', 'frontier_stack', 'block_refine', 'pyramid_sweep']
+_U64_SOLVERS = ['reference', 'frontier3d', 'frontier2d', 'frontier2d_par',
+                'frontier_stack', 'block_refine', 'pyramid_sweep']
 for _s in _U64_SOLVERS:
     SIDES[_s] = dict(
         vfile=f'value_{_s}.npy', pfile=f'policy_{_s}.npy', tfile=f'timing_{_s}.json',
@@ -106,7 +99,7 @@ def directional_unreach_agreement(u_small, u_big):
 
 def main():
     out_dir = sys.argv[1]
-    side = sys.argv[2] if len(sys.argv) > 2 else 'ros2'
+    side = sys.argv[2] if len(sys.argv) > 2 else 'ref'
     if side not in SIDES:
         print(f"unknown side '{side}' (choose: {', '.join(SIDES)})", file=sys.stderr)
         sys.exit(2)

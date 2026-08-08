@@ -86,14 +86,14 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context as ACtx, Result};
 
 use vi_reference::bridge::{
-    downsample_occupancy, occupancy_view_to_vi_grid, OccupancyGridView, PoseView,
+    downsample_occupancy, downsample_occupancy_optimistic, occupancy_view_to_vi_grid,
+    OccupancyGridView, PoseView,
 };
 use vi_reference::msg::LaserScan as ViLaserScan;
 use vi_reference::planner::PathPose;
 use vi_reference::solvers::U64Solver;
 use vi_reference::Action;
 // nav_msgs::msg::OccupancyGrid と名前が衝突するので別名で入れる。
-use vi_reference::OccupancyGrid as ViOccupancyGrid;
 
 use vi_planner::core::{
     value_grid_on, BuildParams, Decision, PlanConfig, PlanError, PlanStats, PlannerCore,
@@ -152,6 +152,7 @@ struct Params {
     start_tolerance: f64,
     path_spacing: f64,
     // ── 狭域 (follow_path) ──
+    follow: bool,
     scan_topic: String,
     control_frequency: f64,
     refine_budget_ms: i64,
@@ -225,6 +226,10 @@ fn read_params(node: &Node) -> Result<Params> {
     let start_tolerance = p!("start_tolerance", f64, 0.5);
     let path_spacing = p!("path_spacing", f64, 0.05);
 
+    // follow_path サーバを立てるか。false は nav2_controller (controller_server) と
+    // 組む構成 — 立てると follow_path のサーバが 2 つになるため。false のとき
+    // このノードは compute_path_to_pose 専用 (旧 vi_global_planner 相当) になる。
+    let follow = p!("follow", bool, true);
     let scan_topic = p!("scan_topic", Arc<str>, "scan".into()).to_string();
     let control_frequency = p!("control_frequency", f64, 10.0);
     let refine_budget_ms = p!("refine_budget_ms", i64, 40);
@@ -356,6 +361,7 @@ fn read_params(node: &Node) -> Result<Params> {
         max_rollout_steps,
         start_tolerance,
         path_spacing,
+        follow,
         scan_topic,
         control_frequency,
         refine_budget_ms,
@@ -404,6 +410,11 @@ fn validate(p: &Params) -> Result<U64Solver> {
     }
     if p.control_frequency <= 0.0 {
         return Err(anyhow!("control_frequency must be > 0, got {}", p.control_frequency));
+    }
+    // standalone は navigate_to_pose / follow_waypoints が追従本体を回すので
+    // follow を切る組み合わせは成立しない。
+    if p.standalone && !p.follow {
+        return Err(anyhow!("standalone: true requires follow: true"));
     }
     let solver = U64Solver::from_name(&p.solver)
         .ok_or_else(|| anyhow!("unknown solver: {} (see U64Solver::from_name)", p.solver))?;
@@ -515,57 +526,6 @@ fn compact_sink_dir(params: &Params, solver: U64Solver, nstates: usize) -> Optio
     }
     eprintln!("vi_planner: compact output -> RAM ({:.2} GB)", bytes as f64 / 1e9);
     None
-}
-
-/// `downsample_occupancy` の楽観版。ブロック内に 1 つでも free があれば出力セルを free にする。
-///
-/// 本家の `downsample_occupancy` は障害物優先なので通路が片側最大 `(scale-1)·resolution` 細る。
-/// map_tsudanuma は unknown が 68% あり、`map_scale >= 4` では free **面積**は数 % しか減らないのに
-/// **通路のセル幅**が落ちる。VI の遷移はサブセルサンプリングによる約 2 セル幅の分布なので、
-/// 散り先に 1 つでも未到達セルがあると期待値が MAX_COST 側に張り付き、波がゴール近傍で止まる。
-///
-/// 安全余裕を地図に焼き込んではいけない。VI の `safety_radius` は硬い壁ではなく秒/セルのソフトな
-/// ペナルティで、膨張として焼き込むと scale 3 でも波が死ぬ (実測)。ここでは通路を開けるだけにする。
-///
-/// `vi_global_planner` にも同じ関数がある (別クレートなので共有できない)。片方を直したら両方直すこと。
-fn downsample_occupancy_optimistic(grid: &ViOccupancyGrid, scale: i32) -> ViOccupancyGrid {
-    if scale <= 1 {
-        return grid.clone();
-    }
-    let (w, h, s) = (grid.width as usize, grid.height as usize, scale as usize);
-    let (ow, oh) = (w.div_ceil(s), h.div_ceil(s));
-    let mut data = vec![100i8; ow * oh];
-    for oy in 0..oh {
-        for ox in 0..ow {
-            let mut free = false;
-            'blk: for dy in 0..s {
-                let iy = oy * s + dy;
-                if iy >= h {
-                    break;
-                }
-                for dx in 0..s {
-                    let ix = ox * s + dx;
-                    if ix >= w {
-                        break;
-                    }
-                    if grid.data[iy * w + ix] == 0 {
-                        free = true;
-                        break 'blk;
-                    }
-                }
-            }
-            data[oy * ow + ox] = if free { 0 } else { 100 };
-        }
-    }
-    ViOccupancyGrid {
-        width: ow as i32,
-        height: oh as i32,
-        resolution: grid.resolution * scale as f64,
-        origin_x: grid.origin_x,
-        origin_y: grid.origin_y,
-        origin_quat: grid.origin_quat.clone(),
-        data,
-    }
 }
 
 /// vi_reference の可視化描画済み OccupancyGrid → ROS メッセージ。
@@ -1957,7 +1917,8 @@ fn main() -> Result<()> {
     };
 
     // 6h. follow_path action サーバ (controller_server の置き換え)。
-    let _follow_server = node.create_action_server::<nav2_msgs::action::FollowPath, _>(
+    // `follow: false` (nav2_controller と組む構成) では立てない。
+    let _follow_server = params.follow.then(|| node.create_action_server::<nav2_msgs::action::FollowPath, _>(
         "follow_path",
         move |requested_goal: RequestedGoal<nav2_msgs::action::FollowPath>| {
             let core = Arc::clone(&core);
@@ -2053,11 +2014,12 @@ fn main() -> Result<()> {
                 }
             }
         },
-    )?;
+    )).transpose()?;
 
     eprintln!(
-        "vi_planner: ready (solver={}, actions=compute_path_to_pose + follow_path{}, {}Hz{})",
+        "vi_planner: ready (solver={}, actions=compute_path_to_pose{}{}, {}Hz{})",
         params.solver,
+        if params.follow { " + follow_path" } else { " (follow: false — nav2_controller 構成)" },
         if params.standalone {
             " + navigate_to_pose + follow_waypoints (standalone: no Nav2 nodes)"
         } else {

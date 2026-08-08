@@ -71,7 +71,7 @@ use vi_reference::params::{MAX_COST, PROB_BASE};
 use vi_reference::planner::CompactPolicy;
 use vi_reference::planner::PolicyView;
 use vi_reference::solvers::frontier2d_sparse_compact::{
-    default_threads, solve_compact_mapped_observed, CompactSink, RamSink,
+    default_threads, solve_compact_mapped_observed, CompactSink, MmapSink, RamSink,
 };
 use vi_reference::state::State;
 use vi_reference::value_iterator::ValueIterator;
@@ -596,7 +596,7 @@ fn rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
 /// compact 出力 sink を作る。`dir` 指定時はディスク mmap、無指定は RAM。
 ///
 /// `gen` があるときは `dir` 直下ではなく `dir/gen<N>` に置き、その場を捨てた
-/// ときにディレクトリごと消す ([`crate::sink::MmapSink::new_owned`])。**先読み
+/// ときにディレクトリごと消す ([`MmapSink::new_owned`])。**先読み
 /// ([`super::Prefetcher`]) を入れると場が同時に 2 つ以上生きる**ので、固定
 /// ファイル名のままだと後から解くほうが `truncate` で先の場のファイルを潰す
 /// (mmap したまま長さが変わるので、読めばゼロか SIGBUS)。カウンタは先読み側の
@@ -611,7 +611,7 @@ fn make_sink(
     let Some(dir) = dir else { return Ok(Box::new(RamSink::new(nstates))) };
     let boxed = |s| Box::new(s) as Box<dyn CompactSink + Send>;
     let Some(counter) = gen else {
-        return crate::sink::MmapSink::new(dir, nstates)
+        return MmapSink::new(dir, nstates)
             .map(boxed)
             .map_err(|e| PlanError::Sink(e.to_string()));
     };
@@ -621,7 +621,7 @@ fn make_sink(
         // 場はまだ 1 つも無いので、生きている sink を消す心配はない。
         remove_stale_generations(dir);
     }
-    crate::sink::MmapSink::new_owned(&dir.join(format!("gen{n}")), nstates)
+    MmapSink::new_owned(&dir.join(format!("gen{n}")), nstates)
         .map(boxed)
         .map_err(|e| PlanError::Sink(e.to_string()))
 }

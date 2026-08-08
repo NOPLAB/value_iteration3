@@ -18,21 +18,18 @@
 #         the same value function twice, in two processes.
 #
 #       local_planner:=nav2
-#         vi_global_planner (compute_path_to_pose only) + nav2_controller's
-#         controller_server (DWB etc.). This is the wiring to use for maps that
-#         need the out-of-core solver or map_scale, which vi_planner does not
-#         support.
+#         vi_planner with `follow: false` (compute_path_to_pose only) +
+#         nav2_controller's controller_server (DWB etc.).
 #
 #     Exactly one of the two serves compute_path_to_pose — never launch both,
 #     or bt_navigator binds to whichever action server it happens to discover.
 #
 # Any Nav2 robot can include this file in place of nav2_bringup's
-# navigation_launch.py to switch to value-iteration planning. Both nodes read
+# navigation_launch.py to switch to value-iteration planning. The node reads
 # the robot pose from a PoseWithCovarianceStamped topic (`pose_topic` launch
 # argument; emcl2: mcl_pose / AMCL: amcl_pose) because rclrs has no tf2 binding
-# yet. Parameters may be supplied via `vi_planner:` / `vi_global_planner:`
-# sections in `params_file`; anything unset falls back to the node's built-in
-# defaults.
+# yet. Parameters may be supplied via a `vi_planner:` section in `params_file`;
+# anything unset falls back to the node's built-in defaults.
 
 import os
 
@@ -44,7 +41,7 @@ from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import LoadComposableNodes
 from launch_ros.actions import Node
-from launch_ros.descriptions import ComposableNode, ParameterFile
+from launch_ros.descriptions import ComposableNode, ParameterFile, ParameterValue
 from nav2_common.launch import RewrittenYaml
 
 
@@ -133,7 +130,7 @@ def generate_launch_description():
 
     declare_pose_topic_cmd = DeclareLaunchArgument(
         'pose_topic', default_value='mcl_pose',
-        description='PoseWithCovarianceStamped topic vi_planner / vi_global_planner use as '
+        description='PoseWithCovarianceStamped topic vi_planner uses as '
                     'the robot pose (emcl2: mcl_pose / AMCL: amcl_pose)')
 
     declare_scan_topic_cmd = DeclareLaunchArgument(
@@ -145,16 +142,15 @@ def generate_launch_description():
         'local_planner', default_value='vi',
         description="Local planner: 'vi' (default) = vi_planner, one node serving "
                     "both compute_path_to_pose and follow_path from a single value "
-                    "function; 'nav2' = vi_global_planner (global only) plus "
-                    "nav2_controller's controller_server — the wiring to use when "
-                    "the map needs the out-of-core solver or map_scale")
+                    "function; 'nav2' = vi_planner with follow: false (global only) "
+                    "plus nav2_controller's controller_server")
 
-    # local_planner:=vi: vi_planner が compute_path_to_pose と follow_path の両方を
-    # 提供するので、vi_global_planner も controller_server も起動しない。Rust ノード
+    # vi_planner は常に 1 つ。local_planner:=vi なら follow_path も提供するので
+    # controller_server を起動しない。local_planner:=nav2 なら follow: false で
+    # compute_path_to_pose 専用になり、追従は controller_server が担う。Rust ノード
     # (非 composable・非 lifecycle) なので composition の有無によらず単独プロセス。
     # cmd_vel は controller_server と同じく velocity_smoother 経由 (cmd_vel_nav)。
     vi_planner_node = Node(
-        condition=IfCondition(use_vi_local),
         package='vi_planner',
         executable='vi_planner',
         name='vi_planner',
@@ -164,25 +160,10 @@ def generate_launch_description():
         parameters=[configured_params,
                     {'use_sim_time': use_sim_time,
                      'pose_topic': pose_topic,
-                     'scan_topic': scan_topic}],
+                     'scan_topic': scan_topic,
+                     'follow': ParameterValue(use_vi_local, value_type=bool)}],
         arguments=['--ros-args', '--log-level', log_level],
         remappings=remappings + [('cmd_vel', 'cmd_vel_nav')])
-
-    # local_planner:=nav2: 広域だけ VI、追従は controller_server。vi_planner とは
-    # 排他 (両方立てると compute_path_to_pose のサーバが 2 つになる)。
-    vi_global_planner_node = Node(
-        condition=UnlessCondition(use_vi_local),
-        package='vi_global_planner',
-        executable='vi_global_planner',
-        name='vi_global_planner',
-        output='screen',
-        respawn=use_respawn,
-        respawn_delay=2.0,
-        parameters=[configured_params,
-                    {'use_sim_time': use_sim_time,
-                     'pose_topic': pose_topic}],
-        arguments=['--ros-args', '--log-level', log_level],
-        remappings=remappings)
 
     load_nodes = GroupAction(
         condition=IfCondition(PythonExpression(['not ', use_composition])),
@@ -375,7 +356,6 @@ def generate_launch_description():
     ld.add_action(declare_local_planner_cmd)
 
     ld.add_action(vi_planner_node)
-    ld.add_action(vi_global_planner_node)
     ld.add_action(load_nodes)
     ld.add_action(load_composable_controller)
     ld.add_action(load_composable_nodes)

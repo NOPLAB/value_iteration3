@@ -452,11 +452,6 @@ pub fn value_grid_on(p: &dyn PolicyView, threshold_steps: u64) -> OccupancyGrid 
     }
 }
 
-/// `value_grid_on` の `&ValueIterator` 版 (後方互換の別名)。
-pub fn value_grid_of(vi: &ValueIterator, threshold_steps: u64) -> OccupancyGrid {
-    value_grid_on(vi, threshold_steps)
-}
-
 impl PlannerCore {
     pub fn new(build: BuildParams, cfg: PlanConfig) -> Self {
         // penalty 表は compact だけ (密は states がそのまま持つ)。1 B/セルなので

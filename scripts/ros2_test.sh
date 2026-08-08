@@ -10,25 +10,13 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Library unit tests (no ROS deps): bridge / solver_factory / sweep_thread plus
-# the oracle-equivalence tests (now library-internal — see src/oracle.rs). They
-# run under `--lib` so cargo does NOT build the rclrs `vi_node` binary, which
-# links only via colcon (a plain `cargo test --test ...` would fail to find the
-# vi_interfaces C typesupport libs). Run both feature flavors.
-cd "$REPO_ROOT/vi_ros2/vi_node"
-cargo test --lib --no-default-features
-cargo test --lib
-
-# vi_global_planner core (rclrs-free) unit tests — same --lib technique.
-cd "$REPO_ROOT/vi_ros2/vi_global_planner"
-cargo test --lib
-
-# vi_planner core (rclrs-free) unit tests — same --lib technique. This is the
-# unified core: one value function shared by compute_path_to_pose and follow_path.
+# vi_planner core (rclrs-free) unit tests. They run under `--lib` so cargo does
+# NOT build the rclrs `vi_planner` binary, which links only via colcon (a plain
+# `cargo test --test ...` would fail to find the nav2_msgs C typesupport libs).
 cd "$REPO_ROOT/vi_ros2/vi_planner"
 cargo test --lib
 
-# Full colcon build (this is what links the rclrs `vi_node` binary; plain cargo
-# cannot link the vi_interfaces C typesupport libs outside colcon).
+# Full colcon build (this is what links the rclrs `vi_planner` binary; plain
+# cargo cannot link the message C typesupport libs outside colcon).
 cd "$REPO_ROOT"
 bash scripts/ros2_build.sh
