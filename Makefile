@@ -93,13 +93,13 @@ clean:
 	$(MAKE) -C vi_fpga/driver/uio clean
 	$(MAKE) -C vi_fpga/host clean
 
-# ----- vi_ros2 (ROS2 Humble + ros2_rust) ------------------------------
+# ----- vi_planner (ROS2 Humble + ros2_rust) ---------------------------
 
 VI_ROS2_DOCKER_IMG ?= vi_ros2_dev:humble
 VI_COMPARE_ROS1_IMG ?= vi_compare_ros1:noetic
 
 ros2-docker:
-	docker build -t $(VI_ROS2_DOCKER_IMG) vi_ros2/docker
+	docker build -t $(VI_ROS2_DOCKER_IMG) vi_rs/vi_planner/docker
 
 ros2-shell:
 	docker run --rm -it \

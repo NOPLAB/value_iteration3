@@ -2,7 +2,7 @@
 and follow_path from a single value function. Expects /map (transient_local), a
 PoseWithCovarianceStamped pose topic and a LaserScan topic; in a full Nav2
 bringup remap cmd_vel to cmd_vel_nav (launch/navigation_launch.py does this).
-Details: repo CLAUDE.md, vi_ros2 section."""
+Details: repo CLAUDE.md, ROS2 node section."""
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
