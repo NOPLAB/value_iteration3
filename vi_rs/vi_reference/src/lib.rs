@@ -12,9 +12,9 @@ pub use state_transition::StateTransition;
 pub mod action;
 
 pub use action::Action;
-pub mod sweep_status;
 
-pub use sweep_status::SweepWorkerStatus;
+// 本家 SweepWorkerStatus は本家ソルバ機構ごと solvers::original へ移動した。
+pub use solvers::original::SweepWorkerStatus;
 pub mod state;
 
 pub use state::State;
