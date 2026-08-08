@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# VIOLA (vi_planner standalone + 内蔵 localizer=viterbi + QMDP + 能動的再定位)
+# VIOLA (vi_planner standalone + 内蔵の全地図 belief + QMDP)
 # を TurtleBot3 world (Gazebo classic) で走らせるデモ。ネイティブ RoboStack 環境用。
+#
+# belief は VI と同じ格子に載る全地図フィールド (窓も多重解像度レベルも無い)。
+# 値反復は belief_levels > 1 で状態を (x, y, θ, b) に広げられるが、この地図では
+# 効かないので 1 のまま — 理由は belief_levels の行を参照。
 #
 #   scripts/ros2_build.sh          # 先にネイティブビルド
 #   scripts/viola_tb3_demo.sh      # Gazebo + map_server + vi_planner + RViz
@@ -43,8 +47,8 @@ ros2 run nav2_map_server map_server --ros-args \
 
 # vi_planner の全パラメータ (main.rs の宣言順)。値はこのデモの設定で、各行の
 # コメントが規定値。規定値から変えているのは use_sim_time / map_wait_sec /
-# pose_topic / publish_tf / localizer / belief_radius / follow_controller /
-# qmdp / active_reloc / standalone のみ。
+# pose_topic / publish_tf / localizer / follow_controller / qmdp / standalone
+# のみ。
 VI_ARGS=(
     -p use_sim_time:=true                # 規定: false (ROS 標準) — Gazebo の /clock に乗る
     # ── ソルバ / 地図 ──
@@ -70,14 +74,15 @@ VI_ARGS=(
     # ── ゴール判定 / 姿勢・TF ──
     -p goal_tolerance_xy:=0.25           # 規定: 0.25 [m] (navigate_to_pose の達成判定)
     -p goal_tolerance_deg:=10.0          # 規定: 10.0 [deg]
-    -p pose_topic:=initialpose           # 規定: mcl_pose — grid/adaptive では手動シード口
+    -p pose_topic:=initialpose           # 規定: mcl_pose — 内蔵 belief では手動シード口
     -p global_frame:=map                 # 規定: map
     -p publish_tf:=true                  # 規定: false — map→odom TF を配信 (AMCL の契約の置き換え)
     -p transform_tolerance:=0.5          # 規定: 0.5 [s] (TF スタンプの未来日付け)
     -p odom_topic:=odom                  # 規定: odom (publish_tf 用の T_odom→base の出どころ)
     # ── 自己位置推定 ──
-    -p localizer:=viterbi                # 規定: external | grid | adaptive (多重解像度) | viterbi (同 min-plus 版)
-    -p belief_radius:=5.0                # 規定: 2.5 [m] (belief 窓の半径)
+    -p localizer:=belief                 # 規定: external | belief (全地図 sum-product) | viterbi (同 min-plus)
+                                         #   viterbi は observe が全域走査なので tb3 実測 183 ms/tick —
+                                         #   追従ループの 40 ms 予算を超える。ベンチ用と割り切る。
     -p belief_sensor_sigma:=0.2          # 規定: 0.2 [m] (尤度場のガウス幅)
     -p belief_beam_step:=10              # 規定: 10 (補正に使うビームの間引き、1 = 全ビーム)
     -p belief_max_range:=25.0            # 規定: 25.0 [m] (これより遠いレンジは補正に使わない)
@@ -85,6 +90,18 @@ VI_ARGS=(
     -p belief_motion_sigma_theta_deg:=2.0 # 規定: 2.0 [deg/tick]
     -p belief_z_min:=0.05                # 規定: 0.05 (ビーム尤度の床)
     -p belief_weight_skip_ratio:=0.0001  # 規定: 1e-4 (補正で読む重みの相対しきい値)
+    -p belief_reset_quality:=0.25        # 規定: 0.25 — 観測一致度がこれを割ると free 一様を混ぜて再定位
+    -p belief_lost_ess:=500.0            # 規定: 500.0 — belief の有効セル数がこれを超えたらロスト
+    -p belief_levels:=1                  # 規定: 1 = b 次元なし。>1 で状態が (x,y,θ,b) になり、
+                                         #   ゴールは b ≤ 0 の層でしか成立しない (方策自体が先に
+                                         #   定位しに行く)。要 solver:=frontier2d + 非 compact、
+                                         #   メモリと solve 時間はレベル数倍。
+                                         #   tb3 では効かないので 1 のまま: 自由空間 19 m² が全て
+                                         #   壁の近傍で、どこを通っても同じだけ定位できる。実測
+                                         #   (bench_map --belief-levels 4 --scale 2 --solver frontier2d)
+                                         #   で 4 層とも到達可能・層間の平均値差 0.1% 未満、solve は
+                                         #   0.23 s → 1.04 s。効くのは「見通しの良い広間と特徴の多い
+                                         #   廊下が選べる」広い地図。
     -p scan_quality_gate:=0.25           # 規定: 0.25 — 観測一致度がこれ未満の scan は注入を減衰、0 で無効
     -p footprint_clear_m:=0.2            # 規定: 0.2 [m] — 注入のたびに機体周囲の local_penalty を消す、0 で無効
     # ── 広域 (compute_path_to_pose) ──
@@ -112,9 +129,8 @@ VI_ARGS=(
     -p mppi_lambda:=1.0                  # 規定: 1.0 (softmax 温度)
     -p mppi_sigma_v:=0.0                 # 規定: 0.0 = 行動集合から自動
     -p mppi_sigma_w_deg:=0.0             # 規定: 0.0 = 行動集合から自動
-    -p qmdp:=false                       # 規定: false — belief 多峰の tick は QMDP で行動選択
-    -p active_reloc:=true                # 規定: false — ロスト中は判別点への多目標 VI を解いて QMDP で走る (密ソルバのみ)
-    -p reloc_timeout_sec:=30.0           # 規定: 30.0 [s] (能動的再定位を諦めて停止待ちに戻すまで)
+    -p qmdp:=true                        # 規定: false — belief 多峰の tick は QMDP で行動選択
+                                         #   (単峰の tick は follow_controller のまま)
     # ── スタンドアロン (navigate_to_pose / follow_waypoints) ──
     -p standalone:=true                  # 規定: false — bt_navigator 等の代わりに自前で提供
     -p goal_retry_limit:=3               # 規定: 3 (追従失敗時の投げ直し上限、負で無制限)

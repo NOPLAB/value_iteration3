@@ -147,6 +147,12 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     action_scale: f64,
 
+    /// belief 次元 (x, y, θ, b) のレベル数。1 = 無効（従来の 3D、構成的に同一）。
+    /// 2 以上は `caps().belief` を持つソルバ（reference / frontier2d /
+    /// stream_mimic）のみ。状態数・所要メモリはこの倍数になる。
+    #[arg(long, default_value_t = 1)]
+    belief_levels: i32,
+
     /// compact の確定出力をディスク mmap に置くディレクトリ（value/policy を RAM から外す）。
     /// 未指定なら RAM 出力。巨大マップで出力の O(total) RAM を避けたいとき指定する。
     #[arg(long)]
@@ -308,6 +314,8 @@ fn main() -> ExitCode {
     // the solve; called once per solver so each run starts from a clean state.
     let build = || -> ValueIterator {
         let mut vi = ValueIterator::new(scaled_actions(args.action_scale), 1);
+        // belief 次元は set_map より前に立てる（層の複製と info マップがここで決まる）。
+        vi.belief.nb_levels = args.belief_levels.max(1);
         vi.set_map_with_occupancy_grid(
             &grid,
             THETA_CELL_NUM,
@@ -515,6 +523,26 @@ fn main() -> ExitCode {
             row.total_ms,
             if row.converged { "Y" } else { "N" },
         );
+        // belief 次元を立てたときは層ごとの到達状態数を出す。goal gating は
+        // ib > ib_goal の層からゴールを外すので、高 b の層が全滅していれば
+        // 「不確かなままでは辿り着けない」= 方策が情報収集を強制できていない。
+        if let Some(vi) = solved_vi.as_ref().filter(|v| v.belief.nb_levels > 1) {
+            let layer = vi.states.len() / vi.belief.nb_levels as usize;
+            for ib in 0..vi.belief.nb_levels as usize {
+                let sl = &vi.states[ib * layer..(ib + 1) * layer];
+                let n = sl.iter().filter(|s| s.total_cost < REACH).count();
+                // 層間の値差が b ごとの一定オフセットなら、その地図では b 次元は
+                // 経路を選び分けていない (どこを通っても同じだけ定位できる)。
+                let mean = if n > 0 {
+                    sl.iter().filter(|s| s.total_cost < REACH).map(|s| s.total_cost as f64).sum::<f64>()
+                        / n as f64
+                        / PROB_BASE as f64
+                } else {
+                    f64::NAN
+                };
+                eprintln!("  b={ib}: reachable states {n}  mean value {mean:.3} s");
+            }
+        }
         // 結果値の参照: 非 compact は vi.states、compact(mapped) は sink（orig 索引は同一順序）。
         let value_at = |ix: i32, iy: i32, it: i32| -> u64 {
             // usize 演算（i32 だと iy*THETA*ow が巨大マップで i32 オーバーフロー）。
