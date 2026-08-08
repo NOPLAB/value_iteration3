@@ -68,6 +68,7 @@ ROS2 Humble Rust node, built via `colcon` + `cargo-ament-build` inside a Docker 
 - `make ros2-docker` — build the dev image (`vi_rs/vi_planner/docker/Dockerfile`), tag `vi_ros2_dev:humble` (override `VI_ROS2_DOCKER_IMG`).
 - `make ros2-shell` — interactive shell in the image with the repo mounted at `/workspace`.
 - `make ros2-build` / `make ros2-test` — run `scripts/ros2_build.sh` / `scripts/ros2_test.sh` in the container.
+- **Native build (no Docker)**: this WSL Fedora host has ROS2 Humble via RoboStack (pixi global env `ros`, activated by sourcing `scripts/ros2_native_env.sh`). `bash scripts/ros2_build.sh` auto-detects the missing `/opt/ros/humble` and uses it. Prereqs (already set up): rclrs colcon-built in `~/ros2_rust_ws` (ros2_rust @ 2c6b926 + rosidl_rust + rosidl_runtime_rs only — RoboStack ships the Rust bindings for message packages **including nav2_msgs**, so no interface repos and no nav2_msgs source build), `colcon-cargo`/`colcon-ros-cargo` pip-installed into the env python, `cargo install cargo-ament-build`. VIOLA closed-loop sim demo (TurtleBot3 world, Gazebo classic, WSLg GUI): `scripts/viola_tb3_demo.sh` — gzserver+gzclient, map_server (`assets/tb3_world/`), vi_planner (`standalone: true`, `localizer: grid`, seeded at spawn via `/initialpose`), RViz (Nav2 Goal tool sends `navigate_to_pose`). Verified headless: goal SUCCEEDED, (-2,-0.5)→(2,0.5) in ~25 s on GridLocalizer only (truth never fed back).
 
 One package:
 

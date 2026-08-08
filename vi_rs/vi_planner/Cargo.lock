@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "action_msgs"
-version = "1.2.3"
+version = "1.2.2"
 dependencies = [
  "builtin_interfaces",
  "rosidl_runtime_rs",
@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "builtin_interfaces"
-version = "1.2.3"
+version = "1.2.2"
 dependencies = [
  "rosidl_runtime_rs",
 ]
@@ -883,6 +883,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "068e763e8279de7ab94b6afebded2cb701678af094feb1c12ccb061b4783c1be"
 
 [[package]]
+name = "vi_lib"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
+]
+
+[[package]]
 name = "vi_planner"
 version = "0.1.0"
 dependencies = [
@@ -894,13 +901,6 @@ dependencies = [
  "rclrs",
  "sensor_msgs",
  "vi_lib",
-]
-
-[[package]]
-name = "vi_lib"
-version = "0.1.0"
-dependencies = [
- "memmap2",
 ]
 
 [[package]]
@@ -1005,24 +1005,56 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[patch.unused]]
+name = "action_tutorials_interfaces"
+version = "0.20.9"
+
+[[patch.unused]]
 name = "actionlib_msgs"
 version = "4.9.1"
 
 [[patch.unused]]
+name = "bond"
+version = "4.1.4"
+
+[[patch.unused]]
 name = "composition_interfaces"
-version = "1.2.3"
+version = "1.2.2"
 
 [[patch.unused]]
 name = "diagnostic_msgs"
 version = "4.9.1"
 
 [[patch.unused]]
+name = "example_interfaces"
+version = "0.9.3"
+
+[[patch.unused]]
+name = "gazebo_msgs"
+version = "3.9.0"
+
+[[patch.unused]]
 name = "lifecycle_msgs"
-version = "1.2.3"
+version = "1.2.2"
+
+[[patch.unused]]
+name = "logging_demo"
+version = "0.20.9"
+
+[[patch.unused]]
+name = "map_msgs"
+version = "2.1.0"
+
+[[patch.unused]]
+name = "pcl_msgs"
+version = "1.0.0"
+
+[[patch.unused]]
+name = "pendulum_msgs"
+version = "0.20.9"
 
 [[patch.unused]]
 name = "rcl_interfaces"
-version = "1.2.3"
+version = "1.2.2"
 
 [[patch.unused]]
 name = "rmw_dds_common"
@@ -1034,7 +1066,7 @@ version = "0.15.16"
 
 [[patch.unused]]
 name = "rosgraph_msgs"
-version = "1.2.3"
+version = "1.2.2"
 
 [[patch.unused]]
 name = "shape_msgs"
@@ -1042,7 +1074,7 @@ version = "4.9.1"
 
 [[patch.unused]]
 name = "statistics_msgs"
-version = "1.2.3"
+version = "1.2.2"
 
 [[patch.unused]]
 name = "std_srvs"
@@ -1059,6 +1091,10 @@ version = "0.25.20"
 [[patch.unused]]
 name = "trajectory_msgs"
 version = "4.9.1"
+
+[[patch.unused]]
+name = "turtlesim"
+version = "1.4.3"
 
 [[patch.unused]]
 name = "visualization_msgs"
