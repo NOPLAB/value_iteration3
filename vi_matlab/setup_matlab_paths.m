@@ -22,10 +22,6 @@ function added = setup_matlab_paths(varargin)
             case "fpga-export"
                 added = add_dir(added, layout.platforms_fpga_export);
                 added = add_dir(added, layout.platforms_fpga_model);
-            case "soc"
-                added = add_tree(added, layout.platforms_fpga_soc);
-                added = add_dir(added, layout.platforms_fpga_model);
-                added = add_tree(added, layout.platforms_fpga_board_support);
             case "board-support"
                 added = add_tree(added, layout.platforms_fpga_board_support);
             case "all"

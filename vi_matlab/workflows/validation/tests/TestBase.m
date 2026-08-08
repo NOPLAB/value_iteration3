@@ -6,8 +6,8 @@ classdef (Abstract) TestBase < matlab.unittest.TestCase
             matlab_root = fileparts(fileparts(fileparts(fileparts(mfilename('fullpath')))));
             original_path = path();
             testCase.addTeardown(@() path(original_path));
-            addpath(genpath(fullfile(matlab_root, 'src')));
-            addpath(genpath(fullfile(matlab_root, 'workflows', 'validation', 'tests')));
+            addpath(matlab_root);
+            setup_matlab_paths('src', 'tests');
         end
     end
 end
