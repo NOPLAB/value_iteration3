@@ -37,7 +37,6 @@ fn build(size: i32) -> BuildParams {
         goal_margin_radius: 0.2,
         goal_margin_theta: 180,
         local_xy_range: 1.0,
-        scan_attribution_m: 0.0,
         patch_slack_cells: 2,
         repair_interior_cells: 16,
     }
@@ -764,24 +763,6 @@ fn observe_scan_gated_attenuates_injection() {
     let (hx, hy, _) = pose_to_cell(&vi.base, 1.5, 1.0, 0.0);
     let hit = vi.base.to_index(hx, hy, 0) as usize;
     assert_eq!(vi.base.states[hit].local_penalty, 256u64 << PROB_BASE_BIT);
-}
-
-/// 地図帰属サプレッションの半径が dense / compact 両経路の追従側 vi に
-/// 届いていること (生成箇所が 2 つあるので配線をピン留めする)。
-#[test]
-fn scan_attribution_threads_to_both_paths() {
-    let build_attr = BuildParams { scan_attribution_m: 0.3, ..build(64) };
-    let cancel = AtomicBool::new(false);
-    // RES = 0.05 → ceil(0.3 / 0.05) = 6 セル。
-    let mut dense = PlannerCore::new(build_attr.clone(), cfg());
-    dense.prepare_goal(pose(2.5, 1.0, 0.0), &cancel).expect("solve");
-    dense.set_window(pose(1.0, 1.0, 0.0));
-    assert_eq!(dense.local().unwrap().scan_attribution_cells, 6);
-
-    let mut compact = PlannerCore::new(build_attr, cfg_compact());
-    compact.prepare_goal(pose(2.5, 1.0, 0.0), &cancel).expect("solve");
-    compact.set_window(pose(1.0, 1.0, 0.0));
-    assert_eq!(compact.local().unwrap().scan_attribution_cells, 6);
 }
 
 /// footprint クリア: 機体の真上に塗られたゴースト壁が注入のたびに消えること。

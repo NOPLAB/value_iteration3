@@ -108,10 +108,6 @@ pub struct BuildParams {
     pub goal_margin_theta: i32,
     /// 追従のローカルウィンドウ半径 [m] (本家 `ValueIteratorLocal` は 1.0 固定)。
     pub local_xy_range: f64,
-    /// 地図帰属サプレッションの半径 [m] (0 以下で無効)。ヒット点からこの距離以内に
-    /// 地図障害物があるスキャンヒットは「壁の再投影 (pose 誤差のゴースト)」と
-    /// みなして注入しない。pose 誤差の許容幅そのもの。
-    pub scan_attribution_m: f64,
     /// compact パッチの寸法スラック [セル] (`half = 2*win + reach + slack`)。
     pub patch_slack_cells: i32,
     /// 修復タイルの interior の 1 辺 [セル]。大きいほど 1 訪問あたりの halo の
@@ -745,7 +741,6 @@ impl PlannerCore {
             self.build.goal_margin_theta,
         );
         vi.set_local_xy_range(self.build.local_xy_range);
-        vi.set_scan_attribution_range(self.build.scan_attribution_m);
         vi.base.set_goal(goal.x, goal.y, goal_t_deg);
 
         let mut director =
@@ -807,7 +802,6 @@ impl PlannerCore {
             self.build.goal_margin_theta,
         );
         vi.set_local_xy_range(self.build.local_xy_range);
-        vi.set_scan_attribution_range(self.build.scan_attribution_m);
         // 半径はゴール margin と同じ、ただし最低 1 セルは確実にマークする。
         let radius = self.build.goal_margin_radius.max(vi.base.xy_resolution);
         vi.base.set_goal_region(targets, radius);

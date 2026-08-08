@@ -125,9 +125,6 @@ struct Params {
     /// スキャン注入の品質ゲート: localizer の観測一致度がこれを割ると注入
     /// penalty を quality/gate に比例して減衰 (2 冪量子化)。0 で無効。
     scan_quality_gate: f64,
-    /// 地図帰属サプレッション半径 [m]: ヒット点からこの距離以内に地図障害物が
-    /// あるスキャンヒットは注入しない (壁の再投影ゴースト対策)。0 で無効。
-    scan_attribution_m: f64,
     /// footprint クリア半径 [m]: スキャン注入のたびに機体位置の周囲の
     /// local_penalty を消す (真上でゴースト壁が閉じるのを防ぐ)。0 で無効。
     footprint_clear_m: f64,
@@ -309,11 +306,6 @@ fn read_params(node: &Node) -> Result<Params> {
         // adaptive の expansion しきい値 (expand_quality) と同じ 0.25。external
         // localizer は quality 1.0 固定なので実質無効。
         scan_quality_gate: p!("scan_quality_gate", f64, 0.25),
-        // 地図障害物の近傍に落ちたヒットは壁の再投影 (pose 誤差のゴースト) と
-        // みなして注入しない。半径 = pose 誤差の許容幅。副作用: 地図の壁のこの
-        // 距離以内に立つ本物の新規障害物も注入されない (静的 penalty 帯 +
-        // dwa_lethal_penalty がそこを守る)。
-        scan_attribution_m: p!("scan_attribution_m", f64, 0.4),
         // ロボットが現にいる場所は free — 注入のたびに footprint を消し、
         // ゴースト壁が真上で閉じて完全停止する事態を構造的に防ぐ。
         footprint_clear_m: p!("footprint_clear_m", f64, 0.2),
@@ -1556,7 +1548,6 @@ fn main() -> Result<()> {
         goal_margin_radius: params.goal_margin_radius,
         goal_margin_theta: params.goal_margin_theta_deg as i32,
         local_xy_range: params.local_xy_range,
-        scan_attribution_m: params.scan_attribution_m,
         patch_slack_cells: params.patch_slack_cells.max(0) as i32,
         repair_interior_cells: params.repair_interior_cells.max(1) as i32,
     };

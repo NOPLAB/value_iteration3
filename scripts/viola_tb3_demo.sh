@@ -86,7 +86,6 @@ VI_ARGS=(
     -p belief_z_min:=0.05                # 規定: 0.05 (ビーム尤度の床)
     -p belief_weight_skip_ratio:=0.0001  # 規定: 1e-4 (補正で読む重みの相対しきい値)
     -p scan_quality_gate:=0.25           # 規定: 0.25 — 観測一致度がこれ未満の scan は注入を減衰、0 で無効
-    -p scan_attribution_m:=0.4           # 規定: 0.4 [m] — 地図障害物のこの距離以内のヒットは注入しない (再投影ゴースト対策)、0 で無効
     -p footprint_clear_m:=0.2            # 規定: 0.2 [m] — 注入のたびに機体周囲の local_penalty を消す、0 で無効
     # ── 広域 (compute_path_to_pose) ──
     -p max_rollout_steps:=10000          # 規定: 10000 (経路ロールアウトの上限歩数)
@@ -113,7 +112,7 @@ VI_ARGS=(
     -p mppi_lambda:=1.0                  # 規定: 1.0 (softmax 温度)
     -p mppi_sigma_v:=0.0                 # 規定: 0.0 = 行動集合から自動
     -p mppi_sigma_w_deg:=0.0             # 規定: 0.0 = 行動集合から自動
-    -p qmdp:=true                        # 規定: false — belief 多峰の tick は QMDP で行動選択
+    -p qmdp:=false                       # 規定: false — belief 多峰の tick は QMDP で行動選択
     -p active_reloc:=true                # 規定: false — ロスト中は判別点への多目標 VI を解いて QMDP で走る (密ソルバのみ)
     -p reloc_timeout_sec:=30.0           # 規定: 30.0 [s] (能動的再定位を諦めて停止待ちに戻すまで)
     # ── スタンドアロン (navigate_to_pose / follow_waypoints) ──
