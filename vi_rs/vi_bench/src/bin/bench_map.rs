@@ -4,10 +4,10 @@
 //! Loads a ROS `map_server` PGM + YAML pair (e.g. the Tsudanuma campus map in
 //! `assets/`), builds a `vi_lib::ValueIterator` directly from the
 //! occupancy grid (本家 `setMapWithOccupancyGrid` semantics: penalty/goal are
-//! computed inside the iterator, in 18-bit fixed point), and runs the Reference
-//! and/or Frontier3D u64 solvers to convergence (or until a budget cap),
-//! reporting wall-clock per solver. This is the CPU baseline for the `<60 s`
-//! FPGA target (see `CLAUDE.md`).
+//! computed inside the iterator, in 18-bit fixed point), and runs the selected
+//! u64 solver (`--solver`, any `U64Solver::from_name` name) to convergence
+//! (or until a budget cap), reporting wall-clock. This is the CPU baseline for
+//! the `<60 s` FPGA target (see `CLAUDE.md`).
 //!
 //! The full-resolution Tsudanuma map is 5888×4000×60 ≈ 1.41e9 states; one
 //! `ValueIterator::states` vector is therefore tens of GB. Full-res Gauss-Seidel
@@ -124,15 +124,20 @@ struct Args {
     #[arg(long, default_value_t = 100000.0)]
     safety_penalty: f64,
 
-    /// Which solver(s) to run.
-    #[arg(long, value_enum, default_value_t = SolverSel::Both)]
-    solver: SolverSel,
+    /// Which solver to run: any `U64Solver::from_name` name (reference,
+    /// frontier3d, frontier2d, frontier2d_par, frontier2d_par_unsafe,
+    /// frontier2d_fused, frontier2d_sparse, frontier2d_sparse_compact,
+    /// frontier_stack, block_refine, pyramid_sweep, stream_mimic, prio_ls,
+    /// prio_lc).
+    #[arg(long, default_value = "frontier3d")]
+    solver: String,
 
-    /// Sweep budget cap for Reference (terminates even without convergence).
+    /// Sweep budget cap for `--solver reference` (terminates even without
+    /// convergence).
     #[arg(long, default_value_t = 2000)]
     max_sweeps: u32,
 
-    /// Iteration budget cap for Frontier3D.
+    /// Iteration budget cap for every non-reference solver.
     #[arg(long, default_value_t = 2_000_000)]
     max_iters: u32,
 
@@ -142,19 +147,10 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     action_scale: f64,
 
-    /// 値バンド幅（`frontier2d_sparse_compact` 専用、18bit 固定小数点単位）。0=auto（結合深さの
-    /// 安全側）。小さいほど常駐メモリは減るが、結合深さ未満だと bit-exact が壊れる。
-    #[arg(long, default_value_t = 0)]
-    compact_band: u64,
-
     /// compact の確定出力をディスク mmap に置くディレクトリ（value/policy を RAM から外す）。
     /// 未指定なら RAM 出力。巨大マップで出力の O(total) RAM を避けたいとき指定する。
     #[arg(long)]
     compact_out_dir: Option<PathBuf>,
-
-    /// Optional CSV output path (parent dirs created).
-    #[arg(long)]
-    out: Option<PathBuf>,
 
     /// Optional path to dump the converged value field (min over theta, seconds)
     /// as a binary `[i32 ow][i32 oh][f32 ow*oh]` (row-major `v[ix + ow*iy]`,
@@ -181,32 +177,9 @@ enum UnknownMode {
     Free,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum SolverSel {
-    Reference,
-    Frontier3d,
-    /// frontier2d_pad の決定的マルチスレッド版 (本家 並列スイープと対になる CPU 並列ベースライン)。
-    #[value(name = "frontier2d_par")]
-    Frontier2dPar,
-    /// 非同期 (Gauss-Seidel) unsafe 並列版。スレッド間同期を最小化し収束値は bit-exact のまま。
-    #[value(name = "frontier2d_par_unsafe")]
-    Frontier2dParUnsafe,
-    /// 非同期 G-S + penalty 融合レイアウト (バケット 17B→8B)。収束値は bit-exact のまま。
-    #[value(name = "frontier2d_fused")]
-    Frontier2dFused,
-    /// fused + θマスク疎評価 (依存 θ のみ再評価)。収束値は bit-exact のまま。
-    #[value(name = "frontier2d_sparse")]
-    Frontier2dSparse,
-    /// アウトオブコア版（値バンド+遅延確保+退避）。メモリ制約下で巨大マップを bit-exact に解く。
-    /// `--compact-band` で値バンド幅（0=auto）。
-    #[value(name = "frontier2d_sparse_compact")]
-    Frontier2dSparseCompact,
-    Both,
-}
-
 /// One solver's measurement.
 struct Row {
-    solver: &'static str,
+    solver: String,
     iters: u32,
     updates: u64,
     total_ms: f64,
@@ -259,29 +232,6 @@ fn snap_to_free(occ: &[i8], w: i32, h: i32, gx: i32, gy: i32, max_r: i32) -> Opt
     None
 }
 
-fn write_csv(path: &std::path::Path, rows: &[Row]) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    let mut f = std::fs::File::create(path)?;
-    writeln!(f, "solver,iters,updates,total_ms,converged")?;
-    for r in rows {
-        writeln!(
-            f,
-            "{},{},{},{:.3},{}",
-            r.solver,
-            r.iters,
-            r.updates,
-            r.total_ms,
-            if r.converged { "Y" } else { "N" },
-        )?;
-    }
-    Ok(())
-}
-
 fn main() -> ExitCode {
     let args = Args::parse();
 
@@ -289,6 +239,14 @@ fn main() -> ExitCode {
         eprintln!("error: --scale must be >= 1");
         return ExitCode::from(2);
     }
+
+    let solver = match U64Solver::from_name(&args.solver) {
+        Some(s) => s,
+        None => {
+            eprintln!("error: unknown --solver '{}' (see --help for the names)", args.solver);
+            return ExitCode::from(2);
+        }
+    };
 
     let map_path = args.map.clone().unwrap_or_else(default_map_path);
     eprintln!("loading map: {}", map_path.display());
@@ -368,7 +326,7 @@ fn main() -> ExitCode {
     // build costs tens of seconds single-threaded, so this throwaway is worth avoiding.
     // compact-only モードは states（O(total)）を一切確保しない（mapped 経路）。prebuilt はスキップし、
     // goal_cells は MapSource から数える（O(nx·ny)）。
-    let compact_only = matches!(args.solver, SolverSel::Frontier2dSparseCompact);
+    let compact_only = matches!(solver, U64Solver::Frontier2DSparseCompact { .. });
     let mut prebuilt: Option<ValueIterator> = if compact_only { None } else { Some(build()) };
     let goal_cells = if let Some(p) = prebuilt.as_ref() {
         p.states.iter().filter(|s| s.total_cost < REACH).count()
@@ -457,41 +415,8 @@ fn main() -> ExitCode {
         );
     }
 
-    // --- Build solver schedule ---
-    let mut schedule: Vec<(&'static str, U64Solver, u32)> = Vec::new();
-    let want_ref = matches!(args.solver, SolverSel::Reference | SolverSel::Both);
-    let want_fr = matches!(args.solver, SolverSel::Frontier3d | SolverSel::Both);
-    if want_ref {
-        schedule.push(("reference", U64Solver::Reference, args.max_sweeps));
-    }
-    if want_fr {
-        schedule.push(("frontier3d", U64Solver::Frontier3D, args.max_iters));
-    }
-    if matches!(args.solver, SolverSel::Frontier2dPar) {
-        schedule.push(("frontier2d_par", U64Solver::Frontier2DPar, args.max_iters));
-    }
-    if matches!(args.solver, SolverSel::Frontier2dParUnsafe) {
-        schedule.push((
-            "frontier2d_par_unsafe",
-            U64Solver::Frontier2DParUnsafe,
-            args.max_iters,
-        ));
-    }
-    if matches!(args.solver, SolverSel::Frontier2dFused) {
-        schedule.push(("frontier2d_fused", U64Solver::Frontier2DFused, args.max_iters));
-    }
-    if matches!(args.solver, SolverSel::Frontier2dSparse) {
-        schedule.push(("frontier2d_sparse", U64Solver::Frontier2DSparse, args.max_iters));
-    }
-    if matches!(args.solver, SolverSel::Frontier2dSparseCompact) {
-        schedule.push((
-            "frontier2d_sparse_compact",
-            U64Solver::Frontier2DSparseCompact { band: args.compact_band },
-            args.max_iters,
-        ));
-    }
-
-    if want_ref && states > 100_000_000 {
+    let budget = if solver == U64Solver::Reference { args.max_sweeps } else { args.max_iters };
+    if solver == U64Solver::Reference && states > 100_000_000 {
         eprintln!(
             "WARNING: reference on {} states will likely hit the --max-sweeps cap ({}) before \
              converging and may run for many minutes/hours. Use --scale to shrink, or \
@@ -501,7 +426,8 @@ fn main() -> ExitCode {
     }
 
     let mut rows: Vec<Row> = Vec::new();
-    for (sel, solver, budget) in schedule {
+    let sel = args.solver.as_str();
+    {
         eprintln!("running {sel} ...");
         let t0 = Instant::now();
         // 解いた結果の参照元: 非 compact は vi.states、compact(mapped) は sink（states なし）。
@@ -575,7 +501,7 @@ fn main() -> ExitCode {
         };
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let row = Row {
-            solver: sel,
+            solver: sel.to_string(),
             iters: stats.iters,
             updates: stats.updates,
             total_ms: ms,
@@ -757,14 +683,6 @@ fn main() -> ExitCode {
     if rows.iter().any(|r| r.solver == "reference") {
         println!();
         println!("_note: reference `updates` is always 0 (not tracked); use iters (sweeps) + total_s._");
-    }
-
-    if let Some(out) = &args.out {
-        if let Err(e) = write_csv(out, &rows) {
-            eprintln!("error: failed to write CSV {}: {e}", out.display());
-            return ExitCode::from(2);
-        }
-        eprintln!("wrote {} ({} rows)", out.display(), rows.len());
     }
 
     ExitCode::SUCCESS

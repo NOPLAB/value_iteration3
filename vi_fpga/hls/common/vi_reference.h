@@ -2,19 +2,22 @@
 
 #include <cstdint>
 
-// CPU reference for the HLS testbenches. The per-cell Bellman update and the
-// transition table are the *shared* C implementations (driver/uio/
-// vi_bellman_cell.h, host/src/transitions.c), included verbatim by
-// vi_reference.cpp so the 16-bit contract cannot drift between host,
-// mock device and HLS reference.
+#include "vi_hls_common.h"
+
+// CPU reference for the HLS testbenches. The per-cell Bellman update, the
+// transition table and the sweep loop are the *shared* C implementations
+// (driver/uio/vi_bellman_cell.h, host/src/transitions.c,
+// host/src/vi_reference_c.c), included verbatim by vi_reference.cpp so the
+// 16-bit contract cannot drift between host, mock device and HLS reference.
 
 namespace vi_ref {
 
-constexpr int N_ACTIONS = 6;
-constexpr int N_THETA   = 60;
-constexpr uint16_t MAX_VALUE        = 0xFFFF;
-constexpr uint16_t PENALTY_OBSTACLE = 0xFFFF;
-constexpr uint16_t PENALTY_GOAL     = 0xFFFE;
+// Aliases of the shared contract in vi_hls_common.h — single source of truth.
+constexpr int N_ACTIONS = ::N_ACTIONS;
+constexpr int N_THETA   = ::N_THETA;
+const uint16_t MAX_VALUE        = (uint16_t)::MAX_VALUE;
+const uint16_t PENALTY_OBSTACLE = (uint16_t)::PENALTY_OBSTACLE;
+const uint16_t PENALTY_GOAL     = (uint16_t)::PENALTY_GOAL;
 
 // Deterministic transition table for the 6 fixed actions (spec §2.3),
 // packed per (action, theta) as uint32: byte0=dix, byte1=diy, byte2=dit.

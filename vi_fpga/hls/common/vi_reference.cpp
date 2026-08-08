@@ -3,7 +3,7 @@
 // Share the exact host/driver implementations instead of copying them.
 // Requires -I driver/uio and -I host/src (see tcl/hls_common.tcl).
 #include "transitions.c"      // transitions_compute()
-#include "vi_bellman_cell.h"  // per-cell Bellman update (PENALTY_GOAL -> 0)
+#include "vi_reference_c.c"   // vi_reference_run() over the shared vi_bellman_cell.h
 
 namespace vi_ref {
 
@@ -15,18 +15,8 @@ int run_vi(uint16_t *value_table, const uint16_t *penalty_table,
            const uint32_t *trans, int map_x, int map_y,
            uint16_t threshold, int max_sweeps)
 {
-    int sweep;
-    for (sweep = 0; sweep < max_sweeps; sweep++) {
-        uint16_t max_delta = 0;
-        for (int iy = 0; iy < map_y; iy++)
-            for (int ix = 0; ix < map_x; ix++) {
-                uint16_t d = vi_bellman_cell(value_table, penalty_table, trans,
-                                             map_x, map_y, ix, iy);
-                if (d > max_delta) max_delta = d;
-            }
-        if (max_delta <= threshold) { sweep++; break; }
-    }
-    return sweep;
+    return vi_reference_run(value_table, penalty_table, trans,
+                            map_x, map_y, threshold, max_sweeps);
 }
 
 void build_test_map(uint16_t *penalty, uint16_t *value,

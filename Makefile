@@ -44,11 +44,14 @@ edf-docker:
 edf-shell:
 	$(MAKE) -C vi_fpga/petalinux docker-shell
 
+# XSA / MACHINE はコマンドライン変数として MAKEFLAGS 経由で sub-make に伝わる。
+# `VAR=$(VAR)` を書くと未指定時に空のコマンドライン上書きになり、sub-Makefile の
+# `MACHINE ?= ...` 既定値を消してしまうので書かない。
 edf-setup:
-	$(MAKE) -C vi_fpga/petalinux edf-setup XSA=$(XSA)
+	$(MAKE) -C vi_fpga/petalinux edf-setup
 
 edf-build:
-	$(MAKE) -C vi_fpga/petalinux edf-build MACHINE=$(MACHINE)
+	$(MAKE) -C vi_fpga/petalinux edf-build
 
 # ---------- MATLAB (HDL Coder) ----------
 
@@ -72,6 +75,7 @@ matlab-bench:
 
 rs-test:
 	cd vi_rs && cargo test --workspace
+	cd vi_rs && cargo run -p vi_bench --bin bench_summary -- --smoke
 
 rs-bench:
 	cd vi_rs && cargo bench -p vi_bench

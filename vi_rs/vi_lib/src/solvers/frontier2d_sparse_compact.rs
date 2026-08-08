@@ -463,13 +463,6 @@ impl BlockStore {
     }
 
     #[inline(always)]
-    fn set_cp(&mut self, i: usize, v: u64) {
-        let b = i / self.chunk;
-        let off = i - b * self.chunk;
-        self.blocks[b].as_mut().expect("block not allocated").cp[off] = v;
-    }
-
-    #[inline(always)]
     fn set_final(&mut self, i: usize) {
         let b = i / self.chunk;
         let off = i - b * self.chunk;
@@ -616,71 +609,6 @@ fn ensure_window(store: &mut BlockStore, ix: i32, iy: i32, src: &dyn StateSource
     for b in b_lo..=b_hi {
         store.ensure_block(b, src);
     }
-}
-
-/// 列 (ix,iy) の到達済みセル（`cp != UNREACHED`）の値域 `(min, max)`。無ければ `(MAX, MAX)`。
-fn column_range(store: &BlockStore, g: &Geom, ix: i32, iy: i32) -> (u64, u64) {
-    let pad_col = g.pad_col(ix, iy);
-    let (mut mn, mut mx) = (MAX_COST, MAX_COST);
-    let mut any = false;
-    for it in 0..g.nt {
-        let pad_idx = (pad_col + it as i64) as usize;
-        let cp = store.get(pad_idx);
-        if cp != UNREACHED {
-            let v = cp.wrapping_sub(store.pen(pad_idx));
-            if !any {
-                mn = v;
-                mx = v;
-                any = true;
-            } else {
-                mn = mn.min(v);
-                mx = mx.max(v);
-            }
-        }
-    }
-    (mn, mx)
-}
-
-/// 列 (ix,iy) の全 θ を 1 回 Bellman 更新する。窓ブロックを確保してから relax。
-/// `(値を下げた θ があるか, 更新後 min, 更新後 max, 減少 θ 数)`。
-fn relax_column(
-    store: &mut BlockStore,
-    g: &Geom,
-    ix: i32,
-    iy: i32,
-    src: &dyn StateSource,
-) -> (bool, u64, u64, u64) {
-    ensure_window(store, ix, iy, src);
-    let pad_col = g.pad_col(ix, iy);
-    let mut changed = false;
-    let mut ups = 0u64;
-    for it in 0..g.nt {
-        let pad_idx = (pad_col + it as i64) as usize;
-        if !store.eval_ok(pad_idx) {
-            continue;
-        }
-        let cp_self = store.get(pad_idx);
-        let pen_self = store.pen(pad_idx);
-        let before = if cp_self == UNREACHED {
-            MAX_COST
-        } else {
-            cp_self.wrapping_sub(pen_self)
-        };
-        let mut min_cost = MAX_COST;
-        for per_theta in g.precomp.iter() {
-            let c = action_cost_fused(store, &per_theta[it as usize], pad_col);
-            if c < min_cost {
-                min_cost = c;
-            }
-        }
-        if min_cost < before {
-            store.set_cp(pad_idx, min_cost.wrapping_add(pen_self));
-            ups += 1;
-            changed = true;
-        }
-    }
-    let (mn, mx) = column_range(store, g, ix, iy);
-    (changed, mn, mx, ups)
 }
 
 /// 列 (ix,iy) の `eval_mask` で立つ θ だけを Bellman 更新し、減少分を `view` へ **in-place 原子
@@ -948,76 +876,9 @@ pub struct CompactStats {
     pub map_floor_bytes: u64,
 }
 
-/// 波内バンドを直列 Gauss–Seidel で収束させる。frontier から始め、減少 θ があった in-band 列の
-/// 依存窓を膨張して次フロンティアにし、丸ごと無変化になったら `true`。`max_iter` 到達で `false`。
-/// `cancel` が立っていてもラウンド境界で `false` を返す（呼び出し側が両者を区別する）。
-/// store/col_min/col_max/reached/live/iters/total_updates を更新する（波ループ本体から切り出し）。
-#[allow(clippy::too_many_arguments)]
-fn converge_band_serial(
-    store: &mut BlockStore,
-    g: &Geom,
-    src: &dyn StateSource,
-    nx: i32,
-    ny: i32,
-    dx: u32,
-    dy: u32,
-    t: u64,
-    max_iter: u32,
-    cancel: &AtomicBool,
-    frontier: &mut Vec<(u32, u32)>,
-    col_min: &mut [u64],
-    col_max: &mut [u64],
-    col_final: &[bool],
-    reached: &mut [bool],
-    live: &mut Vec<usize>,
-    iters: &mut u32,
-    total_updates: &mut u64,
-) -> bool {
-    let cidx = |ix: i32, iy: i32| (iy * nx + ix) as usize;
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return false;
-        }
-        let mut changed = Bitboard2D::new(nx as u32, ny as u32);
-        let mut any = false;
-        for &(ixu, iyu) in frontier.iter() {
-            let (ix, iy) = (ixu as i32, iyu as i32);
-            let i = cidx(ix, iy);
-            if col_final[i] {
-                continue;
-            }
-            let (chg, mn, mx, ups) = relax_column(store, g, ix, iy, src);
-            col_min[i] = mn;
-            col_max[i] = mx;
-            if mn != MAX_COST && !reached[i] {
-                reached[i] = true;
-                live.push(i);
-            }
-            *total_updates += ups;
-            if chg {
-                any = true;
-            }
-            if mn != MAX_COST && mn < t {
-                changed.set(ixu, iyu);
-            }
-        }
-        *iters += 1;
-        if *iters >= max_iter {
-            return false;
-        }
-        if !any {
-            return true;
-        }
-        *frontier = changed
-            .dilate(dx, dy)
-            .enumerate()
-            .filter(|&(ixu, iyu)| !col_final[cidx(ixu as i32, iyu as i32)])
-            .collect();
-    }
-}
-
-/// 波内バンドを**並列非同期 Gauss–Seidel × θ マスク疎評価**で収束させる（`converge_band_serial`
-/// と同じ収束値、bit-exact）。`frontier2d_fused`/`frontier2d_sparse` の async + θマスクを out-of-core
+/// 波内バンドを**並列非同期 Gauss–Seidel × θ マスク疎評価**で収束させる
+/// （`nthreads==1` なら単一ワーカー = 直列 G-S と同じ評価順、収束値は常に bit-exact）。
+/// `frontier2d_fused`/`frontier2d_sparse` の async + θマスクを out-of-core
 /// ブロックへ移植したもの。各ラウンド: ① 直列で frontier 全列の窓ブロックを `ensure_window` 確保
 /// ② 確保済みブロックの cp/pen/eval 生ポインタ表（`AtomicCpView`）を作り、各ワーカーが担当列を
 /// 評価して cp を **in-place 原子書き込み**。評価する θ は、窓 (±mx,±my) の前ラウンド変化マスクを
@@ -1468,11 +1329,7 @@ fn solve_compact_core(
     assert!(g.nt <= 64, "θ マスクは u64 前提 (nt={})", g.nt);
     let mw = (nx + 2 * g.mx) as usize;
     let full_mask: u64 = if g.nt >= 64 { u64::MAX } else { (1u64 << g.nt) - 1 };
-    let mut mask: Vec<u64> = if nthreads >= 2 {
-        vec![0u64; mw * (ny + 2 * g.my) as usize]
-    } else {
-        Vec::new() // 直列 G-S 経路は θ マスクを使わない。
-    };
+    let mut mask: Vec<u64> = vec![0u64; mw * (ny + 2 * g.my) as usize];
 
     let mut iters = 0u32;
     let mut total_updates = 0u64;
@@ -1513,21 +1370,13 @@ fn solve_compact_core(
     let mut stopped = false;
     let converged = 'outer: loop {
         // ── 波: バンド [.., t) を収束。relax は隣接（未到達含む）を発見、伝播は in-band 列のみ。
-        //    nthreads==1 は直列 G-S、>=2 は並列 async G-S × θマスク疎評価。max_iter 到達なら
+        //    async G-S × θマスク疎評価（nthreads==1 は単一ワーカー）。max_iter 到達なら
         //    'outer を false で抜ける。 ──
-        let band_ok = if nthreads >= 2 {
-            converge_band_async(
-                &mut store, g, src, nthreads, nx, ny, dx, dy, t, max_iter, cancel, &mut frontier,
-                &mut col_min, &mut col_max, &col_final, &mut reached, &mut live, &mut iters,
-                &mut total_updates, &mut mask, mw, mt, full_mask,
-            )
-        } else {
-            converge_band_serial(
-                &mut store, g, src, nx, ny, dx, dy, t, max_iter, cancel, &mut frontier,
-                &mut col_min, &mut col_max, &col_final, &mut reached, &mut live, &mut iters,
-                &mut total_updates,
-            )
-        };
+        let band_ok = converge_band_async(
+            &mut store, g, src, nthreads, nx, ny, dx, dy, t, max_iter, cancel, &mut frontier,
+            &mut col_min, &mut col_max, &col_final, &mut reached, &mut live, &mut iters,
+            &mut total_updates, &mut mask, mw, mt, full_mask,
+        );
         if !band_ok {
             break 'outer false;
         }
@@ -1674,7 +1523,8 @@ mod tests {
         });
     }
 
-    /// 直列 G-S パス（nthreads==1）を機械のコア数に依らず固定して value+policy parity を検証。
+    /// nthreads==1（async 経路の単一ワーカー）を機械のコア数に依らず固定して
+    /// value+policy parity を検証。
     #[test]
     fn parity_serial_nthreads1_compact() {
         crate::solvers::test_support::parity_standard_maps(|vi| {

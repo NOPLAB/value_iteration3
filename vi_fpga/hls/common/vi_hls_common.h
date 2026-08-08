@@ -14,6 +14,10 @@ typedef ap_int<8>   offset_t;
 constexpr int N_ACTIONS = 6;
 constexpr int N_THETA   = 60;
 
+// Halo width shared by both kernels: max |dix|, |diy| of any transition
+// (0.3 m max forward / 0.05 m resolution = 6 cells).
+constexpr int HALO_MAX  = 6;
+
 // Transition table: packed as (dix, diy, dit) in one 32-bit word
 // Layout: bits [7:0]=dix, [15:8]=diy, [23:16]=dit, [31:24]=reserved
 constexpr int TRANS_TABLE_SIZE = N_ACTIONS * N_THETA;  // 360

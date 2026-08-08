@@ -1,13 +1,14 @@
 function export_repo_ip()
 %EXPORT_REPO_IP Generate MATLAB HDL Coder IP for the repo Vivado flow.
 %   EXPORT_REPO_IP() regenerates the Simulink model, runs HDL Coder IP core
-%   generation, and exports the packaged IP into fpga/build/matlab_ip_repo.
+%   generation, and exports the packaged IP into vi_fpga/build/matlab_ip_repo
+%   (where vi_fpga/tcl/create_project_matlab.tcl expects it).
 
     layout = vi_matlab_layout();
     repo_root = fileparts(layout.root);
     build_root = layout.artifacts_build_repo_ip;
-    output_repo = fullfile(repo_root, 'fpga', 'build', 'matlab_ip_repo');
-    output_header = fullfile(repo_root, 'driver', 'uio', 'generated', ...
+    output_repo = fullfile(repo_root, 'vi_fpga', 'build', 'matlab_ip_repo');
+    output_header = fullfile(repo_root, 'vi_fpga', 'driver', 'uio', 'generated', ...
                              'xalgorithm_ip_addr.h');
 
     fprintf('=== MATLAB HDL Coder IP export ===\n');

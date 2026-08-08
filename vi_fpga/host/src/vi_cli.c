@@ -45,6 +45,17 @@ static int parse_goal(const char *arg, int *gx, int *gy, int *gt) {
     return sscanf(arg, "%d,%d,%d", gx, gy, gt) >= 2 ? 0 : -1;
 }
 
+/* Seed the goal cell to value 0 — one theta when 0 <= gt < VI_N_THETA, else
+   all thetas. Shared by the device run and the --verify reference so both
+   sides always grade against the same seeding. */
+static void seed_goal(uint16_t *val, const pgm_map_t *map, int gx, int gy, int gt) {
+    if (gx < 0 || gx >= map->w || gy < 0 || gy >= map->h) return;
+    int t0 = 0, t1 = VI_N_THETA;
+    if (gt >= 0 && gt < VI_N_THETA) { t0 = gt; t1 = gt + 1; }
+    for (int it = t0; it < t1; it++)
+        val[((size_t)gy * map->w + gx) * VI_N_THETA + it] = 0;
+}
+
 static int write_bin(const char *path, const void *data, size_t n) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
@@ -55,6 +66,7 @@ static int write_bin(const char *path, const void *data, size_t n) {
 
 int main(int argc, char **argv) {
     cli_args_t a = {0};
+    a.gt            = -1;   /* no --goal theta -> seed all thetas (matches parse_goal) */
     a.safety_radius = 6;
     a.max_sweeps    = 200;
 
@@ -143,15 +155,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < (size_t)map.w * map.h * VI_N_THETA; i++) val[i] = 0xFFFF;
     penalty_build(&map, a.safety_radius, a.gx, a.gy, pen);
 
-    /* Mark goal value = 0 */
-    if (a.gx >= 0 && a.gx < map.w && a.gy >= 0 && a.gy < map.h) {
-        if (a.gt >= 0 && a.gt < VI_N_THETA) {
-            val[((size_t)a.gy * map.w + a.gx) * VI_N_THETA + a.gt] = 0;
-        } else {
-            for (int it = 0; it < VI_N_THETA; it++)
-                val[((size_t)a.gy * map.w + a.gx) * VI_N_THETA + it] = 0;
-        }
-    }
+    seed_goal(val, &map, a.gx, a.gy, a.gt);
 
     transitions_compute(map.resolution, tr);
 
@@ -170,9 +174,7 @@ int main(int argc, char **argv) {
         size_t n = (size_t)map.w * map.h * VI_N_THETA;
         uint16_t *ref_val = malloc(n * sizeof(uint16_t));
         for (size_t i = 0; i < n; i++) ref_val[i] = 0xFFFF;
-        if (a.gx >= 0 && a.gx < map.w && a.gy >= 0 && a.gy < map.h)
-            for (int it = 0; it < VI_N_THETA; it++)
-                ref_val[((size_t)a.gy * map.w + a.gx) * VI_N_THETA + it] = 0;
+        seed_goal(ref_val, &map, a.gx, a.gy, a.gt);
         vi_reference_run(ref_val, pen, tr, map.w, map.h, (uint16_t)a.threshold, a.max_sweeps);
 
         int mismatches = 0;

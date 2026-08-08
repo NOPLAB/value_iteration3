@@ -10,10 +10,9 @@ edf/
 *.log
 *.str
 
-# vi_ros2 colcon workspace + generated cargo config (created by make ros2-build)
+# colcon workspace + generated cargo config (created by scripts/ros2_build.sh)
 /vi_ros2_ws/
 /.cargo/
-/log/
 
 # Python bytecode caches (vi_compare bench clients / compare tooling)
 __pycache__/
