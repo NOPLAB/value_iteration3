@@ -148,6 +148,10 @@ pub struct PlanConfig {
     /// DWA: 並進 / 角速度の候補数 (格子は n_v × n_w)。
     pub dwa_n_v: usize,
     pub dwa_n_w: usize,
+    /// DWA: 軌道途中のセルを致死とみなす penalty しきい値 (PROB_BASE 単位、
+    /// 0 = 無効)。既定 2.0 で margin 帯とレーザ注入セルが候補棄却になる
+    /// (`DwaConfig::lethal_penalty` 参照)。
+    pub dwa_lethal_penalty: f64,
     /// MPPI: サンプル本数 / softmax 温度 / 制御ノイズ標準偏差 (0 = 行動集合から
     /// 自動 — σ_v は速度幅の 1/4、σ_ω は上限の 1/4)。
     pub mppi_samples: usize,

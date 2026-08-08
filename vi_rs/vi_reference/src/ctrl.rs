@@ -9,8 +9,9 @@
 //!   (`MAX_COST`) が混ざる点は「評価不能 = `None`」(障害物際で安全側に倒す)。
 //! - [`dwa_decide`] — (v, ω) 候補格子をユニサイクルモデルで `horizon_s` 前進
 //!   シミュレーションし、**終端 V̂ 最小** (ゴール圏到達候補は最優先・早い到達優先)
-//!   の候補を返す。占有セルに触れる候補・終端 V̂ が評価不能な候補は棄却。全滅
-//!   なら `None` (呼び出し側が従来の離散 greedy へフォールバックする)。
+//!   の候補を返す。占有セルに触れる候補・致死帯 (`lethal_penalty`) を踏む候補・
+//!   終端 V̂ が評価不能な候補は棄却。全滅、または最良候補が現在 V̂ を下げられない
+//!   ときは `None` (呼び出し側が従来の離散 greedy へフォールバックする)。
 //! - [`mppi_decide`] — MPPI 型: 前 tick の名目制御列 (warm start) の周りに
 //!   ガウス摂動した制御**列**を `n_samples` 本ロールアウトし、softmax 重み付き
 //!   平均で名目列を更新して先頭を実行する。DWA が定数 (v, ω) の弧しか描けない
@@ -25,9 +26,18 @@
 //! の滞在を tick 課金で再徴収すると V̂ が推す経路を DWA が拒否して帯の縁で膠着
 //! する (壁角テストで実測)。安全 (占有セル非侵入) は衝突棄却が担う。margin 帯の
 //! 一時的な通過露出は本家 greedy (方策追従) も同様に持つ性質。
+//!
+//! ただし DWA は積算しない代わりに**侵入**を禁じる ([`DwaConfig::lethal_penalty`]):
+//! 決定的 argmax は境界最適弧を毎回正確に選ぶので車体余白がゼロになり、実機で
+//! 壁を掠めた。軌道途中のセルが致死しきい値以上の候補は棄却する。棄却で前進候補が
+//! 全滅した角のポケットでは後退シャッフルだけが生き残り Some を返し続ける
+//! (greedy 救済が発火しない) ライブロックになり得るので、対で無進展ガードを置く:
+//! 最良候補が現在 V̂ を下げられないなら None を返して greedy に譲る (壁角テストで
+//! 実測した膠着)。MPPI は壁側の摂動サンプルが衝突棄却で脱落して重み付き平均が
+//! 壁から離れる暗黙のマージンを持つので、しきい値なしのまま。
 
 use crate::action::Action;
-use crate::params::MAX_COST;
+use crate::params::{MAX_COST, PROB_BASE};
 use crate::planner::PolicyView;
 use crate::value_iterator::ValueIterator;
 
@@ -114,6 +124,12 @@ pub struct DwaConfig {
     pub tick_s: f64,
     /// 衝突判定の弧長サンプリング間隔 [m]。0 = auto (セル解像度の半分)。
     pub collide_step_m: f64,
+    /// 軌道途中のセルを致死とみなす penalty しきい値 (18bit 固定小数点、
+    /// `penalty + local_penalty` がこの値以上で候補棄却)。0 = 無効。free の base が
+    /// `PROB_BASE`、margin 帯は `(margin_penalty+1)·PROB_BASE` の二値なので、既定の
+    /// `2·PROB_BASE` で帯全域 (とレーザ注入セル = `2048·PROB_BASE` から半減減衰)
+    /// が致死になる。ゴール圏到達はこの判定より先に見るので、帯内ゴールへは入れる。
+    pub lethal_penalty: u64,
 }
 
 impl DwaConfig {
@@ -132,6 +148,7 @@ impl DwaConfig {
             horizon_s: 1.0,
             tick_s,
             collide_step_m: 0.0,
+            lethal_penalty: 2 * PROB_BASE,
         }
     }
 }
@@ -201,7 +218,18 @@ pub fn dwa_decide(
             }
         }
     }
-    best
+    let best = best?;
+    // 無進展ガード: 生き残りはあるが V̂ を下げられない (致死帯に阻まれた角の
+    // ポケット等では後退シャッフルだけが残る)。Some を返し続けると greedy 救済が
+    // 一生発火しないライブロックになるので、ここで手放す。
+    if !best.hits_goal {
+        if let Some(v_now) = v_hat(p, x, y, yaw_rad) {
+            if best.cost >= v_now {
+                return None;
+            }
+        }
+    }
+    Some(best)
 }
 
 /// 1 候補 (v, ω) の前進シミュレーション評価。棄却は `None`。
@@ -239,6 +267,9 @@ fn eval_candidate(
             // ゴール圏に入れる候補: そこで停まれる。早い到達ほど低コスト。
             let t_hit = (k + 1) as f64 * dt;
             return Some(DwaChoice { v, w_deg, cost: t_hit - GOAL_BONUS, hits_goal: true });
+        }
+        if cfg.lethal_penalty > 0 && cost.penalty_at(ix, iy) >= cfg.lethal_penalty {
+            return None; // margin 帯 / レーザ注入セル — 車体余白を候補側で確保する。
         }
     }
     let vh = v_hat(p, px, py, pyaw)?;
@@ -603,6 +634,7 @@ mod tests {
     }
 
     /// DWA を 1 tick ごとに再決定しながらユニサイクルで実行する (テスト用 follow ループ)。
+    /// `None` の tick は本番 (bench/vi_planner) と同じく離散 greedy へ退避する。
     /// 経路上の全セルが free であることも検証する。
     fn dwa_follow(
         vi: &ValueIterator,
@@ -622,10 +654,16 @@ mod tests {
             if vi.is_final(ix, iy, it) {
                 return (true, traj);
             }
-            let Some(c) = dwa_decide(vi, vi, &cfg, x, y, yaw) else {
-                return (false, traj);
+            let (v, w_deg) = match dwa_decide(vi, vi, &cfg, x, y, yaw) {
+                Some(c) => (c.v, c.w_deg),
+                None => {
+                    let ai = crate::planner::optimal_action_at(vi, ix, iy, it);
+                    assert!(ai >= 0, "no dwa candidate and no greedy action at ({x:.3}, {y:.3})");
+                    let a = &vi.actions[ai as usize];
+                    (a.delta_fw, a.delta_rot)
+                }
             };
-            let (nx2, ny2, nyaw) = unicycle_step(x, y, yaw, c.v, c.w_deg.to_radians(), cfg.tick_s);
+            let (nx2, ny2, nyaw) = unicycle_step(x, y, yaw, v, w_deg.to_radians(), cfg.tick_s);
             x = nx2;
             y = ny2;
             yaw = nyaw;
@@ -706,7 +744,12 @@ mod tests {
         let vi = solved_vi(size, size, walled_map(size), (2.8, 0.6, 0));
         // 壁の左側から出発 → 上端の開口を回ってゴールへ。free 検証は dwa_follow 内。
         let (reached, traj) = dwa_follow(&vi, (0.4, 0.4, 0.0), 6000);
-        assert!(reached, "did not reach goal in 6000 ticks ({} poses)", traj.len());
+        assert!(
+            reached,
+            "did not reach goal in 6000 ticks ({} poses, tail {:?})",
+            traj.len(),
+            &traj[traj.len().saturating_sub(5)..]
+        );
     }
 
     #[test]
@@ -718,6 +761,24 @@ mod tests {
         let x = 34.5 * RES;
         let y = 1.0;
         assert!(dwa_decide(&vi, &vi, &cfg, x, y, 0.0).is_none());
+    }
+
+    #[test]
+    fn dwa_lethal_penalty_defers_band_cells_to_greedy() {
+        let size = 64;
+        let vi = solved_vi(size, size, walled_map(size), (2.8, 0.6, 0));
+        let cfg = DwaConfig::from_actions(&vi.actions, 0.1);
+        // 壁 (x セル 32..40) の margin 帯 (safety_radius 0.1 m = 2 セル) 内の
+        // free セル。penalty は二値なので帯内は一様に (30+1)·PROB_BASE。
+        let (x, y) = (30.5 * RES, 20.5 * RES);
+        assert!(CostView::free_at(&vi, 30, 20));
+        assert!(CostView::penalty_at(&vi, 30, 20) >= cfg.lethal_penalty);
+        // 既定 (致死しきい値あり): どの候補も帯内を通る → 全滅 → greedy 救済へ。
+        assert!(dwa_decide(&vi, &vi, &cfg, x, y, 0.0).is_none());
+        // 無効化すれば従来通り候補が出る (掠め挙動の再現側)。
+        let mut off = cfg.clone();
+        off.lethal_penalty = 0;
+        assert!(dwa_decide(&vi, &vi, &off, x, y, 0.0).is_some());
     }
 
     /// MPPI を 1 tick ごとに再決定しながらユニサイクルで実行する (dwa_follow の

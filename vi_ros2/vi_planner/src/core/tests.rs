@@ -58,6 +58,7 @@ fn cfg() -> PlanConfig {
         dwa_horizon_s: 1.0,
         dwa_n_v: 7,
         dwa_n_w: 11,
+        dwa_lethal_penalty: 2.0,
         mppi_samples: 256,
         mppi_lambda: 1.0,
         mppi_sigma_v: 0.0,

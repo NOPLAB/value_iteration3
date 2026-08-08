@@ -141,6 +141,8 @@ struct Params {
     dwa_horizon_s: f64,
     dwa_n_v: i64,
     dwa_n_w: i64,
+    /// DWA の致死 penalty しきい値 (PROB_BASE 単位、0 = 無効)。
+    dwa_lethal_penalty: f64,
     /// MPPI のサンプル本数 / softmax 温度 / 制御ノイズ標準偏差 (0 = 行動集合から自動)。
     mppi_samples: i64,
     mppi_lambda: f64,
@@ -306,6 +308,9 @@ fn read_params(node: &Node) -> Result<Params> {
         dwa_horizon_s: p!("dwa_horizon_s", f64, 1.0),
         dwa_n_v: p!("dwa_n_v", i64, 7),
         dwa_n_w: p!("dwa_n_w", i64, 11),
+        // 軌道途中に margin 帯 (penalty ≥ 2·PROB_BASE) を踏む候補を棄却する。
+        // 0 で無効 (実機で壁を掠める旧挙動に戻る)。
+        dwa_lethal_penalty: p!("dwa_lethal_penalty", f64, 2.0),
         // MPPI のサンプル本数・温度・ノイズ (0 = 行動集合から自動)。実測 decide ~0.2 ms。
         mppi_samples: p!("mppi_samples", i64, 256),
         mppi_lambda: p!("mppi_lambda", f64, 1.0),
@@ -1311,6 +1316,7 @@ fn main() -> Result<()> {
         dwa_horizon_s: params.dwa_horizon_s,
         dwa_n_v: params.dwa_n_v.max(2) as usize,
         dwa_n_w: params.dwa_n_w.max(3) as usize,
+        dwa_lethal_penalty: params.dwa_lethal_penalty.max(0.0),
         mppi_samples: params.mppi_samples.max(2) as usize,
         mppi_lambda: params.mppi_lambda.max(1e-3),
         mppi_sigma_v: params.mppi_sigma_v.max(0.0),

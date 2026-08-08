@@ -134,6 +134,8 @@ impl DwaController {
         dwa.horizon_s = cfg.dwa_horizon_s.max(cfg.dwa_tick_s);
         dwa.n_v = cfg.dwa_n_v.max(2);
         dwa.n_w = cfg.dwa_n_w.max(3);
+        dwa.lethal_penalty =
+            (cfg.dwa_lethal_penalty.max(0.0) * vi_reference::params::PROB_BASE as f64) as u64;
         Self { dwa }
     }
 }

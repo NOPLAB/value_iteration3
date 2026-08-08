@@ -30,7 +30,7 @@ use clap::Parser;
 use vi_bench::params::{canonical_actions, N_THETA};
 use vi_bench::pgm;
 use vi_reference::ctrl::{dwa_decide, mppi_decide, unicycle_step, CostView, DwaConfig, MppiConfig, MppiState};
-use vi_reference::params::MAX_COST;
+use vi_reference::params::{MAX_COST, PROB_BASE};
 use vi_reference::planner::{pose_to_cell, PolicyView};
 use vi_reference::solvers::{solve, U64Solver};
 use vi_reference::{Action, OccupancyGrid, Quaternion, ValueIterator};
@@ -119,6 +119,10 @@ struct Args {
     n_v: usize,
     #[arg(long, default_value_t = 11)]
     n_w: usize,
+
+    /// DWA の致死 penalty しきい値 (PROB_BASE 単位、0 = 無効)。
+    #[arg(long, default_value_t = 2.0)]
+    dwa_lethal: f64,
 
     /// MPPI のサンプル本数 / softmax 温度 / ノイズ時間相関 / 制御逸脱ペナルティ /
     /// 制御ノイズ標準偏差 (省略・0 = `MppiConfig::from_actions` の既定)。
@@ -570,6 +574,7 @@ fn main() -> ExitCode {
     dwa_cfg.horizon_s = args.horizon_s;
     dwa_cfg.n_v = args.n_v;
     dwa_cfg.n_w = args.n_w;
+    dwa_cfg.lethal_penalty = (args.dwa_lethal.max(0.0) * PROB_BASE as f64) as u64;
 
     let mut mppi_cfg = MppiConfig::from_actions(&vi.actions, args.tick_s);
     mppi_cfg.horizon_s = args.horizon_s;
