@@ -60,8 +60,9 @@ use vi_lib::Action;
 // nav_msgs::msg::OccupancyGrid と名前が衝突するので別名で入れる。
 
 use vi_planner::core::{
-    lock, quality_shift, try_lock, value_grid_on, Belief, BeliefConfig, BeliefModel, BuildParams,
-    Decision, FollowKind, PlanConfig, PlanError, PlanStats, PlannerCore, Prefetcher, SweepCursor,
+    lock, mode_count, quality_shift, try_lock, value_grid_on, Belief, BeliefConfig, BeliefModel,
+    BuildParams, Decision, FollowKind, PlanConfig, PlanError, PlanStats, PlannerCore, Prefetcher,
+    SweepCursor,
 };
 
 use rclrs::*;
@@ -719,6 +720,12 @@ struct FollowTuning {
 /// 覆える (それ以下は veto 判定も動かさない微小仮説)。
 const QMDP_TOP_K: usize = 64;
 
+/// QMDP の発火条件で「別の峰」とみなす最小間隔 [m] ([`mode_count`])。
+/// 収束した単峰 belief の広がり (数セル) より十分大きく、実際に迷う距離
+/// (廊下 1 本ぶん) より小さい値。
+// ponytail: 定数。地図の粒度で調整が要るならパラメータへ昇格。
+const QMDP_MIN_SEP_M: f64 = 0.5;
+
 /// 自己位置推定。`External` = pose トピックの素通し、`Belief` = 全地図 belief
 /// ([`vi_planner::core::Belief`])。
 ///
@@ -1103,10 +1110,15 @@ fn run_follow(
                     window_grid = core.window_value_grid(pose, v.window_threshold_steps);
                 }
             }
-            // 多峰 belief (仮説 2 個以上) は QMDP — どの仮説でも悪くない行動を
-            // 選び、有意な仮説が衝突と言う行動しか無ければ止まる。単峰は従来の
-            // decide (follow_controller 経由) と一致するので点推定に退避。
-            let decision = if hyps.len() >= 2 {
+            // 多峰 belief は QMDP — どの仮説でも悪くない行動を選び、有意な仮説が
+            // 衝突と言う行動しか無ければ止まる。単峰は従来の decide
+            // (follow_controller 経由) と一致するので点推定に退避。
+            //
+            // 多峰性は**セル数ではなく峰の数**で測る: 全地図 belief のアクティブ
+            // 集合は収束していても数千セルあるので、`hyps.len() >= 2` は常に真に
+            // なり follow_controller が一度も動かない (tb3 デモで実測、
+            // `mode_count` の doc 参照)。
+            let decision = if mode_count(&hyps, QMDP_MIN_SEP_M) >= 2 {
                 core.decide_qmdp(&hyps, ib_hat)
             } else {
                 core.decide(pose, ib_hat)

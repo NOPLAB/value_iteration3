@@ -129,8 +129,9 @@ VI_ARGS=(
     -p mppi_lambda:=1.0                  # 規定: 1.0 (softmax 温度)
     -p mppi_sigma_v:=0.0                 # 規定: 0.0 = 行動集合から自動
     -p mppi_sigma_w_deg:=0.0             # 規定: 0.0 = 行動集合から自動
-    -p qmdp:=true                        # 規定: false — belief 多峰の tick は QMDP で行動選択
-                                         #   (単峰の tick は follow_controller のまま)
+    -p qmdp:=true                        # 規定: false — belief が多峰の tick だけ QMDP で行動選択
+                                         #   (単峰の tick は follow_controller のまま)。多峰性は峰の
+                                         #   数で測る — セル数だと全地図 belief では常に真になる。
     # ── スタンドアロン (navigate_to_pose / follow_waypoints) ──
     -p standalone:=true                  # 規定: false — bt_navigator 等の代わりに自前で提供
     -p goal_retry_limit:=3               # 規定: 3 (追従失敗時の投げ直し上限、負で無制限)

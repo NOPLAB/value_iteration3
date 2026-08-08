@@ -1177,6 +1177,24 @@ fn minplus_relax(delta: &mut [f32], nx: i32, ny: i32, nt: i32, l_xy: f32, l_t: f
     }
 }
 
+/// 重み降順の仮説列 ([`Belief::top_cells`] の出力) を最小間隔 `min_sep_m` で
+/// 間引いた「峰」の数。
+///
+/// 多峰性を**セル数**で測ってはいけない: 全地図 belief のアクティブ集合は
+/// 収束していても数千セルあるので `top_cells(k).len() >= 2` は常に真になり、
+/// それを QMDP の発火条件にすると毎 tick QMDP = follow_controller が一度も
+/// 動かない (tb3 デモで実測: ゴール手前 0.29 m で 302 s 張り付き、この関数で
+/// ゲートすると 22 s で到達)。旧 AdaptiveLocalizer の `top_modes` の後継。
+pub fn mode_count(hyps: &[(PoseView, f64)], min_sep_m: f64) -> usize {
+    let mut modes: Vec<(f64, f64)> = Vec::new();
+    for (p, _) in hyps {
+        if modes.iter().all(|&(x, y)| (p.x - x).hypot(p.y - y) >= min_sep_m) {
+            modes.push((p.x, p.y));
+        }
+    }
+    modes.len()
+}
+
 /// 真値姿勢からの全周スキャンをレイマーチで合成する理想センサ (angle_min = 0)。
 /// テストと `viola_bench` の閉ループシミュレーションが共用する。
 pub fn cast_scan(g: &OccupancyGrid, truth: PoseView, n_beams: usize, max_r: f64) -> LaserScan {
@@ -1545,6 +1563,28 @@ mod tests {
             "最大重み仮説 ({:.2}, {:.2}) がシードから遠い",
             top.x, top.y
         );
+    }
+
+    /// mode_count: 収束した単峰 belief は 1 峰、離れた 2 山は 2 峰と数えること
+    /// (QMDP の発火条件 — セル数で測ると常に多峰になる、の回帰)。
+    #[test]
+    fn mode_count_separates_peaks_not_cells() {
+        // 単峰でもアクティブセルは多数 — セル数で多峰性を測ると常に真になる、
+        // という実地図での状況をシードだけで再現する。
+        let g = walled_grid(60);
+        let mut loc = Belief::new(&g, 36, &g, BeliefConfig::default());
+        loc.seed(pose(1.2, 1.5, 0.5));
+        let hyps = loc.top_cells(64);
+        assert!(hyps.len() >= 2, "セル数では常に多峰に見える (この前提が壊れたら本テストは無意味)");
+        assert_eq!(mode_count(&hyps, 0.5), 1, "広がっていても峰が 1 つなら 1 峰");
+
+        // 1 m 離れた 2 山を手で作る。
+        let two = vec![
+            (pose(1.2, 1.5, 0.5), 0.6),
+            (pose(1.25, 1.5, 0.5), 0.2),
+            (pose(2.2, 1.5, 0.5), 0.2),
+        ];
+        assert_eq!(mode_count(&two, 0.5), 2, "離れた 2 山は 2 峰");
     }
 
     /// ESS が pose のゲートと b_hat の広がり報告を担うこと:

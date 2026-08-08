@@ -43,7 +43,7 @@ mod tests;
 pub use follow::{DwaController, FollowController, FollowKind, GreedyController, MppiController};
 // 自己位置推定は vi_lib::belief の全地図 Belief (アルゴリズムは vi_lib、配線は
 // ノードの分担)。窓つきの旧 localize::* はもう使わない。
-pub use vi_lib::belief::{Belief, BeliefConfig};
+pub use vi_lib::belief::{mode_count, Belief, BeliefConfig};
 pub use vi_lib::value_iterator::BeliefModel;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
