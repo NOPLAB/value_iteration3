@@ -3,36 +3,9 @@
   <name>vi_planner</name>
   <version>0.1.0</version>
   <description>
-    Unified value-iteration planner for Nav2: a single Rust node that serves
-    BOTH the compute_path_to_pose and follow_path actions (nav2_msgs) from ONE
-    value function. Replaces nav2_planner's planner_server and
-    nav2_controller's controller_server at the same time, so a goal is solved
-    once instead of twice (as it was when vi_global_planner and
-    vi_local_planner ran side by side). The global path is a greedy rollout of
-    the solved value function; the local control loop refines the same value
-    function inside a moving +-1m window with laser-scan penalties and
-    publishes the greedy action as cmd_vel.
-
-    Because both actions read the same ValueIterator::states, what the local
-    window learns from the laser is visible to the global rollout -- but only
-    after it is propagated: the windowed refinement sweeps the +-1m window and
-    stops there, so a blocked corridor stays invisible to a rollout descending
-    from 20m away. global_sweep (on by default) closes that loop by sweeping the
-    whole shared field with Gauss-Seidel in the background, in chunks that yield
-    the lock so the 10Hz follow loop keeps running.
-
-    map_scale and the out-of-core (compact) solver are both supported, and
-    global_sweep works under both. A compact solve never allocates states, so the
-    follow loop hydrates a patch around the robot from the sink and writes its
-    window back every tick -- the sink is the shared field -- and the propagation
-    repairs that sink one tile at a time (interior plus a frozen halo) instead of
-    sweeping a full states array. Same update rule, so the same fixed point, and
-    the work scales with the region the change reaches rather than with the map.
-    Dense costs 80 B/state (56 for states plus 24 for sweep_orders) and
-    dense_limit_mb refuses to start above the limit; compact keeps 12 B/state in
-    the sink plus a few MB of patch and tile. compact_ram_limit_mb spills the
-    compact sink to disk when compact_sink_dir is unset and it would not fit in
-    RAM.
+    Unified value-iteration planner for Nav2: one Rust node serving both the
+    compute_path_to_pose and follow_path actions (nav2_msgs) from a single
+    value function.
   </description>
   <maintainer email="noplab90@gmail.com">nop</maintainer>
   <license>Apache-2.0</license>

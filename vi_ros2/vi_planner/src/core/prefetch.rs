@@ -1,41 +1,20 @@
 //! ウェイポイントの先読み: **次の点の価値関数を、いまの点へ走っている間に解いて
-//! おく**機構 ([`Prefetcher`])。`waypoint_prefetch: true` のときだけ立ち上がる。
-//!
-//! # 何を無くすための機構か
-//!
-//! `nav2_waypoint_follower` は 1 点ずつ `navigate_to_pose` を呼ぶので、点が変わる
-//! たびに BT が `compute_path_to_pose` を投げ、その中で**新しいゴールの価値反復が
-//! 丸ごと 1 回走る**。VI の solve はゴールに依存するので使い回しが効かず、実測で
-//! 19F が 29 秒・津田沼 (compact, scale 5) が 87 秒。巡回中はその間ずっと機体が
-//! 止まっている。走っている時間のほうが長いのだから、**次の点はその間に解ける**。
-//!
-//! # 仕掛け
+//! おく**機構 ([`Prefetcher`])。`waypoint_prefetch: true` のときだけ立ち上がる
+//! (背景と実測はリポジトリ CLAUDE.md)。
 //!
 //! 予備の [`PlannerCore`] ([`PlannerCore::new_solve_only`]) を専用スレッドに 1 つ
-//! 持たせ、注文が来たら解かせる。要点は 3 つ:
+//! 持たせ、注文が来たら解かせる。要点:
 //!
 //! - **共有ロックを一切握らない。** ワーカーが触るのはこのモジュールの `state`
 //!   だけで、走行中の核の `Mutex<PlannerCore>` には手を出さない。握ったら 10Hz の
-//!   追従ループが `try_lock` に落ち続けて機体が止まり、無くしたはずの停止が
-//!   そのまま戻ってくる。
+//!   追従ループが `try_lock` に落ち続けて機体が止まる。
 //! - **注文は「いまのゴール」から引く** ([`Prefetcher::note_goal`])。並び
 //!   ([`Prefetcher::set_waypoints`]) の中で今のゴールに当たる点を探し、その次を
 //!   解かせる。並びに無いゴール (単発の Nav2 Goal など) では何もしない。
 //! - **採用は場ごと移す** ([`Prefetcher::adopt`])。解けた場は
-//!   `prepare_goal_with_progress` がそのままキャッシュに載せる。solve を飛ばす
-//!   だけで、載ってからの扱いは自分で解いたときと 1 ビットも変わらない。
-//!
-//! # 承知しておくこと
-//!
-//! - **先読みした場は静的地図だけで解いてある。** いまの点へ走る間に
-//!   `observe_scan` が積んだ `local_penalty` は次の点の場には入らない。これは
-//!   自分で解くときも同じ (ゴールが変わると `states` を作り直し、compact なら
-//!   penalty 表も `clear` する) なので後退ではないが、「走りながら覚えた障害物を
-//!   持ち越してくれる」ものではない。
-//! - **CPU は取られる。** 追従は 10Hz・予算 40ms/tick で回っているので、先読みの
-//!   スレッド数は既定 1 に絞ってある。ただし効くのは compact 経路だけで、密経路の
-//!   `frontier2d_sparse` はスレッド数を環境変数 `VI_THREADS` から読む (プロセスで
-//!   1 つ) ため、先読みだけ絞ることができない。
+//!   `prepare_goal_with_progress` がそのままキャッシュに載せる。
+//! - **先読みした場は静的地図だけで解いてある。** 走行中に `observe_scan` が
+//!   積んだ `local_penalty` は次の点の場には入らない (自分で解き直すときと同じ)。
 //! - **場が 2 つ同時に生きる。** メモリ (密) とディスク (compact の sink) が
 //!   2 倍要る。**ちょうど 2 つで頭打ち**なのは、新しい場を確保する前に必ず古い
 //!   ほうを手放しているから — 走行中の核は solve の前に `cached = None`、
@@ -52,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use vi_reference::bridge::{yaw_to_goal_theta_deg, PoseView};
 
-use super::{goal_matches, BuildParams, CachedGoal, PlanConfig, PlanError, PlannerCore};
+use super::{goal_matches, lock, BuildParams, CachedGoal, PlanConfig, PlanError, PlannerCore};
 
 /// 進行中の先読みを待つときの観測間隔。呼び出し側の cancel (プリエンプト) を
 /// 見る刻みでもあるので、待ちが長引いても取り消しはこの粒度で効く。
@@ -269,12 +248,6 @@ fn cancel_in_flight(st: &mut State) {
     if let Some(c) = st.cancel.take() {
         c.store(true, Ordering::SeqCst);
     }
-}
-
-/// 他スレッドの panic で毒されていても、この state は個々のフィールドが独立して
-/// いて不変条件を跨がないので、そのまま使い続けてよい (核の `Mutex` と同じ扱い)。
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// 先読みワーカー。注文を待ち、予備の核で解き、解けた場を `ready` へ置く。

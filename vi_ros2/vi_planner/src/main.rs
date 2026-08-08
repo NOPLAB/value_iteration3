@@ -1,49 +1,13 @@
 //! vi_planner entry point — Nav2 の planner_server と controller_server を
-//! **1 ノードで同時に**置き換える全 Rust ノード。`standalone: true` にすると
-//! さらに bt_navigator と waypoint_follower も置き換え、**Nav2 のノードを 1 つも
-//! 立てずに**自律移動する (下の「スタンドアロン」を参照)。
+//! **1 ノードで同時に**置き換える全 Rust ノード。`compute_path_to_pose` と
+//! `follow_path` (nav2_msgs) の両方を提供し、どちらも同じ `PlannerCore` =
+//! 同じ価値関数を読む。`standalone: true` ならさらに `navigate_to_pose` と
+//! `follow_waypoints` も提供し、**Nav2 のノードを 1 つも立てずに**自律移動する
+//! (アクション型は nav2_msgs のままなので RViz 等の配線は変わらない。何が
+//! 良くなるかはリポジトリ CLAUDE.md を参照。投げ直しの前に [`run_settle`] が
+//! 止まったまま場を更新するのが BT の `Wait` との本質的な違い)。
 //!
-//! `compute_path_to_pose` (nav2_msgs) と `follow_path` (nav2_msgs) の両方を
-//! 提供し、どちらも同じ `PlannerCore` = 同じ価値関数を読む。従来の
-//! vi_global_planner + vi_local_planner の 2 プロセス構成では、同じ地図・同じ
-//! ゴールに対して価値反復を別々に 2 回解いていた (走り出しまでの時間も常駐
-//! メモリも 2 倍) 上に、広域側が返した `nav_msgs/Path` は狭域側が終端姿勢しか
-//! 読まないので大部分が捨てられていた。ここでは solve をゴールごとに 1 回に
-//! 畳み、経路はその価値関数の貪欲ロールアウト、追従は同じ価値関数の
-//! ±1m ウィンドウ精密化として扱う。
-//!
-//! ## スタンドアロン (`standalone: true`)
-//!
-//! `navigate_to_pose` と `follow_waypoints` を**このノード自身が**提供する。
-//! bt_navigator / behavior_server / waypoint_follower / smoother_server と、
-//! それらを起こす lifecycle_manager が要らなくなる。アクション型は nav2_msgs の
-//! ままなので、RViz の `Nav2 Goal` も daifuku の各パネルも配線を変えずに動く。
-//!
-//! Nav2 の BT を挟まなくなることで消える制約が 4 つある。どれも「VI の場は
-//! 走りながら良くなる」のに BT がゴール単位で諦めていたことに由来する:
-//!
-//!   * **1 Hz のリプランが消える。** BT は `ComputePathToPose` を毎秒呼び、
-//!     キャッシュヒットでもロールアウト + densify を**ロックの中で**回していた。
-//!     10 Hz の追従ループは同じ Mutex を `try_lock` するので、これは毎秒の
-//!     取り合いだった。ここではロールアウトはゴールにつき 1 回で、しかも
-//!     `plan` トピックへの表示専用。
-//!   * **ロールアウトの失敗でゴールが死ななくなる。** `LoopDetected` は
-//!     「貪欲降下が振動した」であって「方策が無い」ではない。追従は方策を
-//!     1 手ずつ引くので、経路が引けなくても走れることがある。BT 構成では
-//!     `ComputePathToPose` の失敗がそのままゴールの失敗だった。
-//!   * **リカバリが実際に効く。** BT の `Spin` / `BackUp` は
-//!     `local_costmap/costmap_raw` を待つので、コストマップを持たないこの構成
-//!     では**必ず失敗**し、動くのは `Wait` だけだった。その `Wait` も
-//!     follow_path が走っていない間は `observe_scan` も `refine_for` も呼ばない
-//!     ので、「待てば通れる」の唯一の仕組み ([`set_local_cost`] の penalty 半減)
-//!     が進まない。ここでは投げ直しの前に [`run_settle`] が**止まったまま場を
-//!     更新する**。
-//!   * **先読みが黙って効かない経路が無くなる。** `waypoint_prefetch` は順路を
-//!     `waypoint_topic` から拾うしか手が無く、そこへ出すものがいない構成では
-//!     警告も出ずに何もしなかった。`follow_waypoints` を自分で持つと、順路は
-//!     ゴールと同じ経路で入ってくる。
-//!
-//! Boot order (vi_global_planner と同型):
+//! Boot order:
 //!   1. `Context::default_from_env` + basic executor + node 作成
 //!   2. パラメータ宣言・検証 (行動集合と θ 数は起動パラメータがそのまま効く)
 //!   3. `VI_THREADS` 設定 (vi_threads > 0 のとき)
@@ -76,7 +40,7 @@
 //! 走らせない)。
 //!
 //! NOTE: rclrs API は ros2-rust/ros2_rust @ 2c6b926 (rclrs 0.7.0) — Docker
-//! イメージがビルドする版 — に合わせている (vi_node / vi_global_planner と同一)。
+//! イメージがビルドする版 — に合わせている。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -96,8 +60,8 @@ use vi_reference::Action;
 // nav_msgs::msg::OccupancyGrid と名前が衝突するので別名で入れる。
 
 use vi_planner::core::{
-    value_grid_on, BuildParams, Decision, FollowKind, PlanConfig, PlanError, PlanStats,
-    PlannerCore, Prefetcher, SweepCursor,
+    lock, try_lock, value_grid_on, BuildParams, Decision, FollowKind, PlanConfig, PlanError,
+    PlanStats, PlannerCore, Prefetcher, SweepCursor,
 };
 
 use rclrs::*;
@@ -203,129 +167,6 @@ fn read_params(node: &Node) -> Result<Params> {
         };
     }
 
-    let solver = p!("solver", Arc<str>, "frontier2d_sparse".into()).to_string();
-    let theta_cell_num = p!("theta_cell_num", i64, 60);
-    let safety_radius = p!("safety_radius", f64, 0.2);
-    let safety_radius_penalty = p!("safety_radius_penalty", i64, 30);
-    let goal_margin_radius = p!("goal_margin_radius", f64, 0.3);
-    let goal_margin_theta_deg = p!("goal_margin_theta", f64, 15.0);
-    let map_wait_sec = p!("map_wait_sec", i64, 30);
-    let unknown_as_obstacle = p!("unknown_as_obstacle", bool, true);
-    let map_scale = p!("map_scale", i64, 1);
-    // "conservative" = 本家 downsample_occupancy (障害物優先)。"optimistic" = ブロック内に free が
-    // 1 つでもあれば free。map_scale >= 4 で通路のセル幅を保つために必要 (既定は挙動不変の保守側)。
-    let downsample_policy = p!("downsample_policy", Arc<str>, "conservative".into()).to_string();
-    // solver = frontier2d_sparse_compact のときだけ効く。空文字なら RAM (RamSink)。
-    // 指定先が tmpfs だと結局 RAM に載るので、メモリ退避が目的なら実ディスクを指すこと。
-    let compact_sink_dir = p!("compact_sink_dir", Arc<str>, "".into()).to_string();
-    // compact_sink_dir 未指定でも、確定出力がこれを超えるならディスクへ逃がす。小メモリ機で
-    // 黙って GB 級の RamSink を確保すると OOM killer に落とされるため (vi_global_planner と同じ)。
-    let compact_ram_limit_mb = p!("compact_ram_limit_mb", i64, 512);
-    // 密ソルバの価値関数 (states 56 B/state + sweep_orders 24 B/state) の上限。
-    // 超えたら起動を止める。既定 1500 は 4GB 機 (Pi4) で他のノードと同居できる線
-    // — 19F を map_scale 2 で解くと実測 655 MB。
-    let dense_limit_mb = p!("dense_limit_mb", i64, 1500);
-    let vi_threads = p!("vi_threads", i64, 0);
-    let max_solve_iter = p!("max_solve_iter", i64, 1_000_000);
-    let solve_chunk = p!("solve_chunk", i64, 64);
-    let goal_tolerance_xy = p!("goal_tolerance_xy", f64, 0.25);
-    let goal_tolerance_deg = p!("goal_tolerance_deg", f64, 10.0);
-    let pose_topic = p!("pose_topic", Arc<str>, "mcl_pose".into()).to_string();
-    let global_frame = p!("global_frame", Arc<str>, "map".into()).to_string();
-
-    let max_rollout_steps = p!("max_rollout_steps", i64, 10_000);
-    let start_tolerance = p!("start_tolerance", f64, 0.5);
-    let path_spacing = p!("path_spacing", f64, 0.05);
-
-    // follow_path サーバを立てるか。false は nav2_controller (controller_server) と
-    // 組む構成 — 立てると follow_path のサーバが 2 つになるため。false のとき
-    // このノードは compute_path_to_pose 専用 (旧 vi_global_planner 相当) になる。
-    let follow = p!("follow", bool, true);
-    let scan_topic = p!("scan_topic", Arc<str>, "scan".into()).to_string();
-    let control_frequency = p!("control_frequency", f64, 10.0);
-    let refine_budget_ms = p!("refine_budget_ms", i64, 40);
-    let action_tolerance = p!("action_tolerance", f64, 0.2);
-    let no_action_timeout_sec = p!("no_action_timeout_sec", f64, 3.0);
-    // follow 1 tick の判断器。"greedy" (既定) は本家 ViNode::decision 準拠の離散
-    // 6 行動。"dwa" / "mppi" は同じ価値関数を連続に読む (V̂ 補間 + 軌道サンプリング、
-    // core::follow の doc 参照)。指令の速度範囲は行動集合と同じで、候補全滅時は
-    // greedy へフォールバックするので、切り替えても失敗の形は変わらない。
-    let follow_controller = p!("follow_controller", Arc<str>, "greedy".into()).to_string();
-    // DWA/MPPI の前方シミュレーション時間と DWA の候補数 (計算量 ∝ n_v × n_w × horizon)。
-    // 既定 (1.0 s, 7×11) の実測は decide ~30 µs — 10 Hz の 40 ms 予算には遠い。
-    let dwa_horizon_s = p!("dwa_horizon_s", f64, 1.0);
-    let dwa_n_v = p!("dwa_n_v", i64, 7);
-    let dwa_n_w = p!("dwa_n_w", i64, 11);
-    // MPPI のサンプル本数・温度・ノイズ (0 = 行動集合から自動)。実測 decide ~0.2 ms。
-    let mppi_samples = p!("mppi_samples", i64, 256);
-    let mppi_lambda = p!("mppi_lambda", f64, 1.0);
-    let mppi_sigma_v = p!("mppi_sigma_v", f64, 0.0);
-    let mppi_sigma_w_deg = p!("mppi_sigma_w_deg", f64, 0.0);
-
-    // navigate_to_pose と follow_waypoints をこのノード自身が提供する
-    // (= bt_navigator / behavior_server / waypoint_follower を立てない)。
-    // **既定は false**: Nav2 構成でこれを立てると navigate_to_pose のサーバが
-    // bt_navigator と 2 つになり、クライアントは先に見つけたほうへ繋ぐ
-    // (どちらに繋がったかはログにも出ない)。立てるのは launch の責任。
-    let standalone = p!("standalone", bool, false);
-    // 追従が失敗したときにゴールを投げ直す上限 (負で無制限)。BT の
-    // `RecoveryNode number_of_retries` の置き換えだが、あちらと違って
-    // **投げ直しの合間に場が実際に動く** (下の goal_retry_settle_sec)。
-    let goal_retry_limit = p!("goal_retry_limit", i64, 3);
-    // 投げ直す前に、止まったままスキャンを取り込んで場を精密化する時間。
-    // 0 で即座に投げ直す (それだと同じ場で同じ失敗を繰り返しやすい)。
-    let goal_retry_settle_sec = p!("goal_retry_settle_sec", f64, 3.0);
-    // follow_waypoints: 1 点失敗したら残りを諦めるか。false なら次の点へ進み、
-    // 飛ばした番号を result.missed_waypoints で返す (nav2_waypoint_follower と同義)。
-    let waypoint_stop_on_failure = p!("stop_on_failure", bool, false);
-    // 1 点に着いてから次の点へ向かうまでの待ち (nav2_waypoint_follower の
-    // waypoint_pause_duration [ms] に相当。こちらは秒)。
-    let waypoint_pause_sec = p!("waypoint_pause_sec", f64, 0.2);
-
-    // 狭域が書いた local_penalty を全域へ伝播させる背景掃き (core::sweep_global)。
-    // これを止めると、狭域が「通れない」と判断しても広域の経路は塞がった通路を
-    // 指し続ける (旧挙動)。密ソルバは全域 Gauss–Seidel、compact は sink の
-    // タイル修復で同じことをする (どちらも `core::sweep_global` の入口)。
-    let global_sweep = p!("global_sweep", bool, true);
-    // 1 回のロック取得で掃きに使う時間と、そのあとロックを手放して待つ時間。
-    // 比がそのまま CPU の取り分になる (既定 20:60 = 1 コアの 25%)。追従ループは
-    // 同じ Mutex を try_lock で取り、3 tick 続けて取れないとロボットを止めるので、
-    // budget を伸ばすときは idle も一緒に伸ばすこと。
-    let global_sweep_budget_ms = p!("global_sweep_budget_ms", i64, 20);
-    let global_sweep_idle_ms = p!("global_sweep_idle_ms", i64, 60);
-
-    // 次のウェイポイントの価値関数を、いまの点へ走っている間に解いておく
-    // (core::Prefetcher)。巡回では点が変わるたびに solve が丸ごと 1 回走り、その間
-    // 機体が止まる (19F で 29 秒、津田沼 compact で 87 秒) — それを走行時間に隠す。
-    // **既定は false**: 価値関数が同時に 2 つ生きるので、密ならメモリが、compact
-    // なら sink のディスクが最大 2 倍 + 採用待ちの 1 つぶん要る。効くのは
-    // waypoint_topic に並びを出すもの (daifuku_waypoint_manager) がいるときだけで、
-    // 並びが無ければ立ち上がっていても何も解かない。
-    let waypoint_prefetch = p!("waypoint_prefetch", bool, false);
-    // 先読み対象の並び (nav_msgs/Path)。transient_local で購読するので、後から
-    // 起動しても latch されている並びを拾える。
-    let waypoint_topic = p!("waypoint_topic", Arc<str>, "waypoints".into()).to_string();
-    // 先読みの solve に使うスレッド数。追従は 10Hz・予算 40ms/tick で回っているので
-    // 既定 1 に絞ってある。**効くのは compact 経路だけ** — 密の frontier2d_sparse は
-    // スレッド数を環境変数 VI_THREADS から読む (プロセスで 1 つ) ので、先読みだけを
-    // 絞ることができない。
-    let waypoint_prefetch_threads = p!("waypoint_prefetch_threads", i64, 1);
-
-    // 機体の現在地からゴールまで方策が繋がった時点で solve を打ち切って走り出す
-    // (core::PlanConfig::early_start)。**既定は false**: 経路の外は未確定のままに
-    // なるので、機体が経路から外れると解き直しが要る (そのときは打ち切った場を
-    // 捨ててから最後まで解くので、待ちは合計で長くなる)。先読み
-    // (waypoint_prefetch) と違い追加のメモリは要らず、両者は併用できる
-    // — 先読みで用意した場は打ち切らないので、受け取れた点では関係しない。
-    let early_start = p!("early_start", bool, false);
-
-    let publish_value_function = p!("publish_value_function", bool, true);
-    // solve の途中経過の配信間隔。0 は「完了時のみ」。追従中の再配信は掃き
-    // スレッドが 2 秒ごとに出すので、ここを 0 にすると追従中は出なくなる。
-    let value_publish_interval_ms = p!("value_publish_interval_ms", i64, 500);
-    let cost_drawing_threshold = p!("cost_drawing_threshold", i64, 60);
-    let window_cost_drawing_threshold = p!("window_cost_drawing_threshold", i64, 60);
-
     let names: Vec<String> = node
         .declare_parameter::<Arc<[Arc<str>]>>("action_names")
         .default_string_array(["forward", "back", "right", "rightfw", "left", "leftfw"])
@@ -359,64 +200,131 @@ fn read_params(node: &Node) -> Result<Params> {
             rots.len()
         ));
     }
-    let action_list =
-        names.into_iter().zip(fws).zip(rots).map(|((n, f), r)| (n, f, r)).collect();
 
     Ok(Params {
-        solver,
-        theta_cell_num,
-        safety_radius,
-        safety_radius_penalty,
-        goal_margin_radius,
-        goal_margin_theta_deg,
-        map_wait_sec,
-        action_list,
-        unknown_as_obstacle,
-        map_scale,
-        downsample_policy,
-        compact_sink_dir,
-        compact_ram_limit_mb,
-        dense_limit_mb,
-        vi_threads,
-        max_solve_iter,
-        solve_chunk,
-        goal_tolerance_xy,
-        goal_tolerance_deg,
-        pose_topic,
-        global_frame,
-        max_rollout_steps,
-        start_tolerance,
-        path_spacing,
-        follow,
-        scan_topic,
-        control_frequency,
-        refine_budget_ms,
-        action_tolerance,
-        no_action_timeout_sec,
-        follow_controller,
-        dwa_horizon_s,
-        dwa_n_v,
-        dwa_n_w,
-        mppi_samples,
-        mppi_lambda,
-        mppi_sigma_v,
-        mppi_sigma_w_deg,
-        standalone,
-        goal_retry_limit,
-        goal_retry_settle_sec,
-        waypoint_stop_on_failure,
-        waypoint_pause_sec,
-        global_sweep,
-        global_sweep_budget_ms,
-        global_sweep_idle_ms,
-        waypoint_prefetch,
-        waypoint_topic,
-        waypoint_prefetch_threads,
-        early_start,
-        publish_value_function,
-        value_publish_interval_ms,
-        cost_drawing_threshold,
-        window_cost_drawing_threshold,
+        solver: p!("solver", Arc<str>, "frontier2d_sparse".into()).to_string(),
+        theta_cell_num: p!("theta_cell_num", i64, 60),
+        safety_radius: p!("safety_radius", f64, 0.2),
+        safety_radius_penalty: p!("safety_radius_penalty", i64, 30),
+        goal_margin_radius: p!("goal_margin_radius", f64, 0.3),
+        goal_margin_theta_deg: p!("goal_margin_theta", f64, 15.0),
+        map_wait_sec: p!("map_wait_sec", i64, 30),
+        action_list: names.into_iter().zip(fws).zip(rots).map(|((n, f), r)| (n, f, r)).collect(),
+        unknown_as_obstacle: p!("unknown_as_obstacle", bool, true),
+        map_scale: p!("map_scale", i64, 1),
+        // "conservative" = 本家 downsample_occupancy (障害物優先)。"optimistic" = ブロック内に free が
+        // 1 つでもあれば free。map_scale >= 4 で通路のセル幅を保つために必要 (既定は挙動不変の保守側)。
+        downsample_policy: p!("downsample_policy", Arc<str>, "conservative".into()).to_string(),
+        // solver = frontier2d_sparse_compact のときだけ効く。空文字なら RAM (RamSink)。
+        // 指定先が tmpfs だと結局 RAM に載るので、メモリ退避が目的なら実ディスクを指すこと。
+        compact_sink_dir: p!("compact_sink_dir", Arc<str>, "".into()).to_string(),
+        // compact_sink_dir 未指定でも、確定出力がこれを超えるならディスクへ逃がす。小メモリ機で
+        // 黙って GB 級の RamSink を確保すると OOM killer に落とされるため。
+        compact_ram_limit_mb: p!("compact_ram_limit_mb", i64, 512),
+        // 密ソルバの価値関数 (states 56 B/state + sweep_orders 24 B/state) の上限。
+        // 超えたら起動を止める。既定 1500 は 4GB 機 (Pi4) で他のノードと同居できる線
+        // — 19F を map_scale 2 で解くと実測 655 MB。
+        dense_limit_mb: p!("dense_limit_mb", i64, 1500),
+        vi_threads: p!("vi_threads", i64, 0),
+        max_solve_iter: p!("max_solve_iter", i64, 1_000_000),
+        solve_chunk: p!("solve_chunk", i64, 64),
+        goal_tolerance_xy: p!("goal_tolerance_xy", f64, 0.25),
+        goal_tolerance_deg: p!("goal_tolerance_deg", f64, 10.0),
+        pose_topic: p!("pose_topic", Arc<str>, "mcl_pose".into()).to_string(),
+        global_frame: p!("global_frame", Arc<str>, "map".into()).to_string(),
+
+        max_rollout_steps: p!("max_rollout_steps", i64, 10_000),
+        start_tolerance: p!("start_tolerance", f64, 0.5),
+        path_spacing: p!("path_spacing", f64, 0.05),
+
+        // follow_path サーバを立てるか。false は nav2_controller (controller_server) と
+        // 組む構成 — 立てると follow_path のサーバが 2 つになるため。false のとき
+        // このノードは compute_path_to_pose 専用になる。
+        follow: p!("follow", bool, true),
+        scan_topic: p!("scan_topic", Arc<str>, "scan".into()).to_string(),
+        control_frequency: p!("control_frequency", f64, 10.0),
+        refine_budget_ms: p!("refine_budget_ms", i64, 40),
+        action_tolerance: p!("action_tolerance", f64, 0.2),
+        no_action_timeout_sec: p!("no_action_timeout_sec", f64, 3.0),
+        // follow 1 tick の判断器。"greedy" (既定) は本家 ViNode::decision 準拠の離散
+        // 6 行動。"dwa" / "mppi" は同じ価値関数を連続に読む (V̂ 補間 + 軌道サンプリング、
+        // core::follow の doc 参照)。指令の速度範囲は行動集合と同じで、候補全滅時は
+        // greedy へフォールバックするので、切り替えても失敗の形は変わらない。
+        follow_controller: p!("follow_controller", Arc<str>, "greedy".into()).to_string(),
+        // DWA/MPPI の前方シミュレーション時間と DWA の候補数 (計算量 ∝ n_v × n_w × horizon)。
+        // 既定 (1.0 s, 7×11) の実測は decide ~30 µs — 10 Hz の 40 ms 予算には遠い。
+        dwa_horizon_s: p!("dwa_horizon_s", f64, 1.0),
+        dwa_n_v: p!("dwa_n_v", i64, 7),
+        dwa_n_w: p!("dwa_n_w", i64, 11),
+        // MPPI のサンプル本数・温度・ノイズ (0 = 行動集合から自動)。実測 decide ~0.2 ms。
+        mppi_samples: p!("mppi_samples", i64, 256),
+        mppi_lambda: p!("mppi_lambda", f64, 1.0),
+        mppi_sigma_v: p!("mppi_sigma_v", f64, 0.0),
+        mppi_sigma_w_deg: p!("mppi_sigma_w_deg", f64, 0.0),
+
+        // navigate_to_pose と follow_waypoints をこのノード自身が提供する
+        // (= bt_navigator / behavior_server / waypoint_follower を立てない)。
+        // **既定は false**: Nav2 構成でこれを立てると navigate_to_pose のサーバが
+        // bt_navigator と 2 つになり、クライアントは先に見つけたほうへ繋ぐ
+        // (どちらに繋がったかはログにも出ない)。立てるのは launch の責任。
+        standalone: p!("standalone", bool, false),
+        // 追従が失敗したときにゴールを投げ直す上限 (負で無制限)。BT の
+        // `RecoveryNode number_of_retries` の置き換えだが、あちらと違って
+        // **投げ直しの合間に場が実際に動く** (下の goal_retry_settle_sec)。
+        goal_retry_limit: p!("goal_retry_limit", i64, 3),
+        // 投げ直す前に、止まったままスキャンを取り込んで場を精密化する時間。
+        // 0 で即座に投げ直す (それだと同じ場で同じ失敗を繰り返しやすい)。
+        goal_retry_settle_sec: p!("goal_retry_settle_sec", f64, 3.0),
+        // follow_waypoints: 1 点失敗したら残りを諦めるか。false なら次の点へ進み、
+        // 飛ばした番号を result.missed_waypoints で返す (nav2_waypoint_follower と同義)。
+        waypoint_stop_on_failure: p!("stop_on_failure", bool, false),
+        // 1 点に着いてから次の点へ向かうまでの待ち (nav2_waypoint_follower の
+        // waypoint_pause_duration [ms] に相当。こちらは秒)。
+        waypoint_pause_sec: p!("waypoint_pause_sec", f64, 0.2),
+
+        // 狭域が書いた local_penalty を全域へ伝播させる背景掃き (core::sweep_global)。
+        // これを止めると、狭域が「通れない」と判断しても広域の経路は塞がった通路を
+        // 指し続ける (旧挙動)。密ソルバは全域 Gauss–Seidel、compact は sink の
+        // タイル修復で同じことをする (どちらも `core::sweep_global` の入口)。
+        global_sweep: p!("global_sweep", bool, true),
+        // 1 回のロック取得で掃きに使う時間と、そのあとロックを手放して待つ時間。
+        // 比がそのまま CPU の取り分になる (既定 20:60 = 1 コアの 25%)。追従ループは
+        // 同じ Mutex を try_lock で取り、3 tick 続けて取れないとロボットを止めるので、
+        // budget を伸ばすときは idle も一緒に伸ばすこと。
+        global_sweep_budget_ms: p!("global_sweep_budget_ms", i64, 20),
+        global_sweep_idle_ms: p!("global_sweep_idle_ms", i64, 60),
+
+        // 次のウェイポイントの価値関数を、いまの点へ走っている間に解いておく
+        // (core::Prefetcher)。巡回では点が変わるたびに solve が丸ごと 1 回走り、その間
+        // 機体が止まる (19F で 29 秒、津田沼 compact で 87 秒) — それを走行時間に隠す。
+        // **既定は false**: 価値関数が同時に 2 つ生きるので、密ならメモリが、compact
+        // なら sink のディスクが最大 2 倍 + 採用待ちの 1 つぶん要る。効くのは
+        // waypoint_topic に並びを出すもの (daifuku_waypoint_manager) がいるときだけで、
+        // 並びが無ければ立ち上がっていても何も解かない。
+        waypoint_prefetch: p!("waypoint_prefetch", bool, false),
+        // 先読み対象の並び (nav_msgs/Path)。transient_local で購読するので、後から
+        // 起動しても latch されている並びを拾える。
+        waypoint_topic: p!("waypoint_topic", Arc<str>, "waypoints".into()).to_string(),
+        // 先読みの solve に使うスレッド数。追従は 10Hz・予算 40ms/tick で回っているので
+        // 既定 1 に絞ってある。**効くのは compact 経路だけ** — 密の frontier2d_sparse は
+        // スレッド数を環境変数 VI_THREADS から読む (プロセスで 1 つ) ので、先読みだけを
+        // 絞ることができない。
+        waypoint_prefetch_threads: p!("waypoint_prefetch_threads", i64, 1),
+
+        // 機体の現在地からゴールまで方策が繋がった時点で solve を打ち切って走り出す
+        // (core::PlanConfig::early_start)。**既定は false**: 経路の外は未確定のままに
+        // なるので、機体が経路から外れると解き直しが要る (そのときは打ち切った場を
+        // 捨ててから最後まで解くので、待ちは合計で長くなる)。先読み
+        // (waypoint_prefetch) と違い追加のメモリは要らず、両者は併用できる
+        // — 先読みで用意した場は打ち切らないので、受け取れた点では関係しない。
+        early_start: p!("early_start", bool, false),
+
+        publish_value_function: p!("publish_value_function", bool, true),
+        // solve の途中経過の配信間隔。0 は「完了時のみ」。追従中の再配信は掃き
+        // スレッドが 2 秒ごとに出すので、ここを 0 にすると追従中は出なくなる。
+        value_publish_interval_ms: p!("value_publish_interval_ms", i64, 500),
+        cost_drawing_threshold: p!("cost_drawing_threshold", i64, 60),
+        window_cost_drawing_threshold: p!("window_cost_drawing_threshold", i64, 60),
     })
 }
 
@@ -532,13 +440,11 @@ fn stop_cmd(pub_cmd: &Publisher<geometry_msgs::msg::Twist>) {
 ///   `/tmp/vi_planner_sink` に逃がす。小メモリ機で黙って GB 級の `RamSink` を確保すると
 ///   OOM killer に落とされるため。
 ///
-/// `vi_global_planner` の同名関数と同じ判断順 (明示指定が先、上限による自動退避が後) だが、
-/// **ディスクに置いたときの代償はこちらのほうが大きい**。広域だけを解く
-/// `vi_global_planner` と違い、`vi_planner` の追従はパッチを置き直すたびに sink を読むので
-/// (10Hz の制御ループ)、SD カード上の sink は追従の遅延に直結する。逃がす先は
-/// できるだけ実ディスクでも速いところを `compact_sink_dir` で明示すること。
+/// 判断順は明示指定が先、上限による自動退避が後。追従はパッチを置き直すたびに
+/// sink を読むので (10Hz の制御ループ)、SD カード上の sink は追従の遅延に直結する。
+/// 逃がす先はできるだけ実ディスクでも速いところを `compact_sink_dir` で明示すること。
 fn compact_sink_dir(params: &Params, solver: U64Solver, nstates: usize) -> Option<PathBuf> {
-    if !matches!(solver, U64Solver::Frontier2DSparseCompact { .. }) {
+    if !solver.caps().out_of_core {
         return None;
     }
     let bytes = nstates as u64 * 12;
@@ -692,6 +598,48 @@ struct FollowCtx<'a> {
     tuning: FollowTuning,
 }
 
+/// 4 つのアクションサーバ・購読コールバック・掃きスレッドが共有するハンドル束。
+/// 各サーバはこれを 1 つ clone するだけでよい (以前は 6〜10 個の Arc を
+/// closure 用と内側 async 用に二重 clone していた)。
+struct Handles {
+    core: Mutex<PlannerCore>,
+    latest_pose: Mutex<Option<PoseView>>,
+    scan_queue: Mutex<Vec<ViLaserScan>>,
+    cmd_pub: Publisher<geometry_msgs::msg::Twist>,
+    viz: Option<Viz>,
+    /// 表示専用の経路 (`plan`)。standalone のときだけ Some。
+    plan_pub: Option<PlanPub>,
+}
+
+impl Handles {
+    /// 追従ループ用の借用ビュー。`with_plan: false` は Nav2 構成の follow_path
+    /// (表示用の `plan` は BT 側の compute_path_to_pose が出す)。
+    fn follow_ctx(&self, tuning: FollowTuning, with_plan: bool) -> FollowCtx<'_> {
+        FollowCtx {
+            core: &self.core,
+            latest_pose: &self.latest_pose,
+            scan_queue: &self.scan_queue,
+            cmd_pub: &self.cmd_pub,
+            plan_pub: if with_plan { self.plan_pub.as_ref() } else { None },
+            viz: self.viz.as_ref(),
+            tuning,
+        }
+    }
+}
+
+/// プリエンプト: 前のゴールの cancel を立て、自分の cancel をスロットへ置く。
+/// 追従を回す 3 つのサーバはスロットを共有する — 同じ 1 台を走らせるので、
+/// どれが来ても前のものは止まらなければならない。
+fn preempt(slot: &Mutex<Option<Arc<AtomicBool>>>) -> Arc<AtomicBool> {
+    let my = Arc::new(AtomicBool::new(false));
+    let mut slot = lock(slot);
+    if let Some(prev) = slot.take() {
+        prev.store(true, Ordering::SeqCst);
+    }
+    *slot = Some(Arc::clone(&my));
+    my
+}
+
 /// 1 ゴールぶんの追従ループ。
 ///
 /// solve 中だけロックを保持し、制御ループは **tick ごとに取得・解放**する
@@ -817,14 +765,7 @@ fn run_follow(
         // 計画要求を受けると、その solve は数秒〜数十秒ロックを握り続ける。
         // ここでブロックすると、その間ずっと直前の速度指令が出たままロボットが
         // 走り続けることになる (velocity_smoother のタイムアウト任せにしない)。
-        let guard = match core.try_lock() {
-            Ok(g) => Some(g),
-            Err(std::sync::TryLockError::WouldBlock) => None,
-            // 他スレッドの panic で毒された場合も、価値関数自体は
-            // ValueIterator の内部状態として一貫しているので続行する。
-            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
-        };
-        let Some(mut core) = guard else {
+        let Some(mut core) = try_lock(core) else {
             // 1〜2 tick 取れないのは同一ゴールのロールアウト待ち (BT の 1Hz
             // リプランはキャッシュヒットでも rollout + densify をロック内で回す)。
             // ここで毎回止めると、取り除いたはずの「1 秒ごとに 0 速度が挟まる」
@@ -918,7 +859,7 @@ fn run_follow(
             // 残したままだと BT が投げ直すたびに同じ場で同じ失敗を繰り返す
             // (prepare_goal はキャッシュヒットで solve に入らない)。捨てておけば
             // 次の要求が最後まで解き直す。収束済みの場なら何もしない。
-            if shared.lock().unwrap_or_else(|p| p.into_inner()).discard_truncated() {
+            if lock(shared).discard_truncated() {
                 eprintln!(
                     "vi_planner: dropped the truncated value function (early_start) after \
                      {failure_ticks} ticks without an action; the next request solves it \
@@ -941,10 +882,9 @@ fn run_follow(
 enum TourOutcome {
     /// 最後の点まで回った (途中で失敗した点があっても、進み続けたならこれ)。
     Done,
-    /// `stop_on_failure: true` で 1 点目の失敗のところで止めた。
-    Stopped,
-    /// 新しいゴールか cancel で止まった。
-    Preempted,
+    /// 中断 (`stop_on_failure: true` での停止 / 新しいゴールか cancel での
+    /// プリエンプト)。中身はそのままログへ出すメッセージ。
+    Aborted(&'static str),
 }
 
 /// `NavigateToPose` の Feedback を 1 tick ぶん作る。
@@ -1015,12 +955,7 @@ fn run_settle(ctx: &FollowCtx, cancel: &AtomicBool, dur: Duration) -> bool {
 
         let pose = *latest_pose.lock().unwrap();
         if let Some(pose) = pose {
-            let guard = match core.try_lock() {
-                Ok(g) => Some(g),
-                Err(std::sync::TryLockError::WouldBlock) => None,
-                Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
-            };
-            if let Some(mut c) = guard {
+            if let Some(mut c) = try_lock(core) {
                 let scans = std::mem::take(&mut *scan_queue.lock().unwrap());
                 c.set_window(pose);
                 for scan in &scans {
@@ -1141,7 +1076,7 @@ fn main() -> Result<()> {
     drop(binary_grid);
     let nstates =
         vi_grid.width as usize * vi_grid.height as usize * params.theta_cell_num as usize;
-    let use_compact = matches!(solver, U64Solver::Frontier2DSparseCompact { .. });
+    let use_compact = solver.caps().out_of_core;
     // 密が実際に確保するのは `states` (State 56 B/state) だけではない。
     // `set_sweep_orders` が掃き順を 6 本ぶん持つ (`[0..3]` 各 total、`[4]` 1.5×total、
     // `[5]` 0.5×total = 合わせて 6.0×total の i32) ので +24 B/state。
@@ -1308,34 +1243,76 @@ fn main() -> Result<()> {
     if let Some(pf) = prefetch.clone() {
         core = core.with_prefetch(pf);
     }
-    let core = Arc::new(Mutex::new(core));
+
+    // 6. 共有ハンドル束 (核・姿勢・スキャン・cmd_vel・可視化・表示用経路)。
+    //    cmd_vel は Nav2 構成では launch 側で cmd_vel_nav にリマップし
+    //    velocity_smoother を経由させる。可視化は価値関数が 1 本なので
+    //    value_function も 1 本。plan はスタンドアロンのみ — あちらでは
+    //    `compute_path_to_pose` を誰も呼ばないので、表示用の経路は追従側が
+    //    出さないと画面に 1 本も出ない (Nav2 構成では compute_path_to_pose の
+    //    成功が出すトピックなので立てない)。
+    let handles = Arc::new(Handles {
+        core: Mutex::new(core),
+        latest_pose: Mutex::new(None),
+        scan_queue: Mutex::new(Vec::new()),
+        cmd_pub: node.create_publisher::<geometry_msgs::msg::Twist>("cmd_vel".keep_last(1))?,
+        viz: if params.publish_value_function {
+            Some(Viz {
+                vf_pub: node.create_publisher::<nav_msgs::msg::OccupancyGrid>(
+                    "value_function".reliable().transient_local().keep_last(1),
+                )?,
+                win_pub: node.create_publisher::<nav_msgs::msg::OccupancyGrid>(
+                    "local_window_value".reliable().transient_local().keep_last(1),
+                )?,
+                clock: node.get_clock(),
+                frame_id: params.global_frame.clone(),
+                threshold_steps: params.cost_drawing_threshold.max(0) as u64,
+                window_threshold_steps: params.window_cost_drawing_threshold.max(0) as u64,
+                interval: Duration::from_millis(params.value_publish_interval_ms.max(0) as u64),
+            })
+        } else {
+            None
+        },
+        plan_pub: params
+            .standalone
+            .then(|| -> Result<PlanPub> {
+                Ok(PlanPub {
+                    path_pub: node
+                        .create_publisher::<nav_msgs::msg::Path>("plan".keep_last(1))?,
+                    clock: node.get_clock(),
+                    frame_id: params.global_frame.clone(),
+                })
+            })
+            .transpose()?,
+    });
 
     // 6a. 自己位置トピック購読 (tf2 代替)。
-    let latest_pose: Arc<Mutex<Option<PoseView>>> = Arc::new(Mutex::new(None));
-    let latest_pose_w = Arc::clone(&latest_pose);
-    let _pose_sub = node
-        .create_subscription::<geometry_msgs::msg::PoseWithCovarianceStamped, _>(
+    let _pose_sub = {
+        let h = Arc::clone(&handles);
+        node.create_subscription::<geometry_msgs::msg::PoseWithCovarianceStamped, _>(
             params.pose_topic.as_str().keep_last(1),
             move |msg: geometry_msgs::msg::PoseWithCovarianceStamped| {
-                *latest_pose_w.lock().unwrap() = Some(pose_view_from(&msg.pose.pose));
+                *lock(&h.latest_pose) = Some(pose_view_from(&msg.pose.pose));
             },
-        )?;
+        )?
+    };
 
     // 6b. スキャン購読 (sensor QoS = best effort)。tick 間に届いた分を貯めて
     //     制御ループが順に消化する。
-    let scan_queue: Arc<Mutex<Vec<ViLaserScan>>> = Arc::new(Mutex::new(Vec::new()));
-    let scan_queue_w = Arc::clone(&scan_queue);
-    let _scan_sub = node.create_subscription::<sensor_msgs::msg::LaserScan, _>(
-        params.scan_topic.as_str().best_effort().keep_last(5),
-        move |msg: sensor_msgs::msg::LaserScan| {
-            let mut q = scan_queue_w.lock().unwrap();
-            // 制御ループが止まっていても際限なく溜めない (最新を優先)。
-            if q.len() >= 10 {
-                q.remove(0);
-            }
-            q.push(vi_scan_from(&msg));
-        },
-    )?;
+    let _scan_sub = {
+        let h = Arc::clone(&handles);
+        node.create_subscription::<sensor_msgs::msg::LaserScan, _>(
+            params.scan_topic.as_str().best_effort().keep_last(5),
+            move |msg: sensor_msgs::msg::LaserScan| {
+                let mut q = lock(&h.scan_queue);
+                // 制御ループが止まっていても際限なく溜めない (最新を優先)。
+                if q.len() >= 10 {
+                    q.remove(0);
+                }
+                q.push(vi_scan_from(&msg));
+            },
+        )?
+    };
 
     // 6b-2. 先読み対象の並び (nav_msgs/Path)。daifuku_waypoint_manager が
     //       waypoint を編集するたび latch して出す。**受け取っただけでは何も
@@ -1371,30 +1348,7 @@ fn main() -> Result<()> {
         }
     };
 
-    // 6c. cmd_vel パブリッシャ (Nav2 構成では launch 側で cmd_vel_nav に
-    //     リマップし velocity_smoother を経由させる)。
-    let cmd_pub = node.create_publisher::<geometry_msgs::msg::Twist>("cmd_vel".keep_last(1))?;
-
-    // 6d. 可視化。価値関数は 1 本なので value_function も 1 本。
-    let viz: Option<Arc<Viz>> = if params.publish_value_function {
-        Some(Arc::new(Viz {
-            vf_pub: node.create_publisher::<nav_msgs::msg::OccupancyGrid>(
-                "value_function".reliable().transient_local().keep_last(1),
-            )?,
-            win_pub: node.create_publisher::<nav_msgs::msg::OccupancyGrid>(
-                "local_window_value".reliable().transient_local().keep_last(1),
-            )?,
-            clock: node.get_clock(),
-            frame_id: params.global_frame.clone(),
-            threshold_steps: params.cost_drawing_threshold.max(0) as u64,
-            window_threshold_steps: params.window_cost_drawing_threshold.max(0) as u64,
-            interval: Duration::from_millis(params.value_publish_interval_ms.max(0) as u64),
-        }))
-    } else {
-        None
-    };
-
-    // 6d-2. 狭域 → 広域のフィードバック: 共有価値関数の全域掃き。
+    // 6c. 狭域 → 広域のフィードバック: 共有価値関数の全域掃き。
     //
     // 追従 (`observe_scan`) が書いた local_penalty はローカルウィンドウ (±1m) の
     // 中で値を上げるだけで、そこから外へは広がらない。ここで同じ `states` を
@@ -1416,8 +1370,7 @@ fn main() -> Result<()> {
     // budget ms だけ掃いてロックを手放し、idle ms 待つ形にしてある
     // (既定 20:60 = 1 コアの 25%)。
     if params.global_sweep {
-        let core = Arc::clone(&core);
-        let viz = viz.clone();
+        let h = Arc::clone(&handles);
         let budget = Duration::from_millis(params.global_sweep_budget_ms.max(1) as u64);
         let idle = Duration::from_millis(params.global_sweep_idle_ms.max(0) as u64);
         std::thread::spawn(move || {
@@ -1446,11 +1399,7 @@ fn main() -> Result<()> {
                 // ロックの中で作って、外で配信する (可視化 1 枚は 100 万セル級)。
                 let mut grid = None;
                 {
-                    let mut c = match core.lock() {
-                        Ok(g) => g,
-                        // 他スレッドの panic で毒されても価値関数自体は一貫している。
-                        Err(p) => p.into_inner(),
-                    };
+                    let mut c = lock(&h.core);
                     if !c.is_dirty() {
                         // 掃く仕事が無い。ロックはすぐ返して、次に狭域が場を動かす
                         // まで長めに待つ (この確認自体もロックを要るので、間隔を
@@ -1503,14 +1452,14 @@ fn main() -> Result<()> {
                         }
                         // `interval: 0` は「solve 完了時のみ」なので、途中の
                         // 再配信はしない (伝播 1 回の完了は完了として出す)。
-                        if let Some(v) = viz.as_ref() {
+                        if let Some(v) = h.viz.as_ref() {
                             if done || !v.interval.is_zero() {
                                 grid = c.value_grid(v.threshold_steps);
                             }
                         }
                     }
                 }
-                if let (Some(v), Some(g)) = (viz.as_ref(), grid) {
+                if let (Some(v), Some(g)) = (h.viz.as_ref(), grid) {
                     let _ = v.vf_pub.publish(ros_grid_from(&g, &v.frame_id, v.stamp()));
                 }
                 std::thread::sleep(idle);
@@ -1544,49 +1493,24 @@ fn main() -> Result<()> {
         settle: Duration::from_secs_f64(params.goal_retry_settle_sec.max(0.0)),
     };
 
-    // スタンドアロンでは `compute_path_to_pose` を誰も呼ばないので、表示用の経路は
-    // 追従側が出す。Nav2 構成では planner_server (ここでは compute_path_to_pose の
-    // 成功) が出すトピックなので、そちらでは立てない。
-    let plan_pub: Option<Arc<PlanPub>> = params
-        .standalone
-        .then(|| -> Result<Arc<PlanPub>> {
-            Ok(Arc::new(PlanPub {
-                path_pub: node.create_publisher::<nav_msgs::msg::Path>("plan".keep_last(1))?,
-                clock: node.get_clock(),
-                frame_id: params.global_frame.clone(),
-            }))
-        })
-        .transpose()?;
-
-    // 6e. compute_path_to_pose action サーバ (planner_server の置き換え)。
+    // 6d. compute_path_to_pose action サーバ (planner_server の置き換え)。
     let _plan_server = {
-        let core = Arc::clone(&core);
-        let latest_pose = Arc::clone(&latest_pose);
+        let handles = Arc::clone(&handles);
         let plan_cancel = Arc::clone(&plan_cancel);
-        let viz = viz.clone();
         let frame_id = frame_id.clone();
         let node_clock = node_clock.clone();
 
         node.create_action_server::<nav2_msgs::action::ComputePathToPose, _>(
             "compute_path_to_pose",
             move |requested_goal: RequestedGoal<nav2_msgs::action::ComputePathToPose>| {
-                let core = Arc::clone(&core);
-                let latest_pose = Arc::clone(&latest_pose);
+                let h = Arc::clone(&handles);
                 let plan_cancel = Arc::clone(&plan_cancel);
-                let viz = viz.clone();
                 let frame_id = frame_id.clone();
                 let node_clock = node_clock.clone();
 
                 async move {
-                    // ── プリエンプト: 前の計画を止め、自分の cancel を登録 ──
-                    let my_cancel = Arc::new(AtomicBool::new(false));
-                    {
-                        let mut slot = plan_cancel.lock().unwrap();
-                        if let Some(prev) = slot.take() {
-                            prev.store(true, Ordering::SeqCst);
-                        }
-                        *slot = Some(Arc::clone(&my_cancel));
-                    }
+                    // 前の計画を止め、自分の cancel を登録。
+                    let my_cancel = preempt(&plan_cancel);
 
                     let accepted = requested_goal.accept();
                     let goal_msg = accepted.goal();
@@ -1594,7 +1518,7 @@ fn main() -> Result<()> {
                     let start = if goal_msg.use_start {
                         Some(pose_view_from(&goal_msg.start.pose))
                     } else {
-                        *latest_pose.lock().unwrap()
+                        *lock(&h.latest_pose)
                     };
                     let executing = accepted.execute();
 
@@ -1618,15 +1542,14 @@ fn main() -> Result<()> {
                     type PlanOutcome =
                         std::result::Result<(Vec<PathPose>, PlanStats), PlanError>;
                     let (done_tx, done_rx) = futures::channel::oneshot::channel::<PlanOutcome>();
-                    let core_t = Arc::clone(&core);
-                    let viz_t = viz.clone();
+                    let h_t = Arc::clone(&h);
                     let frame_t = frame_id.clone();
                     std::thread::spawn(move || {
-                        let mut core = core_t.lock().unwrap();
+                        let mut core = lock(&h_t.core);
                         let mut last_viz: Option<Instant> = None;
                         let result =
                             core.plan_with_progress(start, goal, &my_cancel, &mut |vi| {
-                                let Some(v) = &viz_t else { return };
+                                let Some(v) = h_t.viz.as_ref() else { return };
                                 if !v.due(&mut last_viz) {
                                     return;
                                 }
@@ -1635,7 +1558,7 @@ fn main() -> Result<()> {
                                     v.vf_pub.publish(ros_grid_from(&g, &frame_t, v.stamp()));
                             });
                         // solve が走った場合のみ完成形を配信し直す。
-                        if let (Ok((_, stats)), Some(v)) = (&result, &viz_t) {
+                        if let (Ok((_, stats)), Some(v)) = (&result, h_t.viz.as_ref()) {
                             if stats.solved_now {
                                 if let Some(g) = core.value_grid(v.threshold_steps) {
                                     let _ = v
@@ -1706,48 +1629,29 @@ fn main() -> Result<()> {
         )?
     };
 
-    // 6f. navigate_to_pose action サーバ (bt_navigator + behavior_server の置き換え)。
+    // 6e. navigate_to_pose action サーバ (bt_navigator + behavior_server の置き換え)。
     //     **standalone のときだけ立てる** — Nav2 構成で立てると bt_navigator と
     //     2 つになり、クライアントは先に見つけたほうへ繋ぐ (どちらに繋がったかは
     //     どこにも出ないので、症状は「ときどき挙動が違う」になる)。
     let _nav_to_pose_server = if !params.standalone {
         None
     } else {
-        let core = Arc::clone(&core);
-        let latest_pose = Arc::clone(&latest_pose);
-        let scan_queue = Arc::clone(&scan_queue);
-        let cmd_pub = cmd_pub.clone();
+        let handles = Arc::clone(&handles);
         let follow_cancel = Arc::clone(&follow_cancel);
-        let viz = viz.clone();
-        let plan_pub = plan_pub.clone();
         let frame_id = frame_id.clone();
         let node_clock = node_clock.clone();
 
         Some(node.create_action_server::<nav2_msgs::action::NavigateToPose, _>(
             "navigate_to_pose",
             move |requested_goal: RequestedGoal<nav2_msgs::action::NavigateToPose>| {
-                let core = Arc::clone(&core);
-                let latest_pose = Arc::clone(&latest_pose);
-                let scan_queue = Arc::clone(&scan_queue);
-                let cmd_pub = cmd_pub.clone();
+                let h = Arc::clone(&handles);
                 let follow_cancel = Arc::clone(&follow_cancel);
-                let viz = viz.clone();
-                let plan_pub = plan_pub.clone();
                 let frame_id = frame_id.clone();
                 let node_clock = node_clock.clone();
 
                 async move {
-                    // ── プリエンプト: 前の追従を止め、自分の cancel を登録 ──
-                    // スロットは follow_path と共有する。3 つのサーバは同じ 1 台を
-                    // 走らせるので、どれが来ても前のものは止まらなければならない。
-                    let my_cancel = Arc::new(AtomicBool::new(false));
-                    {
-                        let mut slot = follow_cancel.lock().unwrap();
-                        if let Some(prev) = slot.take() {
-                            prev.store(true, Ordering::SeqCst);
-                        }
-                        *slot = Some(Arc::clone(&my_cancel));
-                    }
+                    // 前の追従を止め、自分の cancel を登録。
+                    let my_cancel = preempt(&follow_cancel);
 
                     let accepted = requested_goal.accept();
                     let goal = pose_view_from(&accepted.goal().pose.pose);
@@ -1758,15 +1662,7 @@ fn main() -> Result<()> {
                     let (done_tx, done_rx) = futures::channel::oneshot::channel::<Outcome>();
                     let cancel_t = Arc::clone(&my_cancel);
                     std::thread::spawn(move || {
-                        let ctx = FollowCtx {
-                            core: &core,
-                            latest_pose: &latest_pose,
-                            scan_queue: &scan_queue,
-                            cmd_pub: &cmd_pub,
-                            plan_pub: plan_pub.as_deref(),
-                            viz: viz.as_deref(),
-                            tuning,
-                        };
+                        let ctx = h.follow_ctx(tuning, true);
                         let retries = AtomicU64::new(0);
                         let t0 = Instant::now();
                         let outcome =
@@ -1819,7 +1715,7 @@ fn main() -> Result<()> {
         )?)
     };
 
-    // 6g. follow_waypoints action サーバ (nav2_waypoint_follower の置き換え)。
+    // 6f. follow_waypoints action サーバ (nav2_waypoint_follower の置き換え)。
     //     **順路は配列の順**に回る (距離で並べ替えたりはしない。nav2 側も同じ)。
     //
     //     ここで順路を丸ごと受け取れることには、単に 1 ノード減る以上の意味がある:
@@ -1830,13 +1726,8 @@ fn main() -> Result<()> {
     let _follow_waypoints_server = if !params.standalone {
         None
     } else {
-        let core = Arc::clone(&core);
-        let latest_pose = Arc::clone(&latest_pose);
-        let scan_queue = Arc::clone(&scan_queue);
-        let cmd_pub = cmd_pub.clone();
+        let handles = Arc::clone(&handles);
         let follow_cancel = Arc::clone(&follow_cancel);
-        let viz = viz.clone();
-        let plan_pub = plan_pub.clone();
         let prefetch = prefetch.clone();
         let stop_on_failure = params.waypoint_stop_on_failure;
         let pause = Duration::from_secs_f64(params.waypoint_pause_sec.max(0.0));
@@ -1844,24 +1735,12 @@ fn main() -> Result<()> {
         Some(node.create_action_server::<nav2_msgs::action::FollowWaypoints, _>(
             "follow_waypoints",
             move |requested_goal: RequestedGoal<nav2_msgs::action::FollowWaypoints>| {
-                let core = Arc::clone(&core);
-                let latest_pose = Arc::clone(&latest_pose);
-                let scan_queue = Arc::clone(&scan_queue);
-                let cmd_pub = cmd_pub.clone();
+                let h = Arc::clone(&handles);
                 let follow_cancel = Arc::clone(&follow_cancel);
-                let viz = viz.clone();
-                let plan_pub = plan_pub.clone();
                 let prefetch = prefetch.clone();
 
                 async move {
-                    let my_cancel = Arc::new(AtomicBool::new(false));
-                    {
-                        let mut slot = follow_cancel.lock().unwrap();
-                        if let Some(prev) = slot.take() {
-                            prev.store(true, Ordering::SeqCst);
-                        }
-                        *slot = Some(Arc::clone(&my_cancel));
-                    }
+                    let my_cancel = preempt(&follow_cancel);
 
                     let accepted = requested_goal.accept();
                     let goals: Vec<PoseView> =
@@ -1884,15 +1763,7 @@ fn main() -> Result<()> {
                         futures::channel::oneshot::channel::<(TourOutcome, Vec<i32>)>();
                     let cancel_t = Arc::clone(&my_cancel);
                     std::thread::spawn(move || {
-                        let ctx = FollowCtx {
-                            core: &core,
-                            latest_pose: &latest_pose,
-                            scan_queue: &scan_queue,
-                            cmd_pub: &cmd_pub,
-                            plan_pub: plan_pub.as_deref(),
-                            viz: viz.as_deref(),
-                            tuning,
-                        };
+                        let ctx = h.follow_ctx(tuning, true);
                         let retries = AtomicU64::new(0);
                         let mut missed: Vec<i32> = Vec::new();
                         let mut outcome = TourOutcome::Done;
@@ -1911,7 +1782,7 @@ fn main() -> Result<()> {
                             match run_goal(&ctx, *goal, &cancel_t, retry, &retries, &|_| {}) {
                                 Outcome::Reached => {}
                                 Outcome::Preempted => {
-                                    outcome = TourOutcome::Preempted;
+                                    outcome = TourOutcome::Aborted("vi_planner: tour preempted");
                                     break;
                                 }
                                 Outcome::Failed(reason) => {
@@ -1921,7 +1792,10 @@ fn main() -> Result<()> {
                                     );
                                     missed.push(i as i32);
                                     if stop_on_failure {
-                                        outcome = TourOutcome::Stopped;
+                                        outcome = TourOutcome::Aborted(
+                                            "ERROR: vi_planner: tour stopped at the first \
+                                             failure (stop_on_failure: true)",
+                                        );
                                         break;
                                     }
                                 }
@@ -1929,11 +1803,11 @@ fn main() -> Result<()> {
                             // 次の点へ向かうまでの間 (`waypoint_pause_sec`)。単に
                             // 待つのではなく場を更新し続ける (run_settle)。
                             if !pause.is_zero() && !run_settle(&ctx, &cancel_t, pause) {
-                                outcome = TourOutcome::Preempted;
+                                outcome = TourOutcome::Aborted("vi_planner: tour preempted");
                                 break;
                             }
                         }
-                        stop_cmd(&cmd_pub);
+                        stop_cmd(ctx.cmd_pub);
                         let _ = done_tx.send((outcome, missed));
                     });
 
@@ -1951,15 +1825,8 @@ fn main() -> Result<()> {
                                     );
                                     executing.succeeded_with(result)
                                 }
-                                TourOutcome::Stopped => {
-                                    eprintln!(
-                                        "ERROR: vi_planner: tour stopped at the first failure \
-                                         (stop_on_failure: true)"
-                                    );
-                                    executing.aborted_with(result)
-                                }
-                                TourOutcome::Preempted => {
-                                    eprintln!("vi_planner: tour preempted");
+                                TourOutcome::Aborted(msg) => {
+                                    eprintln!("{msg}");
                                     executing.aborted_with(result)
                                 }
                             }
@@ -1981,28 +1848,17 @@ fn main() -> Result<()> {
         )?)
     };
 
-    // 6h. follow_path action サーバ (controller_server の置き換え)。
+    // 6g. follow_path action サーバ (controller_server の置き換え)。
     // `follow: false` (nav2_controller と組む構成) では立てない。
     let _follow_server = params.follow.then(|| node.create_action_server::<nav2_msgs::action::FollowPath, _>(
         "follow_path",
         move |requested_goal: RequestedGoal<nav2_msgs::action::FollowPath>| {
-            let core = Arc::clone(&core);
-            let latest_pose = Arc::clone(&latest_pose);
-            let scan_queue = Arc::clone(&scan_queue);
-            let cmd_pub = cmd_pub.clone();
+            let h = Arc::clone(&handles);
             let follow_cancel = Arc::clone(&follow_cancel);
-            let viz = viz.clone();
 
             async move {
-                // ── プリエンプト: 前の追従を止め、自分の cancel を登録 ──
-                let my_cancel = Arc::new(AtomicBool::new(false));
-                {
-                    let mut slot = follow_cancel.lock().unwrap();
-                    if let Some(prev) = slot.take() {
-                        prev.store(true, Ordering::SeqCst);
-                    }
-                    *slot = Some(Arc::clone(&my_cancel));
-                }
+                // 前の追従を止め、自分の cancel を登録。
+                let my_cancel = preempt(&follow_cancel);
 
                 let accepted = requested_goal.accept();
                 // ゴール姿勢は path 終端 (controller_id / goal_checker_id は無視)。
@@ -2021,23 +1877,10 @@ fn main() -> Result<()> {
                 // ── 追従本体は専用スレッド (solve + 制御ループがブロックする) ──
                 let feedback = executing.feedback_publisher();
                 let (done_tx, done_rx) = futures::channel::oneshot::channel::<Outcome>();
-                let core_t = Arc::clone(&core);
                 let cancel_t = Arc::clone(&my_cancel);
-                let latest_pose_t = Arc::clone(&latest_pose);
-                let scan_queue_t = Arc::clone(&scan_queue);
-                let cmd_pub_t = cmd_pub.clone();
-                let viz_t = viz.clone();
                 std::thread::spawn(move || {
-                    let ctx = FollowCtx {
-                        core: &core_t,
-                        latest_pose: &latest_pose_t,
-                        scan_queue: &scan_queue_t,
-                        cmd_pub: &cmd_pub_t,
-                        // Nav2 構成で `plan` を出すのは compute_path_to_pose の側。
-                        plan_pub: None,
-                        viz: viz_t.as_deref(),
-                        tuning,
-                    };
+                    // Nav2 構成で `plan` を出すのは compute_path_to_pose の側。
+                    let ctx = h.follow_ctx(tuning, false);
                     // BT 構成では投げ直しは BT (RecoveryNode) の仕事なので、
                     // ここは 1 回きり (run_goal を通さない)。
                     let outcome = run_follow(&ctx, goal, &cancel_t, &|p| {
@@ -2133,12 +1976,11 @@ fn wait_for_map(
     use std::sync::mpsc::sync_channel;
 
     let (tx, rx) = sync_channel::<nav_msgs::msg::OccupancyGrid>(1);
-    let tx_c = tx.clone();
 
     let _sub = node.create_subscription::<nav_msgs::msg::OccupancyGrid, _>(
         "map".transient_local().reliable().keep_last(1),
         move |msg: nav_msgs::msg::OccupancyGrid| {
-            let _ = tx_c.try_send(msg);
+            let _ = tx.try_send(msg);
         },
     )?;
 

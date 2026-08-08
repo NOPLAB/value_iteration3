@@ -1,13 +1,12 @@
 FROM ros:humble-ros-base-jammy
 
 # ros-humble-nav2-common は後段の nav2_msgs ソースビルドの buildtool 依存
-# (nav2_package() CMake マクロ)。
+# (nav2_package() CMake マクロ)。git/build-essential/colcon/vcstool/cmake は
+# base イメージ同梱 (dpkg -s で確認済み) なのでここでは入れない。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git curl build-essential pkg-config libclang-dev \
-      python3-colcon-common-extensions \
+      curl pkg-config libclang-dev \
       python3-pip \
-      python3-vcstool \
-      libssl-dev cmake \
+      libssl-dev \
       ros-humble-nav2-common \
     && rm -rf /var/lib/apt/lists/*
 

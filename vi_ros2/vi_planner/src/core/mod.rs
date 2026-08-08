@@ -1,17 +1,13 @@
 //! rclrs 非依存の統合プランナ中核。**1 本の価値関数**を広域 (経路計画) と
-//! 狭域 (経路追従) の両方で共有する。
-//!
-//! vi_global_planner (`compute_path_to_pose`) と vi_local_planner
-//! (`follow_path`) を別プロセスで動かすと、同じ地図・同じゴールに対して同じ
-//! 価値反復を 2 回解くことになる (走り出しまでの時間も、常駐する価値関数の
-//! メモリも 2 倍)。しかも広域側が作った `nav_msgs/Path` は狭域側が終端姿勢しか
-//! 読まないので、ロールアウトの成果はほぼ捨てられていた。ここではその 2 つを
-//! 1 つの価値関数の上に載せ直す:
+//! 狭域 (経路追従) の両方で共有する:
 //!
 //!   - solve はゴールごとに 1 回だけ (`prepare_goal_with_progress`)
-//!   - `plan_*` は解決済み価値関数の貪欲ロールアウト = 旧実装の
-//!     「キャッシュヒット経路」そのもの
+//!   - `plan_*` は解決済み価値関数の貪欲ロールアウト
 //!   - 追従は同じ価値関数の ±1m ウィンドウをスキャンで補正しながら回す
+//!
+//! 狭域 → 広域の伝播 (全域掃き) は [`PlannerCore::sweep_global`]、収束前に
+//! 走り出す早期打ち切りは [`PlannerCore::prepare_goal_with_progress`] の doc に
+//! それぞれ詳細がある (経緯と実測値はリポジトリ CLAUDE.md)。
 //!
 //! # ファイルの分かれ方
 //!
@@ -20,97 +16,23 @@
 //! - [`compact`] — アウトオブコア経路だけの機構 (sink・追従パッチ・penalty 表・
 //!   タイル修復)。`PlannerCore` の compact 側メソッドもそちらに置いてある。
 //! - [`prefetch`] — 次のウェイポイントを走行中に解いておく先読み ([`Prefetcher`])。
-//!   付けるかどうかは任意で、付けなければ以下は何も変わらない。走り出しまでの
-//!   待ちを消すという狙いは [`PlanConfig::early_start`] と同じだが、あちらが
-//!   「解く量を減らす」のに対しこちらは「解く時刻を早める」ので、併用できる。
 //! - `core/tests.rs` — 両経路をまたぐテスト。
-//!
-//! # 走り出しの短縮 ([`PlanConfig::early_start`], 既定 false)
-//!
-//! solve はゴールごとに 1 回で、その間**機体は止まっている** (19F で 29 秒、
-//! 津田沼 compact で 87 秒)。ここで解いているのは地図の全域ぶんの価値関数だが、
-//! 走り出すのに要るのは**いまの姿勢からゴールまでの経路**だけなので、それが
-//! 引けた時点で止めてしまえる。判定はロールアウトそのもの ([`reaches_goal`]) で、
-//! 密は `solve_chunk` の切れ目ごと、compact は波の finalize ごとに試す。
-//!
-//! 止めた場でよい理由は経路の側にある。compact の finalize は値の昇順に進むので
-//! sink に載っている列は**最後まで解いたときと同じ値**で、未確定の列が
-//! `MAX_COST` のまま残っているだけ。密は値が上から単調に下がるので途中の場は
-//! 常に Bellman の上界 = 貪欲降下は必ず値を下げながらゴールに着く (循環しない)
-//! — ただし**最短とは限らない**。
-//!
-//! 残りは `global_sweep: true` なら走りながら詰まる。**起点の作り方だけが 2 経路で
-//! 違う**: 密は打ち切った時点で `dirty` を立てて全域掃きに渡す (立てるものが他に
-//! ないため)。compact のタイル修復は変化した範囲から広げる形なので `dirty` を
-//! 立てても待ち行列が空で空振りするが、追従が始まれば窓が未確定域 (機体の後ろは
-//! まだ `MAX_COST`) をまたいで値が動き、`commit_window` がそれを sink へ返して
-//! タイルを積む — つまり**1 tick 遅れで同じ状態になる**。
-//!
-//! 承知しておくこと 3 つ:
-//!
-//! - **経路の外は未確定。** 機体が経路から外れると方策が引けない位置に入り得る。
-//!   そのときは打ち切った場を捨てて解き直すので ([`PlannerCore::discard_truncated`])、
-//!   **待ちは合計で長くなる** (打ち切りぶん + 最後まで)。
-//! - **キャッシュヒットは solve に入らない。** 逃げ道を持たずに打ち切った場を
-//!   載せたままにすると、BT が 1Hz で投げ直しても同じ場で同じ失敗を繰り返す。
-//!   `plan_*` の中の解き直しと `discard_truncated` はそのための道。
-//! - **compact では効かない地図がある。** finalize は値バンド
-//!   (`COUPLE_SAFETY(4) · 遷移到達セル数 · 最大 penalty`) 単位でしか進まないので、
-//!   地図の値域が丸ごと 1 バンドに収まると波 2 つで解き終わり、打ち切る隙がない。
-//!   **エラーも警告も出ず、ただ何も短くならない**。バンドは 0.1 m/cell・
-//!   `safety_radius_penalty: 30` で 4·4·31 ≒ 500 ステップ ≒ 150 m ぶんの値域なので、
-//!   建物 1 フロア程度の地図はまず 1 バンドに収まる (解像度が粗いほどバンドは
-//!   狭くなるので、`map_scale` を上げた広域地図のほうが効きやすい)。効いたかは
-//!   `SolveStats::truncated` — ログの "cut short" / ", truncated" で見る。
-//!
-//! # 狭域 → 広域のフィードバック ([`PlannerCore::sweep_global`])
-//!
-//! 上の 3 つ目で狭域が書き込む `local_penalty` は、密経路では**同じ `states` に
-//! 載る**。共有場はここで既に成立している。足りないのは伝播で、局所精密化
-//! (`refine_pass_until`) が掃くのはウィンドウの中だけなので、上がった値はそこで
-//! 止まり広域のロールアウトは塞がった通路へ降り続ける。`sweep_global` が同じ
-//! `states` を全域 Gauss–Seidel で掃き直してそれを外へ広げる (詳細はそちらの doc)。
-//!
-//! `local_penalty` はウィンドウの外では**誰も消さない** (`set_local_cost` は
-//! `in_local_area` の中しか触らない)。障害物の脇を通り過ぎるとその penalty は
-//! そのゴールの間ずっと `states` に残り、全域掃きのたびに広域の場を歪め続ける。
-//! これは本家 `ViNode` から引き継いだ挙動で、意図的にそのままにしてある
-//! (「一度通れないと分かった場所は覚えておく」= 望ましい側の効果でもあるため)。
-//! 消したければゴールを取り直すこと。
-//!
-//! ## 効いているかを見るときに引っかかる 2 つ
-//!
-//! - **塞ぎ方で桁が変わる。** `set_local_cost` が置くのは壁ではなくコストなので、
-//!   通路の一部だけを塞いでも脇を抜けられれば遠方の値はほぼ動かない (幅 2m の
-//!   通路を幅 0.4m 塞いで +0.75 ステップ = `cost_drawing_threshold: 60` の色 1 段)。
-//!   幅いっぱい塞げば桁が変わる (実測 13 → 38 ステップ、12 秒相当で収束。
-//!   `tests::a_full_width_block_raises_the_value_far_outside_the_window`)。
-//! - **走行中は待ち行列がまず空にならない** (compact 経路)。壁が窓 (±1m) に
-//!   入っていれば `set_local_cost` が毎 tick penalty を塗り直すので、次の伝播が
-//!   積まれ続ける (実測 1000 tick 中 987 tick が dirty)。「1 回終わった」ログを
-//!   待っても出ないので、[`PlannerCore::repair_progress`] のほうを見ること。
 //!
 //! # 2 つの経路: 密 (dense) とアウトオブコア (compact)
 //!
-//! `PlanConfig::solver` が `frontier2d_sparse_compact` かどうかで価値関数の持ち方が
-//! 変わる。広域と狭域が 1 本の場を共有するという上の性質はどちらでも同じ。
+//! `PlanConfig::solver` が out-of-core かどうかで価値関数の持ち方が変わる。
+//! 広域と狭域が 1 本の場を共有するという上の性質はどちらでも同じ。
 //!
-//! - **密**: `ValueIteratorLocal` を全域ぶん確保する (`State` は 56 B/state)。
-//!   狭域はその `states` をその場で書き換える。小〜中規模の地図はこちら。
+//! - **密**: `ValueIteratorLocal` を全域ぶん確保する。狭域はその `states` を
+//!   その場で書き換える。小〜中規模の地図はこちら。
 //! - **compact**: `solve_compact_mapped` が `states` を作らずに解き、確定出力
 //!   (12 B/state) だけを `CompactSink` (既定は mmap ファイル) に置く。追従は
 //!   `states` を必要とするので、**ロボット近傍だけを compact の場から起こした
-//!   小さな密パッチ** ([`compact::Patch`]) の上で回す。津田沼のような広域地図
-//!   (0.25 m/cell で 5650 万状態 = 密なら 3.17 GB) を Pi4 4GB に載せるための経路。
+//!   小さな密パッチ** ([`compact::Patch`]) の上で回す。
 //!
-//! compact 側の作り (sink がどう共有場になるか、全域伝播をタイル修復でどう回すか)
-//! は [`compact`] の doc にある。
-//!
-//! `BuildParams` が vi_global_planner::core と重複しているのは意図的
-//! (クレート間依存を避けるため; vi_local_planner から引き継いだ規約)。
-//!
-//! このモジュールは vi_reference のみに依存し、ホストで `cargo test --lib`
-//! できる (分離クレート方式; リポジトリ CLAUDE.md 参照)。
+//! `BuildParams` の重複定義は意図的 (クレート間依存を避ける)。このモジュールは
+//! vi_reference のみに依存し、ホストで `cargo test --lib` できる (分離クレート
+//! 方式; リポジトリ CLAUDE.md 参照)。
 
 mod compact;
 mod follow;
@@ -121,10 +43,8 @@ mod tests;
 pub use follow::{DwaController, FollowController, FollowKind, GreedyController, MppiController};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
-
-use ndarray::Array2;
 
 use vi_reference::bridge::{value_slice_to_occupancy, yaw_to_goal_theta_deg, PoseView};
 use vi_reference::msg::{LaserScan, OccupancyGrid};
@@ -138,6 +58,22 @@ use vi_reference::{Action, ValueIteratorLocal};
 
 use compact::{new_patch, new_repair, CompactField, Patch, PenaltyOverlay, Repair};
 pub use prefetch::Prefetcher;
+
+/// 他スレッドの panic で毒された Mutex もそのまま使い続けて取る。この核の場も
+/// 先読みの state も、フィールドが独立していて panic を跨ぐ不変条件を持たない
+/// (価値関数は `ValueIterator` の内部状態として一貫している) ため。
+pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// [`lock`] の try 版。取れなければ `None` (WouldBlock)。毒は同じく無視する。
+pub fn try_lock<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match m.try_lock() {
+        Ok(g) => Some(g),
+        Err(TryLockError::WouldBlock) => None,
+        Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+    }
+}
 
 /// ゴールごとの ValueIterator 構築入力 (地図は起動時に一度だけ取り込む)。
 /// vi_global_planner::core::BuildParams と同型 — クレート間依存を避けるための
@@ -459,10 +395,11 @@ fn is_final(vi: &ValueIterator, ix: i32, iy: i32, it: i32) -> bool {
 /// も同じ実装で描く。solve 中の途中経過 (`*_with_progress` のコールバック) からも呼べる。
 pub fn value_grid_on(p: &dyn PolicyView, threshold_steps: u64) -> OccupancyGrid {
     let (nx, ny, _) = p.cell_num();
-    let mut slice = Array2::<u64>::zeros((ny as usize, nx as usize));
+    let (w, h) = (nx as usize, ny as usize);
+    let mut slice = vec![0u64; w * h];
     for iy in 0..ny {
         for ix in 0..nx {
-            slice[[iy as usize, ix as usize]] = p.value_at(ix, iy, 0);
+            slice[iy as usize * w + ix as usize] = p.value_at(ix, iy, 0);
         }
     }
     let (ox, oy) = p.map_origin();
@@ -473,7 +410,7 @@ pub fn value_grid_on(p: &dyn PolicyView, threshold_steps: u64) -> OccupancyGrid 
         origin_x: ox,
         origin_y: oy,
         origin_quat: p.map_origin_quat(),
-        data: value_slice_to_occupancy(&slice, threshold_steps),
+        data: value_slice_to_occupancy(&slice, w, h, threshold_steps),
     }
 }
 
@@ -903,10 +840,10 @@ impl PlannerCore {
             return None;
         }
         let (w, h) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
-        let mut slice = Array2::<u64>::zeros((h, w));
+        let mut slice = vec![0u64; w * h];
         for iy in y0..=y1 {
             for ix in x0..=x1 {
-                slice[[(iy - y0) as usize, (ix - x0) as usize]] =
+                slice[(iy - y0) as usize * w + (ix - x0) as usize] =
                     vi.base.states[vi.base.to_index(ix, iy, it) as usize].total_cost;
             }
         }
@@ -917,7 +854,7 @@ impl PlannerCore {
             origin_x: vi.base.map_origin_x + x0 as f64 * vi.base.xy_resolution,
             origin_y: vi.base.map_origin_y + y0 as f64 * vi.base.xy_resolution,
             origin_quat: vi.base.map_origin_quat.clone(),
-            data: value_slice_to_occupancy(&slice, threshold_steps),
+            data: value_slice_to_occupancy(&slice, w, h, threshold_steps),
         })
     }
 
@@ -980,6 +917,7 @@ impl PlannerCore {
     }
 
     /// ウィンドウ全体を `n` パス回す (決定的テスト用)。
+    #[cfg(test)]
     pub fn refine_passes(&mut self, n: usize) {
         for _ in 0..n {
             let _ = self.refine_pass_until(|| false);

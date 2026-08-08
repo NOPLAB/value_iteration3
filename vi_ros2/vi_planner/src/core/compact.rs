@@ -1,16 +1,9 @@
 //! アウトオブコア (compact) 経路だけの機構。密 (dense) 経路との違いは価値関数の
 //! **持ち方**だけで、「広域と狭域が 1 本の場を共有する」という [`super`] の性質は
 //! どちらでも同じように成り立つ — 密の `states` にあたるものが、こちらでは
-//! [`CompactField`] の sink になる。
-//!
-//! `solve_compact_mapped` は `states` を作らずに解き、確定出力 (12 B/state) だけを
-//! `CompactSink` (既定は mmap ファイル) に置く。津田沼のような広域地図
-//! (0.25 m/cell で 5650 万状態 = 密なら 3.17 GB) を Pi4 4GB に載せるための経路。
-//!
-//! [`PlannerCore`] のうち compact でしか走らないメソッド
-//! (`solve_compact` / `harvest_penalties` / `commit_window` / `repair_one_tile`) も
-//! ここに置いてある。密と compact を切り替える側 (`set_window` / `value_grid` /
-//! `sweep_global` など) は [`super`] のまま。
+//! [`CompactField`] の sink になる。[`PlannerCore`] のうち compact でしか走らない
+//! メソッド (`solve_compact` / `harvest_penalties` / `commit_window` /
+//! `repair_one_tile`) もここに置いてある。
 //!
 //! # 追従は近傍の密パッチで回す ([`Patch`])
 //!
@@ -24,8 +17,7 @@
 //!
 //! パッチだけで回すと、狭域の成果はパッチの外へ出られない。sink は全域ぶんの配列
 //! なので、**狭域が動かした窓を毎 tick sink へ書き戻す** ([`PlannerCore::commit_window`])
-//! と、密経路の `states` と同じ意味で共有場になる。広域のロールアウトは sink を
-//! 読むので、そこで見えるようになる。
+//! と、密経路の `states` と同じ意味で共有場になる。
 //!
 //! ただし sink は `(value, action)` の 12 B/state しか持たない。値を書き戻しても
 //! **その値を正当化する `local_penalty` がどこにも残らない**ので、次にその区画を
@@ -35,32 +27,20 @@
 //!
 //! # 全域伝播はタイル修復で回す ([`Repair`])
 //!
-//! 共有場ができても、上がった値を外へ広げなければ広域の経路は変わらない。密経路の
-//! [`PlannerCore::sweep_global`] は全域 Gauss–Seidel でそれをやるが、要求する
-//! のは全域ぶんの `states` と `sweep_orders` (80 B/state) で、compact はまさにそれを
-//! 持てないから compact なので同じコードは使えない。
-//!
-//! 代わりに sink を**タイル単位**で起こして掃く。1 タイル = 更新する interior
-//! (既定 16 セル角) + 遷移が届く距離 `reach` の halo。halo を凍結境界にして
-//! interior だけを掃き、変わった列を sink へ返し、変化の外接矩形から `reach` セル
-//! 以内のタイルを待ち行列へ入れ直す。キューが空になったら収束 = 全域 Gauss–Seidel
-//! と同じ不動点。更新式は `value_iteration_at` そのままなので、狭域・広域・solve・
-//! 修復の 4 者が同一の更新式のままになる (vi_rs には手を入れない)。
-//!
-//! - **打ち切りではない。** 値が動かないタイルは 1 パスで抜けるだけで、動く範囲は
-//!   全部掃く。仕事量が地図の大きさではなく**実際に影響が及ぶ範囲**に比例する。
-//! - **メモリはタイル 1 枚ぶんだけ。** 0.25 m/cell・reach 2 で 20x20x60 = 1.9 MB
-//!   (追従パッチの 3.5 MB と合わせて 6 MB 弱)。
-//! - **最悪は全域 1 掃きぶん**。津田沼 (0.25 m/cell) で 3,700 タイル訪問 = 読み
-//!   1.3 GB / 書き 0.7 GB になる。暴走ガードとして訪問回数に上限を置いてある。
+//! 密経路の [`PlannerCore::sweep_global`] は全域の `states` + `sweep_orders` を
+//! 要求するので compact では使えない。代わりに sink を**タイル単位**で起こして掃く。
+//! 1 タイル = 更新する interior (既定 16 セル角) + 遷移が届く距離 `reach` の halo。
+//! halo を凍結境界にして interior だけを掃き、変わった列を sink へ返し、変化の
+//! 外接矩形から `reach` セル以内のタイルを待ち行列へ入れ直す。キューが空になったら
+//! 収束 = 全域 Gauss–Seidel と同じ不動点。更新式は `value_iteration_at` そのまま
+//! なので、狭域・広域・solve・修復の 4 者が同一の更新式のままになる。仕事量は
+//! 地図の大きさではなく**実際に影響が及ぶ範囲**に比例し、メモリはタイル 1 枚ぶん
+//! (暴走ガードとして訪問回数に上限を置いてある)。
 //!
 //! 修復が追従パッチの footprint を書き換えたら、パッチを無効化して次の tick で
 //! 起こし直させる ([`PlannerCore::repair_one_tile`] の「パッチの無効化」)。パッチは
 //! sink の写しを凍結して持っているので、これをしないと修復とパッチが同じセルを
 //! 互いに上書きし合って**収束しない** (値は正しいまま、掃きが終わらなくなる)。
-//!
-//! 伝播が効いているかを見るときの落とし穴 2 つ ([`PlannerCore::repair_progress`] を
-//! 見ること) は [`super`] の doc にまとめてある。
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
