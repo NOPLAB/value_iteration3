@@ -27,6 +27,11 @@ export TURTLEBOT3_MODEL=burger
 LOG="$REPO_ROOT/out/viola_demo_logs"
 mkdir -p "$LOG"
 
+# 前回の残骸 gzserver/gzclient が居ると新しい gzserver が即死する (exit 255)。
+# Gazebo classic は SIGTERM で綺麗に死なないことがあるので起動前に掃除する。
+pkill -x gzserver 2>/dev/null && sleep 2 || true
+pkill -x gzclient 2>/dev/null || true
+
 # kill 0 は自分にも届くので、再帰しないよう先にトラップを解除する
 trap 'trap - EXIT INT TERM; kill 0' EXIT INT TERM
 
