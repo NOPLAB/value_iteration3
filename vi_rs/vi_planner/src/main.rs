@@ -60,9 +60,9 @@ use vi_lib::Action;
 // nav_msgs::msg::OccupancyGrid と名前が衝突するので別名で入れる。
 
 use vi_planner::core::{
-    lock, try_lock, value_grid_on, BeliefConfig, BuildParams, Decision, ExternalLocalizer,
-    FollowKind, GridLocalizer, Localizer, PlanConfig, PlanError, PlanStats, PlannerCore,
-    Prefetcher, SweepCursor,
+    lock, try_lock, value_grid_on, AdaptiveLocalizer, BeliefConfig, BuildParams, Decision,
+    ExternalLocalizer, FollowKind, GridLocalizer, Localizer, PlanConfig, PlanError, PlanStats,
+    PlannerCore, Prefetcher, SweepCursor,
 };
 
 use rclrs::*;
@@ -102,7 +102,7 @@ struct Params {
     pose_topic: String,
     global_frame: String,
     // ── 自己位置推定 (core::Localizer) ──
-    /// 自己位置の出どころ ("external" | "grid")。
+    /// 自己位置の出どころ ("external" | "grid" | "adaptive")。
     localizer: String,
     /// grid: belief 窓の半径 [m] / 尤度場の σ [m] / ビーム間引き / レンジ上限 [m]。
     belief_radius: f64,
@@ -259,6 +259,10 @@ fn read_params(node: &Node) -> Result<Params> {
         // 初期化し直す。以後は scan_topic と自分の出した cmd_vel だけで推定する
         // ので、"grid" のときは pose_topic を mcl の連続出力に向けないこと
         // (毎メッセージでリセットされて素通しと変わらなくなる)。
+        // "adaptive" = grid の多重解像度版 — 観測一致度が落ちると belief を粗い
+        // 広域レベルへ広げて再定位する (EMCL の expansion resetting 相当) ので、
+        // 誘拐 (持ち上げ移動) から復帰でき、未シードなら大域初期化で立ち上がる。
+        // ロスト中は pose を返さず follow ループが安全停止する。シード運用は grid と同じ。
         localizer: p!("localizer", Arc<str>, "external".into()).to_string(),
         // belief 窓は native 解像度 (map_scale をかける前) の 2×radius 四方 × θ。
         // 0.05 m/cell で radius 2.5 なら 100×100×60 = 60 万セル ≈ 5 MB。
@@ -432,9 +436,9 @@ fn validate(p: &Params) -> Result<U64Solver> {
             p.follow_controller
         ));
     }
-    if !matches!(p.localizer.as_str(), "external" | "grid") {
+    if !matches!(p.localizer.as_str(), "external" | "grid" | "adaptive") {
         return Err(anyhow!(
-            "unknown localizer: {} (expected \"external\" or \"grid\")",
+            "unknown localizer: {} (expected \"external\", \"grid\" or \"adaptive\")",
             p.localizer
         ));
     }
@@ -944,13 +948,13 @@ fn run_follow(
                 let _ = cmd_pub.publish(tw);
                 // 自分が出した指令がそのまま推定器の動作モデル (external では
                 // no-op)。dt は制御周期 — 実際の適用時間との差は motion ノイズが
-                // 吸収する。停止指令は動きゼロなので predict しない。
+                // 吸収する。停止指令は動きゼロなので predict しない。代入は
+                // 無条件 — adaptive がロストしたら latest_pose ごと消え、次 tick
+                // から「pose なし」の安全停止に入る。
                 {
                     let mut l = lock(localizer);
                     l.predict(fw, rot_deg, tuning.period.as_secs_f64());
-                    if let Some(p) = l.pose() {
-                        *lock(latest_pose) = Some(p);
-                    }
+                    *lock(latest_pose) = l.pose();
                 }
                 speed = fw as f32;
                 failure_ticks = 0;
@@ -1187,7 +1191,7 @@ fn main() -> Result<()> {
     // 自己位置推定器。grid は native 解像度の占有格子から尤度場を起こすので、
     // ダウンサンプル前の binary_grid をここで使い切ってから捨てる。
     let localizer: Box<dyn Localizer> = match params.localizer.as_str() {
-        "grid" => {
+        kind @ ("grid" | "adaptive") => {
             let bc = BeliefConfig {
                 half_m: params.belief_radius.max(0.5),
                 sensor_sigma_m: params.belief_sensor_sigma.max(0.01),
@@ -1199,17 +1203,30 @@ fn main() -> Result<()> {
                 weight_skip_ratio: params.belief_weight_skip_ratio.max(0.0) as f32,
                 ..BeliefConfig::default()
             };
-            let g = GridLocalizer::new(&binary_grid, params.theta_cell_num as i32, bc);
-            eprintln!(
-                "vi_planner: localizer = grid ({}m window @{}m x{} theta, {:.1} MB belief; \
-                 seed it via {} — e.g. remap to initialpose)",
-                params.belief_radius * 2.0,
-                binary_grid.resolution,
-                params.theta_cell_num,
-                g.belief_mb(),
-                params.pose_topic
-            );
-            Box::new(g)
+            if kind == "grid" {
+                let g = GridLocalizer::new(&binary_grid, params.theta_cell_num as i32, bc);
+                eprintln!(
+                    "vi_planner: localizer = grid ({}m window @{}m x{} theta, {:.1} MB belief; \
+                     seed it via {} — e.g. remap to initialpose)",
+                    params.belief_radius * 2.0,
+                    binary_grid.resolution,
+                    params.theta_cell_num,
+                    g.belief_mb(),
+                    params.pose_topic
+                );
+                Box::new(g)
+            } else {
+                let g = AdaptiveLocalizer::new(&binary_grid, params.theta_cell_num as i32, bc);
+                eprintln!(
+                    "vi_planner: localizer = adaptive ({} levels up to whole-map, {:.1} MB \
+                     belief; seed via {} or leave unseeded for global init; lost → pose \
+                     withheld until re-localized)",
+                    g.num_levels(),
+                    g.belief_mb(),
+                    params.pose_topic
+                );
+                Box::new(g)
+            }
         }
         _ => Box::new(ExternalLocalizer::default()),
     };
@@ -1472,9 +1489,10 @@ fn main() -> Result<()> {
                     let mut l = lock(&h.localizer);
                     l.observe(&scan);
                     let p = l.pose();
-                    if let Some(p) = p {
-                        *lock(&h.latest_pose) = Some(p);
-                    }
+                    // 無条件代入: adaptive はロスト中 None を返すので、latest_pose
+                    // ごと消して follow ループを「pose なし」停止経路に乗せる
+                    // (external / grid は observe 後も Some のままで従来どおり)。
+                    *lock(&h.latest_pose) = p;
                     p
                 };
                 if let Some(p) = est {

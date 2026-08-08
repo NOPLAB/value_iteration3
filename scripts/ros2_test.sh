@@ -3,10 +3,16 @@ set -euo pipefail
 
 # The ROS setup scripts reference unbound vars (e.g. AMENT_TRACE_SETUP_FILES),
 # so relax nounset while sourcing them, then restore it.
-set +u
-. /opt/ros/humble/setup.sh
-. /ros2_rust_ws/install/local_setup.sh
-set -u
+if [ -f /opt/ros/humble/setup.sh ]; then
+    # Docker (make ros2-test)
+    set +u
+    . /opt/ros/humble/setup.sh
+    . /ros2_rust_ws/install/local_setup.sh
+    set -u
+else
+    # ネイティブ (RoboStack pixi env + ~/ros2_rust_ws)
+    . "$(cd "$(dirname "$0")" && pwd)/ros2_native_env.sh"
+fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
