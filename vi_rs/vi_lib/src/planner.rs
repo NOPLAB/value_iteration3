@@ -438,6 +438,92 @@ fn normalize_deg(d: f64) -> f64 {
     d.rem_euclid(360.0)
 }
 
+// ═══ QMDP — belief 加重の行動選択 ═══
+
+/// [`qmdp_decide`] の拒否権しきい値: 勝った行動でも「衝突/場外 (Q = MAX_COST)」と
+/// 言う仮説の質量比がこれを超えたら走らない (None = 停止)。仮説間で行動が割れる
+/// 場面で期待値だけ見ると、有意な仮説の下で衝突する行動を選び得るための安全弁。
+// ponytail: 定数 1 個。地図・センサごとの調整が要るなら PlanConfig へ昇格。
+pub const QMDP_VETO_MASS: f64 = 0.2;
+
+/// [`qmdp_decide`] の結果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QmdpDecision {
+    /// 評価できた質量の過半がゴール圏 (`final_state`)。
+    Goal,
+    /// `vi.actions` への添字。
+    Action(usize),
+    /// 評価できる仮説が無い / 全行動が拒否権で落ちた。呼び出し側は停止。
+    NoAction,
+}
+
+/// QMDP 行動選択: belief の仮説集合 `{(pose, w)}` で Q(b,a) = Σᵢ wᵢ·Q(sᵢ,a) を
+/// 評価し、argmin の行動を返す。Q(s,a) は本家 `actionCost` (遷移テーブル期待値 —
+/// solve と同じ [`action_cost_raw`]) なので、方策 (`optimal_action`) が無いセルの
+/// 仮説も価値関数から直接評価できる (greedy の近傍借用は不要)。
+///
+/// - 重み `w` は非正規化でよい (質量比しか使わない)。
+/// - 場外 / 非 free (VI 解像度で壁の中) の仮説は評価対象外 — compact 経路の
+///   パッチで呼ぶときは「パッチ外の仮説は無視される」ことを意味する。
+/// - Q = MAX_COST の項はそのまま和に入る (衝突質量が僅かでも argmin はまず
+///   衝突ゼロの行動を選ぶ)。勝者の衝突質量が [`QMDP_VETO_MASS`] を超えたら
+///   `NoAction` — 全行動が危険なら止まるのが正解。
+/// - 単峰 belief (仮説 1 個) では argmin_a Q(s,a) = 本家 greedy と同じ行動になる。
+pub fn qmdp_decide(vi: &ValueIterator, hyps: &[(crate::bridge::PoseView, f64)]) -> QmdpDecision {
+    let n_act = vi.actions.len();
+    let mut qb = vec![0.0f64; n_act];
+    let mut veto = vec![0.0f64; n_act];
+    let mut usable = 0.0f64;
+    let mut final_mass = 0.0f64;
+    for &(p, w) in hyps {
+        if !(w > 0.0) {
+            continue;
+        }
+        let (ix, iy, it) = pose_to_cell(vi, p.x, p.y, p.yaw_rad);
+        if !vi.in_map_area(ix, iy) || it < 0 || it >= vi.cell_num_t {
+            continue;
+        }
+        let s = &vi.states[vi.to_index(ix, iy, it) as usize];
+        if !s.free {
+            continue;
+        }
+        if s.final_state {
+            final_mass += w;
+            continue;
+        }
+        usable += w;
+        for (ai, a) in vi.actions.iter().enumerate() {
+            let q = crate::value_iterator::action_cost_raw(
+                &vi.states,
+                a,
+                s,
+                vi.cell_num_x,
+                vi.cell_num_y,
+                vi.cell_num_t,
+            );
+            qb[ai] += w * q as f64;
+            if q == MAX_COST {
+                veto[ai] += w;
+            }
+        }
+    }
+    let total = usable + final_mass;
+    if total <= 0.0 {
+        return QmdpDecision::NoAction;
+    }
+    if final_mass >= 0.5 * total {
+        return QmdpDecision::Goal;
+    }
+    if usable <= 0.0 {
+        return QmdpDecision::NoAction;
+    }
+    let best = (0..n_act).min_by(|&a, &b| qb[a].total_cmp(&qb[b])).unwrap();
+    if veto[best] > QMDP_VETO_MASS * usable {
+        return QmdpDecision::NoAction;
+    }
+    QmdpDecision::Action(best)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,5 +772,102 @@ mod tests {
         // 到達可能な free セルは 0..6 の行動 id を持つ。
         let a = optimal_action_at(&vi, 4, 4, 0);
         assert!((0..6).contains(&a), "action id = {a}");
+    }
+
+    // ═══ QMDP ═══
+
+    use crate::bridge::PoseView;
+
+    fn hyp(x: f64, y: f64, yaw: f64) -> PoseView {
+        PoseView { x, y, yaw_rad: yaw }
+    }
+
+    /// 仮説セルでの Q(s,a)。衝突チェック用 (テスト専用の薄い読み)。
+    fn q_at(vi: &ValueIterator, p: PoseView, ai: usize) -> u64 {
+        let (ix, iy, it) = pose_to_cell(vi, p.x, p.y, p.yaw_rad);
+        let s = &vi.states[vi.to_index(ix, iy, it) as usize];
+        crate::value_iterator::action_cost_raw(
+            &vi.states,
+            &vi.actions[ai],
+            s,
+            vi.cell_num_x,
+            vi.cell_num_y,
+            vi.cell_num_t,
+        )
+    }
+
+    #[test]
+    fn qmdp_single_hypothesis_matches_greedy() {
+        let vi = solved_vi(64, 64, empty_map(64), (2.0, 2.0, 0), U64Solver::Frontier3D);
+        let p = hyp(0.6, 0.6, 0.0);
+        let (ix, iy, it) = pose_to_cell(&vi, p.x, p.y, p.yaw_rad);
+        match qmdp_decide(&vi, &[(p, 1.0)]) {
+            QmdpDecision::Action(ai) => {
+                assert_eq!(vi.actions[ai].id, optimal_action_at(&vi, ix, iy, it))
+            }
+            d => panic!("expected Action, got {d:?}"),
+        }
+    }
+
+    #[test]
+    fn qmdp_multimodal_avoids_collision_for_significant_hypothesis() {
+        // 仮説 A は開けた場所で前進がゴール方向、仮説 B は壁の直前で前進 = 衝突。
+        // どちらも質量 0.5 — 選ばれた行動は両仮説で衝突であってはならない
+        // (衝突項は MAX_COST そのものなので argmin がまず衝突ゼロの行動を選ぶ)。
+        let size = 64;
+        let vi = solved_vi(size, size, walled_map(size), (2.8, 0.6, 0), U64Solver::Frontier3D);
+        let a = hyp(1.0, 2.0, 0.0);
+        // 壁は x セル 32..40。3 セル手前から東向き → 前進 6 セルは壁の中。
+        let b = hyp(1.475, 2.0, 0.0);
+        assert_eq!(q_at(&vi, b, 0), MAX_COST, "premise: forward from B collides");
+        match qmdp_decide(&vi, &[(a, 0.5), (b, 0.5)]) {
+            QmdpDecision::Action(ai) => {
+                assert_ne!(q_at(&vi, a, ai), MAX_COST, "chosen action collides for A");
+                assert_ne!(q_at(&vi, b, ai), MAX_COST, "chosen action collides for B");
+            }
+            d => panic!("expected Action, got {d:?}"),
+        }
+    }
+
+    #[test]
+    fn qmdp_boxed_hypothesis_never_picks_collision() {
+        // 周囲を塞がれたポケットの中の仮説: 並進系 4 行動は全て衝突 (MAX_COST)、
+        // その場旋回は自セル着地 (V = MAX_COST → 本家の u64 折り返しで巨大値だが
+        // MAX_COST ではない)。argmin は旋回を選び、衝突には決して踏み込まない。
+        let size = 64;
+        let mut data = empty_map(size);
+        for y in 4..19 {
+            for x in 4..19 {
+                data[(y * size + x) as usize] = 100;
+            }
+        }
+        data[(11 * size + 11) as usize] = 0;
+        let vi = solved_vi(size, size, data, (2.0, 2.0, 0), U64Solver::Frontier3D);
+        let p = hyp(0.575, 0.575, 0.0);
+        assert_eq!(q_at(&vi, p, 0), MAX_COST, "premise: forward collides");
+        match qmdp_decide(&vi, &[(p, 1.0)]) {
+            QmdpDecision::Action(ai) => {
+                assert_ne!(q_at(&vi, p, ai), MAX_COST, "picked a colliding action");
+                assert_eq!(vi.actions[ai].delta_fw, 0.0, "only in-place turns are safe");
+            }
+            d => panic!("expected Action, got {d:?}"),
+        }
+    }
+
+    #[test]
+    fn qmdp_goal_majority_reports_goal() {
+        let vi = solved_vi(64, 64, empty_map(64), (2.0, 2.0, 0), U64Solver::Frontier3D);
+        // ゴール中心の仮説 (final_state) が過半、残りは通常セル。
+        let hyps = [(hyp(2.0, 2.0, 0.0), 0.6), (hyp(0.6, 0.6, 0.0), 0.4)];
+        assert_eq!(qmdp_decide(&vi, &hyps), QmdpDecision::Goal);
+    }
+
+    #[test]
+    fn qmdp_no_usable_hypotheses_is_no_action() {
+        let vi = solved_vi(32, 32, empty_map(32), (1.0, 1.0, 0), U64Solver::Frontier3D);
+        // 地図外と重みゼロだけ → 評価できる質量なし。
+        let hyps = [(hyp(-5.0, -5.0, 0.0), 1.0), (hyp(0.6, 0.6, 0.0), 0.0)];
+        assert_eq!(qmdp_decide(&vi, &hyps), QmdpDecision::NoAction);
+        assert_eq!(qmdp_decide(&vi, &[]), QmdpDecision::NoAction);
     }
 }

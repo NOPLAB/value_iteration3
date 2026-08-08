@@ -54,6 +54,12 @@ pub trait Localizer: Send {
     fn quality(&self) -> f64 {
         1.0
     }
+    /// belief の上位 `k` 仮説 (セル中心の姿勢, 非正規化重み)。重み降順。QMDP
+    /// ([`crate::planner::qmdp_decide`]) の仮説集合用。単一仮説の実装 (External)
+    /// は空を返す — 呼び出し側は `pose()` の点推定にフォールバックすること。
+    fn top_cells(&self, _k: usize) -> Vec<(PoseView, f64)> {
+        Vec::new()
+    }
 }
 
 /// 現行動作: `pose_topic` の推定を素通しする (既定)。
@@ -656,6 +662,23 @@ impl Localizer for GridLocalizer {
     fn quality(&self) -> f64 {
         self.quality
     }
+
+    fn top_cells(&self, k: usize) -> Vec<(PoseView, f64)> {
+        if !self.initialized || k == 0 {
+            return Vec::new();
+        }
+        let nw = self.nw;
+        let plane = (nw * nw) as usize;
+        top_k_weights(&self.b, k)
+            .into_iter()
+            .map(|(w, i)| {
+                let (it, rem) = ((i / plane) as i32, i % plane);
+                let (iy, ix) = ((rem / nw as usize) as i32, (rem % nw as usize) as i32);
+                let (x, y) = self.cell_center(ix, iy);
+                (PoseView { x, y, yaw_rad: self.theta_center(it) }, w as f64)
+            })
+            .collect()
+    }
 }
 
 // ═══ AdaptiveLocalizer — 多重解像度 belief + expansion resetting ═══
@@ -700,6 +723,19 @@ struct Level {
 #[inline]
 fn bidx2(nx: i32, ny: i32, ix: i32, iy: i32, it: i32) -> usize {
     ((it * ny + iy) * nx + ix) as usize
+}
+
+/// belief バッファ `b[..n]` の上位 `k` セルを (重み, 添字) の降順で返す。
+/// [`Localizer::top_cells`] の共通部 (Grid / Adaptive で幾何だけが違う)。
+fn top_k_weights(b: &[f32], k: usize) -> Vec<(f32, usize)> {
+    let mut cells: Vec<(f32, usize)> =
+        b.iter().enumerate().filter(|&(_, &w)| w > 0.0).map(|(i, &w)| (w, i)).collect();
+    if cells.len() > k {
+        cells.select_nth_unstable_by(k - 1, |a, b| b.0.total_cmp(&a.0));
+        cells.truncate(k);
+    }
+    cells.sort_by(|a, b| b.0.total_cmp(&a.0));
+    cells
 }
 
 /// レベルのセル (窓座標) が free か。L0 は native の bitset、粗レベルは構築時の
@@ -1534,6 +1570,33 @@ impl Localizer for AdaptiveLocalizer {
     fn quality(&self) -> f64 {
         self.quality
     }
+
+    /// 現レベルの上位仮説。ロスト中 (粗レベル) も返す — pose() と違い多峰の
+    /// まま渡せるのが QMDP の意義なので、レベルでは絞らない。
+    fn top_cells(&self, k: usize) -> Vec<(PoseView, f64)> {
+        if !self.initialized || k == 0 {
+            return Vec::new();
+        }
+        let l = &self.levels[self.cur];
+        let (nx, ny, res, t_res) = (l.nx, l.ny, l.res, l.t_res_deg);
+        let plane = (nx * ny) as usize;
+        let n = self.n_active();
+        top_k_weights(&self.b[..n], k)
+            .into_iter()
+            .map(|(w, i)| {
+                let (it, rem) = ((i / plane) as i32, i % plane);
+                let (iy, ix) = ((rem / nx as usize) as i32, (rem % nx as usize) as i32);
+                (
+                    PoseView {
+                        x: self.field.ox + (self.wx0 + ix) as f64 * res + res * 0.5,
+                        y: self.field.oy + (self.wy0 + iy) as f64 * res + res * 0.5,
+                        yaw_rad: ((it as f64 + 0.5) * t_res).to_radians(),
+                    },
+                    w as f64,
+                )
+            })
+            .collect()
+    }
 }
 
 /// 真値姿勢からの全周スキャンをレイマーチで合成する理想センサ (angle_min = 0)。
@@ -1838,5 +1901,35 @@ mod tests {
         al.set_pose(block_center);
         let p = al.pose().expect("マスク後も free 側に質量が残ること");
         assert!(free_at(p), "adaptive: 推定 ({:.2}, {:.2}) が free でない", p.x, p.y);
+    }
+
+    /// top_cells: シード直後の最大重み仮説がシード姿勢のセルで、重みが降順なこと
+    /// (QMDP の仮説集合の契約)。grid / adaptive 両方。
+    #[test]
+    fn top_cells_returns_descending_hypotheses_near_the_seed() {
+        let g = walled_grid(60);
+        let seed = pose(1.5, 1.5, 0.0);
+        let check = |cells: Vec<(PoseView, f64)>, name: &str| {
+            assert!(!cells.is_empty(), "{name}: 仮説が空");
+            assert!(cells.len() <= 8, "{name}: k を超過");
+            for w in cells.windows(2) {
+                assert!(w[0].1 >= w[1].1, "{name}: 重みが降順でない");
+            }
+            let top = cells[0].0;
+            assert!(
+                (top.x - seed.x).abs() < 0.1 && (top.y - seed.y).abs() < 0.1,
+                "{name}: 最大重み仮説 ({:.2}, {:.2}) がシードから遠い",
+                top.x, top.y
+            );
+        };
+        let mut gl =
+            GridLocalizer::new(&g, 36, BeliefConfig { half_m: 1.0, ..BeliefConfig::default() });
+        assert!(gl.top_cells(8).is_empty(), "シード前は空");
+        gl.set_pose(seed);
+        check(gl.top_cells(8), "grid");
+
+        let mut al = AdaptiveLocalizer::new(&g, 36, BeliefConfig::default());
+        al.set_pose(seed);
+        check(al.top_cells(8), "adaptive");
     }
 }

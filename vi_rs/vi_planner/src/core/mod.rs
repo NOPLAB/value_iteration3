@@ -53,8 +53,8 @@ use std::time::{Duration, Instant};
 use vi_lib::bridge::{value_slice_to_occupancy, yaw_to_goal_theta_deg, PoseView};
 use vi_lib::msg::{LaserScan, OccupancyGrid};
 use vi_lib::planner::{
-    densify, optimal_action_at, pose_to_cell, rollout_path_on, PathPose, PolicyView, Rollout,
-    RolloutStatus,
+    densify, optimal_action_at, pose_to_cell, qmdp_decide, rollout_path_on, PathPose, PolicyView,
+    QmdpDecision, Rollout, RolloutStatus,
 };
 use vi_lib::solvers::{solve_observed, SolveFlow, SolveObserver, SolveProbe, U64Solver};
 use vi_lib::value_iterator::ValueIterator;
@@ -1085,5 +1085,23 @@ impl PlannerCore {
     pub fn decide(&self, pose: PoseView) -> Decision {
         let Some(local) = self.local() else { return Decision::NoAction };
         self.follow.decide(&local.base, &self.cfg, pose)
+    }
+
+    /// belief 仮説集合での判断 (QMDP — [`qmdp_decide`])。読む場は [`Self::decide`]
+    /// と同じ密な局所場 (compact 経路では `set_window` 済みパッチ — パッチ外の
+    /// 仮説は評価対象外)。仮説が割れていても「どの仮説でも悪くない行動」を選び、
+    /// 有意な仮説が衝突と言う行動しか無ければ `NoAction` (停止)。
+    /// `follow_controller` (dwa/mppi) は経由しない — 多峰時は離散 QMDP が優先で、
+    /// 単峰時は呼び出し側が [`Self::decide`] へフォールバックする分担。
+    pub fn decide_qmdp(&self, hyps: &[(PoseView, f64)]) -> Decision {
+        let Some(local) = self.local() else { return Decision::NoAction };
+        match qmdp_decide(&local.base, hyps) {
+            QmdpDecision::Goal => Decision::Goal,
+            QmdpDecision::Action(ai) => {
+                let a = &local.base.actions[ai];
+                Decision::Action { id: Some(a.id as usize), fw: a.delta_fw, rot_deg: a.delta_rot }
+            }
+            QmdpDecision::NoAction => Decision::NoAction,
+        }
     }
 }

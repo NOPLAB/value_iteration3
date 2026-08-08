@@ -144,6 +144,9 @@ struct Params {
     repair_interior_cells: i64,
     /// follow 1 tick の判断器 ("greedy" = 本家 decision / "dwa"・"mppi" = 連続行動)。
     follow_controller: String,
+    /// belief が多峰のとき QMDP (Q(b,a) = Σ w·Q(s,a) の argmin) で行動を選ぶ。
+    /// grid/adaptive localizer 用 (external は仮説を出さないので実質無効)。
+    qmdp: bool,
     /// DWA/MPPI の前方シミュレーション時間 [s] と DWA の (v, ω) 候補数。
     dwa_horizon_s: f64,
     dwa_n_v: i64,
@@ -330,6 +333,11 @@ fn read_params(node: &Node) -> Result<Params> {
         mppi_lambda: p!("mppi_lambda", f64, 1.0),
         mppi_sigma_v: p!("mppi_sigma_v", f64, 0.0),
         mppi_sigma_w_deg: p!("mppi_sigma_w_deg", f64, 0.0),
+        // belief が多峰 (grid/adaptive の上位仮説が 2 個以上) の tick は
+        // QMDP: Q(b,a) = Σ w·Q(s,a) の argmin で「どの仮説でも悪くない行動」を
+        // 選び、有意な仮説が衝突と言う行動しか無ければ止まる。単峰の tick は
+        // 従来の follow_controller に退避するので、収束中の挙動だけが変わる。
+        qmdp: p!("qmdp", bool, false),
 
         // navigate_to_pose と follow_waypoints をこのノード自身が提供する
         // (= bt_navigator / behavior_server / waypoint_follower を立てない)。
@@ -640,7 +648,13 @@ struct FollowTuning {
     failure_ticks_limit: u32,
     /// ロックをこの tick 数連続で取れなかったら停止指令を出す。
     busy_ticks_before_stop: u32,
+    /// belief が多峰のとき QMDP (`decide_qmdp`) で行動を選ぶ (単峰は従来どおり)。
+    qmdp: bool,
 }
+
+/// QMDP に渡す belief 仮説の上限。ヒストグラムの上位セルだけで質量の大半を
+/// 覆える (それ以下は veto 判定も動かさない微小仮説)。
+const QMDP_TOP_K: usize = 64;
 
 enum Outcome {
     Reached,
@@ -900,6 +914,9 @@ fn run_follow(
             }
             continue;
         };
+        // QMDP 用の belief 仮説。core のロックの前に取る (localizer と core の
+        // 入れ子ロックを作らない)。external localizer は空 = 点推定へ退避。
+        let hyps = if tuning.qmdp { lock(localizer).top_cells(QMDP_TOP_K) } else { Vec::new() };
 
         // ── ロックを取るのはこのブロックだけ ──
         //
@@ -951,7 +968,15 @@ fn run_follow(
                     window_grid = core.window_value_grid(pose, v.window_threshold_steps);
                 }
             }
-            (core.decide(pose), core.goal_distance(pose.x, pose.y), window_grid)
+            // 多峰 belief (仮説 2 個以上) は QMDP — どの仮説でも悪くない行動を
+            // 選び、有意な仮説が衝突と言う行動しか無ければ止まる。単峰は従来の
+            // decide (follow_controller 経由) と一致するので点推定に退避。
+            let decision = if hyps.len() >= 2 {
+                core.decide_qmdp(&hyps)
+            } else {
+                core.decide(pose)
+            };
+            (decision, core.goal_distance(pose.x, pose.y), window_grid)
         };
         // ここで手放す。スコープ末尾まで持つと sleep の間もロックを握ったままに
         // なり、広域側の計画要求がほぼ通らなくなる。
@@ -1744,6 +1769,7 @@ fn main() -> Result<()> {
             .ceil()
             .max(1.0) as u32,
         busy_ticks_before_stop: params.busy_ticks_before_stop.max(1) as u32,
+        qmdp: params.qmdp,
     };
     let retry = RetryTuning {
         limit: params.goal_retry_limit,
