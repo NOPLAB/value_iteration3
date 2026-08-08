@@ -59,6 +59,19 @@ Visualization Manager:
       Size (Pixels): 3
       Color Transformer: FlatColor
       Color: 255; 0; 0
+    - Class: rviz_default_plugins/Pose
+      Name: ViolaPose
+      Enabled: true
+      Topic:
+        Value: /viola_pose
+        Depth: 1
+      Shape: Arrow
+      Color: 255; 25; 240
+      Alpha: 1
+      Shaft Length: 0.5
+      Shaft Radius: 0.03
+      Head Length: 0.2
+      Head Radius: 0.08
     - Class: rviz_default_plugins/RobotModel
       Name: RobotModel
       Enabled: true

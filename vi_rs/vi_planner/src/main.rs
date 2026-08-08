@@ -689,9 +689,28 @@ struct Handles {
     viz: Option<Viz>,
     /// 表示専用の経路 (`plan`)。standalone のときだけ Some。
     plan_pub: Option<PlanPub>,
+    /// 推定姿勢の表示用出力 (`viola_pose`)。シードとスキャン補正のたびに出す。
+    /// TF は書かないので、RViz でロボット (真値の TF) と見比べられる。
+    est_pub: Publisher<geometry_msgs::msg::PoseStamped>,
+    est_frame: String,
+    est_clock: Clock,
 }
 
 impl Handles {
+    /// 推定姿勢を `viola_pose` へ。
+    fn publish_est(&self, p: PoseView) {
+        let mut msg = geometry_msgs::msg::PoseStamped::default();
+        msg.header.frame_id = self.est_frame.as_str().into();
+        let (sec, nanosec) = self.est_clock.now().to_sec_nanosec().unwrap_or((0, 0));
+        msg.header.stamp.sec = sec;
+        msg.header.stamp.nanosec = nanosec;
+        msg.pose.position.x = p.x;
+        msg.pose.position.y = p.y;
+        msg.pose.orientation.z = (p.yaw_rad / 2.0).sin();
+        msg.pose.orientation.w = (p.yaw_rad / 2.0).cos();
+        let _ = self.est_pub.publish(msg);
+    }
+
     /// 追従ループ用の借用ビュー。`with_plan: false` は Nav2 構成の follow_path
     /// (表示用の `plan` は BT 側の compute_path_to_pose が出す)。
     fn follow_ctx(&self, tuning: FollowTuning, with_plan: bool) -> FollowCtx<'_> {
@@ -1383,6 +1402,10 @@ fn main() -> Result<()> {
         localizer: Mutex::new(localizer),
         scan_queue: Mutex::new(Vec::new()),
         cmd_pub: node.create_publisher::<geometry_msgs::msg::Twist>("cmd_vel".keep_last(1))?,
+        est_pub: node
+            .create_publisher::<geometry_msgs::msg::PoseStamped>("viola_pose".keep_last(1))?,
+        est_frame: params.global_frame.clone(),
+        est_clock: node.get_clock(),
         viz: if params.publish_value_function {
             Some(Viz {
                 vf_pub: node.create_publisher::<nav_msgs::msg::OccupancyGrid>(
@@ -1420,9 +1443,16 @@ fn main() -> Result<()> {
         node.create_subscription::<geometry_msgs::msg::PoseWithCovarianceStamped, _>(
             params.pose_topic.as_str().keep_last(1),
             move |msg: geometry_msgs::msg::PoseWithCovarianceStamped| {
-                let mut l = lock(&h.localizer);
-                l.set_pose(pose_view_from(&msg.pose.pose));
-                *lock(&h.latest_pose) = l.pose();
+                let p = {
+                    let mut l = lock(&h.localizer);
+                    l.set_pose(pose_view_from(&msg.pose.pose));
+                    let p = l.pose();
+                    *lock(&h.latest_pose) = p;
+                    p
+                };
+                if let Some(p) = p {
+                    h.publish_est(p);
+                }
             },
         )?
     };
@@ -1438,12 +1468,17 @@ fn main() -> Result<()> {
             params.scan_topic.as_str().best_effort().keep_last(5),
             move |msg: sensor_msgs::msg::LaserScan| {
                 let scan = vi_scan_from(&msg, invalid_range_m);
-                {
+                let est = {
                     let mut l = lock(&h.localizer);
                     l.observe(&scan);
-                    if let Some(p) = l.pose() {
+                    let p = l.pose();
+                    if let Some(p) = p {
                         *lock(&h.latest_pose) = Some(p);
                     }
+                    p
+                };
+                if let Some(p) = est {
+                    h.publish_est(p);
                 }
                 let mut q = lock(&h.scan_queue);
                 // 制御ループが止まっていても際限なく溜めない (最新を優先)。

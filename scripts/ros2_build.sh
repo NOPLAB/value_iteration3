@@ -42,10 +42,10 @@ cd "$REPO_ROOT"
 # profile, so cargo would otherwise default to the `dev` (debug) profile —
 # a debug-profile VI solver is ~10-50x slower. `--cargo-args --release` is
 # placed BEFORE --cmake-args so the trailing "$@" still forwards to cmake-args.
-colcon build --merge-install --packages-select vi_planner \
+# --log-base は verb より前に置くグローバル引数 (colcon log を repo 直下に作らせない)
+colcon --log-base "$WS/log" build --merge-install --packages-select vi_planner \
        --base-paths "$WS/src" \
        --build-base "$WS/build" \
        --install-base "$WS/install" \
-       --log-base "$WS/log" \
        --cargo-args --release \
        --cmake-args -DCMAKE_BUILD_TYPE=Release "$@"
