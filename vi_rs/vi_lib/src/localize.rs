@@ -142,6 +142,10 @@ struct LikelihoodField {
     ox: f64,
     oy: f64,
     lf: Vec<u8>,
+    /// free (data == 0) セルの bitset。belief の物理拘束用 — 壁・未知の中の
+    /// 姿勢仮説を許さない (尤度場はビームの当たり先しか見ないので、これが
+    /// 無いと「壁の中に居る」仮説が観測で一切罰されない)。
+    free: Vec<u64>,
 }
 
 impl LikelihoodField {
@@ -150,9 +154,12 @@ impl LikelihoodField {
         let n = (w as usize) * (h as usize);
         // ValueIterator と同じ規約: data == 0 が free、非 0 は障害物。
         let mut d = vec![f32::INFINITY; n];
+        let mut free = vec![0u64; n.div_ceil(64)];
         for i in 0..n {
             if g.data[i] != 0 {
                 d[i] = 0.0;
+            } else {
+                free[i >> 6] |= 1u64 << (i & 63);
             }
         }
         let idx = |x: i32, y: i32| (y * w + x) as usize;
@@ -203,7 +210,26 @@ impl LikelihoodField {
                 (255.0 * (-dm * dm * inv_2s2).exp()).round() as u8
             })
             .collect();
-        Self { w, h, res: g.resolution, ox: g.origin_x, oy: g.origin_y, lf }
+        Self { w, h, res: g.resolution, ox: g.origin_x, oy: g.origin_y, lf, free }
+    }
+
+    /// セルが free か。地図外は false。
+    #[inline]
+    fn free_cell(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 || x >= self.w || y >= self.h {
+            return false;
+        }
+        let i = (y * self.w + x) as usize;
+        self.free[i >> 6] & (1u64 << (i & 63)) != 0
+    }
+
+    /// 世界座標が free セルに乗っているか。
+    #[inline]
+    fn free_at(&self, wx: f64, wy: f64) -> bool {
+        self.free_cell(
+            ((wx - self.ox) / self.res).floor() as i32,
+            ((wy - self.oy) / self.res).floor() as i32,
+        )
     }
 
     /// 世界座標の尤度 [0,1]。地図外は 0。
@@ -350,6 +376,58 @@ impl GridLocalizer {
         self.normalize();
     }
 
+    /// 物理拘束: free でないセル (壁・未知) の質量を落とす。全質量が消えるとき
+    /// だけ何もしない — 非 free 地帯に取り残された belief の復帰は observe と
+    /// 呼び出し側の再シードに任せる (0 除算・全滅 NaN をここで作らない)。
+    fn apply_free_mask(&mut self) {
+        let nw = self.nw;
+        let mut kept = 0.0f64;
+        for iy in 0..nw {
+            for ix in 0..nw {
+                if self.field.free_cell(self.wx0 + ix, self.wy0 + iy) {
+                    for it in 0..self.nt {
+                        kept += self.b[bidx(nw, ix, iy, it)] as f64;
+                    }
+                }
+            }
+        }
+        if kept <= 0.0 {
+            return;
+        }
+        for iy in 0..nw {
+            for ix in 0..nw {
+                if !self.field.free_cell(self.wx0 + ix, self.wy0 + iy) {
+                    for it in 0..self.nt {
+                        self.b[bidx(nw, ix, iy, it)] = 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// free セル上の最大重み仮説 (mode)。free 上に質量が無ければ None。
+    fn mode_free(&self) -> Option<PoseView> {
+        let nw = self.nw;
+        let mut best: Option<(f32, i32, i32, i32)> = None;
+        for it in 0..self.nt {
+            for iy in 0..nw {
+                for ix in 0..nw {
+                    let w = self.b[bidx(nw, ix, iy, it)];
+                    if w > 0.0
+                        && best.map_or(true, |(bw, ..)| w > bw)
+                        && self.field.free_cell(self.wx0 + ix, self.wy0 + iy)
+                    {
+                        best = Some((w, ix, iy, it));
+                    }
+                }
+            }
+        }
+        best.map(|(_, ix, iy, it)| {
+            let (x, y) = self.cell_center(ix, iy);
+            PoseView { x, y, yaw_rad: self.theta_center(it) }
+        })
+    }
+
     /// 3 点カーネル [a, 1-2a, a] の a。σ [セル] 1 tick のランダムウォーク分散
     /// (2a セル²) を合わせる。0.25 で頭打ち (それ以上は 1 tick で表せない)。
     fn blur_a(sigma_cells: f64) -> f32 {
@@ -435,6 +513,7 @@ impl Localizer for GridLocalizer {
                 }
             }
         }
+        self.apply_free_mask();
         self.initialized = true;
         self.normalize();
     }
@@ -498,6 +577,8 @@ impl Localizer for GridLocalizer {
             Self::blur_a(self.cfg.motion_sigma_xy_m / res),
             Self::blur_a(self.cfg.motion_sigma_theta_deg / self.t_res_deg),
         );
+        // 拡散が壁・未知へ漏らした質量を毎 tick 回収する (物理拘束)。
+        self.apply_free_mask();
         self.normalize();
     }
 
@@ -537,6 +618,11 @@ impl Localizer for GridLocalizer {
                         self.b[i] = 0.0;
                         continue;
                     }
+                    // 物理拘束: 壁・未知の中の仮説はビーム評価するまでもなく棄却。
+                    if !self.field.free_cell(self.wx0 + ix, self.wy0 + iy) {
+                        self.b[i] = 0.0;
+                        continue;
+                    }
                     let (cx, cy) = self.cell_center(ix, iy);
                     let mut prod = 1.0f64;
                     let mut lsum = 0.0f64;
@@ -558,7 +644,13 @@ impl Localizer for GridLocalizer {
     }
 
     fn pose(&self) -> Option<PoseView> {
-        self.initialized.then(|| self.mean()).flatten()
+        let m = self.initialized.then(|| self.mean()).flatten()?;
+        if self.field.free_at(m.x, m.y) {
+            return Some(m);
+        }
+        // 多峰・ドーナツ状 belief の平均は穴 (壁・未知) に落ちる — 実在する
+        // 仮説 (free 上の mode) へ吸着して返す。
+        self.mode_free().or(Some(m))
     }
 
     fn quality(&self) -> f64 {
@@ -608,6 +700,21 @@ struct Level {
 #[inline]
 fn bidx2(nx: i32, ny: i32, ix: i32, iy: i32, it: i32) -> usize {
     ((it * ny + iy) * nx + ix) as usize
+}
+
+/// レベルのセル (窓座標) が free か。L0 は native の bitset、粗レベルは構築時の
+/// 集約マスク (native free を 1 つでも含めば free)。自由関数なのは borrow 分割
+/// (`self.b` の可変ループ内から呼ぶ) のため。
+#[inline]
+fn level_free(field: &LikelihoodField, l: &Level, wx0: i32, wy0: i32, ix: i32, iy: i32) -> bool {
+    if l.free.is_empty() {
+        return field.free_cell(wx0 + ix, wy0 + iy);
+    }
+    let (x, y) = (wx0 + ix, wy0 + iy);
+    if x < 0 || y < 0 || x >= l.map_w || y >= l.map_h {
+        return false;
+    }
+    l.free[(y * l.map_w + x) as usize]
 }
 
 /// 多重解像度ヒストグラム MCL。通常走行は [`GridLocalizer`] と同じ細窓 (L0)。
@@ -779,6 +886,61 @@ impl AdaptiveLocalizer {
         (sw > 0.0).then(|| PoseView { x: sx / sw, y: sy / sw, yaw_rad: ss.atan2(sc) })
     }
 
+    /// 物理拘束: free でないセルの質量を落とす ([`GridLocalizer::apply_free_mask`]
+    /// と同じ規約 — 全質量が消えるときだけ何もしない)。
+    fn apply_free_mask(&mut self) {
+        let l = &self.levels[self.cur];
+        let (nx, ny, nt) = (l.nx, l.ny, l.nt);
+        let (wx0, wy0) = (self.wx0, self.wy0);
+        let mut kept = 0.0f64;
+        for iy in 0..ny {
+            for ix in 0..nx {
+                if level_free(&self.field, l, wx0, wy0, ix, iy) {
+                    for it in 0..nt {
+                        kept += self.b[bidx2(nx, ny, ix, iy, it)] as f64;
+                    }
+                }
+            }
+        }
+        if kept <= 0.0 {
+            return;
+        }
+        for iy in 0..ny {
+            for ix in 0..nx {
+                if !level_free(&self.field, l, wx0, wy0, ix, iy) {
+                    for it in 0..nt {
+                        self.b[bidx2(nx, ny, ix, iy, it)] = 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 現レベルの free セル上の最大重み仮説 (mode)。free 上に質量が無ければ None。
+    fn mode_free(&self) -> Option<PoseView> {
+        let l = &self.levels[self.cur];
+        let (nx, ny, nt, res, t_res) = (l.nx, l.ny, l.nt, l.res, l.t_res_deg);
+        let mut best: Option<(f32, i32, i32, i32)> = None;
+        for it in 0..nt {
+            for iy in 0..ny {
+                for ix in 0..nx {
+                    let w = self.b[bidx2(nx, ny, ix, iy, it)];
+                    if w > 0.0
+                        && best.map_or(true, |(bw, ..)| w > bw)
+                        && level_free(&self.field, l, self.wx0, self.wy0, ix, iy)
+                    {
+                        best = Some((w, ix, iy, it));
+                    }
+                }
+            }
+        }
+        best.map(|(_, ix, iy, it)| PoseView {
+            x: self.field.ox + (self.wx0 + ix) as f64 * res + res * 0.5,
+            y: self.field.oy + (self.wy0 + iy) as f64 * res + res * 0.5,
+            yaw_rad: ((it as f64 + 0.5) * t_res).to_radians(),
+        })
+    }
+
     /// 有効セル数 ESS = 1/Σb² (正規化済み前提)。集中度の指標。
     fn ess(&self) -> f64 {
         let n = self.n_active();
@@ -826,6 +988,7 @@ impl AdaptiveLocalizer {
                 }
             }
         }
+        self.apply_free_mask();
         self.normalize();
     }
 
@@ -1263,6 +1426,8 @@ impl Localizer for AdaptiveLocalizer {
             GridLocalizer::blur_a(self.cfg.motion_sigma_xy_m / res),
             GridLocalizer::blur_a(self.cfg.motion_sigma_theta_deg / t_res),
         );
+        // 拡散が壁・未知へ漏らした質量を毎 tick 回収する (物理拘束)。
+        self.apply_free_mask();
         self.normalize();
     }
 
@@ -1309,6 +1474,7 @@ impl Localizer for AdaptiveLocalizer {
         let z_min = self.cfg.z_min;
         let (ox, oy) = (self.field.ox, self.field.oy);
         let (wx0, wy0) = (self.wx0, self.wy0);
+        let lvl = &self.levels[self.cur];
         let mut quality = 0.0f64;
         for it in 0..nt {
             let th = ((it as f64 + 0.5) * t_res).to_radians();
@@ -1318,6 +1484,11 @@ impl Localizer for AdaptiveLocalizer {
                     let i = bidx2(nx, ny, ix, iy, it);
                     let w = self.b[i];
                     if w <= thr {
+                        self.b[i] = 0.0;
+                        continue;
+                    }
+                    // 物理拘束: 壁・未知の中の仮説はビーム評価するまでもなく棄却。
+                    if !level_free(&self.field, lvl, wx0, wy0, ix, iy) {
                         self.b[i] = 0.0;
                         continue;
                     }
@@ -1351,7 +1522,13 @@ impl Localizer for AdaptiveLocalizer {
     /// どこでもない点に落ちるので None にし、呼び出し側の「pose なし」停止経路に
     /// 乗せる。
     fn pose(&self) -> Option<PoseView> {
-        (self.initialized && self.cur == 0).then(|| self.mean()).flatten()
+        let m = (self.initialized && self.cur == 0).then(|| self.mean()).flatten()?;
+        if self.field.free_at(m.x, m.y) {
+            return Some(m);
+        }
+        // 多峰・ドーナツ状 belief の平均は穴 (壁・未知) に落ちる — 実在する
+        // 仮説 (free 上の mode) へ吸着して返す。
+        self.mode_free().or(Some(m))
     }
 
     fn quality(&self) -> f64 {
@@ -1633,5 +1810,33 @@ mod tests {
             }
         }
         assert!(ok.is_some(), "未シードでも大域初期化で再定位すること");
+    }
+
+    /// 推定が壁・未知の中に落ちないこと (free マスク + free スナップ)。
+    /// ブロックのど真ん中へシードすると、マスクが質量を周囲の free へ追い出し、
+    /// リング状に残った belief の平均はブロック内 (穴) に戻る — pose() は free 上の
+    /// mode へ吸着して返すはず。マスクかスナップのどちらが欠けても落ちる。
+    #[test]
+    fn estimate_never_lands_in_occupied_space() {
+        let g = walled_grid(80);
+        let free_at = |p: PoseView| {
+            let ix = ((p.x - g.origin_x) / g.resolution).floor() as i32;
+            let iy = ((p.y - g.origin_y) / g.resolution).floor() as i32;
+            (0..g.width).contains(&ix)
+                && (0..g.height).contains(&iy)
+                && g.data[(iy * g.width + ix) as usize] == 0
+        };
+        // walled_grid の内部ブロック (x40..44, y10..14) の中心。
+        let block_center = pose(42.0 * 0.05, 12.0 * 0.05, 0.0);
+
+        let mut gl = GridLocalizer::new(&g, 36, BeliefConfig::default());
+        gl.set_pose(block_center);
+        let p = gl.pose().expect("マスク後も free 側に質量が残ること");
+        assert!(free_at(p), "grid: 推定 ({:.2}, {:.2}) が free でない", p.x, p.y);
+
+        let mut al = AdaptiveLocalizer::new(&g, 36, BeliefConfig::default());
+        al.set_pose(block_center);
+        let p = al.pose().expect("マスク後も free 側に質量が残ること");
+        assert!(free_at(p), "adaptive: 推定 ({:.2}, {:.2}) が free でない", p.x, p.y);
     }
 }
