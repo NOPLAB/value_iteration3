@@ -22,6 +22,9 @@ struct Args {
     /// θ セル数（列長）。
     #[arg(long, default_value_t = 60)]
     nt: usize,
+    /// 符号化済みアリーナをこのパスへダンプする（zstd 等の追い圧縮率の外部計測用）。
+    #[arg(long)]
+    dump_arena: Option<PathBuf>,
 }
 
 fn main() {
@@ -89,6 +92,11 @@ fn main() {
         if written > 0 { arena as f64 / written as f64 } else { 0.0 },
     );
     println!("lossless: 全 {nstates} セルの read() が生データと一致");
+
+    if let Some(path) = &args.dump_arena {
+        std::fs::write(path, sink.arena()).expect("dump arena");
+        println!("arena dumped to {}", path.display());
+    }
 }
 
 fn mb(b: usize) -> f64 {

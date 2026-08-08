@@ -514,10 +514,11 @@ fn main() -> ExitCode {
     );
     let states_gb = states as f64 * std::mem::size_of::<State>() as f64 / 1e9;
     if compact_only {
-        // mapped 経路は states を作らず、2D の free(1B)+pen2d(8B)/cell だけ常駐（O(nx·ny)）。
-        let src_mb = (ow as f64) * (oh as f64) * 9.0 / 1e6;
+        // mapped 経路は states を作らず、2D の free(1bit)+pen コードブック索引(1B)/cell だけ
+        // 常駐（O(nx·ny)）。実測は solve 後の map_floor 行。
+        let src_mb = (ow as f64) * (oh as f64) * (1.0 + 1.0 / 8.0) / 1e6;
         eprintln!(
-            "est. memory: mapped 2D source {:.1} MB (free+pen, {} B/state states {:.2} GB は非確保)",
+            "est. memory: mapped 2D source {:.1} MB (free bits+pen code, {} B/state states {:.2} GB は非確保)",
             src_mb,
             std::mem::size_of::<State>(),
             states_gb,
@@ -666,13 +667,14 @@ fn main() -> ExitCode {
                     (st, Box::new(sink))
                 };
                 eprintln!(
-                    "  memory: resident_blocks_peak={}/{} ({:.1} MB)  freed_blocks={}  resident_cols_peak={}/{}",
+                    "  memory: resident_blocks_peak={}/{} ({:.1} MB)  freed_blocks={}  resident_cols_peak={}/{}  map_floor={:.1} MB",
                     s.peak_resident_blocks,
                     s.total_blocks,
                     s.peak_resident_block_bytes as f64 / (1024.0 * 1024.0),
                     s.freed_blocks,
                     s.peak_resident_cols,
                     s.reachable_cols,
+                    s.map_floor_bytes as f64 / (1024.0 * 1024.0),
                 );
                 compact_sink = Some(sink);
                 U64SolveStats { iters: s.iters, updates: s.updates, converged: s.converged }

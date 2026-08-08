@@ -226,6 +226,11 @@ impl CompressedRamSink {
         self.arena.len()
     }
 
+    /// 符号化済みアリーナの中身（追い圧縮の効果計測用。追記順 = finalize 順）。
+    pub fn arena(&self) -> &[u8] {
+        &self.arena
+    }
+
     /// 列索引の実確保バイト数（ページポインタ + 確保済みページ）。
     pub fn index_bytes(&self) -> usize {
         let allocated = self.pages.iter().flatten().count();

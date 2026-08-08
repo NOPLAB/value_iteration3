@@ -52,6 +52,11 @@ pub(crate) trait StateSource {
     fn for_each_seed(&self, f: &mut dyn FnMut(i32, i32, i32));
     /// free な (ix,iy) を列挙する（2D、n_eval 算出用）。
     fn for_each_free(&self, f: &mut dyn FnMut(i32, i32));
+    /// 源自身の常駐ヒープバイト数（O(nx·ny) 床の計測用）。states 借用の SliceSource は
+    /// 自前確保がないので 0。
+    fn floor_bytes(&self) -> u64 {
+        0
+    }
 }
 
 /// orig 索引 `it + ix·nt + iy·nx·nt` を **usize で**計算する。i32 演算だと nstates が i32::MAX
@@ -123,14 +128,20 @@ impl StateSource for SliceSource<'_> {
 
 /// マップから 2D の free/penalty とゴール近傍の final 集合だけを構築する源（O(nx·ny) メモリ）。
 /// O(total) の states を持たないので巨大マップでもメモリ床が下がる。
+///
+/// 表現は可逆圧縮済み: free は 1 bit/セル、penalty は distinct 値表 + u8 索引（本家
+/// `from_occupancy` の式は {PROB_BASE, margin_penalty·PROB_BASE+PROB_BASE} の 2 値しか
+/// 生まない）。素朴な bool + u64 の 9 B/セルが約 1.13 B/セルになる。
 pub(crate) struct MapSource {
     nx: i32,
     ny: i32,
     nt: i32,
-    /// (ix,iy) の free（`map.data==0`）。
-    free: Vec<bool>,
-    /// (ix,iy) の `penalty`（local_penalty=0）。本家 `State::from_occupancy` の margin ループそのまま。
-    pen2d: Vec<u64>,
+    /// (ix,iy) の free（`map.data==0`）。線形 xy 順で 64 セル/語のビットセット。
+    free_bits: Vec<u64>,
+    /// (ix,iy) の `penalty`（local_penalty=0）のコードブック索引。値本体は `pen_table`。
+    pen_code: Vec<u8>,
+    /// penalty の distinct 値表（`pen_code` が索引）。
+    pen_table: Vec<u64>,
     max_pen: u64,
     /// final セルの orig 索引集合（ゴール局所で小さい）。
     finals: HashSet<i64>,
@@ -148,23 +159,41 @@ impl MapSource {
         let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
         let margin = (safety_radius / vi.xy_resolution).ceil() as i32;
         let n2d = (nx as usize) * (ny as usize);
-        let mut free = vec![false; n2d];
-        let mut pen2d = vec![0u64; n2d];
+        let mut free_bits = vec![0u64; n2d.div_ceil(64)];
+        let mut pen_code = vec![0u8; n2d];
+        let mut pen_table: Vec<u64> = Vec::new();
         let mut max_pen = 0u64;
         // 2D: free/penalty は θ 非依存なので θ=0 で 1 回だけ本家式を回す。
         for y in 0..ny {
             for x in 0..nx {
                 let s = State::from_occupancy(x, y, 0, map, margin, safety_radius_penalty, nx);
                 let i = (y * nx + x) as usize;
-                free[i] = s.free;
-                pen2d[i] = s.penalty; // local_penalty = 0
+                if s.free {
+                    free_bits[i >> 6] |= 1u64 << (i & 63);
+                }
+                // local_penalty = 0。distinct 値は構造上ごく少数なので線形探索で十分。
+                pen_code[i] = match pen_table.iter().position(|&p| p == s.penalty) {
+                    Some(c) => c as u8,
+                    None => {
+                        pen_table.push(s.penalty);
+                        assert!(
+                            pen_table.len() <= 256,
+                            "MapSource pen codebook overflow: from_occupancy が 256 種超の \
+                             penalty を生んだ（式を変えたら pen_code を広げること）"
+                        );
+                        (pen_table.len() - 1) as u8
+                    }
+                };
                 if s.penalty > max_pen {
                     max_pen = s.penalty;
                 }
             }
         }
-        let finals = compute_finals(vi, &free);
-        Self { nx, ny, nt, free, pen2d, max_pen, finals }
+        let finals = compute_finals(vi, |ix, iy| {
+            let i = (iy * nx + ix) as usize;
+            (free_bits[i >> 6] >> (i & 63)) & 1 == 1
+        });
+        Self { nx, ny, nt, free_bits, pen_code, pen_table, max_pen, finals }
     }
     #[inline]
     fn xy(&self, ix: i32, iy: i32) -> usize {
@@ -179,11 +208,12 @@ impl MapSource {
 impl StateSource for MapSource {
     #[inline]
     fn pen(&self, ix: i32, iy: i32) -> u64 {
-        self.pen2d[self.xy(ix, iy)]
+        self.pen_table[self.pen_code[self.xy(ix, iy)] as usize]
     }
     #[inline]
     fn free(&self, ix: i32, iy: i32) -> bool {
-        self.free[self.xy(ix, iy)]
+        let i = self.xy(ix, iy);
+        (self.free_bits[i >> 6] >> (i & 63)) & 1 == 1
     }
     #[inline]
     fn is_final(&self, ix: i32, iy: i32, it: i32) -> bool {
@@ -206,18 +236,24 @@ impl StateSource for MapSource {
     fn for_each_free(&self, f: &mut dyn FnMut(i32, i32)) {
         for iy in 0..self.ny {
             for ix in 0..self.nx {
-                if self.free[self.xy(ix, iy)] {
+                if self.free(ix, iy) {
                     f(ix, iy);
                 }
             }
         }
+    }
+    fn floor_bytes(&self) -> u64 {
+        (self.free_bits.len() * 8
+            + self.pen_code.len()
+            + self.pen_table.len() * 8
+            + self.finals.len() * 8) as u64
     }
 }
 
 /// 本家 `setStateValues` の final 判定を**ゴール近傍 bbox のみ**で再現し、final セルの orig 集合を返す。
 /// final_xy は両角 (x0,y0)/(x1,y1) がともに goal から `goal_margin_radius` 内を要求するので、bbox の
 /// 外側のセルは決して final にならない（健全な絞り込み）。bit-exact のため式は本家と完全一致させる。
-fn compute_finals(vi: &ValueIterator, free: &[bool]) -> HashSet<i64> {
+fn compute_finals(vi: &ValueIterator, free_at: impl Fn(i32, i32) -> bool) -> HashSet<i64> {
     let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
     let (xy_res, ox, oy) = (vi.xy_resolution, vi.map_origin_x, vi.map_origin_y);
     let (gx, gy, gt, gm) = (vi.goal_x, vi.goal_y, vi.goal_t, vi.goal_margin_theta);
@@ -235,7 +271,7 @@ fn compute_finals(vi: &ValueIterator, free: &[bool]) -> HashSet<i64> {
     let hi_y = (((gy + rad - oy) / xy_res).ceil() as i32 + 1).min(ny - 1);
     for iy in lo_y..=hi_y {
         for ix in lo_x..=hi_x {
-            if !free[(iy * nx + ix) as usize] {
+            if !free_at(ix, iy) {
                 continue;
             }
             let x0 = ix as f64 * xy_res + ox;
@@ -839,6 +875,8 @@ pub struct CompactStats {
     pub peak_resident_block_bytes: u64,
     /// 総ブロック数。
     pub total_blocks: u64,
+    /// 源（MapSource）の常駐ヒープバイト数 = O(nx·ny) メモリ床。SliceSource 経路は 0。
+    pub map_floor_bytes: u64,
 }
 
 /// 波内バンドを直列 Gauss–Seidel で収束させる。frontier から始め、減少 θ があった in-band 列の
@@ -1601,6 +1639,7 @@ fn solve_compact_core(
         peak_resident_blocks,
         peak_resident_block_bytes,
         total_blocks,
+        map_floor_bytes: src.floor_bytes(),
     }
 }
 
