@@ -10,3 +10,4 @@
 pub mod fixtures;
 pub mod params;
 pub mod pgm;
+pub mod sim;
