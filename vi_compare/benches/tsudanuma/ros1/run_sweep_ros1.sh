@@ -22,7 +22,8 @@ MLIST="${MLIST:-1 2 4 6 8 10 12 16}"
 
 echo "[ros1 sweep] catkin_make 本家"
 mkdir -p /catkin_ws/src
-ln -sfn /src_value_iteration /catkin_ws/src/value_iteration
+rm -rf /catkin_ws/src/value_iteration
+ln -s /src_value_iteration /catkin_ws/src/value_iteration
 cd /catkin_ws
 catkin_make >/tmp/catkin.log 2>&1 || { echo FAIL; tail -30 /tmp/catkin.log; exit 1; }
 source devel/setup.bash

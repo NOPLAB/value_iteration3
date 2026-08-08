@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_sweep_vi_rs.sh の n 回反復版: 各 m を REPS 回計測し、rep 列付き CSV を出力する。
+# bench_map の m 掃引を各 m につき REPS 回計測し、rep 列付き CSV を出力する。
 # 統計 (mean±std) は後段で集計する。単発版と同じく VI_THREADS=m で bench_map を回す。
 set -e
 cd "${REPO_ROOT:-/home/nop/dev/mywork/value_iteration3}"

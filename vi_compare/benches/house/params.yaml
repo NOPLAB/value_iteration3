@@ -1,4 +1,4 @@
-# 比較ベンチ共通パラメータ (正典)。planning は ros1/bench.launch と ros2/vi_node_params.yaml にミラー。
+# 比較ベンチ共通パラメータ (正典)。planning は ros1/bench.launch にミラー。
 goal:
   x: -0.425   # m  (house.pgm 自由空間重心セル pixel(col,row)=(191,192))
   y: -0.425   # m

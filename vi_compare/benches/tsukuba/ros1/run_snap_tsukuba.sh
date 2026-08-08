@@ -5,7 +5,8 @@
 # vi_rs frontier2d_sparse の VI_SNAP_DIR ランと対をなす本家側の動画素材生成。
 #
 # コンテナ内で実行する想定。mounts:
-#   /src_value_iteration : video/value_iteration_snap (snapshotWorker パッチ済, ro)
+#   /src_value_iteration : 本家 value_iteration (無改変, ro)。snapshotWorker は
+#                          video/snapshot.patch をコピーに適用して足す。
 #   /workspace           : この repo (results もこの下)
 #   /catkin_ws           : 永続ビルドキャッシュ (vi_compare/.cache/catkin_ws)
 # env:
@@ -38,9 +39,12 @@ export VI_SNAP_DIR="${VI_SNAP_DIR:-$OUTDIR/frames_ros1}"
 export VI_SNAP_MS="${VI_SNAP_MS:-2000}"
 echo "[run_snap] VI_SNAP_DIR=$VI_SNAP_DIR VI_SNAP_MS=$VI_SNAP_MS"
 
-echo "[run_snap] catkin_make 本家 (snapshot パッチ版)"
+echo "[run_snap] catkin_make 本家 (snapshot パッチ適用)"
 mkdir -p /catkin_ws/src
-ln -sfn /src_value_iteration /catkin_ws/src/value_iteration
+# :ro マウントへはパッチを当てられないのでコピーしてから snapshot.patch を適用する。
+rm -rf /catkin_ws/src/value_iteration
+cp -r /src_value_iteration /catkin_ws/src/value_iteration
+patch -p1 -d /catkin_ws/src/value_iteration < /workspace/vi_compare/video/snapshot.patch
 cd /catkin_ws
 catkin_make >/tmp/catkin.log 2>&1 || { echo "catkin_make FAILED"; tail -40 /tmp/catkin.log; exit 1; }
 source devel/setup.bash

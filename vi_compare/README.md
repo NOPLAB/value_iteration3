@@ -1,15 +1,15 @@
 # vi_compare — 本家 ROS1 `value_iteration` との比較ベンチ一式
 
-本家 ROS1 ノード (`~/dev/mywork/value_iteration`、読み取り専用マウント) と
+本家 ROS1 ノード (`../value_iteration`、読み取り専用マウント) と
 このリポジトリの実装 (vi_rs / vi_ros2) を、同一問題・同一パラメータで
 突き合わせるためのハーネス群。**本家リポジトリは一切改変しない**
-(パッチが要る場合は `video/value_iteration_snap/` のようにコピーへ適用する)。
+(パッチが要る場合は `video/snapshot.patch` のようにコンテナ内のコピーへ適用する)。
 
 ## ディレクトリ構成
 
 ```
 vi_compare/
-├── docker/                  ROS1 noetic ベンチイメージ (Dockerfile.ros1, compose)
+├── docker/                  ROS1 noetic ベンチイメージ (Dockerfile.ros1)
 ├── benches/
 │   ├── house/               house マップでのオラクル比較スイート (単スレ中心)
 │   │   ├── params.yaml      共通パラメータ (goal, theta 数など)
@@ -21,9 +21,8 @@ vi_compare/
 │   └── tsudanuma/           論文 (Ueda+ 2023) 構成の並列スイープ再現スイート
 │       ├── maps/            pool_tsudanuma.py / crop_pool.py (lite/full 地図生成)
 │       ├── ros1/            bench_tsudanuma.launch + bench_client +
-│       │                    run_bench.sh (フル収束計測) / run_sweep_ros1.sh (m掃引)
-│       │                    / parse_ros1_log.py (手動停止ラン救済)
-│       ├── vi_rs/           run_sweep_vi_rs.sh (bench_map の m 掃引; host 実行)
+│       │                    run_sweep_ros1.sh / run_sweep_ros1_reps.sh (m掃引)
+│       ├── vi_rs/           run_sweep_vi_rs_reps.sh (bench_map の m 掃引; host 実行)
 │       ├── plot.py          図生成 (speed/house/lite/full/tsukuba モード)
 │       └── report_paper_style.md              論文対応レポート
 │   └── tsukuba/             tsukuba フル地図 (226M states) の動画素材生成
@@ -33,7 +32,7 @@ vi_compare/
 │   ├── render_frames_house.py     house 版 (×8 スローモーション)
 │   ├── render_frames_tsudanuma.py 津田沼フル版 (real-time → ×40 timelapse)
 │   ├── render_frames_tsukuba.py   tsukuba 版 (226M states; real-time → ×40 timelapse)
-│   └── value_iteration_snap/    本家のパッチ済コピー (snapshotWorker 追加)
+│   └── snapshot.patch           本家へ snapshotWorker を足すパッチ (コピーに適用)
 ├── results/                 生成物 (git 管理外; 下記)
 └── .cache/                  catkin_ws / cargo target の永続キャッシュ (git 管理外)
 ```
@@ -72,19 +71,16 @@ results/
 
 ```sh
 make compare-build          # ROS1 noetic イメージ
-make compare-ros1           # 本家を実行 → /results (= results/house_oracle) に npy
-make compare-ref            # vi_reference u64 ハーネス
+make compare-bench          # 本家 → ref → 突き合わせを一括 (scripts/compare_bench.sh)
 make compare-u64 compare-u64-summary   # u64 全ソルバ + report_u64.md
-make compare-report         # ros1 vs ros2 突き合わせ
+make compare-strict         # 真の固定点での bit 比較 (scripts/compare_strict.sh)
 ```
-
-(`scripts/compare_bench.sh` / `scripts/compare_strict.sh` も同じ配置を使う)
 
 ### 津田沼 / 並列スイープ
 
-`benches/tsudanuma/ros1/` の `run_bench.sh` (フル収束計測) と
-`run_sweep_ros1.sh` (スレッド数掃引) を docker (`vi_compare_ros1:noetic`) 内で、
-`vi_rs/run_sweep_vi_rs.sh` を host で実行。env (`MAP_YAML`, `OUTDIR`,
+`benches/tsudanuma/ros1/` の `run_sweep_ros1.sh` / `run_sweep_ros1_reps.sh`
+(スレッド数掃引) を docker (`vi_compare_ros1:noetic`) 内で、
+`vi_rs/run_sweep_vi_rs_reps.sh` を host で実行。env (`MAP_YAML`, `OUTDIR`,
 `GOAL_*`, `MLIST`, `DELTA_THR`, `TIMEOUT`, `SOLVER` など) で制御。
 図は `plot.py [RES] [mode]` (mode = all/speed/house/lite/full/tsukuba,
 RES 省略時 `../../results/tsudanuma`;
@@ -93,8 +89,9 @@ matplotlib は docker イメージ `raspicat-vla-sim:latest` で実行)。
 ### 動画
 
 1. スナップショット付き計測: vi_rs 側は `VI_SNAP_DIR`/`VI_SNAP_EVERY` env
-   (frontier2d_sparse の Snapshotter)、本家側は `video/value_iteration_snap/`
-   を `/src_value_iteration` にマウントし `VI_SNAP_DIR`/`VI_SNAP_MS` env。
+   (frontier2d_sparse の Snapshotter)、本家側は無改変の本家 checkout を
+   `/src_value_iteration` にマウントし `VI_SNAP_DIR`/`VI_SNAP_MS` env
+   (run_snap_tsukuba.sh がコピーへ `video/snapshot.patch` を適用する)。
 2. レンダリング: `video/render_frames_{house,tsudanuma,tsukuba}.py` を raspicat-vla-sim で実行
    (リポジトリを `/work` にマウント) → `results/<map>/video_frames/` に PNG。
 3. エンコード: host ffmpeg は libx264 無し — `h264_nvenc -cq 21` か
@@ -118,7 +115,7 @@ VI_THREADS=16 VI_SNAP_DIR=vi_compare/results/tsukuba/frames_sparse VI_SNAP_EVERY
 
 # 本家 ROS1 スナップショット (docker, TIMEOUT まで未収束)
 docker run --rm \
-  -v "$PWD/vi_compare/video/value_iteration_snap:/src_value_iteration:ro" \
+  -v "$PWD/../value_iteration:/src_value_iteration:ro" \
   -v "$PWD:/workspace" -v "$PWD/vi_compare/.cache/catkin_ws:/catkin_ws" \
   -e VI_SNAP_MS=2000 -e TIMEOUT=600 vi_compare_ros1:noetic \
   bash /workspace/vi_compare/benches/tsukuba/ros1/run_snap_tsukuba.sh

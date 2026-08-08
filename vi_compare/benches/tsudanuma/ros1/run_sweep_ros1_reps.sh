@@ -19,7 +19,8 @@ REPS="${REPS:-10}"
 
 echo "[ros1 reps] catkin_make 本家"
 mkdir -p /catkin_ws/src
-ln -sfn /src_value_iteration /catkin_ws/src/value_iteration
+rm -rf /catkin_ws/src/value_iteration
+ln -s /src_value_iteration /catkin_ws/src/value_iteration
 cd /catkin_ws
 catkin_make >/tmp/catkin.log 2>&1 || { echo FAIL; tail -30 /tmp/catkin.log; exit 1; }
 source devel/setup.bash

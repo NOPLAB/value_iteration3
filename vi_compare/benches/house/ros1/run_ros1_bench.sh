@@ -4,7 +4,8 @@
 set -e
 source /opt/ros/noetic/setup.bash
 mkdir -p /catkin_ws/src
-ln -sfn /src_value_iteration /catkin_ws/src/value_iteration
+rm -rf /catkin_ws/src/value_iteration
+ln -s /src_value_iteration /catkin_ws/src/value_iteration
 cd /catkin_ws
 # /catkin_ws はホスト側 vi_compare/.cache/catkin_ws にマウントして永続化する。
 # catkin_make は増分ビルド: 初回はフルビルド、以降は本家 C++ が未変更ならほぼ no-op

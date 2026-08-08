@@ -47,6 +47,9 @@ cd "$ROOT"
 
 REPS="${REPS:-10}"
 DOCKER_IMG="${VI_COMPARE_DOCKER_IMG:-vi_compare_ros1:noetic}"
+# 本家 value_iteration の checkout (無改変)。snapshotWorker が要るステップは
+# コンテナ内で vi_compare/video/snapshot.patch をコピーへ適用する。
+VI_ORIG="${VI_ORIG:-$ROOT/../value_iteration}"
 REPS_VIRS="$SCRIPT_DIR/tsudanuma/vi_rs/run_sweep_vi_rs_reps.sh"
 REPS_ROS1="$SCRIPT_DIR/tsudanuma/ros1/run_sweep_ros1_reps.sh"
 SWEEP_ROS1="$SCRIPT_DIR/tsudanuma/ros1/run_sweep_ros1.sh"
@@ -100,7 +103,7 @@ docker_ros1() { # docker_ros1 NAME SCRIPT_IN_CONTAINER LOG_HOST_PATH env...
   for e in "$@"; do envs+=(-e "$e"); done
   trap 'docker rm -f '"$name"' >/dev/null 2>&1 || true' INT TERM
   docker run --rm --name "$name" \
-    -v "$ROOT/vi_compare/video/value_iteration_snap:/src_value_iteration:ro" \
+    -v "$VI_ORIG:/src_value_iteration:ro" \
     -v "$ROOT:/workspace" \
     -v "$ROOT/vi_compare/.cache/catkin_ws:/catkin_ws" \
     -v "$ROOT/vi_compare/results:/results" \
