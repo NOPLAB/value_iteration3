@@ -1,70 +1,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cmath>
-#include <algorithm>
 #include "../src/vi_sweep_stream_top.h"
 #include "vi_reference.h"
-
-static void build_test_map(
-    uint16_t *penalty, uint16_t *value,
-    int map_x, int map_y, int goal_x, int goal_y)
-{
-    int map_size = map_x * map_y;
-    int state_size = map_size * vi_ref::N_THETA;
-
-    for (int i = 0; i < map_size; i++) penalty[i] = 0;
-
-    // Border obstacles
-    for (int x = 0; x < map_x; x++) {
-        penalty[0 * map_x + x] = vi_ref::PENALTY_OBSTACLE;
-        penalty[(map_y - 1) * map_x + x] = vi_ref::PENALTY_OBSTACLE;
-    }
-    for (int y = 0; y < map_y; y++) {
-        penalty[y * map_x + 0] = vi_ref::PENALTY_OBSTACLE;
-        penalty[y * map_x + (map_x - 1)] = vi_ref::PENALTY_OBSTACLE;
-    }
-
-    // L-shaped obstacle
-    for (int x = 5; x <= std::min(12, map_x - 2); x++)
-        penalty[10 * map_x + x] = vi_ref::PENALTY_OBSTACLE;
-    for (int y = 6; y <= 10; y++)
-        if (12 < map_x)
-            penalty[y * map_x + 12] = vi_ref::PENALTY_OBSTACLE;
-
-    // Safety penalty near obstacles
-    for (int y = 1; y < map_y - 1; y++)
-        for (int x = 1; x < map_x - 1; x++) {
-            if (penalty[y * map_x + x] == vi_ref::PENALTY_OBSTACLE) continue;
-            bool near = false;
-            for (int dy = -1; dy <= 1; dy++)
-                for (int dx = -1; dx <= 1; dx++)
-                    if (penalty[(y+dy)*map_x + (x+dx)] == vi_ref::PENALTY_OBSTACLE)
-                        near = true;
-            if (near) penalty[y * map_x + x] = 100;
-        }
-
-    // Goal
-    penalty[goal_y * map_x + goal_x] = vi_ref::PENALTY_GOAL;
-
-    // Value init
-    for (int i = 0; i < state_size; i++) value[i] = vi_ref::MAX_VALUE;
-    for (int it = 0; it < vi_ref::N_THETA; it++)
-        value[(goal_y * map_x + goal_x) * vi_ref::N_THETA + it] = 0;
-}
-
-static void pack_transitions(
-    const vi_ref::TransitionEntry trans[vi_ref::N_ACTIONS][vi_ref::N_THETA],
-    uint32_t *packed)
-{
-    for (int a = 0; a < vi_ref::N_ACTIONS; a++)
-        for (int it = 0; it < vi_ref::N_THETA; it++) {
-            uint32_t w = ((uint32_t)(uint8_t)trans[a][it].dix)
-                       | ((uint32_t)(uint8_t)trans[a][it].diy << 8)
-                       | ((uint32_t)(uint8_t)trans[a][it].dit << 16);
-            packed[a * vi_ref::N_THETA + it] = w;
-        }
-}
 
 static int run_test(const char *name, int map_x, int map_y,
                     int goal_x, int goal_y, double xy_res)
@@ -80,18 +18,16 @@ static int run_test(const char *name, int map_x, int map_y,
     uint16_t *pen_hls = new uint16_t[map_size];
     uint16_t *val_hls = new uint16_t[state_size];
 
-    build_test_map(pen_ref, val_ref, map_x, map_y, goal_x, goal_y);
+    vi_ref::build_test_map(pen_ref, val_ref, map_x, map_y, goal_x, goal_y);
     memcpy(pen_hls, pen_ref, map_size * sizeof(uint16_t));
     memcpy(val_hls, val_ref, state_size * sizeof(uint16_t));
 
-    // Transitions
-    vi_ref::TransitionEntry trans[vi_ref::N_ACTIONS][vi_ref::N_THETA];
-    vi_ref::compute_transitions(xy_res, trans);
+    // Transitions (packed, shared with HLS)
     uint32_t trans_packed[vi_ref::N_ACTIONS * vi_ref::N_THETA];
-    pack_transitions(trans, trans_packed);
+    vi_ref::compute_transitions(xy_res, trans_packed);
 
     // CPU reference
-    int ref_sweeps = vi_ref::run_vi(val_ref, pen_ref, trans,
+    int ref_sweeps = vi_ref::run_vi(val_ref, pen_ref, trans_packed,
                                      map_x, map_y, 0, 200);
     printf("  CPU reference: %d sweeps\n", ref_sweeps);
 

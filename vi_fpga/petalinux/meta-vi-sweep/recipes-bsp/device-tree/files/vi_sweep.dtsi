@@ -7,7 +7,6 @@
  *
  * SPI numbers for pl_ps_irq0[1:0] must be verified from the Vivado
  * IP Integrator address editor after regenerating the bitstream.
- * See fpga/vivado/ultra96v2/irq_notes.txt for placeholders.
  */
 
 /include/ "dt-bindings/interrupt-controller/irq.h"

@@ -50,8 +50,7 @@ static int read_line(const char *path, char *buf, size_t sz) {
     if (!f) return -1;
     if (!fgets(buf, (int)sz, f)) { fclose(f); return -1; }
     fclose(f);
-    size_t n = strlen(buf);
-    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = 0;
+    buf[strcspn(buf, "\r\n")] = 0;
     return 0;
 }
 
@@ -71,18 +70,11 @@ static int find_uio_by_name(const char *name) {
     return found;
 }
 
-static uint64_t read_udma_phys(const char *sys_path) {
+static uint64_t read_udma_u64(const char *sys_path, const char *name) {
     char p[512], buf[64];
-    snprintf(p, sizeof p, "%s/phys_addr", sys_path);
+    snprintf(p, sizeof p, "%s/%s", sys_path, name);
     if (read_line(p, buf, sizeof buf) < 0) return 0;
     return strtoull(buf, NULL, 0);
-}
-
-static size_t read_udma_size(const char *sys_path) {
-    char p[512], buf[64];
-    snprintf(p, sizeof p, "%s/size", sys_path);
-    if (read_line(p, buf, sizeof buf) < 0) return 0;
-    return (size_t)strtoull(buf, NULL, 0);
 }
 
 static void linux_shutdown(void *vctx);
@@ -113,11 +105,11 @@ static int linux_init(void *vctx) {
     c->udma_pendata_fd = open(UDMA_PENDATA_DEV, O_RDWR);
     if (c->udma_value_fd < 0 || c->udma_pendata_fd < 0) { linux_shutdown(vctx); return VI_ERR_OPEN; }
 
-    c->value_size   = read_udma_size(UDMA_VALUE_SYS);
-    c->pendata_size = read_udma_size(UDMA_PENDATA_SYS);
+    c->value_size   = (size_t)read_udma_u64(UDMA_VALUE_SYS, "size");
+    c->pendata_size = (size_t)read_udma_u64(UDMA_PENDATA_SYS, "size");
     if (c->value_size == 0 || c->pendata_size == 0) { linux_shutdown(vctx); return VI_ERR_OPEN; }
-    c->value_phys   = read_udma_phys(UDMA_VALUE_SYS);
-    c->pendata_phys = read_udma_phys(UDMA_PENDATA_SYS);
+    c->value_phys   = read_udma_u64(UDMA_VALUE_SYS, "phys_addr");
+    c->pendata_phys = read_udma_u64(UDMA_PENDATA_SYS, "phys_addr");
 
     c->value_mmap   = mmap(NULL, c->value_size, PROT_READ | PROT_WRITE,
                            MAP_SHARED, c->udma_value_fd, 0);

@@ -7,6 +7,3 @@ downloads/
 
 # Build output artifacts
 output/
-
-# PetaLinux installer (legacy, no longer needed for EDF)
-docker/*.run

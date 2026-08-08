@@ -1,23 +1,23 @@
 # ===========================================================================
-# create_project_stream.tcl — Ultra96-V2 Vivado project (streaming kernel)
+# create_project_hls.tcl — Ultra96-V2 Vivado project for an HLS kernel.
+# Caller sets $variant (tile | stream) before sourcing (see build_vivado.tcl).
 # ===========================================================================
 
-set project_name "vi_stream"
+set project_name "vi_${variant}"
 set tcl_dir      [file normalize [file dirname [info script]]]
-set vivado_dir   [file normalize "$tcl_dir/../vivado/ultra96v2"]
-set ip_repo_dir  [file normalize "$vivado_dir/ip_repo_stream"]
+set ip_repo_dir  [file normalize "$tcl_dir/../vivado/ultra96v2/ip_repo_${variant}"]
 set part         "xczu3eg-sbva484-1-i"
 
 create_project $project_name "$::build_dir/$project_name" -part $part -force
 
 set_property board_part Avnet-tria:Ultra96v2:part0:1.3 [current_project]
 
-# Add HLS IP repo (contains vi_sweep_stream IP)
+# Add HLS IP repo (contains the vi_sweep / vi_sweep_stream IP)
 set_property ip_repo_paths $ip_repo_dir [current_project]
 update_ip_catalog
 
 # Source block design
-source "$tcl_dir/create_bd_stream.tcl"
+source "$tcl_dir/create_bd_hls.tcl"
 
 # Generate output products
 generate_target all [get_files vi_bd.bd]

@@ -1,15 +1,6 @@
 #include "compute_bellman.h"
 
-// Saturating add for cost computation.
-// If either input is a sentinel (MAX_VALUE / PENALTY_OBSTACLE),
-// returns MAX_VALUE. PENALTY_GOAL is treated as 0.
-static inline value_t cost_of(value_t nv, penalty_t np_raw) {
-    if (nv == MAX_VALUE || np_raw == PENALTY_OBSTACLE) return MAX_VALUE;
-    penalty_t np = (np_raw == PENALTY_GOAL) ? (penalty_t)0 : np_raw;
-    ap_uint<17> sum = (ap_uint<17>)nv + (ap_uint<17>)np;
-    return (sum >= (ap_uint<17>)MAX_VALUE)
-           ? (value_t)(MAX_VALUE - 1) : (value_t)sum;
-}
+// cost_of comes from vi_hls_common.h (shared with the streaming kernel).
 
 void compute_bellman(
     value_t val_buf[TILE_H_H][TILE_W_H][N_THETA],

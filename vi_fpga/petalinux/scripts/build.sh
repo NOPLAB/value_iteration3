@@ -2,19 +2,11 @@
 # Build AMD EDF Linux image for Ultra96-V2.
 # Run inside the Docker container with the repo mounted at /work.
 #
-# Usage: build.sh [--machine <name>] [--image <recipe>]
+# Usage: build.sh <machine> <image>   (defaults live in petalinux/Makefile)
 set -euo pipefail
 
-MACHINE="${MACHINE:-ultra96v2-vi}"
-IMAGE="edf-linux-disk-image"
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --machine) MACHINE="$2"; shift 2 ;;
-        --image)   IMAGE="$2"; shift 2 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
-    esac
-done
+MACHINE="${1:?usage: build.sh <machine> <image>}"
+IMAGE="${2:?usage: build.sh <machine> <image>}"
 
 EDF_DIR="/work/edf"
 OUTPUT_DIR="/work/petalinux/output"

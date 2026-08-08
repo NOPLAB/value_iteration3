@@ -1,4 +1,4 @@
-#include "vi_assert.h"
+#include <assert.h>
 #include "libvi_sweep.h"
 #include "vi_device.h"
 
@@ -8,7 +8,7 @@
 int main(void) {
     void *ctx = vi_mock_ctx_new();
     vi_device_t *dev = vi_open(&vi_mock_ops, ctx);
-    VI_ASSERT(dev != NULL);
+    assert(dev != NULL);
 
     int W = 4, H = 4;
     size_t nv, np, nt;
@@ -33,15 +33,15 @@ int main(void) {
 
     uint8_t *act = calloc((size_t)W * H * VI_N_THETA, 1);
     int rc = vi_compute_action_table(dev, W, H, act);
-    VI_ASSERT_EQ(rc, VI_OK);
+    assert(rc == VI_OK);
 
     /* Cell (x=0, y=0, theta=0): action 3 (+x, 20) beats action 0 (self, 30). */
-    VI_ASSERT_EQ(act[((size_t)0 * W + 0) * VI_N_THETA + 0], 3);
+    assert(act[((size_t)0 * W + 0) * VI_N_THETA + 0] == 3);
     /* Cell (x=W-1, y=0, theta=0): action 3 out-of-bounds -> action 0 wins. */
-    VI_ASSERT_EQ(act[((size_t)0 * W + (W-1)) * VI_N_THETA + 0], 0);
+    assert(act[((size_t)0 * W + (W-1)) * VI_N_THETA + 0] == 0);
 
     free(act);
     vi_close(dev);
     vi_mock_ctx_free(ctx);
-    VI_TEST_MAIN_END();
+    return 0;
 }

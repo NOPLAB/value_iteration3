@@ -10,23 +10,7 @@ MACHINE ?= ultra96v2-vi
 # Yocto image recipe
 IMAGE ?= edf-linux-disk-image
 
-.PHONY: docker-build docker-shell edf-setup edf-build clean help
-
-help:
-	@echo "AMD EDF (Yocto) build targets for Ultra96-V2:"
-	@echo ""
-	@echo "  make docker-build                    Build Docker image (no installer needed)"
-	@echo "  make docker-shell                    Interactive shell in container"
-	@echo "  make edf-setup                       repo init + sync EDF layers (first time)"
-	@echo "  make edf-setup XSA=<path>            Setup + generate machine config from XSA"
-	@echo "  make edf-build                       Build Linux image (WIC + BOOT.BIN)"
-	@echo "  make edf-build MACHINE=<name>        Build for specific machine"
-	@echo "  make clean                           Remove project and output dirs"
-	@echo ""
-	@echo "First-time workflow:"
-	@echo "  1. make docker-build"
-	@echo "  2. make edf-setup XSA=path/to/design.xsa"
-	@echo "  3. make edf-build"
+.PHONY: docker-build docker-shell edf-setup edf-build clean
 
 # ---------- Docker image ----------
 
@@ -56,8 +40,7 @@ edf-setup:
 		$(if $(XSA),--xsa "$(XSA)")
 
 edf-build:
-	$(DOCKER_RUN) bash /work/petalinux/scripts/build.sh \
-		--machine "$(MACHINE)" --image "$(IMAGE)"
+	$(DOCKER_RUN) bash /work/petalinux/scripts/build.sh "$(MACHINE)" "$(IMAGE)"
 
 # ---------- Clean ----------
 

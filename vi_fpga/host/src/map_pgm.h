@@ -8,10 +8,7 @@ typedef struct {
     int      w;
     int      h;
     double   resolution;   /* meters per cell */
-    double   origin_x;     /* meters */
-    double   origin_y;
     double   occupied_thresh;
-    double   free_thresh;
     int      negate;       /* 0 = white is free (default), 1 = black is free */
     uint8_t *pixels;       /* w*h bytes, 0..255 raw (post-negate) */
 } pgm_map_t;

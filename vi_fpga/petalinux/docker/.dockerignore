@@ -1,5 +1,4 @@
-# Keep build context small — only send Dockerfile, entrypoint, and installer
+# Keep build context small — only send Dockerfile and entrypoint
 *
 !Dockerfile
 !entrypoint.sh
-!petalinux-v*.run

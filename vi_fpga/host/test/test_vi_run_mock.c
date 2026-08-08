@@ -1,6 +1,6 @@
 /* test_vi_run_mock.c — exercises libvi_sweep against mock ops. */
 
-#include "vi_assert.h"
+#include <assert.h>
 #include "libvi_sweep.h"
 #include "vi_device.h"
 
@@ -36,10 +36,10 @@ static void init_tiny_map(vi_device_t *dev, int w, int h, int gx, int gy) {
 
 int main(void) {
     void *ctx = vi_mock_ctx_new();
-    VI_ASSERT(ctx != NULL);
+    assert(ctx != NULL);
 
     vi_device_t *dev = vi_open(&vi_mock_ops, ctx);
-    VI_ASSERT(dev != NULL);
+    assert(dev != NULL);
 
     int W = 16, H = 16;
     init_tiny_map(dev, W, H, 8, 8);
@@ -48,21 +48,21 @@ int main(void) {
                             .threshold = 0, .max_sweeps = 100 };
     vi_run_stats_t stats = {0};
     int rc = vi_run_until_converged(dev, &cfg, &stats);
-    VI_ASSERT_EQ(rc, VI_OK);
-    VI_ASSERT(stats.converged == 1);
-    VI_ASSERT(stats.sweeps > 0);
-    VI_ASSERT(stats.sweeps <= 100);
+    assert(rc == VI_OK);
+    assert(stats.converged == 1);
+    assert(stats.sweeps > 0);
+    assert(stats.sweeps <= 100);
 
     /* Goal should still be 0 */
     size_t nv;
     uint16_t *val = vi_value_buffer(dev, &nv);
-    VI_ASSERT_EQ(val[(8 * W + 8) * VI_N_THETA + 0], 0);
+    assert(val[(8 * W + 8) * VI_N_THETA + 0] == 0);
 
     /* Non-goal cell on the same row as goal (reachable via dix=+/-1) should
        be strictly less than MAX after convergence. */
-    VI_ASSERT(val[(8 * W + 4) * VI_N_THETA + 0] < 0xFFFF);
+    assert(val[(8 * W + 4) * VI_N_THETA + 0] < 0xFFFF);
 
     vi_close(dev);
     vi_mock_ctx_free(ctx);
-    VI_TEST_MAIN_END();
+    return 0;
 }

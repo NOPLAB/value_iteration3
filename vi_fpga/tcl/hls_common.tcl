@@ -8,6 +8,10 @@
 set script_dir [file normalize [file dirname [info script]]]
 set hls_dir    [file normalize "$script_dir/../hls/$kernel"]
 set common_dir [file normalize "$script_dir/../hls/common"]
+# vi_reference.cpp includes the shared C implementations from these dirs.
+set driver_dir [file normalize "$script_dir/../driver/uio"]
+set hostsrc_dir [file normalize "$script_dir/../host/src"]
+set tb_cflags  "-I$common_dir -I$driver_dir -I$hostsrc_dir"
 set part       "xczu3eg-sbva484-1-i"
 set top        [expr {$kernel eq "stream" ? "vi_sweep_stream" : "vi_sweep"}]
 set proj       hls_build_$kernel
@@ -22,9 +26,9 @@ foreach f [lsort [glob "$hls_dir/src/*.cpp"]] {
     add_files $f
 }
 foreach f [lsort [glob "$hls_dir/tb/*.cpp"]] {
-    add_files -tb $f -cflags "-I$common_dir"
+    add_files -tb $f -cflags $tb_cflags
 }
-add_files -tb "$common_dir/vi_reference.cpp" -cflags "-I$common_dir"
+add_files -tb "$common_dir/vi_reference.cpp" -cflags $tb_cflags
 
 if {[file exists $proj/solution1/solution1.aps]} {
     open_solution "solution1"

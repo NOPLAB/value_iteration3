@@ -44,7 +44,11 @@ proc ensure_run_is_launchable {run_name} {
 if {![file exists $xpr_file]} {
     puts "INFO: Project not found, creating..."
     set ::build_dir $build_dir
-    source "$script_dir/create_project_${variant}.tcl"
+    if {$variant eq "matlab"} {
+        source "$script_dir/create_project_matlab.tcl"
+    } else {
+        source "$script_dir/create_project_hls.tcl"
+    }
 } else {
     open_project $xpr_file
 }

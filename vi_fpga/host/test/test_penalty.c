@@ -1,4 +1,4 @@
-#include "vi_assert.h"
+#include <assert.h>
 #include "penalty.h"
 
 #include <stdint.h>
@@ -16,11 +16,11 @@ int main(void) {
     uint16_t pen[25] = {0};
     penalty_build(&m, 2, 0, 0, pen);
 
-    VI_ASSERT_EQ(pen[2*5 + 2], 0xFFFF);  /* center = obstacle */
-    VI_ASSERT(pen[2*5 + 1] > 0);          /* adjacent cell has some penalty */
-    VI_ASSERT_EQ(pen[0*5 + 0], 0xFFFE);   /* goal */
-    VI_ASSERT_EQ(pen[4*5 + 4], 0);        /* far corner = free */
+    assert(pen[2*5 + 2] == 0xFFFF);  /* center = obstacle */
+    assert(pen[2*5 + 1] > 0);          /* adjacent cell has some penalty */
+    assert(pen[0*5 + 0] == 0xFFFE);   /* goal */
+    assert(pen[4*5 + 4] == 0);        /* far corner = free */
 
     free(m.pixels);
-    VI_TEST_MAIN_END();
+    return 0;
 }

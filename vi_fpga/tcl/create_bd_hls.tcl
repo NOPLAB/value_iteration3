@@ -1,6 +1,14 @@
 # ===========================================================================
-# create_bd_tile.tcl — Block Design: Zynq PS + 2x vi_sweep (tile) HLS IP
+# create_bd_hls.tcl — Block Design: Zynq PS + 2x HLS CU.
+# Caller sets $variant (tile | stream) before sourcing (see build_vivado.tcl).
+#   tile   : vi_sweep IP, default PL clock
+#   stream : vi_sweep_stream IP, 150 MHz PL clock
+#            (STRIP_W_MAX=145 → 63 BRAM36 per CU → 2 CUs fit in ZU3EG)
 # ===========================================================================
+
+set hls_ip [expr {$variant eq "stream" ? "vi_sweep_stream" : "vi_sweep"}]
+set cu0 ${hls_ip}_cu0
+set cu1 ${hls_ip}_cu1
 
 create_bd_design "vi_bd"
 
@@ -10,17 +18,27 @@ apply_bd_automation -rule xilinx.com:bd_rule:zynq_ultra_ps_e \
     -config {apply_board_preset "1"} $zynq
 
 # Enable HP0 + HP1 for data, disable unused HPM1
-set_property -dict [list \
+set ps_cfg [list \
     CONFIG.PSU__USE__S_AXI_GP2 {1} \
     CONFIG.PSU__SAXIGP2__DATA_WIDTH {128} \
     CONFIG.PSU__USE__S_AXI_GP3 {1} \
     CONFIG.PSU__SAXIGP3__DATA_WIDTH {128} \
     CONFIG.PSU__USE__M_AXI_GP1 {0} \
-] $zynq
+]
+if {$variant eq "stream"} {
+    # 150 MHz PL clock for the streaming kernel
+    lappend ps_cfg \
+        CONFIG.PSU__USE__CLK0 {1} \
+        CONFIG.PSU__CRL_APB__PL0_REF_CTRL__ACT_FREQMHZ {150.000000} \
+        CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ {150} \
+        CONFIG.PSU__CRL_APB__PL0_REF_CTRL__DIVISOR0 {10} \
+        CONFIG.PSU__CRL_APB__PL0_REF_CTRL__DIVISOR1 {1}
+}
+set_property -dict $ps_cfg $zynq
 
-# --- 2x vi_sweep (tile) HLS IPs ---
-set cu0 [create_bd_cell -type ip -vlnv xilinx.com:hls:vi_sweep:1.0 vi_sweep_cu0]
-set cu1 [create_bd_cell -type ip -vlnv xilinx.com:hls:vi_sweep:1.0 vi_sweep_cu1]
+# --- 2x HLS IPs ---
+create_bd_cell -type ip -vlnv xilinx.com:hls:${hls_ip}:1.0 $cu0
+create_bd_cell -type ip -vlnv xilinx.com:hls:${hls_ip}:1.0 $cu1
 
 # --- Data SmartConnect for CU0 (2 AXI masters -> HP0) ---
 set data_smc0 [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 data_smc0]
@@ -35,7 +53,7 @@ set ctrl_smc [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 ctrl_
 set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {2}] $ctrl_smc
 
 # --- Reset ---
-set rst [create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 proc_sys_reset_0]
+create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 proc_sys_reset_0
 
 # --- Clock and reset wiring ---
 set clk [get_bd_pins zynq_ps/pl_clk0]
@@ -45,8 +63,8 @@ connect_bd_net $clk \
     [get_bd_pins data_smc0/aclk] \
     [get_bd_pins data_smc1/aclk] \
     [get_bd_pins ctrl_smc/aclk] \
-    [get_bd_pins vi_sweep_cu0/ap_clk] \
-    [get_bd_pins vi_sweep_cu1/ap_clk] \
+    [get_bd_pins $cu0/ap_clk] \
+    [get_bd_pins $cu1/ap_clk] \
     [get_bd_pins proc_sys_reset_0/slowest_sync_clk] \
     [get_bd_pins zynq_ps/saxihp0_fpd_aclk] \
     [get_bd_pins zynq_ps/saxihp1_fpd_aclk] \
@@ -58,38 +76,38 @@ connect_bd_net $rstn \
     [get_bd_pins data_smc0/aresetn] \
     [get_bd_pins data_smc1/aresetn] \
     [get_bd_pins ctrl_smc/aresetn] \
-    [get_bd_pins vi_sweep_cu0/ap_rst_n] \
-    [get_bd_pins vi_sweep_cu1/ap_rst_n]
+    [get_bd_pins $cu0/ap_rst_n] \
+    [get_bd_pins $cu1/ap_rst_n]
 
 # --- Interrupt ---
 set irq_concat [create_bd_cell -type ip -vlnv xilinx.com:ip:xlconcat:2.1 irq_concat]
 set_property -dict [list CONFIG.NUM_PORTS {2} CONFIG.IN0_WIDTH {1} CONFIG.IN1_WIDTH {1}] $irq_concat
-connect_bd_net [get_bd_pins vi_sweep_cu0/interrupt] [get_bd_pins irq_concat/In0]
-connect_bd_net [get_bd_pins vi_sweep_cu1/interrupt] [get_bd_pins irq_concat/In1]
+connect_bd_net [get_bd_pins $cu0/interrupt] [get_bd_pins irq_concat/In0]
+connect_bd_net [get_bd_pins $cu1/interrupt] [get_bd_pins irq_concat/In1]
 connect_bd_net [get_bd_pins irq_concat/dout] [get_bd_pins zynq_ps/pl_ps_irq0]
 set_property -dict [list CONFIG.PSU__USE__IRQ0 {1} CONFIG.PSU__IRQ_P2F_IRQ0_SELECT {1}] [get_bd_cells zynq_ps]
 
 # --- Control path ---
 connect_bd_intf_net [get_bd_intf_pins zynq_ps/M_AXI_HPM0_FPD] [get_bd_intf_pins ctrl_smc/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins ctrl_smc/M00_AXI] [get_bd_intf_pins vi_sweep_cu0/s_axi_control]
-connect_bd_intf_net [get_bd_intf_pins ctrl_smc/M01_AXI] [get_bd_intf_pins vi_sweep_cu1/s_axi_control]
+connect_bd_intf_net [get_bd_intf_pins ctrl_smc/M00_AXI] [get_bd_intf_pins $cu0/s_axi_control]
+connect_bd_intf_net [get_bd_intf_pins ctrl_smc/M01_AXI] [get_bd_intf_pins $cu1/s_axi_control]
 
 # --- Data path: CU0 -> HP0, CU1 -> HP1 ---
-connect_bd_intf_net [get_bd_intf_pins vi_sweep_cu0/m_axi_gmem0] [get_bd_intf_pins data_smc0/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins vi_sweep_cu0/m_axi_gmem1] [get_bd_intf_pins data_smc0/S01_AXI]
+connect_bd_intf_net [get_bd_intf_pins $cu0/m_axi_gmem0] [get_bd_intf_pins data_smc0/S00_AXI]
+connect_bd_intf_net [get_bd_intf_pins $cu0/m_axi_gmem1] [get_bd_intf_pins data_smc0/S01_AXI]
 connect_bd_intf_net [get_bd_intf_pins data_smc0/M00_AXI] [get_bd_intf_pins zynq_ps/S_AXI_HP0_FPD]
 
-connect_bd_intf_net [get_bd_intf_pins vi_sweep_cu1/m_axi_gmem0] [get_bd_intf_pins data_smc1/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins vi_sweep_cu1/m_axi_gmem1] [get_bd_intf_pins data_smc1/S01_AXI]
+connect_bd_intf_net [get_bd_intf_pins $cu1/m_axi_gmem0] [get_bd_intf_pins data_smc1/S00_AXI]
+connect_bd_intf_net [get_bd_intf_pins $cu1/m_axi_gmem1] [get_bd_intf_pins data_smc1/S01_AXI]
 connect_bd_intf_net [get_bd_intf_pins data_smc1/M00_AXI] [get_bd_intf_pins zynq_ps/S_AXI_HP1_FPD]
 
 # --- Address assignment ---
 assign_bd_address [get_bd_addr_segs zynq_ps/SAXIGP2/HP0_DDR_LOW]
 assign_bd_address [get_bd_addr_segs zynq_ps/SAXIGP3/HP1_DDR_LOW]
-assign_bd_address [get_bd_addr_segs vi_sweep_cu0/s_axi_control/Reg]
-assign_bd_address [get_bd_addr_segs vi_sweep_cu1/s_axi_control/Reg]
+assign_bd_address [get_bd_addr_segs $cu0/s_axi_control/Reg]
+assign_bd_address [get_bd_addr_segs $cu1/s_axi_control/Reg]
 
 validate_bd_design
 save_bd_design
 
-puts "INFO: Block design 'vi_bd' created (2 CU tile, HP0+HP1)"
+puts "INFO: Block design 'vi_bd' created (2 CU $variant, HP0+HP1)"

@@ -4,33 +4,14 @@
 
 #include "libvi_sweep.h"
 #include "vi_device.h"
+#include "vi_regs.h"
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-/* Register offsets — kept in sync with xvi_sweep_hw.h. If HLS regenerates,
-   run `make sync-hw-header` in driver/uio/ and update these from the
-   generated file. */
-#define VI_OFF_AP_CTRL       0x00
-#define VI_OFF_GIE           0x04
-#define VI_OFF_IER           0x08
-#define VI_OFF_ISR           0x0C
-#define VI_OFF_VALUE_TABLE   0x10  /* 64-bit, 0x10 lo / 0x14 hi */
-#define VI_OFF_PENALTY_TABLE 0x1C
-#define VI_OFF_TRANS_TABLE   0x28
-#define VI_OFF_MAP_X         0x34
-#define VI_OFF_MAP_Y         0x3C
-#define VI_OFF_NUM_TILES_X   0x44
-#define VI_OFF_NUM_TILES_Y   0x4C
-#define VI_OFF_CU_ID         0x54
-#define VI_OFF_MAX_DELTA     0x5C
-
 #define AP_START  0x1
-#define AP_DONE   0x2
-#define AP_IDLE   0x4
-#define AP_READY  0x8
 
 struct vi_device {
     const vi_device_ops_t *ops;

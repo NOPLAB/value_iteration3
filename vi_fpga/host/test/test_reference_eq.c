@@ -1,4 +1,4 @@
-#include "vi_assert.h"
+#include <assert.h>
 #include "libvi_sweep.h"
 #include "vi_device.h"
 #include "vi_reference_c.h"
@@ -37,15 +37,15 @@ int main(void) {
     vi_run_config_t cfg = { W, H, 0, 200 };
     vi_run_stats_t stats = {0};
     int rc = vi_run_until_converged(dev, &cfg, &stats);
-    VI_ASSERT_EQ(rc, VI_OK);
+    assert(rc == VI_OK);
 
     int mismatches = 0;
     for (size_t i = 0; i < n; i++)
         if (ref_val[i] != val[i]) mismatches++;
-    VI_ASSERT_EQ(mismatches, 0);
+    assert(mismatches == 0);
 
     free(ref_val);
     vi_close(dev);
     vi_mock_ctx_free(ctx);
-    VI_TEST_MAIN_END();
+    return 0;
 }

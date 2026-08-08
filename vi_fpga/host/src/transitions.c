@@ -1,6 +1,5 @@
 #include "transitions.h"
 
-#define _USE_MATH_DEFINES
 #include <math.h>
 
 #ifndef M_PI

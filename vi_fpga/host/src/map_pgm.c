@@ -52,23 +52,9 @@ static int parse_yaml(const char *path, pgm_map_t *m, char *image_path, size_t i
     if (find_key(yaml, "resolution", buf, sizeof buf) < 0) goto bad;
     m->resolution = atof(buf);
 
-    if (find_key(yaml, "origin", buf, sizeof buf) == 0) {
-        /* "[x, y, yaw]" */
-        char *p = buf;
-        while (*p && (*p == '[' || *p == ' ')) p++;
-        m->origin_x = atof(p);
-        while (*p && *p != ',') p++;
-        if (*p == ',') p++;
-        m->origin_y = atof(p);
-    }
-
     if (find_key(yaml, "occupied_thresh", buf, sizeof buf) == 0)
         m->occupied_thresh = atof(buf);
     else m->occupied_thresh = 0.65;
-
-    if (find_key(yaml, "free_thresh", buf, sizeof buf) == 0)
-        m->free_thresh = atof(buf);
-    else m->free_thresh = 0.196;
 
     if (find_key(yaml, "negate", buf, sizeof buf) == 0)
         m->negate = atoi(buf);

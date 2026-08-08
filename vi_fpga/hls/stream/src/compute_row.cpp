@@ -1,12 +1,6 @@
 #include "compute_row.h"
 
-static inline value_t cost_of(value_t nv, penalty_t np_raw)
-{
-    if (nv == MAX_VALUE || np_raw == PENALTY_OBSTACLE) return MAX_VALUE;
-    penalty_t np = (np_raw == PENALTY_GOAL) ? (penalty_t)0 : np_raw;
-    ap_uint<17> sum = (ap_uint<17>)nv + (ap_uint<17>)np;
-    return (sum >= MAX_VALUE) ? (value_t)(MAX_VALUE - 1) : (value_t)sum;
-}
+// cost_of comes from vi_hls_common.h (shared with the tile kernel).
 
 void compute_row(
     value_t   val_buf[WINDOW_ROWS][BUF_W][N_THETA],

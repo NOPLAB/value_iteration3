@@ -4,28 +4,17 @@
 #include "vi_device.h"
 #include "libvi_sweep.h"
 #include "vi_bellman_cell.h"
+#include "vi_regs.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
-/* Register offsets (must match the layout libvi_sweep.c uses). */
-#define MOCK_AP_CTRL        0x00
-#define MOCK_ADDR_VALUE     0x10  /* 64-bit */
-#define MOCK_ADDR_PENALTY   0x1C
-#define MOCK_ADDR_TRANS     0x28
-#define MOCK_MAP_X          0x34
-#define MOCK_MAP_Y          0x3C
-#define MOCK_NUM_TILES_X    0x44
-#define MOCK_NUM_TILES_Y    0x4C
-#define MOCK_CU_ID          0x54
-#define MOCK_MAX_DELTA      0x5C
-
-#define MOCK_REG_BYTES      0x100
+#define MOCK_REG_WORDS  64  /* 0x100 bytes of control space */
 
 /* Shared physical backing (same for both CUs) */
 typedef struct {
-    uint8_t   regs[VI_NUM_CU][MOCK_REG_BYTES];
+    uint32_t  regs[VI_NUM_CU][MOCK_REG_WORDS];
 
     /* Simulated DDR buffers */
     uint16_t *value_buf;   size_t value_size;   uint64_t value_phys;
@@ -33,26 +22,17 @@ typedef struct {
     uint32_t *trans_buf;   size_t trans_size;   uint64_t trans_phys;
 } mock_ctx_t;
 
-static uint32_t rd32(const uint8_t *base, uint32_t off) {
-    uint32_t v;
-    memcpy(&v, base + off, 4);
-    return v;
-}
-static void wr32(uint8_t *base, uint32_t off, uint32_t v) {
-    memcpy(base + off, &v, 4);
-}
-
 /* --- One simulated sweep for the checkerboard tiles of cu_id --- */
 static void mock_run_sweep(mock_ctx_t *mc, int cu) {
-    uint8_t *regs = mc->regs[cu];
-    int map_x = (int)rd32(regs, MOCK_MAP_X);
-    int map_y = (int)rd32(regs, MOCK_MAP_Y);
-    int ntx   = (int)rd32(regs, MOCK_NUM_TILES_X);
-    int nty   = (int)rd32(regs, MOCK_NUM_TILES_Y);
-    int cu_id = (int)rd32(regs, MOCK_CU_ID);
+    uint32_t *regs = mc->regs[cu];
+    int map_x = (int)regs[VI_OFF_MAP_X / 4];
+    int map_y = (int)regs[VI_OFF_MAP_Y / 4];
+    int ntx   = (int)regs[VI_OFF_NUM_TILES_X / 4];
+    int nty   = (int)regs[VI_OFF_NUM_TILES_Y / 4];
+    int cu_id = (int)regs[VI_OFF_CU_ID / 4];
 
     if (map_x <= 0 || map_y <= 0 || !mc->value_buf) {
-        wr32(regs, MOCK_MAX_DELTA, 0);
+        regs[VI_OFF_MAX_DELTA / 4] = 0;
         return;
     }
 
@@ -76,7 +56,7 @@ static void mock_run_sweep(mock_ctx_t *mc, int cu) {
         }
     }
 
-    wr32(regs, MOCK_MAX_DELTA, local_max);
+    regs[VI_OFF_MAX_DELTA / 4] = local_max;
 }
 
 /* --- ops implementation --- */
@@ -110,24 +90,22 @@ static void mock_shutdown(void *vctx) {
 
 static uint32_t mock_read_reg(void *vctx, int cu, uint32_t off) {
     mock_ctx_t *mc = (mock_ctx_t*)vctx;
-    if (cu < 0 || cu >= VI_NUM_CU || off + 4 > MOCK_REG_BYTES) return 0;
-    return rd32(mc->regs[cu], off);
+    if (cu < 0 || cu >= VI_NUM_CU || off / 4 >= MOCK_REG_WORDS) return 0;
+    return mc->regs[cu][off / 4];
 }
 
 static void mock_write_reg(void *vctx, int cu, uint32_t off, uint32_t v) {
     mock_ctx_t *mc = (mock_ctx_t*)vctx;
-    if (cu < 0 || cu >= VI_NUM_CU || off + 4 > MOCK_REG_BYTES) return;
+    if (cu < 0 || cu >= VI_NUM_CU || off / 4 >= MOCK_REG_WORDS) return;
 
-    wr32(mc->regs[cu], off, v);
+    mc->regs[cu][off / 4] = v;
 
     /* ap_start: run one sweep synchronously. */
-    if (off == MOCK_AP_CTRL && (v & 0x1)) {
+    if (off == VI_OFF_AP_CTRL && (v & 0x1)) {
         mock_run_sweep(mc, cu);
         /* Clear ap_start, set ap_done and ap_idle. */
-        uint32_t ctrl = rd32(mc->regs[cu], MOCK_AP_CTRL);
-        ctrl &= ~0x1u;
-        ctrl |= 0x6u;  /* done | idle */
-        wr32(mc->regs[cu], MOCK_AP_CTRL, ctrl);
+        uint32_t *ctrl = &mc->regs[cu][VI_OFF_AP_CTRL / 4];
+        *ctrl = (*ctrl & ~0x1u) | 0x6u;  /* done | idle */
     }
 }
 
@@ -137,8 +115,7 @@ static int mock_wait_irq(void *vctx, int cu, int timeout_ms) {
     if (cu < 0 || cu >= VI_NUM_CU) return VI_ERR_IRQ;
     /* Sweep already ran synchronously during write_reg(AP_CTRL).
        Just verify ap_done is set. */
-    uint32_t ctrl = rd32(mc->regs[cu], MOCK_AP_CTRL);
-    return (ctrl & 0x2) ? 0 : VI_ERR_IRQ;
+    return (mc->regs[cu][VI_OFF_AP_CTRL / 4] & 0x2) ? 0 : VI_ERR_IRQ;
 }
 
 static void* mock_map_buf(void *vctx, int buf_id, size_t *size, uint64_t *phys) {

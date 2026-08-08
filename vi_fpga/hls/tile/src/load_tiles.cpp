@@ -1,20 +1,5 @@
 #include "load_tiles.h"
 
-void load_transitions(
-    const ap_uint<32> *trans_table,
-    offset_t delta_table[N_ACTIONS][N_THETA][3])
-{
-    LOAD_TRANS: for (int i = 0; i < TRANS_TABLE_SIZE; i++) {
-        #pragma HLS PIPELINE II=1
-        ap_uint<32> w = trans_table[i];
-        int a = i / N_THETA;
-        int t = i % N_THETA;
-        delta_table[a][t][0] = (offset_t)(w(7, 0));    // dix
-        delta_table[a][t][1] = (offset_t)(w(15, 8));   // diy
-        delta_table[a][t][2] = (offset_t)(w(23, 16));  // dit
-    }
-}
-
 void load_tile(
     const value_t *value_table,
     const penalty_t *penalty_table,

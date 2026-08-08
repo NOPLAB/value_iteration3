@@ -1,9 +1,9 @@
 .PHONY: driver host test-host test-hw \
-       csim hls vivado bitstream sync-hw-header \
+       csim hls vivado bitstream \
        edf-docker edf-shell edf-setup edf-build \
        clean clean-fpga clean-edf
 
-KERNEL ?=
+KERNEL ?= tile
 
 # ---------- Software (driver + host) ----------
 
@@ -20,24 +20,21 @@ test-hw:
 	$(MAKE) -C vi_fpga/host test-hw
 
 # ---------- FPGA (HLS + Vivado) ----------
-# Pass KERNEL= to select tile or stream, e.g.:
+# Pass KERNEL= to select tile (default) or stream, e.g.:
 #   make csim KERNEL=stream
 #   make bitstream KERNEL=tile
 
 csim:
-	$(MAKE) -C vi_fpga csim $(KERNEL)
+	$(MAKE) -C vi_fpga csim KERNEL=$(KERNEL)
 
 hls:
-	$(MAKE) -C vi_fpga hls $(KERNEL)
+	$(MAKE) -C vi_fpga hls KERNEL=$(KERNEL)
 
 vivado:
-	$(MAKE) -C vi_fpga vivado $(KERNEL)
+	$(MAKE) -C vi_fpga vivado KERNEL=$(KERNEL)
 
 bitstream:
-	$(MAKE) -C vi_fpga bitstream $(KERNEL)
-
-sync-hw-header:
-	$(MAKE) -C vi_fpga/driver/uio sync-hw-header KERNEL=$(KERNEL)
+	$(MAKE) -C vi_fpga bitstream KERNEL=$(KERNEL)
 
 # ---------- EDF / Linux (Docker) ----------
 
