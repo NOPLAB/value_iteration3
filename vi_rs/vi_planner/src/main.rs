@@ -60,9 +60,9 @@ use vi_lib::Action;
 // nav_msgs::msg::OccupancyGrid と名前が衝突するので別名で入れる。
 
 use vi_planner::core::{
-    lock, try_lock, value_grid_on, AdaptiveLocalizer, BeliefConfig, BuildParams, Decision,
-    ExternalLocalizer, FollowKind, GridLocalizer, Localizer, PlanConfig, PlanError, PlanStats,
-    PlannerCore, Prefetcher, SweepCursor,
+    lock, quality_shift, try_lock, value_grid_on, AdaptiveLocalizer, BeliefConfig, BuildParams,
+    Decision, ExternalLocalizer, FollowKind, GridLocalizer, Localizer, PlanConfig, PlanError,
+    PlanStats, PlannerCore, Prefetcher, SweepCursor,
 };
 
 use rclrs::*;
@@ -122,6 +122,9 @@ struct Params {
     /// grid: ビームごとの尤度の床 / 補正で読む重みの相対しきい値。
     belief_z_min: f64,
     belief_weight_skip_ratio: f64,
+    /// スキャン注入の品質ゲート: localizer の観測一致度がこれを割ると注入
+    /// penalty を quality/gate に比例して減衰 (2 冪量子化)。0 で無効。
+    scan_quality_gate: f64,
     // ── 広域 (compute_path_to_pose) ──
     max_rollout_steps: i64,
     start_tolerance: f64,
@@ -289,6 +292,10 @@ fn read_params(node: &Node) -> Result<Params> {
         // 読む belief 重みの相対しきい値 (max との比、小さいほど正確で遅い)。
         belief_z_min: p!("belief_z_min", f64, 0.05),
         belief_weight_skip_ratio: p!("belief_weight_skip_ratio", f64, 1e-4),
+        // フィットが怪しいスキャンに満額 (2048) の壁を建てさせない。既定は
+        // adaptive の expansion しきい値 (expand_quality) と同じ 0.25。external
+        // localizer は quality 1.0 固定なので実質無効。
+        scan_quality_gate: p!("scan_quality_gate", f64, 0.25),
 
         max_rollout_steps: p!("max_rollout_steps", i64, 10_000),
         start_tolerance: p!("start_tolerance", f64, 0.5),
@@ -650,6 +657,8 @@ struct FollowTuning {
     busy_ticks_before_stop: u32,
     /// belief が多峰のとき QMDP (`decide_qmdp`) で行動を選ぶ (単峰は従来どおり)。
     qmdp: bool,
+    /// スキャン注入の品質ゲート ([`quality_shift`] の gate)。0 で無効。
+    scan_quality_gate: f64,
 }
 
 /// QMDP に渡す belief 仮説の上限。ヒストグラムの上位セルだけで質量の大半を
@@ -914,9 +923,16 @@ fn run_follow(
             }
             continue;
         };
-        // QMDP 用の belief 仮説。core のロックの前に取る (localizer と core の
+        // QMDP 用の belief 仮説と、スキャン注入の品質ゲート (直近補正の観測
+        // 一致度 → 減衰段数)。core のロックの前に取る (localizer と core の
         // 入れ子ロックを作らない)。external localizer は空 = 点推定へ退避。
-        let hyps = if tuning.qmdp { lock(localizer).top_cells(QMDP_TOP_K) } else { Vec::new() };
+        let (hyps, scan_shift) = {
+            let l = lock(localizer);
+            (
+                if tuning.qmdp { l.top_cells(QMDP_TOP_K) } else { Vec::new() },
+                quality_shift(l.quality(), tuning.scan_quality_gate),
+            )
+        };
 
         // ── ロックを取るのはこのブロックだけ ──
         //
@@ -957,7 +973,7 @@ fn run_follow(
             }
             core.set_window(pose);
             for scan in &scans {
-                core.observe_scan(scan, pose);
+                core.observe_scan_gated(scan, pose, scan_shift);
             }
             core.refine_for(tuning.refine_budget);
 
@@ -1121,7 +1137,7 @@ struct RetryTuning {
 ///
 /// 戻り値は「最後まで待てたか」。false は cancel された。
 fn run_settle(ctx: &FollowCtx, cancel: &AtomicBool, dur: Duration) -> bool {
-    let FollowCtx { core, latest_pose, scan_queue, cmd_pub, tuning, .. } = *ctx;
+    let FollowCtx { core, latest_pose, localizer, scan_queue, cmd_pub, tuning, .. } = *ctx;
     let deadline = Instant::now() + dur;
     while Instant::now() < deadline {
         let tick_start = Instant::now();
@@ -1133,10 +1149,12 @@ fn run_settle(ctx: &FollowCtx, cancel: &AtomicBool, dur: Duration) -> bool {
         let pose = *latest_pose.lock().unwrap();
         if let Some(pose) = pose {
             if let Some(mut c) = try_lock(core) {
+                let scan_shift =
+                    quality_shift(lock(localizer).quality(), tuning.scan_quality_gate);
                 let scans = std::mem::take(&mut *scan_queue.lock().unwrap());
                 c.set_window(pose);
                 for scan in &scans {
-                    c.observe_scan(scan, pose);
+                    c.observe_scan_gated(scan, pose, scan_shift);
                 }
                 c.refine_for(tuning.refine_budget);
             }
@@ -1770,6 +1788,7 @@ fn main() -> Result<()> {
             .max(1.0) as u32,
         busy_ticks_before_stop: params.busy_ticks_before_stop.max(1) as u32,
         qmdp: params.qmdp,
+        scan_quality_gate: params.scan_quality_gate,
     };
     let retry = RetryTuning {
         limit: params.goal_retry_limit,

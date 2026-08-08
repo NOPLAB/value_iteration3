@@ -79,6 +79,21 @@ pub fn try_lock<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
     }
 }
 
+/// 観測一致度 → スキャン注入の減衰段数 ([`PlannerCore::observe_scan_gated`] の
+/// `shift`)。`gate` 以上は 0 (満額 2048)、下回ると注入 ∝ quality/gate の 2 冪
+/// 量子化 (PenaltyOverlay が指数しか持てないため冪に丸める)。上限 11
+/// (2048 → 1)。`gate <= 0` でゲート無効。External localizer は quality 1.0 を
+/// 返すので常に 0 — 挙動は従来と変わらない。
+pub fn quality_shift(quality: f64, gate: f64) -> u32 {
+    if gate <= 0.0 || quality >= gate {
+        return 0;
+    }
+    if quality <= 0.0 {
+        return 11;
+    }
+    ((gate / quality).log2().ceil() as u32).min(11)
+}
+
 /// ゴールごとの ValueIterator 構築入力 (地図は起動時に一度だけ取り込む)。
 /// vi_global_planner::core::BuildParams と同型 — クレート間依存を避けるための
 /// 意図的な重複定義。
@@ -908,8 +923,17 @@ impl PlannerCore {
     /// スキャンのヒット点周辺に local_penalty を注入 (本家 `setLocalCost`)。
     /// `set_window` 後に呼ぶこと (ウィンドウ外のヒットは無視される)。
     pub fn observe_scan(&mut self, scan: &LaserScan, pose: PoseView) {
+        self.observe_scan_gated(scan, pose, 0);
+    }
+
+    /// 品質ゲート付きの [`Self::observe_scan`]: 注入 penalty を `2048 >> shift` に
+    /// 減衰する。自己位置のフィットが怪しい tick は localizer 自身がそれを
+    /// `quality()` で知っている — そのスキャンの投影は地図とずれており、満額で
+    /// 塗るとゴースト壁がロボットを global 勾配との間に挟んで止める。shift は
+    /// [`quality_shift`] で quality から量子化する。0 は `observe_scan` と同一。
+    pub fn observe_scan_gated(&mut self, scan: &LaserScan, pose: PoseView, shift: u32) {
         if let Some(vi) = self.local_mut() {
-            vi.set_local_cost(scan, pose.x, pose.y, pose.yaw_rad);
+            vi.set_local_cost_attenuated(scan, pose.x, pose.y, pose.yaw_rad, shift);
         }
         self.harvest_penalties();
     }

@@ -95,6 +95,23 @@ impl ValueIteratorLocal {
 
     /// 本家 `setLocalCost`。レーザヒット点周辺に local_penalty を設定/半減。
     pub fn set_local_cost(&mut self, msg: &LaserScan, x: f64, y: f64, t: f64) {
+        self.set_local_cost_attenuated(msg, x, y, t, 0);
+    }
+
+    /// `set_local_cost` の注入値を `2048 >> shift` に減衰させる拡張 (本家に無い)。
+    /// 自己位置の観測一致度が低い tick のスキャン投影に満額の壁を建てさせない
+    /// 品質ゲート用。減衰後も 2 の冪 (vi_planner の PenaltyOverlay は指数しか
+    /// 持たない)。shift は 11 でクランプ — 最低 `1 << PROB_BASE_BIT` を書き、
+    /// 0 で既存の壁を消し飛ばすことはしない。
+    pub fn set_local_cost_attenuated(
+        &mut self,
+        msg: &LaserScan,
+        x: f64,
+        y: f64,
+        t: f64,
+        shift: u32,
+    ) {
+        let inject = (2048u64 >> shift.min(11)) << PROB_BASE_BIT;
         let start_angle = msg.angle_min;
         let nt = self.base.cell_num_t;
         let (ox, oy, res) = (self.base.map_origin_x, self.base.map_origin_y, self.base.xy_resolution);
@@ -130,7 +147,7 @@ impl ValueIteratorLocal {
                     }
                     for it in 0..nt {
                         let index = self.base.to_index(iix, iiy, it) as usize;
-                        self.base.states[index].local_penalty = 2048u64 << PROB_BASE_BIT;
+                        self.base.states[index].local_penalty = inject;
                     }
                 }
             }
@@ -224,6 +241,24 @@ mod tests {
         // ヒット点±2 セルのどこかに 2048<<bit が立っていること。
         let hit = vi.base.to_index(10, 0, 0) as usize;
         assert_eq!(vi.base.states[hit].local_penalty, 2048u64 << PROB_BASE_BIT);
+    }
+
+    #[test]
+    fn set_local_cost_attenuated_scales_and_clamps() {
+        let mut vi = ValueIteratorLocal::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
+        let map = free_grid(60, 60);
+        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.2, 10);
+        let scan = LaserScan {
+            angle_min: 0.0,
+            angle_increment: 0.0,
+            ranges: vec![0.5],
+        };
+        let hit = vi.base.to_index(10, 0, 0) as usize;
+        vi.set_local_cost_attenuated(&scan, 0.0, 0.0, 0.0, 2);
+        assert_eq!(vi.base.states[hit].local_penalty, 512u64 << PROB_BASE_BIT);
+        // クランプ: shift が大きくても 0 にはならず 1<<bit で止まる。
+        vi.set_local_cost_attenuated(&scan, 0.0, 0.0, 0.0, 99);
+        assert_eq!(vi.base.states[hit].local_penalty, 1u64 << PROB_BASE_BIT);
     }
 
     #[test]

@@ -734,6 +734,36 @@ fn compact_scan_penalty_raises_upstream_value() {
     assert!(after > before, "upstream value must rise: before={before}, after={after}");
 }
 
+/// 品質ゲート: quality → 減衰段数の量子化。gate 以上・ゲート無効・External
+/// (quality 1.0) は 0、quality が半分ごとに 1 段、床は 11 (注入 1、0 にしない)。
+#[test]
+fn quality_shift_quantizes_by_halving() {
+    assert_eq!(quality_shift(1.0, 0.25), 0); // External / 良好フィット
+    assert_eq!(quality_shift(0.25, 0.25), 0); // gate ちょうど
+    assert_eq!(quality_shift(0.5, 0.0), 0); // ゲート無効
+    assert_eq!(quality_shift(0.125, 0.25), 1); // gate の 1/2 → 2048>>1
+    assert_eq!(quality_shift(0.0625, 0.25), 2); // gate の 1/4 → 2048>>2
+    assert_eq!(quality_shift(0.0, 0.25), 11); // 完全ミスマッチでも床 11
+    assert_eq!(quality_shift(1e-12, 0.25), 11); // クランプ
+}
+
+/// 品質ゲート付き注入がヒット帯へ減衰値を書くこと (shift 0 は従来と同一)。
+#[test]
+fn observe_scan_gated_attenuates_injection() {
+    let mut core = PlannerCore::new(build(64), cfg());
+    let cancel = AtomicBool::new(false);
+    core.prepare_goal(pose(2.5, 1.0, 0.0), &cancel).expect("solve");
+    let robot = pose(1.0, 1.0, 0.0);
+    core.set_window(robot);
+
+    let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.5] };
+    core.observe_scan_gated(&scan, robot, 3);
+    let vi = core.local().unwrap();
+    let (hx, hy, _) = pose_to_cell(&vi.base, 1.5, 1.0, 0.0);
+    let hit = vi.base.to_index(hx, hy, 0) as usize;
+    assert_eq!(vi.base.states[hit].local_penalty, 256u64 << PROB_BASE_BIT);
+}
+
 /// penalty 表が `set_local_cost` の書く値を**丸めずに**持てること
 /// (1 B/セルで足りる根拠 = 2 の冪しか来ない)。
 #[test]
