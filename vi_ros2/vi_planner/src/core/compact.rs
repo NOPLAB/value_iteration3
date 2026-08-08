@@ -45,17 +45,17 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use vi_reference::bridge::PoseView;
-use vi_reference::msg::{OccupancyGrid, Quaternion};
-use vi_reference::params::{MAX_COST, PROB_BASE};
-use vi_reference::planner::CompactPolicy;
-use vi_reference::planner::PolicyView;
-use vi_reference::solvers::frontier2d_sparse_compact::{
+use vi_lib::bridge::PoseView;
+use vi_lib::msg::{OccupancyGrid, Quaternion};
+use vi_lib::params::{MAX_COST, PROB_BASE};
+use vi_lib::planner::CompactPolicy;
+use vi_lib::planner::PolicyView;
+use vi_lib::solvers::frontier2d_sparse_compact::{
     default_threads, solve_compact_mapped_observed, CompactSink, MmapSink, RamSink,
 };
-use vi_reference::state::State;
-use vi_reference::value_iterator::ValueIterator;
-use vi_reference::{Action, ValueIteratorLocal};
+use vi_lib::state::State;
+use vi_lib::value_iterator::ValueIterator;
+use vi_lib::{Action, ValueIteratorLocal};
 
 use super::{
     BuildParams, Field, PlanError, PlannerCore, SinkDir, SinkGen, SolveDirector, SolveStats,
@@ -160,7 +160,7 @@ impl Patch {
 /// **1 セル 1 バイトで正確に持てる。** `set_local_cost` が書くのは
 /// `2048 << PROB_BASE_BIT` (= 2^29) か、それを 2 で割り続けた値だけなので常に
 /// 2 の冪で、指数だけ持てば足りる。しかも θ 方向に一様 (同じ (ix,iy) の全 θ へ
-/// 同じ値を書く) なので 2D でよい。この 2 つは `vi_reference::local` の
+/// 同じ値を書く) なので 2D でよい。この 2 つは `vi_lib::local` の
 /// `set_local_cost` の実装そのもので、崩れたらこの表は近似に落ちる。
 pub(super) struct PenaltyOverlay {
     /// 指数 + 1。0 = penalty 無し、`e` = 値 `1 << (e - 1)`。

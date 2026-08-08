@@ -33,10 +33,10 @@ use clap::Parser;
 
 use vi_bench::params::canonical_actions;
 use vi_bench::pgm;
-use vi_reference::params::PROB_BASE;
-use vi_reference::planner::{rollout_path_on, RolloutStatus};
-use vi_reference::solvers::{solve, U64Solver, REACH_THRESH as REACH};
-use vi_reference::{OccupancyGrid, Quaternion, ValueIterator};
+use vi_lib::params::PROB_BASE;
+use vi_lib::planner::{rollout_path_on, RolloutStatus};
+use vi_lib::solvers::{solve, U64Solver, REACH_THRESH as REACH};
+use vi_lib::{OccupancyGrid, Quaternion, ValueIterator};
 
 const THETA_CELL_NUM: i32 = 60;
 /// ロールアウトの打ち切り歩数（1 歩 = 1 s）。
@@ -153,7 +153,7 @@ fn pick_samples(vi: &ValueIterator, vstar: &[u64], n: usize) -> Vec<Sample> {
 
 /// ロールアウトの歩数（1 歩 = 1 アクション = Δt = 1 s）。
 /// 先頭は開始姿勢なので除外。到達時は末尾に厳密なゴール姿勢が足されているのでこれも除外。
-fn rollout_steps(poses: &[vi_reference::planner::PathPose], reached: bool) -> usize {
+fn rollout_steps(poses: &[vi_lib::planner::PathPose], reached: bool) -> usize {
     let end = if reached { poses.len().saturating_sub(1) } else { poses.len() };
     end.saturating_sub(1)
 }

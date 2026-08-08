@@ -23,8 +23,8 @@ use std::time::Instant;
 
 use clap::Parser;
 use vi_bench::fixtures::{build_vi, BenchMap};
-use vi_reference::solvers::{solve, U64Solver, REACH_THRESH as REACH};
-use vi_reference::ValueIterator;
+use vi_lib::solvers::{solve, U64Solver, REACH_THRESH as REACH};
+use vi_lib::ValueIterator;
 
 #[derive(Parser)]
 #[command(

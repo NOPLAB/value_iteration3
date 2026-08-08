@@ -2,7 +2,7 @@
 //! *real* map.
 //!
 //! Loads a ROS `map_server` PGM + YAML pair (e.g. the Tsudanuma campus map in
-//! `assets/`), builds a `vi_reference::ValueIterator` directly from the
+//! `assets/`), builds a `vi_lib::ValueIterator` directly from the
 //! occupancy grid (本家 `setMapWithOccupancyGrid` semantics: penalty/goal are
 //! computed inside the iterator, in 18-bit fixed point), and runs the Reference
 //! and/or Frontier3D u64 solvers to convergence (or until a budget cap),
@@ -57,12 +57,12 @@ use clap::Parser;
 
 use vi_bench::params::{canonical_actions, MAX_ACTION_FW_M, N_THETA};
 use vi_bench::pgm::{self, Occupancy, PgmMap};
-use vi_reference::params::{MAX_COST, PROB_BASE};
-use vi_reference::solvers::frontier2d_sparse_compact::{
+use vi_lib::params::{MAX_COST, PROB_BASE};
+use vi_lib::solvers::frontier2d_sparse_compact::{
     default_threads, mapped_goal_cell_count, solve_compact_mapped, CompactSink, MmapSink, RamSink,
 };
-use vi_reference::solvers::{solve, U64SolveStats, U64Solver, REACH_THRESH as REACH};
-use vi_reference::{Action, OccupancyGrid, Quaternion, State, ValueIterator};
+use vi_lib::solvers::{solve, U64SolveStats, U64Solver, REACH_THRESH as REACH};
+use vi_lib::{Action, OccupancyGrid, Quaternion, State, ValueIterator};
 
 /// Canonical theta cell count (本家 launch / data contract)。
 const THETA_CELL_NUM: i32 = N_THETA;

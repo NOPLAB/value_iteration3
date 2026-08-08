@@ -893,11 +893,11 @@ dependencies = [
  "nav_msgs",
  "rclrs",
  "sensor_msgs",
- "vi_reference",
+ "vi_lib",
 ]
 
 [[package]]
-name = "vi_reference"
+name = "vi_lib"
 version = "0.1.0"
 dependencies = [
  "memmap2",

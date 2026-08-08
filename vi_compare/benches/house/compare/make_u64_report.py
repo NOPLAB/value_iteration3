@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""u64 高速ソルバ群 (vi_reference solvers) vs 本家ROS1 の一覧レポート report_u64.md を生成。
+"""u64 高速ソルバ群 (vi_lib solvers) vs 本家ROS1 の一覧レポート report_u64.md を生成。
 
 compare.py のヘルパ (align / value_metrics / policy_agreement) を再利用し、各 u64 ソルバの
 value_<solver>.npy / policy_<solver>.npy を本家 value_ros1.npy と比較。厳密ソルバなので
@@ -54,7 +54,7 @@ def main():
     lines.append(f"house.pgm (384×384×60)。本家 elapsed={t1_elapsed:.3f}s (単スレッド)。"
                  "ソルバは原則単スレッド、`frontier2d_par` のみ決定的マルチスレッド (Jacobi) で例外。")
     lines.append("各ソルバは本家と同一 u64 コストモデル上で frontier/block を走らせる "
-                 "(vi_reference solvers)。厳密ソルバなので RMSE 0 / 方策 100% を期待。\n")
+                 "(vi_lib solvers)。厳密ソルバなので RMSE 0 / 方策 100% を期待。\n")
     lines.append("| ソルバ | elapsed[s] | 反復 | updates | 本家比速度 | RMSE | 方策一致 | converged | bit-exact |")
     lines.append("|---|---|---|---|---|---|---|---|---|")
     for r in rows:

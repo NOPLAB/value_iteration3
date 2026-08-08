@@ -2,9 +2,9 @@ use super::compact::{transition_reach, PenaltyOverlay};
 use super::*;
 use std::sync::atomic::AtomicBool;
 // compact 側だけが使う型は core::compact へ移したので、テストからは直接入れる。
-use vi_reference::msg::Quaternion;
-use vi_reference::params::{MAX_COST, PROB_BASE_BIT};
-use vi_reference::solvers::frontier2d_sparse_compact::{CompactSink, RamSink};
+use vi_lib::msg::Quaternion;
+use vi_lib::params::{MAX_COST, PROB_BASE_BIT};
+use vi_lib::solvers::frontier2d_sparse_compact::{CompactSink, RamSink};
 
 const RES: f64 = 0.05;
 
@@ -255,7 +255,7 @@ fn compact_recenters_repeatedly_with_an_interior_patch() {
 /// する (greedy 系テストの「fw を 1 歩ぶん跳ぶ」とは実行モデルが違う)。
 #[test]
 fn dwa_follows_to_goal_on_empty_map() {
-    use vi_reference::ctrl::unicycle_step;
+    use vi_lib::ctrl::unicycle_step;
     let mut c = cfg();
     c.follow_controller = FollowKind::Dwa;
     let mut core = PlannerCore::new(build(64), c);
@@ -295,7 +295,7 @@ fn dwa_follows_to_goal_on_empty_map() {
 /// パッチは走行中に置き直され続ける。
 #[test]
 fn dwa_follows_to_goal_on_compact_patch() {
-    use vi_reference::ctrl::unicycle_step;
+    use vi_lib::ctrl::unicycle_step;
     let mut c = cfg_compact();
     c.follow_controller = FollowKind::Dwa;
     let mut core = PlannerCore::new(build(96), c);
@@ -364,7 +364,7 @@ fn dwa_falls_back_to_greedy_on_unevaluable_cells() {
 /// start の名目列) は MppiController が Mutex で持ち、decide は &self のまま。
 #[test]
 fn mppi_follows_to_goal_on_empty_map() {
-    use vi_reference::ctrl::unicycle_step;
+    use vi_lib::ctrl::unicycle_step;
     let mut c = cfg();
     c.follow_controller = FollowKind::Mppi;
     let mut core = PlannerCore::new(build(64), c);

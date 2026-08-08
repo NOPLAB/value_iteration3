@@ -49,14 +49,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as ACtx, Result};
 
-use vi_reference::bridge::{
+use vi_lib::bridge::{
     downsample_occupancy, downsample_occupancy_optimistic, occupancy_view_to_vi_grid,
     OccupancyGridView, PoseView,
 };
-use vi_reference::msg::LaserScan as ViLaserScan;
-use vi_reference::planner::PathPose;
-use vi_reference::solvers::U64Solver;
-use vi_reference::Action;
+use vi_lib::msg::LaserScan as ViLaserScan;
+use vi_lib::planner::PathPose;
+use vi_lib::solvers::U64Solver;
+use vi_lib::Action;
 // nav_msgs::msg::OccupancyGrid と名前が衝突するので別名で入れる。
 
 use vi_planner::core::{
@@ -480,7 +480,7 @@ fn poses_to_path(poses: &[PathPose], frame_id: &str, stamp: (i32, u32)) -> nav_m
     path
 }
 
-/// sensor_msgs/LaserScan → vi_reference::LaserScan。ビーム角と添字の対応を
+/// sensor_msgs/LaserScan → vi_lib::LaserScan。ビーム角と添字の対応を
 /// 保つため無効レンジは取り除かず `invalid_range_m` に差し替える
 /// (`set_local_cost` がウィンドウ外として自然に無視する)。
 fn vi_scan_from(msg: &sensor_msgs::msg::LaserScan, invalid_range_m: f64) -> ViLaserScan {
@@ -548,9 +548,9 @@ fn compact_sink_dir(params: &Params, solver: U64Solver, nstates: usize) -> Optio
     None
 }
 
-/// vi_reference の可視化描画済み OccupancyGrid → ROS メッセージ。
+/// vi_lib の可視化描画済み OccupancyGrid → ROS メッセージ。
 fn ros_grid_from(
-    g: &vi_reference::msg::OccupancyGrid,
+    g: &vi_lib::msg::OccupancyGrid,
     frame_id: &str,
     stamp: (i32, u32),
 ) -> nav_msgs::msg::OccupancyGrid {
@@ -1746,7 +1746,7 @@ fn main() -> Result<()> {
                             if matches!(
                                 e,
                                 PlanError::Rollout(
-                                    vi_reference::planner::RolloutStatus::LoopDetected
+                                    vi_lib::planner::RolloutStatus::LoopDetected
                                 )
                             ) {
                                 eprintln!(

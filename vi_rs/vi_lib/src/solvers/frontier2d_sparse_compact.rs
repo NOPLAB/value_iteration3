@@ -797,7 +797,7 @@ fn finalize_column(
 /// 確定出力（value, policy）の格納先を抽象化する sink。finalize 時に列単位で書き込み、
 /// write_back 時に orig 単位で読む。RAM 実装（`RamSink`）と、呼び出し側のディスク mmap 実装
 /// （`vi_bench::MmapSink`）を差し替えられる。これで出力の O(total) RAM をディスクへ外せる
-/// （巨大マップ対応）。vi_reference は依存軽量なので mmap 実装はここには置かない。
+/// （巨大マップ対応）。vi_lib は依存軽量なので mmap 実装はここには置かない。
 pub trait CompactSink {
     /// 連続 orig 範囲 `[base, base+values.len())` へ value/action を書く（列の全 θ を 1 回で）。
     fn write_column(&mut self, base: usize, values: &[u64], actions: &[i32]);

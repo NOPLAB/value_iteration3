@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sequential ROS1 -> ref(vi_reference) -> compare. Run from repo root.
+# Sequential ROS1 -> ref(vi_lib) -> compare. Run from repo root.
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ORIG="${VI_ORIG:-$(cd "$REPO_ROOT/.." && pwd)/value_iteration}"
@@ -18,7 +18,7 @@ docker run --rm \
   vi_compare_ros1:noetic \
   bash /workspace/vi_compare/benches/house/ros1/run_ros1_bench.sh
 
-echo "== [2/3] ref (vi_reference u64 忠実移植) =="
+echo "== [2/3] ref (vi_lib u64 忠実移植) =="
 docker run --rm \
   -v "$ORIG":/src_value_iteration:ro \
   -v "$REPO_ROOT":/workspace \
@@ -33,4 +33,4 @@ docker run --rm \
   vi_compare_ros1:noetic \
   bash -lc "cd /workspace/vi_compare/benches/house/compare && python3 compare.py /results ref"
 
-echo "reports: $RESULTS/report_ref.md (vs vi_reference u64)"
+echo "reports: $RESULTS/report_ref.md (vs vi_lib u64)"

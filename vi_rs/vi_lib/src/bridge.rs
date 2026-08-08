@@ -1,4 +1,4 @@
-//! ROS-free conversion layer between ROS message views and vi_reference types.
+//! ROS-free conversion layer between ROS message views and vi_lib types.
 //!
 //! Bridge functions take "view" structs (plain borrowed POD) rather than ROS
 //! message types. ROS nodes (vi_ros2/vi_node, vi_ros2/vi_global_planner) pull fields
@@ -7,12 +7,12 @@
 //! and is shared by every embedding (ROS2 nodes, future FFI).
 //!
 //! (旧 vi_ros2/vi_node/src/bridge.rs から移設。vi_global_planner と共有するため
-//! vi_reference 本体に置く。)
+//! vi_lib 本体に置く。)
 //!
 //! In the u64 (本家忠実) port the penalty field and goal mask are not built
 //! here — `ValueIterator::set_map_with_occupancy_grid` + `set_goal` compute
 //! them internally (in 18-bit fixed point). This module only (a) turns an
-//! occupancy view into a `vi_reference::OccupancyGrid` the iterator can ingest,
+//! occupancy view into a `vi_lib::OccupancyGrid` the iterator can ingest,
 //! and (b) renders a value slice to an `OccupancyGrid` `data[]` for publishing.
 
 use crate::msg::{OccupancyGrid, Quaternion};
@@ -41,7 +41,7 @@ pub fn yaw_to_goal_theta_deg(yaw_rad: f64) -> i32 {
     yaw_rad.to_degrees().rem_euclid(360.0) as i32
 }
 
-/// Build a `vi_reference::OccupancyGrid` from an occupancy view.
+/// Build a `vi_lib::OccupancyGrid` from an occupancy view.
 ///
 /// `ValueIterator` treats `data == 0` as free and any non-zero as blocked, and
 /// applies the safety-radius inflation itself, so this only needs to produce a

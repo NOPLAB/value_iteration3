@@ -1,7 +1,7 @@
 //! 本家 6 アクションでの小マップ end-to-end。
 
-use vi_reference::params::MAX_COST;
-use vi_reference::{Action, OccupancyGrid, ValueIterator};
+use vi_lib::params::MAX_COST;
+use vi_lib::{Action, OccupancyGrid, ValueIterator};
 
 fn default_actions() -> Vec<Action> {
     vec![
@@ -38,7 +38,7 @@ fn small_map_value_iteration_end_to_end() {
     // ゴール近傍に到達可能なセルが存在し、価値関数が抽出できる。
     let vf = vi.value_function_writer();
     assert_eq!(vf.layers.len(), 60);
-    let threshold = MAX_COST as f64 / vi_reference::params::PROB_BASE as f64;
+    let threshold = MAX_COST as f64 / vi_lib::params::PROB_BASE as f64;
     let any_reachable = vf
         .layers
         .iter()

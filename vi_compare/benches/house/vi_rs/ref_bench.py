@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vi_reference (本家 u64 忠実移植) 比較ドライバ。
+"""vi_lib (本家 u64 忠実移植) 比較ドライバ。
 
 ros1 bench_client と **完全に同一の** map_server 意味論で house.pgm を OccupancyGrid 化し、
 その raw int8 (h*w, row-major) を Rust ハーネス `vi_ref_bench` に渡す。ハーネスが

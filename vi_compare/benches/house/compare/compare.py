@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Align ROS1 と 2nd-side (ref=vi_reference / u64 各ソルバ) の value & policy を
+"""Align ROS1 と 2nd-side (ref=vi_lib / u64 各ソルバ) の value & policy を
 整列して比較レポートを出す。
 
   compare.py <out_dir> [side]   # side: ref (既定) | <u64 solver 名>
@@ -9,10 +9,10 @@ import numpy as np
 
 ROS1_UNREACH = 1e6   # detection threshold; actual ROS1 sentinel is ~1e9 (max_cost_/prob_base_)
 
-# 2nd-side ごとの設定。ref=vi_reference(u64 忠実移植)。
+# 2nd-side ごとの設定。ref=vi_lib(u64 忠実移植)。
 SIDES = {
     'ref':  dict(vfile='value_ref.npy', pfile='policy_ref.npy', tfile='timing_ref.json',
-                 unreach=1e6, label='ref(vi_reference u64忠実)', report='report_ref.md',
+                 unreach=1e6, label='ref(vi_lib u64忠実)', report='report_ref.md',
                  model_note='ref は本家と同じ u64+sentinel(~1e9) モデル → 価値はほぼ一致するはず'),
 }
 
@@ -24,7 +24,7 @@ for _s in _U64_SOLVERS:
     SIDES[_s] = dict(
         vfile=f'value_{_s}.npy', pfile=f'policy_{_s}.npy', tfile=f'timing_{_s}.json',
         unreach=1e6, label=f'u64:{_s}', report=f'report_u64_{_s}.md',
-        model_note='本家と同一 u64 コストモデル（vi_reference）上の高速ソルバ → bit-exact を期待')
+        model_note='本家と同一 u64 コストモデル（vi_lib）上の高速ソルバ → bit-exact を期待')
 
 # 8 dihedral spatial transforms on the (H, W) plane (theta axis preserved).
 # Order matters: when two transforms tie on the unreachable-mask score, the

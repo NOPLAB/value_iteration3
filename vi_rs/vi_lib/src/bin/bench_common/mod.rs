@@ -4,8 +4,8 @@
 use std::fs::File;
 use std::io::{self, Write};
 
-use vi_reference::params::PROB_BASE;
-use vi_reference::{Action, OccupancyGrid, Quaternion, ValueIterator};
+use vi_lib::params::PROB_BASE;
+use vi_lib::{Action, OccupancyGrid, Quaternion, ValueIterator};
 
 pub fn arg<T: std::str::FromStr>(args: &[String], i: usize, name: &str) -> T
 where

@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use vi_reference::bridge::{yaw_to_goal_theta_deg, PoseView};
+use vi_lib::bridge::{yaw_to_goal_theta_deg, PoseView};
 
 use super::{goal_matches, lock, BuildParams, CachedGoal, PlanConfig, PlanError, PlannerCore};
 

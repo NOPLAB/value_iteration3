@@ -130,7 +130,7 @@ VI_ORIG ?= $(abspath $(PWD)/../value_iteration)
 compare-build: ros2-docker
 	docker build -t $(VI_COMPARE_ROS1_IMG) -f vi_compare/docker/Dockerfile.ros1 vi_compare/docker
 
-# vi_reference の u64 高速ソルバ群 (frontier/block を本家 u64 モデルで) を vi_ros2_dev
+# vi_lib の u64 高速ソルバ群 (frontier/block を本家 u64 モデルで) を vi_ros2_dev
 # イメージ内でビルド・実行し value_<solver>.npy 等を生成。SOLVERS で集合を上書き可。
 compare-u64:
 	mkdir -p $(PWD)/vi_compare/results/house_oracle

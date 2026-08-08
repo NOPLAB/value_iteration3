@@ -6,8 +6,8 @@ rust-version.workspace = true
 
 [dependencies]
 # u64 (本家忠実) ソルバ群。bench_summary / bench_map / criterion ベンチの本体。
-# bitboard ベンチ (benches/bitboard.rs) は vi_reference::bitboard を参照する。
-vi_reference = { path = "../vi_reference" }
+# bitboard ベンチ (benches/bitboard.rs) は vi_lib::bitboard を参照する。
+vi_lib = { path = "../vi_lib" }
 clap         = { workspace = true }
 
 [dev-dependencies]

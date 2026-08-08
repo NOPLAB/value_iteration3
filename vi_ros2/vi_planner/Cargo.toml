@@ -14,7 +14,7 @@ anyhow  = "1"
 # main.rs が action コールバック (rclrs の futures エグゼキュータ) と
 # 計画/追従スレッドを橋渡しする oneshot チャネルに使う。
 futures = "0.3"
-vi_reference = { path = "../../vi_rs/vi_reference" }
+vi_lib = { path = "../../vi_rs/vi_lib" }
 
 # ROS deps。colcon-ros-cargo の生成 config が [patch.crates-io] でローカル
 # ビルド済みクレートへ差し替える。nav2_msgs は Docker の ros2_rust

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 本家(ROS1) vs ref(vi_reference) を「真の固定点」で bit 比較する strict ベンチ。
+# 本家(ROS1) vs ref(vi_lib) を「真の固定点」で bit 比較する strict ベンチ。
 #
 # 本家の通常収束 (delta>>18==0) は確率的アクションのサブステップ精細化を残し、停止スイープ数に
 # 依存して値が僅かに変わる (RMSE~0.5)。そこで:

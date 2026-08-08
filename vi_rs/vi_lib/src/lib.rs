@@ -36,10 +36,10 @@ pub use planner::{PathPose, Rollout, RolloutStatus};
 // bit-exact 検証体制の外側にあり、方策の意味論には触れない。
 pub mod ctrl;
 
-// ROS メッセージ「ビュー」と vi_reference 型の変換層 (ROS 非依存)。
+// ROS メッセージ「ビュー」と vi_lib 型の変換層 (ROS 非依存)。
 // vi_ros2/vi_node と vi_ros2/vi_global_planner が共有する (旧 vi_node/src/bridge.rs)。
 pub mod bridge;
 
 // 旧 vi_algorithm から取り込んだ word 並列 bitboard プリミティブ。solvers のフロンティアが
-// 使い、vi_bench の bitboard マイクロベンチが `vi_reference::bitboard` として参照する。
+// 使い、vi_bench の bitboard マイクロベンチが `vi_lib::bitboard` として参照する。
 pub mod bitboard;

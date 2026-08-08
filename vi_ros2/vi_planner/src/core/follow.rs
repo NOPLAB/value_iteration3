@@ -1,5 +1,5 @@
 //! follow 1 tick の判断器 ([`FollowController`]) — 離散 greedy (本家 `decision`
-//! 準拠) と連続 DWA ([`vi_reference::ctrl`]) を trait で抽象化し、
+//! 準拠) と連続 DWA ([`vi_lib::ctrl`]) を trait で抽象化し、
 //! [`PlanConfig::follow_controller`] で切り替える。
 //!
 //! どちらも読む場は同じ (`PlannerCore::local` が返す密な `ValueIterator` — 密経路は
@@ -10,7 +10,7 @@
 //! - [`GreedyController`] — 現在セルの離散方策 (無ければ近傍借用)。本家
 //!   `ViNode::decision` そのもの。既定。
 //! - [`DwaController`] — V̂ 三線形補間 + (v, ω) 候補格子の軌道サンプリング
-//!   (評価は衝突棄却 + 終端 V̂ のみ — 理由は `vi_reference::ctrl` の doc)。候補
+//!   (評価は衝突棄却 + 終端 V̂ のみ — 理由は `vi_lib::ctrl` の doc)。候補
 //!   全滅 (現在セル非 free / 全候補衝突 / 終端評価不能) 時は greedy へフォール
 //!   バックするので、失敗の形は greedy と同じに保たれる。実測
 //!   (`follow_ctrl_bench`, 津田沼 scale 3): 同到達率 6/6 でコマンド変動 Σ|Δω|
@@ -27,11 +27,11 @@
 
 use std::sync::Mutex;
 
-use vi_reference::bridge::PoseView;
-use vi_reference::ctrl::{dwa_decide, mppi_decide, DwaConfig, MppiConfig, MppiState};
-use vi_reference::planner::pose_to_cell;
-use vi_reference::value_iterator::ValueIterator;
-use vi_reference::Action;
+use vi_lib::bridge::PoseView;
+use vi_lib::ctrl::{dwa_decide, mppi_decide, DwaConfig, MppiConfig, MppiState};
+use vi_lib::planner::pose_to_cell;
+use vi_lib::value_iterator::ValueIterator;
+use vi_lib::Action;
 
 use super::{action_at, is_final, Decision, PlanConfig};
 
@@ -121,7 +121,7 @@ impl FollowController for GreedyController {
     }
 }
 
-/// 連続行動: `vi_reference::ctrl::dwa_decide` の薄いラッパ。
+/// 連続行動: `vi_lib::ctrl::dwa_decide` の薄いラッパ。
 pub struct DwaController {
     dwa: DwaConfig,
 }
@@ -135,7 +135,7 @@ impl DwaController {
         dwa.n_v = cfg.dwa_n_v.max(2);
         dwa.n_w = cfg.dwa_n_w.max(3);
         dwa.lethal_penalty =
-            (cfg.dwa_lethal_penalty.max(0.0) * vi_reference::params::PROB_BASE as f64) as u64;
+            (cfg.dwa_lethal_penalty.max(0.0) * vi_lib::params::PROB_BASE as f64) as u64;
         Self { dwa }
     }
 }
@@ -159,7 +159,7 @@ impl FollowController for DwaController {
     }
 }
 
-/// 連続行動 (MPPI): `vi_reference::ctrl::mppi_decide` のラッパ。tick 間状態
+/// 連続行動 (MPPI): `vi_lib::ctrl::mppi_decide` のラッパ。tick 間状態
 /// (warm start の名目制御列 + 乱数) は `Mutex` の内部可変性で持つ — `decide` は
 /// 共有ロックの下で `&self` で呼ばれるため。この Mutex は follow ループの
 /// 1 tick 内でしか取られないので競合しない。

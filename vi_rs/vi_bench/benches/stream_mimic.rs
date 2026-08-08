@@ -5,7 +5,7 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use vi_bench::fixtures::{build_vi, BenchMap};
-use vi_reference::solvers::{solve, U64Solver};
+use vi_lib::solvers::{solve, U64Solver};
 
 const SIZE: u32 = 8;
 const MAX_SWEEPS: u32 = 200;

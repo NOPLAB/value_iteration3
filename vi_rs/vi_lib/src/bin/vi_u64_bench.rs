@@ -1,4 +1,4 @@
-//! 比較ベンチ用ハーネス: vi_reference の u64 高速ソルバ群を、vi_compare パイプラインと
+//! 比較ベンチ用ハーネス: vi_lib の u64 高速ソルバ群を、vi_compare パイプラインと
 //! 同一の入力 (map_server 意味論の OccupancyGrid) ・ゴール・パラメータで走らせ、
 //! `value_<solver>.npy` / `policy_<solver>.npy` (float64, 形状 (H, W, N_THETA)) と
 //! `timing_<solver>.json` を出力する。本家 u64 モデルなので compare.py で ros1 と直接比較でき、
@@ -25,8 +25,8 @@ use std::io::Write;
 use std::time::Instant;
 
 use bench_common::{arg, default_actions, extract_value_policy, load_map, write_npy_f64};
-use vi_reference::solvers::{solve, U64Solver};
-use vi_reference::ValueIterator;
+use vi_lib::solvers::{solve, U64Solver};
+use vi_lib::ValueIterator;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

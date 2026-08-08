@@ -5,7 +5,7 @@
 //! throughput numbers.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use vi_reference::bitboard::{Bitboard2D, Bitboard3D};
+use vi_lib::bitboard::{Bitboard2D, Bitboard3D};
 
 const N_THETA: u32 = 60;
 const BB3_X: u32 = 8;

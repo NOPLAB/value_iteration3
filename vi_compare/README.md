@@ -15,7 +15,7 @@ vi_compare/
 │   │   ├── params.yaml      共通パラメータ (goal, theta 数など)
 │   │   ├── ros1/            本家ノードを action 経由で叩くベンチ
 │   │   ├── vi_rs/           ROS 非経由の Rust 直接ハーネス
-│   │   │                    (ref_bench = vi_reference 忠実移植単体,
+│   │   │                    (ref_bench = vi_lib 忠実移植単体,
 │   │   │                     u64_bench = u64 高速ソルバ群一括)
 │   │   └── compare/         npy 突き合わせ・レポート生成 (compare.py ほか)
 │   └── tsudanuma/           論文 (Ueda+ 2023) 構成の並列スイープ再現スイート

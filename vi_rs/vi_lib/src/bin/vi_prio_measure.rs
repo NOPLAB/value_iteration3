@@ -2,7 +2,7 @@
 //! reference / frontier2d / prio_ls / prio_lc の elapsed・更新数・repops を比較し、
 //! markdown 表で出力する。設計 §5.2。
 //!
-//!   cargo run --release -p vi_reference --bin vi_prio_measure
+//!   cargo run --release -p vi_lib --bin vi_prio_measure
 
 // 正典 6 アクションほか (vi_ref_bench / vi_u64_bench と同じ include)。
 // この bin は default_actions しか使わないので未使用ヘルパの警告は落とす。
@@ -13,9 +13,9 @@ mod bench_common;
 use std::time::Instant;
 
 use bench_common::default_actions;
-use vi_reference::solvers::priority::priority_solve;
-use vi_reference::solvers::{solve, U64Solver, REACH_THRESH as REACH};
-use vi_reference::{OccupancyGrid, Quaternion, ValueIterator};
+use vi_lib::solvers::priority::priority_solve;
+use vi_lib::solvers::{solve, U64Solver, REACH_THRESH as REACH};
+use vi_lib::{OccupancyGrid, Quaternion, ValueIterator};
 
 fn build(w: i32, h: i32) -> ValueIterator {
     let mut vi = ValueIterator::new(default_actions(), 1);

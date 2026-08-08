@@ -22,8 +22,8 @@
 //! - ここは rclrs 非依存 (core の分離クレート方式でホストテスト可能)。ROS 配線
 //!   (購読・predict の呼び出し) は main.rs 側。
 
-use vi_reference::bridge::PoseView;
-use vi_reference::msg::{LaserScan, OccupancyGrid};
+use vi_lib::bridge::PoseView;
+use vi_lib::msg::{LaserScan, OccupancyGrid};
 
 /// 自己位置の出どころ。follow ループ・plan サーバは [`Localizer::pose`] の結果
 /// (`latest_pose`) だけを見るので、実装を替えても走行側のコードは変わらない。

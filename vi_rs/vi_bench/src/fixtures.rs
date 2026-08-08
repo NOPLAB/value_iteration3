@@ -1,11 +1,11 @@
-//! u64 (vi_reference) ベンチ用フィクスチャ。合成 `OccupancyGrid` から、本家忠実な
+//! u64 (vi_lib) ベンチ用フィクスチャ。合成 `OccupancyGrid` から、本家忠実な
 //! セット済み `ValueIterator` を組み立てる。u16 時代の `vi_fixtures` ベース
 //! `VIContext` ビルダ (`build_context`) を置き換える。
 //!
-//! ベンチ入力は本家モデル（PROB_BASE 固定小数）なので、`vi_reference::solvers::solve`
+//! ベンチ入力は本家モデル（PROB_BASE 固定小数）なので、`vi_lib::solvers::solve`
 //! の全ソルバが Reference（=本家）と bit-exact になる。
 
-use vi_reference::{OccupancyGrid, Quaternion, ValueIterator};
+use vi_lib::{OccupancyGrid, Quaternion, ValueIterator};
 
 use crate::params::{canonical_actions, N_THETA};
 
@@ -19,7 +19,7 @@ const SAFETY_PENALTY: f64 = 30.0;
 const GOAL_MARGIN_RADIUS: f64 = 0.10;
 const GOAL_MARGIN_THETA: i32 = 15;
 
-/// 合成マップ種別。u16 ベンチの `vi_fixtures::MapType` 相当を vi_reference 入力
+/// 合成マップ種別。u16 ベンチの `vi_fixtures::MapType` 相当を vi_lib 入力
 /// （occupancy i8）として再現する。
 #[derive(Clone, Copy, Debug)]
 pub enum BenchMap {
@@ -129,7 +129,7 @@ pub fn build_vi(size: u32, map: BenchMap) -> ValueIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vi_reference::solvers::REACH_THRESH as REACH;
+    use vi_lib::solvers::REACH_THRESH as REACH;
 
     #[test]
     fn build_vi_has_requested_dimensions() {

@@ -6,9 +6,9 @@
 //! - `greedy` — 現行 `vi_planner` の `decide` 相当 (本家 `ViNode::decision` 準拠)。
 //!   セルに丸めて離散 6 行動の方策を引き、`linear.x = delta_fw [m/s]`、
 //!   `angular.z = delta_rot [deg/s]` を 1 tick 保持する。
-//! - `dwa` — `vi_reference::ctrl` の連続行動 (V̂ 三線形補間 + (v, ω) 候補格子の
+//! - `dwa` — `vi_lib::ctrl` の連続行動 (V̂ 三線形補間 + (v, ω) 候補格子の
 //!   軌道サンプリング、終端 V̂ 最小)。棄却全滅時は greedy へフォールバック。
-//! - `mppi` — 同じく `vi_reference::ctrl` の MPPI 型 (名目制御列の周りにガウス
+//! - `mppi` — 同じく `vi_lib::ctrl` の MPPI 型 (名目制御列の周りにガウス
 //!   摂動列をサンプルし softmax 重み付き平均、warm start 付き)。評価規約は
 //!   dwa と同一 (衝突棄却 + 終端 V̂ のみ)。棄却全滅時は greedy へフォールバック。
 //!
@@ -29,11 +29,11 @@ use clap::Parser;
 
 use vi_bench::params::{canonical_actions, N_THETA};
 use vi_bench::pgm;
-use vi_reference::ctrl::{dwa_decide, mppi_decide, unicycle_step, CostView, DwaConfig, MppiConfig, MppiState};
-use vi_reference::params::{MAX_COST, PROB_BASE};
-use vi_reference::planner::{pose_to_cell, PolicyView};
-use vi_reference::solvers::{solve, U64Solver};
-use vi_reference::{Action, OccupancyGrid, Quaternion, ValueIterator};
+use vi_lib::ctrl::{dwa_decide, mppi_decide, unicycle_step, CostView, DwaConfig, MppiConfig, MppiState};
+use vi_lib::params::{MAX_COST, PROB_BASE};
+use vi_lib::planner::{pose_to_cell, PolicyView};
+use vi_lib::solvers::{solve, U64Solver};
+use vi_lib::{Action, OccupancyGrid, Quaternion, ValueIterator};
 
 #[derive(Parser)]
 #[command(about = "Compare follow controllers (discrete greedy vs continuous DWA/MPPI) on a solved VI field.")]

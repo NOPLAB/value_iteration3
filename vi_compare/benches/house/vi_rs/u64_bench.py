@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vi_reference u64 高速ソルバ 比較ドライバ。
+"""vi_lib u64 高速ソルバ 比較ドライバ。
 
 ros1 bench_client / ref_bench と **完全に同一の** map_server 意味論で house.pgm を
 OccupancyGrid 化し、その raw int8 (h*w, row-major) を Rust ハーネス `vi_u64_bench` に

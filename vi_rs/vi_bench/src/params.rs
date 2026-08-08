@@ -3,7 +3,7 @@
 //! `vi_fpga/hls/*/src/vi_*_types.h` が持つデータ契約と同じ数値。
 //!
 //! かつて `vi_core::params` にあり、ROS ノード (`vi_ros2/*`) が「起動パラメータが
-//! この値と一致するか」を照合するのに使っていた。ソルバ (`vi_reference`) は行動も
+//! この値と一致するか」を照合するのに使っていた。ソルバ (`vi_lib`) は行動も
 //! θ 数も実行時に受け取る (`ValueIterator::new(actions, threads)` /
 //! `cell_num_t`) ので、その照合は launch から値を変える邪魔にしかならず外した。
 //! ベンチは「本家と同じ条件で測る」ことが目的なので、値そのものはここに基準として
@@ -12,7 +12,7 @@
 //!
 //! HLS / MATLAB 側の同じ値は Rust からは参照していない (それぞれが別に持つ)。
 
-use vi_reference::Action;
+use vi_lib::Action;
 
 /// 本家 launch の行動数。
 pub const N_ACTIONS: usize = 6;

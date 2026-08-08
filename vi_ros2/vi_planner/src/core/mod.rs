@@ -31,7 +31,7 @@
 //!   小さな密パッチ** ([`compact::Patch`]) の上で回す。
 //!
 //! `BuildParams` の重複定義は意図的 (クレート間依存を避ける)。このモジュールは
-//! vi_reference のみに依存し、ホストで `cargo test --lib` できる (分離クレート
+//! vi_lib のみに依存し、ホストで `cargo test --lib` できる (分離クレート
 //! 方式; リポジトリ CLAUDE.md 参照)。
 
 mod compact;
@@ -48,15 +48,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
-use vi_reference::bridge::{value_slice_to_occupancy, yaw_to_goal_theta_deg, PoseView};
-use vi_reference::msg::{LaserScan, OccupancyGrid};
-use vi_reference::planner::{
+use vi_lib::bridge::{value_slice_to_occupancy, yaw_to_goal_theta_deg, PoseView};
+use vi_lib::msg::{LaserScan, OccupancyGrid};
+use vi_lib::planner::{
     densify, optimal_action_at, pose_to_cell, rollout_path_on, PathPose, PolicyView, Rollout,
     RolloutStatus,
 };
-use vi_reference::solvers::{solve_observed, SolveFlow, SolveObserver, SolveProbe, U64Solver};
-use vi_reference::value_iterator::ValueIterator;
-use vi_reference::{Action, ValueIteratorLocal};
+use vi_lib::solvers::{solve_observed, SolveFlow, SolveObserver, SolveProbe, U64Solver};
+use vi_lib::value_iterator::ValueIterator;
+use vi_lib::{Action, ValueIteratorLocal};
 
 use compact::{new_patch, new_repair, CompactField, Patch, PenaltyOverlay, Repair};
 pub use prefetch::Prefetcher;
@@ -187,7 +187,7 @@ pub struct PlanConfig {
 
 impl PlanConfig {
     /// アウトオブコア (`states` を作らない) 経路を使うか (ソルバの能力宣言
-    /// [`vi_reference::solvers::SolverCaps::out_of_core`] を読む — ソルバ名の
+    /// [`vi_lib::solvers::SolverCaps::out_of_core`] を読む — ソルバ名の
     /// ハードコードはしない)。
     pub fn use_compact(&self) -> bool {
         self.solver.caps().out_of_core

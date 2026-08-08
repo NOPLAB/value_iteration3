@@ -1,4 +1,4 @@
-//! 比較ベンチ用ハーネス: vi_reference (本家 u64 忠実移植) を、vi_compare パイプラインと
+//! 比較ベンチ用ハーネス: vi_lib (本家 u64 忠実移植) を、vi_compare パイプラインと
 //! 同一の入力 (map_server 意味論の OccupancyGrid) ・ゴール・パラメータで走らせ、
 //! `value_ref.npy` / `policy_ref.npy` (float64, 形状 (H=cell_num_y, W=cell_num_x, N_THETA)) と
 //! `timing_ref.json` を出力する。ros1 (本家) と同じ数値モデルなので compare.py で ros1 と
@@ -22,8 +22,8 @@ use std::io::Write;
 use std::time::Instant;
 
 use bench_common::{arg, default_actions, extract_value_policy, load_map, write_npy_f64};
-use vi_reference::solvers::{solve, U64Solver};
-use vi_reference::ValueIterator;
+use vi_lib::solvers::{solve, U64Solver};
+use vi_lib::ValueIterator;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
