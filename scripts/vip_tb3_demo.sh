@@ -77,6 +77,8 @@ VI_ARGS=(
     -p map_scale:=1                      # 規定: 1 (ダウンサンプル倍率、1 = 等倍)
     -p downsample_policy:=conservative   # 規定: conservative (障害物優先) | optimistic
     # -p compact_sink_dir:=/path         # 規定: "" = 空きメモリ次第で RAM / ディスク自動
+    -p compact_ram_limit_mb:=0           # 規定: 0 = 空きメモリの半分まで RAM sink、超えたら
+                                         #   /tmp/vi_planner_sink へ。>0 で MB を明示
     -p vi_threads:=0                     # 規定: 0 = VI_THREADS を触らない (>0 で設定)
     # ── ゴール判定 / 姿勢・TF ──
     -p goal_tolerance_xy:=0.25           # 規定: 0.25 [m] (navigate_to_pose の達成判定)
@@ -108,7 +110,7 @@ VI_ARGS=(
     # ── スタンドアロン (navigate_to_pose / follow_waypoints) ──
     -p standalone:=true                  # 規定: false — bt_navigator 等の代わりに自前で提供
     -p goal_retry_limit:=3               # 規定: 3 (追従失敗時の投げ直し上限、負で無制限)
-    -p stop_on_failure:=false            # 規定: false (巡回で 1 点失敗しても次へ)
+    -p stop_on_failadaptive=false            # 規定: false (巡回で 1 点失敗しても次へ)
     -p waypoint_pause_sec:=0.2           # 規定: 0.2 [s] (点に着いてから次へ向かうまでの settle)
     # ── 狭域 → 広域フィードバック (全域掃き) ──
     -p global_sweep:=true                # 規定: true (local_penalty を全域へ伝播)

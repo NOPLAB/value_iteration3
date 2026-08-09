@@ -81,6 +81,8 @@ VI_ARGS=(
     -p map_scale:=1                      # 規定: 1 (ダウンサンプル倍率、1 = 等倍)
     -p downsample_policy:=conservative   # 規定: conservative (障害物優先) | optimistic
     # -p compact_sink_dir:=/path         # 規定: "" = 空きメモリ次第で RAM / ディスク自動
+    -p compact_ram_limit_mb:=0           # 規定: 0 = 空きメモリの半分まで RAM sink、超えたら
+                                         #   /tmp/vi_planner_sink へ。>0 で MB を明示
     -p vi_threads:=0                     # 規定: 0 = VI_THREADS を触らない (>0 で設定)
     # ── ゴール判定 / 姿勢・TF ──
     -p goal_tolerance_xy:=0.25           # 規定: 0.25 [m] (navigate_to_pose の達成判定)

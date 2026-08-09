@@ -190,6 +190,7 @@ pub fn read_params(node: &Node) -> Result<Params> {
         // — sink は追従ループが毎パッチ読み直す常時アクセス先で、ディスクへ逃がすか
         // どうかは同居プロセスと保存先の速さ次第、つまり運用側にしか分からない。
         compact_ram_limit_mb: p!("compact_ram_limit_mb", i64, 0),
+        vi_threads: p!("vi_threads", i64, 0),
         goal_tolerance_xy: p!("goal_tolerance_xy", f64, 0.25),
         goal_tolerance_deg: p!("goal_tolerance_deg", f64, 10.0),
         pose_topic: p!("pose_topic", Arc<str>, "mcl_pose".into()).to_string(),
