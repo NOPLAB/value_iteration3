@@ -4,6 +4,7 @@
 //! ここで落とす (= 起動を止める) のは、黙って確保して OOM killer に落とされる
 //! より理由を出して止めるほうがよいものだけ (密の価値関数の見積もり)。
 
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,7 +26,54 @@ use vi_planner::core::{
 use rclrs::*;
 
 use super::handles::Loc;
-use super::params::{compact_sink_dir, Params};
+use super::params::Params;
+
+// ── 正しい値が 1 つしかない定数 ─────────────────────────────────────────────
+// どれも起動パラメータだったもの。launch から変える判断材料が無く (「掃きの
+// チャンクを何セルにすべきか」に答えられるユーザーはいない)、変えて良くなる場面
+// も無かったので、理由と一緒にここへ落としてある。昇格させたくなったら
+// node::params へ戻すだけ。
+
+/// solve 総イテレーション上限 (発散ガード)。終了条件は収束なので実質無限。
+const MAX_SOLVE_ITER: u32 = 1_000_000;
+/// cancel を観測する刻み [イテレーション]。プリエンプトの粒度 (密経路のみ)。
+const SOLVE_CHUNK: u32 = 64;
+/// start が方策なしセルのとき近傍を探す範囲 [m]。
+const START_TOLERANCE_M: f64 = 0.5;
+/// 現在セルに方策が無いとき近傍から行動を借りる範囲 [m]。
+const ACTION_TOLERANCE_M: f64 = 0.2;
+/// compact パッチの寸法スラック [セル] / 修復タイルの interior の 1 辺 [セル]
+/// (効き方は `core::BuildParams` の doc)。
+const PATCH_SLACK_CELLS: i32 = 2;
+const REPAIR_INTERIOR_CELLS: i32 = 16;
+/// 進行中の先読みを待つときの観測間隔 [ms] (cancel を見る刻みでもある)。
+const PREFETCH_POLL_MS: u64 = 50;
+/// DWA の (v, ω) 候補数と MPPI の softmax 温度。実測 decide は DWA ~30 µs /
+/// MPPI ~0.2 ms で、10 Hz の 40 ms 予算からは 3 桁遠い = 詰める理由が無い。
+const DWA_N_V: usize = 7;
+const DWA_N_W: usize = 11;
+const MPPI_LAMBDA: f64 = 1.0;
+/// MPPI の制御ノイズ σ。0 = 行動集合から自動 (σ_v は速度幅の 1/4、σ_ω は上限の 1/4)。
+const MPPI_SIGMA_AUTO: f64 = 0.0;
+/// 投げ直しの前に、止まったままスキャンを取り込んで場を精密化する時間 [s]
+/// (standalone の `run_settle` — BT の `Wait` と違って場が実際に動く)。
+pub const GOAL_RETRY_SETTLE_SEC: f64 = 3.0;
+/// 能動的再定位を諦めて通常の停止待ちに戻すまでの時間 [s]。
+pub const RELOC_TIMEOUT_SEC: f64 = 30.0;
+
+/// このマシンで**いま**確保できるメモリ [B] (`/proc/meminfo` の `MemAvailable`)。
+/// 読めなければ `None` = 判定そのものを見送る (推測で起動を止めない)。
+fn mem_available() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: u64 = s
+        .lines()
+        .find(|l| l.starts_with("MemAvailable:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some(kb * 1024)
+}
 
 /// /map (transient_local) を最初の 1 通が来るまで待つ。
 pub fn wait_for_map(
@@ -98,8 +146,6 @@ pub fn build_core(
                 max_range_m: params.belief_max_range.max(0.1),
                 motion_sigma_xy_m: params.belief_motion_sigma_xy.max(0.0),
                 motion_sigma_theta_deg: params.belief_motion_sigma_theta_deg.max(0.0),
-                z_min: params.belief_z_min.clamp(0.0, 1.0),
-                weight_skip_ratio: params.belief_weight_skip_ratio.max(0.0) as f32,
                 // "adaptive_viterbi" = adaptive の全域レベルを min-plus (MAP) で回す変種。
                 viterbi: kind == "adaptive_viterbi",
                 ..BeliefConfig::default()
@@ -137,10 +183,6 @@ pub fn build_core(
                 max_range_m: params.belief_max_range.max(0.1),
                 motion_sigma_xy_m: params.belief_motion_sigma_xy.max(0.0),
                 motion_sigma_theta_deg: params.belief_motion_sigma_theta_deg.max(0.0),
-                z_min: params.belief_z_min.clamp(0.0, 1.0),
-                weight_skip_ratio: params.belief_weight_skip_ratio.max(0.0),
-                reset_quality: params.belief_reset_quality.clamp(0.0, 1.0),
-                lost_ess: params.belief_lost_ess.max(1.0),
                 // "viterbi" = 同じ belief を min-plus (MAP) 半環で回す変種。
                 viterbi: kind == "viterbi",
                 ..WholeMapBeliefConfig::default()
@@ -193,7 +235,7 @@ pub fn build_core(
         },
     );
     // sink の置き場と、そこを選んだ理由の 1 行はこの中で出る (明示指定 →
-    // compact_ram_limit_mb による自動退避 → RAM)。密ソルバなら None。
+    // 空きメモリによる自動退避 → RAM)。密ソルバなら None。
     let sink_dir = compact_sink_dir(params, solver, nstates);
     if params.waypoint_prefetch {
         // 生きる場はちょうど 2 つ (走行中のと、次の) で頭打ちになる。新しい場を
@@ -208,33 +250,48 @@ pub fn build_core(
             if use_compact { sink_gb } else { states_gb },
         );
     }
-    // 密の見積もりが限度を超えたら**起動を止める**。ここまで来れば地図の実寸が
-    // 分かっているので、launch 側の代理判定 (map_scale > 1 なら密を禁止) より正確。
-    // 黙って確保して OOM killer に落とされるより、理由を出して止めるほうがよい。
-    // 先読みを入れると場が 2 本になるので、限度と突き合わせるのも 2 本ぶん。
-    if !use_compact && states_gb * fields * 1000.0 > params.dense_limit_mb.max(0) as f64 {
-        return Err(anyhow!(
-            "the dense value function needs {:.2} GB (states + sweep_orders) for {} states{}, \
-             over dense_limit_mb={}.\n\
-             Raise map_scale (halving the resolution quarters this), raise dense_limit_mb if the \
-             machine really has the room, or switch to solver: frontier2d_sparse_compact \
-             (+ compact_sink_dir), which keeps only {:.2} GB of finalized output and hydrates a \
-             small patch around the robot for following. The local -> global feedback \
-             (global_sweep) works there too — it repairs the sink tile by tile instead of \
-             sweeping a full `states` array.",
-            states_gb * fields,
-            nstates,
-            if params.waypoint_prefetch {
+    // 密の見積もりが**いまの空きメモリ**を超えたら起動を止める。ここまで来れば
+    // 地図の実寸が分かっているので、launch 側の代理判定 (map_scale > 1 なら密を
+    // 禁止) より正確。黙って確保して OOM killer に落とされるより、理由を出して
+    // 止めるほうがよい。かつては dense_limit_mb という起動パラメータだったが、
+    // 答えは「このマシンの空き」であって固定の MB 数ではない (4GB 機で妥当な値は
+    // 64GB 機では邪魔なだけで、しかも正しい数字はユーザーには分からない)。
+    // 半分を超えたら警告、全部を超えたら停止。先読みを入れると場が 2 本になるので、
+    // 突き合わせるのも 2 本ぶん。
+    let need_gb = states_gb * fields;
+    if !use_compact {
+        // /proc/meminfo が読めない環境では判定を見送る (推測で起動は止めない)。
+        if let Some(avail_gb) = mem_available().map(|b| b as f64 / 1e9) {
+            let doubled = if params.waypoint_prefetch {
                 " x2 value functions (waypoint_prefetch: true)"
             } else {
                 ""
-            },
-            params.dense_limit_mb,
-            sink_gb
-        ));
+            };
+            if need_gb > avail_gb {
+                return Err(anyhow!(
+                    "the dense value function needs {need_gb:.2} GB (states + sweep_orders) for \
+                     {nstates} states{doubled}, but only {avail_gb:.2} GB is available on this \
+                     machine.\n\
+                     Raise map_scale (halving the resolution quarters this), free memory, or \
+                     switch to solver: frontier2d_sparse_compact (+ compact_sink_dir), which \
+                     keeps only {sink_gb:.2} GB of finalized output and hydrates a small patch \
+                     around the robot for following. The local -> global feedback (global_sweep) \
+                     works there too — it repairs the sink tile by tile instead of sweeping a \
+                     full `states` array."
+                ));
+            }
+            if need_gb > avail_gb * 0.5 {
+                eprintln!(
+                    "WARN: the dense value function takes {need_gb:.2} GB{doubled} of the \
+                     {avail_gb:.2} GB available — over half the machine. Raise map_scale or \
+                     switch to solver: frontier2d_sparse_compact if anything else needs to run \
+                     here."
+                );
+            }
+        }
     }
-    let start_tolerance_cells = (params.start_tolerance / vi_grid.resolution).ceil() as i32;
-    let action_tolerance_cells = (params.action_tolerance / vi_grid.resolution).ceil() as i32;
+    let start_tolerance_cells = (START_TOLERANCE_M / vi_grid.resolution).ceil() as i32;
+    let action_tolerance_cells = (ACTION_TOLERANCE_M / vi_grid.resolution).ceil() as i32;
 
     let build = BuildParams {
         grid: vi_grid,
@@ -250,8 +307,8 @@ pub fn build_core(
         goal_margin_radius: params.goal_margin_radius,
         goal_margin_theta: params.goal_margin_theta_deg as i32,
         local_xy_range: params.local_xy_range,
-        patch_slack_cells: params.patch_slack_cells.max(0) as i32,
-        repair_interior_cells: params.repair_interior_cells.max(1) as i32,
+        patch_slack_cells: PATCH_SLACK_CELLS,
+        repair_interior_cells: REPAIR_INTERIOR_CELLS,
     };
     // validate() 済みなので必ず解ける。
     let follow_kind = FollowKind::from_name(&params.follow_controller)
@@ -260,19 +317,19 @@ pub fn build_core(
         eprintln!(
             "vi_planner: follow controller = dwa (continuous; horizon {:.2} s, {}x{} candidates, \
              greedy fallback)",
-            params.dwa_horizon_s, params.dwa_n_v, params.dwa_n_w
+            params.dwa_horizon_s, DWA_N_V, DWA_N_W
         );
     } else if follow_kind == FollowKind::Mppi {
         eprintln!(
             "vi_planner: follow controller = mppi (continuous; horizon {:.2} s, {} samples, \
              lambda {:.2}, greedy fallback)",
-            params.dwa_horizon_s, params.mppi_samples, params.mppi_lambda
+            params.dwa_horizon_s, params.mppi_samples, MPPI_LAMBDA
         );
     }
     let cfg = PlanConfig {
         solver,
-        max_solve_iter: params.max_solve_iter.max(1) as u32,
-        solve_chunk: params.solve_chunk.max(1) as u32,
+        max_solve_iter: MAX_SOLVE_ITER,
+        solve_chunk: SOLVE_CHUNK,
         goal_tolerance_xy: params.goal_tolerance_xy,
         goal_tolerance_deg: params.goal_tolerance_deg,
         max_rollout_steps: params.max_rollout_steps.max(1) as usize,
@@ -281,15 +338,17 @@ pub fn build_core(
         action_tolerance_cells,
         follow_controller: follow_kind,
         footprint_clear_m: params.footprint_clear_m,
+        sigma_margin_gain: params.sigma_margin_gain,
+        map_clear_from_scan: params.map_clear_from_scan,
         dwa_tick_s: 1.0 / params.control_frequency,
         dwa_horizon_s: params.dwa_horizon_s,
-        dwa_n_v: params.dwa_n_v.max(2) as usize,
-        dwa_n_w: params.dwa_n_w.max(3) as usize,
+        dwa_n_v: DWA_N_V,
+        dwa_n_w: DWA_N_W,
         dwa_lethal_penalty: params.dwa_lethal_penalty.max(0.0),
         mppi_samples: params.mppi_samples.max(2) as usize,
-        mppi_lambda: params.mppi_lambda.max(1e-3),
-        mppi_sigma_v: params.mppi_sigma_v.max(0.0),
-        mppi_sigma_w_deg: params.mppi_sigma_w_deg.max(0.0),
+        mppi_lambda: MPPI_LAMBDA,
+        mppi_sigma_v: MPPI_SIGMA_AUTO,
+        mppi_sigma_w_deg: MPPI_SIGMA_AUTO,
         compact_sink_dir: sink_dir,
         // 先読みを入れると場が 2 つ同時に生きるので、compact の確定出力は solve
         // ごとに使い捨てのディレクトリ (<compact_sink_dir>/gen<N>) へ分ける。
@@ -298,7 +357,7 @@ pub fn build_core(
         // 先読み側の核と共有すること。
         compact_sink_gen: params.waypoint_prefetch.then(|| Arc::new(AtomicU64::new(0))),
         vi_threads: params.vi_threads.max(0) as usize,
-        prefetch_poll_ms: params.waypoint_prefetch_poll_ms.max(1) as u64,
+        prefetch_poll_ms: PREFETCH_POLL_MS,
         // 早期走り出しは背景の解き切りとセット (掃きスレッドの起動側と同じ判断)。
         global_sweep: params.global_sweep || params.early_start,
         early_start: params.early_start,
@@ -342,4 +401,58 @@ pub fn build_core(
         core = core.with_prefetch(pf);
     }
     Ok((core, localizer, prefetch))
+}
+
+/// compact 経路の確定出力 (`nstates × 12 B`) の置き場を決める。
+///
+/// - compact 以外のソルバでは常に `None` (使われない)。
+/// - `compact_sink_dir` が明示されていればそれを使う。
+/// - 未指定なら `compact_ram_limit_mb` に収まるかで決め、収まらなければ
+///   `/tmp/vi_planner_sink` へ逃がす。小メモリ機で黙って GB 級の `RamSink` を
+///   確保すると OOM killer に落とされるため。上限が 0 (既定) のときは
+///   **空きメモリの半分** — 密の起動判定と同じ `MemAvailable` 基準。
+///
+/// 追従はパッチを置き直すたびに sink を読むので (10Hz の制御ループ)、SD カード上の
+/// sink は追従の遅延に直結する。逃がす先はできるだけ速い実ディスクを
+/// `compact_sink_dir` で明示すること。
+fn compact_sink_dir(params: &Params, solver: U64Solver, nstates: usize) -> Option<PathBuf> {
+    if !solver.caps().out_of_core {
+        return None;
+    }
+    let bytes = nstates as u64 * 12;
+    if !params.compact_sink_dir.is_empty() {
+        let dir = PathBuf::from(&params.compact_sink_dir);
+        eprintln!(
+            "vi_planner: compact output -> disk mmap {} ({:.2} GB)",
+            dir.display(),
+            bytes as f64 / 1e9
+        );
+        return Some(dir);
+    }
+    // 明示された上限が最優先。0 (既定) なら空きメモリの半分を上限にする。
+    let limit = match params.compact_ram_limit_mb {
+        n if n > 0 => Some((n as u64) * 1024 * 1024),
+        _ => mem_available().map(|avail| avail / 2),
+    };
+    if let Some(limit) = limit {
+        if bytes > limit {
+            let dir = PathBuf::from("/tmp/vi_planner_sink");
+            eprintln!(
+                "WARN: compact output would need {:.2} GB of RAM, over the {:.2} GB limit ({}); \
+                 spilling to disk mmap {}. The follow loop re-reads the sink on every patch \
+                 recenter, so point compact_sink_dir at the fastest real disk available.",
+                bytes as f64 / 1e9,
+                limit as f64 / 1e9,
+                if params.compact_ram_limit_mb > 0 {
+                    "compact_ram_limit_mb"
+                } else {
+                    "half of MemAvailable"
+                },
+                dir.display()
+            );
+            return Some(dir);
+        }
+    }
+    eprintln!("vi_planner: compact output -> RAM ({:.2} GB)", bytes as f64 / 1e9);
+    None
 }

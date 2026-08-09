@@ -37,10 +37,9 @@ pub struct Viz {
     pub belief_last: Mutex<Option<Instant>>,
     pub clock: Clock,
     pub frame_id: String,
-    /// `value_function` のスケール上限 [ステップ数≒秒]。
+    /// カラースケールの上限 [ステップ数≒秒] (`value_function` と
+    /// `local_window_value` で共通)。
     pub threshold_steps: u64,
-    /// `local_window_value` のスケール上限 (窓は近傍だけなので別に持つ)。
-    pub window_threshold_steps: u64,
     /// 配信間隔。0 で solve 完了時のみ。
     pub interval: Duration,
 }

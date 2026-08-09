@@ -9,6 +9,29 @@ use super::handles::Handles;
 use super::msg::ros_grid_from;
 use super::params::Params;
 
+/// 1 回のロック取得で掃く時間。追従ループの 1 tick (100 ms) より十分短いこと
+/// — 手放す間隔がこれで決まる。CPU の取り分は `global_sweep_duty` [%] で、
+/// これを固定したまま待ち時間のほうを伸縮させる。
+const BUDGET: Duration = Duration::from_millis(20);
+
+/// 密経路の 1 チャンクの粒度 [セル]。[`BUDGET`] の中で経過時間を見る刻みでも
+/// あるので、Pi4 (実測 1 掃き 7.9M セルで 8-11 秒 = 約 1M cells/s) で数 ms に
+/// なる大きさ。compact 経路はこの値を使わない (1 呼び出し = タイル 1 枚)。
+const CELLS_PER_STEP: usize = 5_000;
+
+/// 伝播が続いている間の報告間隔。**走行中は待ち行列がまず空にならない**ので
+/// (壁が窓に入っていれば `set_local_cost` が毎 tick penalty を塗り直す)、
+/// 「done」の行はほとんど出ない。掃きが動いているかを見る手掛かりはこの間隔で
+/// 出る進捗のほうになる。
+///
+/// 価値関数の再配信もこの間隔に乗る。追従中は solve が走らないので、ここで
+/// 出さないと `value_function` は solve した瞬間のまま固まり、**伝播が効いて
+/// いても画面では何も起きない** (追従ループが出すのはローカルウィンドウだけ)。
+/// 全域 1 枚は 19F (scale 2) で 13 万セル、津田沼 (scale 5) で 94 万セル読む。
+/// 作るのはロックの中なので、この間隔の tick だけ追従ループが try_lock に
+/// 失敗し得る (2 秒に 1 回なら 3 tick 連続にはならず、機体は止まらない)。
+const REPORT_EVERY: Duration = Duration::from_secs(2);
+
 /// 全域掃きスレッドを立てる (`global_sweep: false` なら何もしない)。
 ///
 /// 追従 (`observe_scan`) が書いた local_penalty はローカルウィンドウ (±1m) の
@@ -28,8 +51,8 @@ use super::params::Params;
 ///
 /// ロックの持ち方が肝。10 Hz の追従ループは同じ Mutex を `try_lock` で取り、
 /// 3 tick 続けて取れないとロボットを止める。そこで 1 掃きを走り切らせず、
-/// budget ms だけ掃いてロックを手放し、idle ms 待つ形にしてある
-/// (既定 20:60 = 1 コアの 25%)。
+/// [`BUDGET`] だけ掃いてロックを手放し、残りは待つ形にしてある
+/// (割合は `global_sweep_duty` [%]、既定 25 = 1 コアの 1/4)。
 pub fn spawn(handles: Arc<Handles>, params: &Params) {
     // 早期走り出し (early_start) は「残りは走りながら背景で解き切る」が前提なので、
     // 掃きが立っていないと未確定のまま走り続けることになる。核の PlanConfig 側も
@@ -38,26 +61,10 @@ pub fn spawn(handles: Arc<Handles>, params: &Params) {
         return;
     }
     let h = handles;
-    let budget = Duration::from_millis(params.global_sweep_budget_ms.max(1) as u64);
-    let idle = Duration::from_millis(params.global_sweep_idle_ms.max(0) as u64);
-    // 密経路の 1 チャンクの粒度。budget の中で経過時間を見る刻みでもあるので、
-    // Pi4 (実測 1 掃き 7.9M セルで 8-11 秒 = 約 1M cells/s) で数 ms になる
-    // 大きさにしてある。compact 経路はこの値を使わず、1 呼び出し = タイル 1 枚
-    // (これも数十 ms で頭打ち)。
-    let cells_per_step = params.global_sweep_cells_per_step.max(1) as usize;
-    // 伝播が続いている間の報告間隔。**走行中は待ち行列がまず空にならない**
-    // ので (壁が窓に入っていれば `set_local_cost` が毎 tick penalty を塗り
-    // 直す)、下の「done」の行はほとんど出ない。掃きが動いているかを見る
-    // 手掛かりはこの間隔で出る進捗のほうになる。
-    //
-    // 価値関数の再配信もここに乗せる。追従中は solve が走らないので、
-    // ここで出さないと `value_function` は solve した瞬間のまま固まり、
-    // **伝播が効いていても画面では何も起きない** (追従ループが出すのは
-    // ローカルウィンドウだけ)。全域 1 枚は 19F (scale 2) で 13 万セル、津田沼
-    // (scale 5) で 94 万セル読むので、10 Hz の追従ループには置けない。
-    // 作るのはロックの中なので、この間隔の tick だけ追従ループが try_lock に
-    // 失敗し得る (2 秒に 1 回なら 3 tick 連続にはならず、機体は止まらない)。
-    let report_every = Duration::from_secs_f64(params.global_sweep_report_sec.max(0.1));
+    // 1 回のロック取得で掃く時間と、そのあと手放して待つ時間。比 (duty) が
+    // そのまま CPU の取り分になる。100% で待ちなし。
+    let duty = params.global_sweep_duty.clamp(1, 100) as f64 / 100.0;
+    let idle = BUDGET.mul_f64((1.0 - duty) / duty);
     std::thread::spawn(move || {
         let mut cur = SweepCursor::default();
         let mut sweep_start: Option<Instant> = None;
@@ -79,21 +86,22 @@ pub fn spawn(handles: Arc<Handles>, params: &Params) {
                 let started = *sweep_start.get_or_insert(t0);
                 let mut done = false;
                 loop {
-                    if c.sweep_global(&mut cur, cells_per_step).1 {
+                    if c.sweep_global(&mut cur, CELLS_PER_STEP).1 {
                         done = true;
                         break;
                     }
-                    if t0.elapsed() >= budget {
+                    if t0.elapsed() >= BUDGET {
                         break;
                     }
                 }
 
-                if done || last_report.elapsed() >= report_every {
+                if done || last_report.elapsed() >= REPORT_EVERY {
                     last_report = Instant::now();
                     if done {
                         // 伝播 1 回に実際かかった時間 (idle を含む実時間 =
-                        // 狭域の判断が広域に届くまでの遅れそのもの)。budget/idle を
-                        // 実測から詰められるよう必ず出す。`still_dirty=false` なら
+                        // 狭域の判断が広域に届くまでの遅れそのもの)。
+                        // `global_sweep_duty` を実測から詰められるよう必ず出す。
+                        // `still_dirty=false` なら
                         // 新しい不動点に達したので、次の狭域の書き込みまで止まる。
                         //
                         // compact は 1 回の伝播で掃く量が地図の大きさで決まらない

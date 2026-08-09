@@ -45,7 +45,7 @@ pub use follow::{DwaController, FollowController, FollowKind, GreedyController, 
 //   - 窓つき: vi_lib::localize の `Localizer` トレイト (external / grid / adaptive)。
 //   - 全地図: vi_lib::belief の `Belief` (belief / viterbi)。窓もレベル機構も無い。
 // `BeliefConfig` が両側にあるので、全地図側は別名で入れる。
-pub use vi_lib::belief::{mode_count, Belief, BeliefConfig as WholeMapBeliefConfig};
+pub use vi_lib::belief::{mode_count, spread_m, Belief, BeliefConfig as WholeMapBeliefConfig};
 pub use vi_lib::localize::{
     AdaptiveLocalizer, BeliefConfig, ExternalLocalizer, GridLocalizer, Localizer,
 };
@@ -166,6 +166,22 @@ pub struct PlanConfig {
     /// 周囲の local_penalty を消す — ロボットが現にいる場所は free という反証
     /// 不能な証拠で、ゴースト壁が機体の真上で閉じて完全停止するのを防ぐ。
     pub footprint_clear_m: f64,
+    /// 自己位置の広がり σ [m] に掛けてマージン膨張量にする係数 (0 以下で無効、既定 0)。
+    /// 上田ら 2023 (4·2·2) の「マージン `m` に σ を足す」を、状態空間を拡張せずに
+    /// ウィンドウの `local_penalty` で作る ([`PlannerCore::inflate_by_sigma`])。
+    /// σ は [`vi_lib::belief::spread_m`] が localizer の上位仮説から測る。
+    pub sigma_margin_gain: f64,
+    /// レーザーが貫通したセルの**地図由来**コスト (`free` / 膨張帯 `penalty`) も
+    /// 反証するか (既定 false)。[`Self::footprint_clear_m`] が機体の真下でやって
+    /// いることを、ビームが通り抜けた範囲まで広げたもの。効くのは「地図には壁が
+    /// あるが実際には無い」— 自己位置がずれている / 地図が古い / ドアが開いた —
+    /// のケースで、ロボットが幽霊壁に囲まれて止まるのを解く。
+    ///
+    /// スキャンが空いていると言った所しか開かないので「地図を無視して突っ切る」
+    /// にはならない。逆に、自己位置がずれたまま開けた穴は本物の壁を消し得るので、
+    /// 開いた分は `global_sweep` 経由で広域の場にも伝わる (寿命は local_penalty と
+    /// 同じ = そのゴールの間だけ)。
+    pub map_clear_from_scan: bool,
     /// DWA/MPPI: 制御周期 [s] (= 1/control_frequency)。候補評価の時間刻みの上限。
     pub dwa_tick_s: f64,
     /// DWA/MPPI: 前方シミュレーション時間 [s]。
@@ -1074,10 +1090,35 @@ impl PlannerCore {
     /// [`quality_shift`] で quality から量子化する。0 は `observe_scan` と同一。
     pub fn observe_scan_gated(&mut self, scan: &LaserScan, pose: PoseView, shift: u32) {
         let clear = self.cfg.footprint_clear_m;
+        let map_clear = self.cfg.map_clear_from_scan;
         if let Some(vi) = self.local_mut() {
+            vi.clear_map_from_scan = map_clear;
             vi.set_local_cost_attenuated(scan, pose.x, pose.y, pose.yaw_rad, shift);
             // 注入の後に footprint を消す — 機体の真上に塗られたゴーストが勝たない
             // ように (harvest より前なので compact の penalty 表にも 0 が写る)。
+            if clear > 0.0 {
+                vi.clear_local_penalty_around(pose.x, pose.y, clear);
+            }
+        }
+        self.harvest_penalties();
+    }
+
+    /// 自己位置の広がり `sigma_m` [m] に応じて壁際のマージンを広げる
+    /// (上田ら 2023 4·2·2 のマージン膨張 — [`PlanConfig::sigma_margin_gain`])。
+    /// `set_window` の後、`refine_for` の前に 1 tick 1 回呼ぶ。
+    ///
+    /// 膨張量はウィンドウ半径でクランプする。窓が丸ごと帯になるとロボットが
+    /// 出口を失い、`decide` が NoAction を返し続けて停止するため。
+    pub fn inflate_by_sigma(&mut self, sigma_m: f64, pose: PoseView) {
+        let gain = self.cfg.sigma_margin_gain;
+        if gain <= 0.0 || sigma_m <= 0.0 {
+            return;
+        }
+        let extra = (sigma_m * gain).min(self.build.local_xy_range);
+        let clear = self.cfg.footprint_clear_m;
+        if let Some(vi) = self.local_mut() {
+            vi.inflate_by_sigma(extra);
+            // 帯が機体の真下で閉じると動けなくなる (observe_scan_gated と同じ理由)。
             if clear > 0.0 {
                 vi.clear_local_penalty_around(pose.x, pose.y, clear);
             }

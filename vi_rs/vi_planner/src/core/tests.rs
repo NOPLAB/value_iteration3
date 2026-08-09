@@ -55,6 +55,8 @@ fn cfg() -> PlanConfig {
         action_tolerance_cells: 4,
         follow_controller: FollowKind::Greedy,
         footprint_clear_m: 0.0,
+        sigma_margin_gain: 0.0,
+        map_clear_from_scan: false,
         dwa_tick_s: 0.1,
         dwa_horizon_s: 1.0,
         dwa_n_v: 7,

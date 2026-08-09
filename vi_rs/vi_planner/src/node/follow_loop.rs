@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use vi_lib::bridge::PoseView;
 
 use vi_planner::core::{
-    lock, mode_count, quality_shift, try_lock, value_grid_on, Decision, PlanError,
+    lock, mode_count, quality_shift, spread_m, try_lock, value_grid_on, Decision, PlanError,
 };
 
 use super::handles::FollowCtx;
@@ -27,10 +27,11 @@ pub struct FollowTuning {
     pub refine_budget: Duration,
     /// pose 欠落 / 方策なしをこの連続 tick 数で追従失敗とみなす。
     pub failure_ticks_limit: u32,
-    /// ロックをこの tick 数連続で取れなかったら停止指令を出す。
-    pub busy_ticks_before_stop: u32,
     /// belief が多峰のとき QMDP (`decide_qmdp`) で行動を選ぶ (単峰は従来どおり)。
     pub qmdp: bool,
+    /// σ に応じた壁際マージンの膨張が有効か (`PlanConfig::sigma_margin_gain > 0`)。
+    /// 立っていると QMDP が off でも上位仮説を取る (σ の測定に要る)。
+    pub sigma_margin: bool,
     /// スキャン注入の品質ゲート ([`quality_shift`] の gate)。0 で無効。
     pub scan_quality_gate: f64,
     /// ロスト中に判別点へ走る能動的再定位 (`prepare_reloc_goal` + QMDP)。
@@ -42,6 +43,11 @@ pub struct FollowTuning {
 /// QMDP に渡す belief 仮説の上限。ヒストグラムの上位セルだけで質量の大半を
 /// 覆える (それ以下は veto 判定も動かさない微小仮説)。
 const QMDP_TOP_K: usize = 64;
+
+/// 核のロックをこの tick 数**連続で**取れなかったら停止指令を出す。1〜2 tick は
+/// 同一ゴールのロールアウト (BT の 1Hz リプラン) や掃きスレッドとの競合なので
+/// 止めない。10 Hz なら 3 tick = 300 ms。
+const BUSY_TICKS_BEFORE_STOP: u32 = 3;
 
 /// 能動的再定位中の近接停止 [m]。姿勢が無く local_penalty を置けないので、
 /// 生の最近接レンジで守る。
@@ -327,11 +333,20 @@ pub fn run_follow(
         // 品質ゲート (直近補正の観測一致度 → 減衰段数) — を **1 回のロックで**
         // まとめて取る。core のロックの前に取るので (localizer → core) 入れ子は
         // 作らない。external は仮説なし・quality 1.0 = 従来と同じ挙動。
-        let (hyps, scan_shift) = {
+        let (hyps, scan_shift, sigma) = {
             let l = lock(localizer);
+            // σ (マージン膨張の量) も同じ仮説集合から測るので、qmdp が off でも
+            // sigma_margin が立っていれば取る。external は空 = σ 0 = 膨張なし。
+            let cells = if tuning.qmdp || tuning.sigma_margin {
+                l.top_cells(QMDP_TOP_K)
+            } else {
+                Vec::new()
+            };
+            let sigma = if tuning.sigma_margin { spread_m(&cells) } else { 0.0 };
             (
-                if tuning.qmdp { l.top_cells(QMDP_TOP_K) } else { Vec::new() },
+                if tuning.qmdp { cells } else { Vec::new() },
                 quality_shift(l.quality(), tuning.scan_quality_gate),
+                sigma,
             )
         };
 
@@ -348,7 +363,7 @@ pub fn run_follow(
             // 挙動が戻ってしまうので、直前の指令を保ったまま次の tick を待つ。
             // 連続で取れない = 本当に長い solve が走っているので、そのときだけ止める。
             busy_ticks += 1;
-            if busy_ticks >= tuning.busy_ticks_before_stop {
+            if busy_ticks >= BUSY_TICKS_BEFORE_STOP {
                 stop_cmd(cmd_pub);
             }
             if let Some(rest) = tuning.period.checked_sub(tick_start.elapsed()) {
@@ -376,13 +391,16 @@ pub fn run_follow(
             for scan in &scans {
                 core.observe_scan_gated(scan, pose, scan_shift);
             }
+            // 自己位置が曖昧なほど壁際のマージンを広げる (文献 4·2·2)。注入の後に
+            // 置く — 帯は地図の壁から起こすので、スキャンの塗り直しと打ち消し合わない。
+            core.inflate_by_sigma(sigma, pose);
             core.refine_for(tuning.refine_budget);
 
             // 可視化グリッドの作成はロック内 (states を読む) / 配信は外。
             let mut window_grid = None;
             if let Some(v) = viz {
                 if v.due(&mut last_viz) {
-                    window_grid = core.window_value_grid(pose, v.window_threshold_steps);
+                    window_grid = core.window_value_grid(pose, v.threshold_steps);
                 }
             }
             // 多峰 belief は QMDP — どの仮説でも悪くない行動を選び、有意な仮説が

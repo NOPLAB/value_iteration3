@@ -124,7 +124,8 @@ fn main() -> Result<()> {
             None
         },
         tf_tolerance: Duration::from_secs_f64(params.transform_tolerance.max(0.0)),
-        viz: if params.publish_value_function {
+        // 負の間隔 = 可視化を立てない (トピックも作らない)。0 なら solve 完了時のみ。
+        viz: if params.value_publish_interval_ms >= 0 {
             Some(Viz {
                 vf_pub: node.create_publisher::<nav_msgs::msg::OccupancyGrid>(
                     "value_function".reliable().transient_local().keep_last(1),
@@ -141,7 +142,6 @@ fn main() -> Result<()> {
                 clock: node.get_clock(),
                 frame_id: params.global_frame.clone(),
                 threshold_steps: params.cost_drawing_threshold.max(0) as u64,
-                window_threshold_steps: params.window_cost_drawing_threshold.max(0) as u64,
                 interval: Duration::from_millis(params.value_publish_interval_ms.max(0) as u64),
             })
         } else {
@@ -208,11 +208,10 @@ fn main() -> Result<()> {
     //     スレッドで足りる)。
     let _scan_sub = {
         let h = Arc::clone(&handles);
-        let invalid_range_m = params.invalid_range_m;
         node.create_subscription::<sensor_msgs::msg::LaserScan, _>(
             params.scan_topic.as_str().best_effort().keep_last(5),
             move |msg: sensor_msgs::msg::LaserScan| {
-                let scan = vi_scan_from(&msg, invalid_range_m);
+                let scan = vi_scan_from(&msg);
                 let est = {
                     let mut l = lock(&h.localizer);
                     l.observe(&scan);
@@ -294,17 +293,16 @@ fn main() -> Result<()> {
                 * params.control_frequency)
                 .ceil()
                 .max(1.0) as u32,
-            busy_ticks_before_stop: params.busy_ticks_before_stop.max(1) as u32,
             qmdp: params.qmdp,
+            sigma_margin: params.sigma_margin_gain > 0.0,
             scan_quality_gate: params.scan_quality_gate,
             active_reloc: params.active_reloc,
-            reloc_ticks_limit: (params.reloc_timeout_sec.max(0.0) * params.control_frequency)
-                .ceil()
-                .max(1.0) as u32,
+            reloc_ticks_limit: (node::boot::RELOC_TIMEOUT_SEC * params.control_frequency).ceil()
+                as u32,
         },
         retry: RetryTuning {
             limit: params.goal_retry_limit,
-            settle: Duration::from_secs_f64(params.goal_retry_settle_sec.max(0.0)),
+            settle: Duration::from_secs_f64(node::boot::GOAL_RETRY_SETTLE_SEC),
         },
         prefetch,
         stop_on_failure: params.waypoint_stop_on_failure,
@@ -359,7 +357,7 @@ fn main() -> Result<()> {
             } else {
                 format!("up to {} times", params.goal_retry_limit)
             },
-            params.goal_retry_settle_sec
+            node::boot::GOAL_RETRY_SETTLE_SEC
         );
     }
 

@@ -1,13 +1,18 @@
-//! 起動パラメータ — 宣言 ([`read_params`])、自己整合検査 ([`validate`])、
-//! compact sink の置き場の決定 ([`compact_sink_dir`])。
+//! 起動パラメータ — 宣言 ([`read_params`]) と自己整合検査 ([`validate`])。
 //!
 //! 既定値と「なぜその既定か」はフィールドのコメントに全部書いてある
 //! (launch から上書きするときの判断材料はここが一次情報)。
-
-use std::path::PathBuf;
-use std::sync::Arc;
+//!
+//! **ここに無いものは意図的に無い。** 正しい値が 1 つしかない内部の粒度と
+//! センチネル (掃きのチャンク幅、パッチのスラック、無効レンジの差し替え値 …)、
+//! マシンから測れるもの (密の価値関数の上限 = `MemAvailable`)、同じことを 2 回
+//! 言っていたもの (窓と全域で別々のカラースケール上限) は、それぞれの使用箇所の
+//! `const` へ落とした — 探すなら [`super::boot`] / [`super::sweep`] /
+//! [`super::follow_loop`] / [`super::msg`] の中。
 
 use anyhow::{anyhow, Result};
+
+use std::sync::Arc;
 
 use vi_lib::solvers::U64Solver;
 
@@ -30,17 +35,11 @@ pub struct Params {
     pub map_scale: i64,
     /// ダウンサンプルの方針 ("conservative" | "optimistic")。
     pub downsample_policy: String,
-    /// compact ソルバの確定出力を置くディレクトリ (空文字 = RAM)。
+    /// compact ソルバの確定出力を置くディレクトリ (空文字 = 空きメモリ次第で自動)。
     pub compact_sink_dir: String,
-    /// RAM sink の上限 [MB]。compact 経路で `compact_sink_dir` 未指定かつ推定サイズが
-    /// これを超えるとき、自動でディスク sink に逃がす。
+    /// RAM sink の上限 [MB]。0 = 空きメモリの半分で自動判定。
     pub compact_ram_limit_mb: i64,
-    /// 密ソルバで確保してよい価値関数の上限 [MB] (states + sweep_orders)。
-    /// 超えたら起動を止める。
-    pub dense_limit_mb: i64,
     pub vi_threads: i64,
-    pub max_solve_iter: i64,
-    pub solve_chunk: i64,
     pub goal_tolerance_xy: f64,
     pub goal_tolerance_deg: f64,
     pub pose_topic: String,
@@ -64,23 +63,20 @@ pub struct Params {
     /// predict 1 tick あたりの動作ノイズ σ ([m] / [deg])。
     pub belief_motion_sigma_xy: f64,
     pub belief_motion_sigma_theta_deg: f64,
-    /// ビームごとの尤度の床 / 補正で読む重みの相対しきい値。
-    pub belief_z_min: f64,
-    pub belief_weight_skip_ratio: f64,
-    /// belief/viterbi: 観測一致度 EWMA がこれ未満なら free 一様を混合してリセット
-    /// (EMCL 風)。窓つきの grid/adaptive は自前の expand/contract カスケードを使う。
-    pub belief_reset_quality: f64,
-    /// belief/viterbi: ESS がこれ超でロスト (pose を返さない)。
-    pub belief_lost_ess: f64,
     /// スキャン注入の品質ゲート: localizer の観測一致度がこれを割ると注入
     /// penalty を quality/gate に比例して減衰 (2 冪量子化)。0 で無効。
     pub scan_quality_gate: f64,
     /// footprint クリア半径 [m]: スキャン注入のたびに機体位置の周囲の
     /// local_penalty を消す (真上でゴースト壁が閉じるのを防ぐ)。0 で無効。
     pub footprint_clear_m: f64,
+    /// 自己位置の広がり σ [m] × この係数 を、壁際マージンの膨張量にする
+    /// (上田ら 2023 4·2·2 の「マージン m に σ を足す」)。0 で無効。
+    /// σ は localizer の上位仮説の RMS 半径なので、`localizer` が external の
+    /// ときは常に 0 = 無効。
+    pub sigma_margin_gain: f64,
+    pub map_clear_from_scan: bool,
     // ── 広域 (compute_path_to_pose) ──
     pub max_rollout_steps: i64,
-    pub start_tolerance: f64,
     pub path_spacing: f64,
     // ── 狭域 (follow_path) ──
     /// ローカルウィンドウ半径 [m] (本家 ValueIteratorLocal は 1.0 固定)。
@@ -89,15 +85,7 @@ pub struct Params {
     pub scan_topic: String,
     pub control_frequency: f64,
     pub refine_budget_ms: i64,
-    pub action_tolerance: f64,
     pub no_action_timeout_sec: f64,
-    /// 無効レンジ (inf / NaN / 非正) の差し替え値 [m]。
-    pub invalid_range_m: f64,
-    /// ロックをこの tick 数連続で取れなかったら停止指令を出す。
-    pub busy_ticks_before_stop: i64,
-    /// compact パッチの寸法スラック [セル] / 修復タイルの interior の 1 辺 [セル]。
-    pub patch_slack_cells: i64,
-    pub repair_interior_cells: i64,
     /// follow 1 tick の判断器 ("greedy" = 本家 decision / "dwa"・"mppi" = 連続行動)。
     pub follow_controller: String,
     /// belief が多峰のとき QMDP (Q(b,a) = Σ w·Q(s,a) の argmin) で行動を選ぶ。
@@ -107,45 +95,31 @@ pub struct Params {
     /// ロスト中に安全停止で待つ代わりに、仮説を判別する地点への多目標 VI を解いて
     /// QMDP で走る (能動的再定位)。判別点を出せる adaptive localizer + 密ソルバ用。
     pub active_reloc: bool,
-    /// 能動的再定位を諦めて通常の停止待ちに戻すまでの時間 [s]。
-    pub reloc_timeout_sec: f64,
-    /// DWA/MPPI の前方シミュレーション時間 [s] と DWA の (v, ω) 候補数。
+    /// DWA/MPPI の前方シミュレーション時間 [s]。
     pub dwa_horizon_s: f64,
-    pub dwa_n_v: i64,
-    pub dwa_n_w: i64,
     /// DWA の致死 penalty しきい値 (PROB_BASE 単位、0 = 無効)。
     pub dwa_lethal_penalty: f64,
-    /// MPPI のサンプル本数 / softmax 温度 / 制御ノイズ標準偏差 (0 = 行動集合から自動)。
+    /// MPPI のサンプル本数。
     pub mppi_samples: i64,
-    pub mppi_lambda: f64,
-    pub mppi_sigma_v: f64,
-    pub mppi_sigma_w_deg: f64,
     // ── スタンドアロン (navigate_to_pose / follow_waypoints) ──
     pub standalone: bool,
     pub goal_retry_limit: i64,
-    pub goal_retry_settle_sec: f64,
     pub waypoint_stop_on_failure: bool,
     pub waypoint_pause_sec: f64,
     // ── 狭域 → 広域のフィードバック (全域掃き) ──
     pub global_sweep: bool,
-    pub global_sweep_budget_ms: i64,
-    pub global_sweep_idle_ms: i64,
-    /// 密経路の 1 チャンクの粒度 [セル] / 伝播中の進捗報告と価値関数再配信の間隔 [s]。
-    pub global_sweep_cells_per_step: i64,
-    pub global_sweep_report_sec: f64,
+    /// 全域掃きに渡す CPU の割合 [%]。
+    pub global_sweep_duty: i64,
     // ── ウェイポイントの先読み ──
     pub waypoint_prefetch: bool,
     pub waypoint_topic: String,
     pub waypoint_prefetch_threads: i64,
-    /// 進行中の先読みを待つときの観測間隔 [ms]。
-    pub waypoint_prefetch_poll_ms: i64,
     // ── 走り出しの短縮 ──
     pub early_start: bool,
     // ── 可視化 ──
-    pub publish_value_function: bool,
+    /// 価値関数の配信間隔 [ms]。負で配信そのものを止め、0 で solve 完了時のみ。
     pub value_publish_interval_ms: i64,
     pub cost_drawing_threshold: i64,
-    pub window_cost_drawing_threshold: i64,
 }
 
 pub fn read_params(node: &Node) -> Result<Params> {
@@ -207,19 +181,15 @@ pub fn read_params(node: &Node) -> Result<Params> {
         // "conservative" = 本家 downsample_occupancy (障害物優先)。"optimistic" = ブロック内に free が
         // 1 つでもあれば free。map_scale >= 4 で通路のセル幅を保つために必要 (既定は挙動不変の保守側)。
         downsample_policy: p!("downsample_policy", Arc<str>, "conservative".into()).to_string(),
-        // solver = frontier2d_sparse_compact のときだけ効く。空文字なら RAM (RamSink)。
+        // solver = frontier2d_sparse_compact のときだけ効く。空文字なら空きメモリを見て
+        // 自動で決める (RAM に収まらなければディスクへ退避 — node::boot::compact_sink_dir)。
         // 指定先が tmpfs だと結局 RAM に載るので、メモリ退避が目的なら実ディスクを指すこと。
         compact_sink_dir: p!("compact_sink_dir", Arc<str>, "".into()).to_string(),
-        // compact_sink_dir 未指定でも、確定出力がこれを超えるならディスクへ逃がす。小メモリ機で
-        // 黙って GB 級の RamSink を確保すると OOM killer に落とされるため。
-        compact_ram_limit_mb: p!("compact_ram_limit_mb", i64, 512),
-        // 密ソルバの価値関数 (states 56 B/state + sweep_orders 24 B/state) の上限。
-        // 超えたら起動を止める。既定 1500 は 4GB 機 (Pi4) で他のノードと同居できる線
-        // — 19F を map_scale 2 で解くと実測 655 MB。
-        dense_limit_mb: p!("dense_limit_mb", i64, 1500),
-        vi_threads: p!("vi_threads", i64, 0),
-        max_solve_iter: p!("max_solve_iter", i64, 1_000_000),
-        solve_chunk: p!("solve_chunk", i64, 64),
+        // 確定出力を RAM (RamSink) に置いてよい上限。既定 0 = このマシンの空きメモリの
+        // 半分で自動判定。密の価値関数の上限と違ってこちらは**明示できる**ようにしてある
+        // — sink は追従ループが毎パッチ読み直す常時アクセス先で、ディスクへ逃がすか
+        // どうかは同居プロセスと保存先の速さ次第、つまり運用側にしか分からない。
+        compact_ram_limit_mb: p!("compact_ram_limit_mb", i64, 0),
         goal_tolerance_xy: p!("goal_tolerance_xy", f64, 0.25),
         goal_tolerance_deg: p!("goal_tolerance_deg", f64, 10.0),
         pose_topic: p!("pose_topic", Arc<str>, "mcl_pose".into()).to_string(),
@@ -249,75 +219,53 @@ pub fn read_params(node: &Node) -> Result<Params> {
         //     "viterbi"  = 同じ belief を min-plus (MAP) 半環で回す変種 (運動整合性で
         //                  偽仮説を削る。全域を掃くので 1 observe ≈ 183 ms — 40 ms の
         //                  追従予算の外)。
+        //
+        // 尤度の床・枝刈りしきい値・リセット/ロストの判定値は vi_lib 側の既定
+        // (`BeliefConfig::default()`) をそのまま使う。詰めるなら viola_bench で。
         localizer: p!("localizer", Arc<str>, "external".into()).to_string(),
         // grid/adaptive の belief 窓は native 解像度 (map_scale をかける前) の
         // 2×radius 四方 × θ。0.05 m/cell で radius 2.5 なら 100×100×60 = 60 万セル
         // ≈ 5 MB。全地図の belief/viterbi では使わない。
-        belief_radius: p!("belief_radius", f64, 2.5),
+        belief_radius: p!("belief_radius", f64, 2.0),
         belief_sensor_sigma: p!("belief_sensor_sigma", f64, 0.2),
         belief_beam_step: p!("belief_beam_step", i64, 10),
         belief_max_range: p!("belief_max_range", f64, 25.0),
         belief_motion_sigma_xy: p!("belief_motion_sigma_xy", f64, 0.03),
         belief_motion_sigma_theta_deg: p!("belief_motion_sigma_theta_deg", f64, 2.0),
-        // 尤度の床 (本家 likelihood field の z_rand/z_max 混合に相当) と、補正で
-        // 読む belief 重みの相対しきい値 (max との比、小さいほど正確で遅い)。
-        belief_z_min: p!("belief_z_min", f64, 0.05),
-        belief_weight_skip_ratio: p!("belief_weight_skip_ratio", f64, 1e-4),
-        // 観測一致度 EWMA がこれを割ると free 一様を混ぜ直す (EMCL の resetting)。
-        belief_reset_quality: p!("belief_reset_quality", f64, 0.25),
-        // ESS (= 1/Σb²) がこれを超えたら「広がりすぎ」= ロスト扱いで pose を返さない。
-        belief_lost_ess: p!("belief_lost_ess", f64, 500.0),
         // フィットが怪しいスキャンに満額 (2048) の壁を建てさせない。既定は
-        // belief_reset_quality (と adaptive の expand しきい値) と同じ 0.25。
+        // vi_lib の reset_quality (と adaptive の expand しきい値) と同じ 0.25。
         // external localizer は quality 1.0 固定なので実質無効。
         scan_quality_gate: p!("scan_quality_gate", f64, 0.25),
         // ロボットが現にいる場所は free — 注入のたびに footprint を消し、
         // ゴースト壁が真上で閉じて完全停止する事態を構造的に防ぐ。
         footprint_clear_m: p!("footprint_clear_m", f64, 0.2),
+        // 自己位置が曖昧なほど壁から離れて通る (文献のマージン膨張)。挙動が
+        // 変わるので既定 off — 内蔵 localizer と併せて使うこと。
+        sigma_margin_gain: p!("sigma_margin_gain", f64, 0.0),
+        // 同じ理屈をビームが貫通した範囲まで広げる: 地図が壁と言っていても
+        // レーザが通り抜けたなら通れる。幽霊壁に囲まれた停止を解くが、自己位置が
+        // ずれていると本物の壁を消し得るので既定 off。
+        map_clear_from_scan: p!("map_clear_from_scan", bool, false),
 
         max_rollout_steps: p!("max_rollout_steps", i64, 10_000),
-        start_tolerance: p!("start_tolerance", f64, 0.5),
         path_spacing: p!("path_spacing", f64, 0.05),
 
-        // follow_path サーバを立てるか。false は nav2_controller (controller_server) と
-        // 組む構成 — 立てると follow_path のサーバが 2 つになるため。false のとき
-        // このノードは compute_path_to_pose 専用になる。
         // 追従が見る・スキャンで補正するウィンドウの半径。広げると 1 tick の
         // refine 対象と compact パッチ (辺 ∝ 2×半径) が大きくなる。
         local_xy_range: p!("local_xy_range", f64, 1.0),
+        // follow_path サーバを立てるか。false は nav2_controller (controller_server) と
+        // 組む構成 — 立てると follow_path のサーバが 2 つになるため。false のとき
+        // このノードは compute_path_to_pose 専用になる。
         follow: p!("follow", bool, true),
         scan_topic: p!("scan_topic", Arc<str>, "scan".into()).to_string(),
         control_frequency: p!("control_frequency", f64, 10.0),
         refine_budget_ms: p!("refine_budget_ms", i64, 40),
-        action_tolerance: p!("action_tolerance", f64, 0.2),
         no_action_timeout_sec: p!("no_action_timeout_sec", f64, 3.0),
-        // 無効レンジの差し替え値。ローカルウィンドウから十分遠く、セル座標化しても
-        // i32 に収まること (set_local_cost がウィンドウ外として自然に無視する)。
-        invalid_range_m: p!("invalid_range_m", f64, 1.0e6),
-        // 1〜2 tick は同一ゴールのロールアウト (BT の 1Hz リプラン) との競合なので
-        // 止めない。control_frequency 10Hz なら 3 tick = 300ms。
-        busy_ticks_before_stop: p!("busy_ticks_before_stop", i64, 3),
-        // compact パッチの寸法スラックと修復タイルの interior (詳細は core の doc)。
-        patch_slack_cells: p!("patch_slack_cells", i64, 2),
-        repair_interior_cells: p!("repair_interior_cells", i64, 16),
         // follow 1 tick の判断器。"greedy" (既定) は本家 ViNode::decision 準拠の離散
         // 6 行動。"dwa" / "mppi" は同じ価値関数を連続に読む (V̂ 補間 + 軌道サンプリング、
         // core::follow の doc 参照)。指令の速度範囲は行動集合と同じで、候補全滅時は
         // greedy へフォールバックするので、切り替えても失敗の形は変わらない。
         follow_controller: p!("follow_controller", Arc<str>, "greedy".into()).to_string(),
-        // DWA/MPPI の前方シミュレーション時間と DWA の候補数 (計算量 ∝ n_v × n_w × horizon)。
-        // 既定 (1.0 s, 7×11) の実測は decide ~30 µs — 10 Hz の 40 ms 予算には遠い。
-        dwa_horizon_s: p!("dwa_horizon_s", f64, 1.0),
-        dwa_n_v: p!("dwa_n_v", i64, 7),
-        dwa_n_w: p!("dwa_n_w", i64, 11),
-        // 軌道途中に margin 帯 (penalty ≥ 2·PROB_BASE) を踏む候補を棄却する。
-        // 0 で無効 (実機で壁を掠める旧挙動に戻る)。
-        dwa_lethal_penalty: p!("dwa_lethal_penalty", f64, 2.0),
-        // MPPI のサンプル本数・温度・ノイズ (0 = 行動集合から自動)。実測 decide ~0.2 ms。
-        mppi_samples: p!("mppi_samples", i64, 256),
-        mppi_lambda: p!("mppi_lambda", f64, 1.0),
-        mppi_sigma_v: p!("mppi_sigma_v", f64, 0.0),
-        mppi_sigma_w_deg: p!("mppi_sigma_w_deg", f64, 0.0),
         // belief が多峰の tick は QMDP: Q(b,a) = Σ w·Q(s,a) の argmin で
         // 「どの仮説でも悪くない行動」を選び、有意な仮説が衝突と言う行動しか
         // 無ければ止まる。単峰の tick は従来の follow_controller に退避するので、
@@ -329,7 +277,14 @@ pub fn read_params(node: &Node) -> Result<Params> {
         // 多目標 VI のゴールにして QMDP で走る。復帰したら本来のゴールを
         // 解き直して走行に戻る (core::prepare_reloc_goal の doc 参照)。
         active_reloc: p!("active_reloc", bool, false),
-        reloc_timeout_sec: p!("reloc_timeout_sec", f64, 30.0),
+        // DWA/MPPI の前方シミュレーション時間。候補数と温度は固定 (node::boot)。
+        // 既定 (1.0 s, 7×11) の実測は decide ~30 µs — 10 Hz の 40 ms 予算には遠い。
+        dwa_horizon_s: p!("dwa_horizon_s", f64, 1.0),
+        // 軌道途中に margin 帯 (penalty ≥ 2·PROB_BASE) を踏む候補を棄却する。
+        // 0 で無効 (実機で壁を掠める旧挙動に戻る)。
+        dwa_lethal_penalty: p!("dwa_lethal_penalty", f64, 2.0),
+        // MPPI のサンプル本数。実測 decide ~0.2 ms。
+        mppi_samples: p!("mppi_samples", i64, 256),
 
         // navigate_to_pose と follow_waypoints をこのノード自身が提供する
         // (= bt_navigator / behavior_server / waypoint_follower を立てない)。
@@ -339,11 +294,8 @@ pub fn read_params(node: &Node) -> Result<Params> {
         standalone: p!("standalone", bool, false),
         // 追従が失敗したときにゴールを投げ直す上限 (負で無制限)。BT の
         // `RecoveryNode number_of_retries` の置き換えだが、あちらと違って
-        // **投げ直しの合間に場が実際に動く** (下の goal_retry_settle_sec)。
+        // **投げ直しの合間に場が実際に動く** (node::boot::GOAL_RETRY_SETTLE)。
         goal_retry_limit: p!("goal_retry_limit", i64, 3),
-        // 投げ直す前に、止まったままスキャンを取り込んで場を精密化する時間。
-        // 0 で即座に投げ直す (それだと同じ場で同じ失敗を繰り返しやすい)。
-        goal_retry_settle_sec: p!("goal_retry_settle_sec", f64, 3.0),
         // follow_waypoints: 1 点失敗したら残りを諦めるか。false なら次の点へ進み、
         // 飛ばした番号を result.missed_waypoints で返す (nav2_waypoint_follower と同義)。
         waypoint_stop_on_failure: p!("stop_on_failure", bool, false),
@@ -356,20 +308,11 @@ pub fn read_params(node: &Node) -> Result<Params> {
         // 指し続ける (旧挙動)。密ソルバは全域 Gauss–Seidel、compact は sink の
         // タイル修復で同じことをする (どちらも `core::sweep_global` の入口)。
         global_sweep: p!("global_sweep", bool, true),
-        // 1 回のロック取得で掃きに使う時間と、そのあとロックを手放して待つ時間。
-        // 比がそのまま CPU の取り分になる (既定 20:60 = 1 コアの 25%)。追従ループは
-        // 同じ Mutex を try_lock で取り、3 tick 続けて取れないとロボットを止めるので、
-        // budget を伸ばすときは idle も一緒に伸ばすこと。
-        global_sweep_budget_ms: p!("global_sweep_budget_ms", i64, 20),
-        global_sweep_idle_ms: p!("global_sweep_idle_ms", i64, 60),
-        // 密経路の 1 チャンクの粒度 (budget の経過時間を見る刻み)。Pi4 (実測 ~1M
-        // cells/s) で数 ms になる大きさ。compact 経路では使わない (1 呼び出し =
-        // タイル 1 枚)。
-        global_sweep_cells_per_step: p!("global_sweep_cells_per_step", i64, 5_000),
-        // 伝播が続いている間の進捗報告と value_function 再配信の間隔。可視化 1 枚は
-        // 100 万セル級をロックの中で作るので、詰めすぎると追従ループの try_lock が
-        // 落ちる (3 tick 連続で機体が止まる)。
-        global_sweep_report_sec: p!("global_sweep_report_sec", f64, 2.0),
+        // 掃きに渡す CPU の割合。掃きスレッドは「この割合だけロックを握って掃き、
+        // 残りは手放して待つ」を繰り返す。追従ループは同じ Mutex を try_lock で取り、
+        // 3 tick 続けて取れないとロボットを止めるので、上げるほど伝播は速く、
+        // 追従が譲られる隙間は狭くなる (100 = 掃きっぱなし)。
+        global_sweep_duty: p!("global_sweep_duty", i64, 25),
 
         // 次のウェイポイントの価値関数を、いまの点へ走っている間に解いておく
         // (core::Prefetcher)。巡回では点が変わるたびに solve が丸ごと 1 回走り、その間
@@ -387,8 +330,6 @@ pub fn read_params(node: &Node) -> Result<Params> {
         // スレッド数を環境変数 VI_THREADS から読む (プロセスで 1 つ) ので、先読みだけを
         // 絞ることができない。
         waypoint_prefetch_threads: p!("waypoint_prefetch_threads", i64, 1),
-        // 進行中の先読みを待つときの観測間隔。プリエンプトの効きの粒度でもある。
-        waypoint_prefetch_poll_ms: p!("waypoint_prefetch_poll_ms", i64, 50),
 
         // 機体の現在地からゴールまで方策が繋がった時点で走り出す
         // (core::PlanConfig::early_start)。**solve をやめるわけではなく**、残りは
@@ -400,12 +341,12 @@ pub fn read_params(node: &Node) -> Result<Params> {
         // 受け取れた点では関係しない。
         early_start: p!("early_start", bool, false),
 
-        publish_value_function: p!("publish_value_function", bool, true),
-        // solve の途中経過の配信間隔。0 は「完了時のみ」。追従中の再配信は掃き
-        // スレッドが 2 秒ごとに出すので、ここを 0 にすると追従中は出なくなる。
+        // 価値関数 (全域スライス・ローカルウィンドウ・belief) の配信間隔。
+        // 負で可視化そのものを立てない、0 は「solve 完了時のみ」。追従中の再配信は
+        // 掃きスレッドが出すので、0 にすると追従中は出なくなる。
         value_publish_interval_ms: p!("value_publish_interval_ms", i64, 500),
+        // カラースケールの上限 [ステップ数≒秒] (全域スライスとローカルウィンドウで共通)。
         cost_drawing_threshold: p!("cost_drawing_threshold", i64, 60),
-        window_cost_drawing_threshold: p!("window_cost_drawing_threshold", i64, 60),
     };
     // 早期走り出しは背景の解き切りとセット。走り出した時点の場はまだ解き終わって
     // いないので、掃きスレッドが無いと未確定のまま走り続けることになる (経路から
@@ -488,46 +429,4 @@ pub fn validate(p: &Params) -> Result<U64Solver> {
         }
     }
     Ok(solver)
-}
-
-/// compact 経路の出力先ディレクトリを決める。
-///
-/// - compact 以外のソルバでは常に `None` (使われない)。
-/// - `compact_sink_dir` が明示されていればそれを使う。
-/// - 未指定でも確定出力 (`nstates × 12 B`) が `compact_ram_limit_mb` を超えるなら
-///   `/tmp/vi_planner_sink` に逃がす。小メモリ機で黙って GB 級の `RamSink` を確保すると
-///   OOM killer に落とされるため。
-///
-/// 判断順は明示指定が先、上限による自動退避が後。追従はパッチを置き直すたびに
-/// sink を読むので (10Hz の制御ループ)、SD カード上の sink は追従の遅延に直結する。
-/// 逃がす先はできるだけ実ディスクでも速いところを `compact_sink_dir` で明示すること。
-pub fn compact_sink_dir(params: &Params, solver: U64Solver, nstates: usize) -> Option<PathBuf> {
-    if !solver.caps().out_of_core {
-        return None;
-    }
-    let bytes = nstates as u64 * 12;
-    if !params.compact_sink_dir.is_empty() {
-        let dir = PathBuf::from(&params.compact_sink_dir);
-        eprintln!(
-            "vi_planner: compact output -> disk mmap {} ({:.2} GB)",
-            dir.display(),
-            bytes as f64 / 1e9
-        );
-        return Some(dir);
-    }
-    let limit = params.compact_ram_limit_mb.max(0) as u64 * 1024 * 1024;
-    if bytes > limit {
-        let dir = PathBuf::from("/tmp/vi_planner_sink");
-        eprintln!(
-            "WARN: compact output would need {:.2} GB of RAM (> compact_ram_limit_mb={}); \
-             spilling to disk mmap {}. The follow loop re-reads the sink on every patch \
-             recenter, so point compact_sink_dir at the fastest real disk available.",
-            bytes as f64 / 1e9,
-            params.compact_ram_limit_mb,
-            dir.display()
-        );
-        return Some(dir);
-    }
-    eprintln!("vi_planner: compact output -> RAM ({:.2} GB)", bytes as f64 / 1e9);
-    None
 }

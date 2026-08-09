@@ -242,11 +242,24 @@ struct RunResult {
     quality_sum: f64,
     loc_us_sum: f64,
     loc_us_max: f64,
+    /// 走行中の壁とのクリアランス (真値セル → 最寄り障害物の L∞ 距離 [m])。
+    /// マージン膨張 (`sigma_margin_gain`) が効いているかはここに出る — 上田ら 2023
+    /// が「隘路 / 大回り」の 2 値で数えたものの連続版で、衝突はいつも最小値の側で
+    /// 起きる。
+    clear_min_m: f64,
+    clear_sum_m: f64,
+    clear_samples: u64,
 }
 
 impl RunResult {
     fn err_rms_m(&self) -> f64 {
         (self.err_sq_sum / self.err_samples.max(1) as f64).sqrt()
+    }
+    fn clear_mean_m(&self) -> f64 {
+        if self.clear_samples == 0 {
+            return f64::NAN;
+        }
+        self.clear_sum_m / self.clear_samples as f64
     }
     fn yaw_rms_deg(&self) -> f64 {
         (self.yaw_sq_sum / self.err_samples.max(1) as f64).sqrt().to_degrees()
@@ -269,6 +282,8 @@ fn simulate(
     vi: &ValueIterator,
     grid: &OccupancyGrid,
     native: &OccupancyGrid,
+    // 障害物までの距離場 (chamfer_dist、3 = 1 セル)。grid と同じ格子。
+    chamfer: &[u32],
     mode: Mode,
     start: (f64, f64, f64),
     goal: (f64, f64),
@@ -310,6 +325,9 @@ fn simulate(
         quality_sum: 0.0,
         loc_us_sum: 0.0,
         loc_us_max: 0.0,
+        clear_min_m: f64::INFINITY,
+        clear_sum_m: 0.0,
+        clear_samples: 0,
     };
     let mut starve = 0usize;
 
@@ -327,6 +345,12 @@ fn simulate(
         if vi.is_final(tix, tiy, tit) {
             r.reached = true;
             break;
+        }
+        if let Some(&d) = chamfer.get((tiy * grid.width + tix) as usize) {
+            let c = d as f64 / 3.0 * grid.resolution; // chamfer は 3-4 重み (3 = 1 セル)
+            r.clear_min_m = r.clear_min_m.min(c);
+            r.clear_sum_m += c;
+            r.clear_samples += 1;
         }
 
         // 判断は推定姿勢で引く (truth モードは真値がそのまま推定)。
@@ -576,6 +600,7 @@ fn main() -> ExitCode {
                 &vi,
                 &grid,
                 &native,
+                &chamfer,
                 mode,
                 start,
                 (goal_wx, goal_wy),
@@ -599,11 +624,13 @@ fn main() -> ExitCode {
                 "TIMEOUT".to_string()
             };
             println!(
-                "  {:5}: {outcome:16} ticks={:5} ({:6.1} s)  len={:6.1} m  err rms={:5.3}/max={:5.3} m  yaw rms={:5.1} deg  qual={:4.2}  loc={:7.1}/{:.0} us",
+                "  {:5}: {outcome:16} ticks={:5} ({:6.1} s)  len={:6.1} m  clr min={:4.2}/avg={:4.2} m  err rms={:5.3}/max={:5.3} m  yaw rms={:5.1} deg  qual={:4.2}  loc={:7.1}/{:.0} us",
                 r.mode,
                 r.ticks,
                 r.ticks as f64 * args.tick_s,
                 r.path_len_m,
+                r.clear_min_m,
+                r.clear_mean_m(),
                 r.err_rms_m(),
                 r.err_max_m,
                 r.yaw_rms_deg(),
@@ -616,15 +643,15 @@ fn main() -> ExitCode {
     }
 
     println!();
-    println!("| mode | reach | bel | bel_err_m | ticks | time_s | len_m | err_rms_m | err_max_m | yaw_rms_deg | quality | loc_us | max_us |");
-    println!("|------|-------|-----|-----------|-------|--------|-------|-----------|-----------|-------------|---------|--------|--------|");
+    println!("| mode | reach | bel | bel_err_m | ticks | time_s | len_m | clr_min_m | clr_avg_m | err_rms_m | err_max_m | yaw_rms_deg | quality | loc_us | max_us |");
+    println!("|------|-------|-----|-----------|-------|--------|-------|-----------|-----------|-----------|-----------|-------------|---------|--------|--------|");
     for mode in ["truth", "dead", "grid", "belief"] {
         let all: Vec<&RunResult> = results.iter().map(|(_, r)| r).filter(|r| r.mode == mode).collect();
         let ok: Vec<&&RunResult> = all.iter().filter(|r| r.reached).collect();
         // 到達扱い (truth final or 信じて停止) の走行。bel_err は後者の真値誤差平均。
         let bel: Vec<&&RunResult> = all.iter().filter(|r| r.believed_goal && !r.reached).collect();
         println!(
-            "| {mode} | {}/{} | {} | {:.2} | {:.0} | {:.1} | {:.1} | {:.3} | {:.3} | {:.1} | {:.2} | {:.1} | {:.0} |",
+            "| {mode} | {}/{} | {} | {:.2} | {:.0} | {:.1} | {:.1} | {:.2} | {:.2} | {:.3} | {:.3} | {:.1} | {:.2} | {:.1} | {:.0} |",
             ok.len(),
             all.len(),
             bel.len(),
@@ -632,6 +659,8 @@ fn main() -> ExitCode {
             mean(ok.iter().map(|r| r.ticks as f64)),
             mean(ok.iter().map(|r| r.ticks as f64 * args.tick_s)),
             mean(ok.iter().map(|r| r.path_len_m)),
+            all.iter().map(|r| r.clear_min_m).fold(f64::INFINITY, f64::min),
+            mean(all.iter().map(|r| r.clear_mean_m())),
             mean(all.iter().map(|r| r.err_rms_m())),
             all.iter().map(|r| r.err_max_m).fold(0.0f64, f64::max),
             mean(all.iter().map(|r| r.yaw_rms_deg())),
@@ -648,7 +677,7 @@ fn main() -> ExitCode {
             }
         }
         let mut csv = String::from(
-            "start,mode,outcome,final_err_m,ticks,time_s,len_m,err_rms_m,err_max_m,yaw_rms_deg,quality,loc_us_avg,loc_us_max\n",
+            "start,mode,outcome,final_err_m,ticks,time_s,len_m,clr_min_m,clr_avg_m,err_rms_m,err_max_m,yaw_rms_deg,quality,loc_us_avg,loc_us_max\n",
         );
         for (si, r) in &results {
             let outcome = if r.reached {
@@ -665,12 +694,14 @@ fn main() -> ExitCode {
                 "timeout"
             };
             csv.push_str(&format!(
-                "{si},{},{outcome},{:.3},{},{:.1},{:.2},{:.4},{:.4},{:.2},{:.3},{:.2},{:.1}\n",
+                "{si},{},{outcome},{:.3},{},{:.1},{:.2},{:.3},{:.3},{:.4},{:.4},{:.2},{:.3},{:.2},{:.1}\n",
                 r.mode,
                 r.final_err_m,
                 r.ticks,
                 r.ticks as f64 * args.tick_s,
                 r.path_len_m,
+                r.clear_min_m,
+                r.clear_mean_m(),
                 r.err_rms_m(),
                 r.err_max_m,
                 r.yaw_rms_deg(),

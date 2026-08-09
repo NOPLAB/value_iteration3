@@ -40,10 +40,14 @@ pub fn poses_to_path(poses: &[PathPose], frame_id: &str, stamp: (i32, u32)) -> n
     path
 }
 
+/// 無効レンジ (inf / NaN / 非正) の差し替え値 [m]。ローカルウィンドウから
+/// 十分遠く、セル座標化しても i32 に収まる値であればよい。
+const INVALID_RANGE_M: f64 = 1.0e6;
+
 /// sensor_msgs/LaserScan → vi_lib::LaserScan。ビーム角と添字の対応を
-/// 保つため無効レンジは取り除かず `invalid_range_m` に差し替える
+/// 保つため無効レンジは取り除かず [`INVALID_RANGE_M`] に差し替える
 /// (`set_local_cost` がウィンドウ外として自然に無視する)。
-pub fn vi_scan_from(msg: &sensor_msgs::msg::LaserScan, invalid_range_m: f64) -> ViLaserScan {
+pub fn vi_scan_from(msg: &sensor_msgs::msg::LaserScan) -> ViLaserScan {
     ViLaserScan {
         angle_min: msg.angle_min as f64,
         angle_increment: msg.angle_increment as f64,
@@ -55,7 +59,7 @@ pub fn vi_scan_from(msg: &sensor_msgs::msg::LaserScan, invalid_range_m: f64) -> 
                 if r.is_finite() && r > 0.0 {
                     r
                 } else {
-                    invalid_range_m
+                    INVALID_RANGE_M
                 }
             })
             .collect(),

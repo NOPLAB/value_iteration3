@@ -1228,6 +1228,38 @@ fn minplus_relax(delta: &mut [f32], nx: i32, ny: i32, nt: i32, l_xy: f32, l_t: f
     }
 }
 
+/// 仮説集合の位置の広がり [m] — 重み付き RMS 半径 `√(σx² + σy²)`。
+/// [`crate::local::ValueIteratorLocal::inflate_by_sigma`] に渡すマージン膨張量の元で、
+/// 窓つき・全地図どちらの `top_cells` にもそのまま使える。
+///
+/// 上田ら 2023 の式(4) は `σ = ∛(σx·σy·σθ)` だが、あちらの σ はパーティクル分布の
+/// 共分散なので軸方向の分散が 0 にならない。離散 belief の上位セルは 1 軸に並ぶことが
+/// あり、そのとき σy = 0 で幾何平均ごと 0 になる — 位置が 2 m ばらけていてもマージンが
+/// 増えない。用途は「壁からどれだけ離れるか」= 長さなので、潰れない RMS 半径を採る。
+/// θ を混ぜないのも同じ理由 (向きのばらつきは離れるべき距離に効かない)。
+///
+/// 重みは非正規化でよい。仮説が 1 個以下なら 0。
+pub fn spread_m(hyps: &[(PoseView, f64)]) -> f64 {
+    if hyps.len() < 2 {
+        return 0.0;
+    }
+    let w: f64 = hyps.iter().map(|h| h.1).sum();
+    if w <= 0.0 {
+        return 0.0;
+    }
+    let (mut mx, mut my) = (0.0, 0.0);
+    for (p, wi) in hyps {
+        mx += wi * p.x;
+        my += wi * p.y;
+    }
+    let (mx, my) = (mx / w, my / w);
+    let mut var = 0.0;
+    for (p, wi) in hyps {
+        var += wi * ((p.x - mx).powi(2) + (p.y - my).powi(2));
+    }
+    (var / w).max(0.0).sqrt()
+}
+
 /// 重み降順の仮説列 ([`Belief::top_cells`] の出力) を最小間隔 `min_sep_m` で
 /// 間引いた「峰」の数。
 ///
@@ -1636,6 +1668,22 @@ mod tests {
             (pose(2.2, 1.5, 0.5), 0.2),
         ];
         assert_eq!(mode_count(&two, 0.5), 2, "離れた 2 山は 2 峰");
+    }
+
+    /// spread_m: 単一仮説は 0、離れた 2 山は峰間距離に比例した**長さ**を返すこと。
+    /// 文献の幾何平均 ∛(σx·σy·σθ) は 1 軸に並んだ時点で 0 に潰れる — その配置で
+    /// マージン膨張が効かなくなるのを防ぐための選択なので、回帰として固定する。
+    #[test]
+    fn spread_m_measures_length_not_geometric_mean() {
+        assert_eq!(spread_m(&[(pose(1.0, 1.0, 0.0), 1.0)]), 0.0, "単一仮説は広がり 0");
+
+        // x 軸上に 1 m 離れた等重み 2 山 → RMS 半径 0.5 m (σy = σθ = 0 の配置)。
+        let two = vec![(pose(1.0, 1.0, 0.0), 0.5), (pose(2.0, 1.0, 0.0), 0.5)];
+        assert!((spread_m(&two) - 0.5).abs() < 1e-9, "got {}", spread_m(&two));
+
+        // 重みが片側に寄れば広がりは縮む。
+        let skewed = vec![(pose(1.0, 1.0, 0.0), 0.99), (pose(2.0, 1.0, 0.0), 0.01)];
+        assert!(spread_m(&skewed) < 0.2, "got {}", spread_m(&skewed));
     }
 
     /// ESS が pose のゲートと b_hat の広がり報告を担うこと:
