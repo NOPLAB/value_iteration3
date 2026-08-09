@@ -147,6 +147,14 @@ fn deposit(scratch: &mut [f32], cand: &mut Vec<u32>, j: usize, m: f32) {
     }
 }
 
+/// [`Belief::reloc_targets`] の峰の取り方: 最大重みに対するしきい値、峰どうしの
+/// 最小間隔 [m]、判別に使う峰の数 (窓つき側の `RELOC_MODES` と同値)、ソートを
+/// 諦める候補数の上限。
+const MODE_THRESHOLD: f32 = 0.05;
+const MODE_MIN_SEP_M: f64 = 1.0;
+const RELOC_MODES: usize = 4;
+const MODE_CANDIDATE_CAP: usize = 4096;
+
 /// 3 点カーネル [a, 1-2a, a] の a。1 tick σ [セル] のランダムウォーク分散
 /// (2a セル²) を合わせる (旧 GridLocalizer::blur_a)。累積 tick 分の a は
 /// 呼び出し側が pass 分割で安定域 (中心重み非負) に収める — 旧 0.25
@@ -712,6 +720,50 @@ impl Belief {
                 (PoseView { x, y, yaw_rad: self.theta_center(it) }, w as f64)
             })
             .collect()
+    }
+
+    /// ロスト中の能動的再定位の行き先候補 ([`crate::localize::Localizer::reloc_targets`]
+    /// と同じ契約)。
+    /// 非ロスト = 空 — 走って判別する価値があるのは pose を止めている間だけ。
+    ///
+    /// 峰の取り方だけが窓つき推定器と違う: 全地図 belief は 1 つの峰でも数千セル
+    /// あるので `top_cells(k)` の上位 k では 2 つ目の峰に届かない。最大重みの
+    /// [`MODE_THRESHOLD`] 以上のセル全部から [`modes`] で間引く。
+    ///
+    /// ロスト中は毎 tick 呼ばれるので、並べるのは候補が [`MODE_CANDIDATE_CAP`]
+    /// 以下のときだけ (走査は active の線形 2 パスで確保)。それを超える = belief
+    /// が一様に近い ⇒ 判別すべき峰が無い ⇒ 空 = 受動復帰。
+    pub fn reloc_targets(&self) -> Vec<(f64, f64)> {
+        if !self.initialized || !self.lost {
+            return Vec::new();
+        }
+        let maxw = self.active.iter().fold(0.0f32, |m, &i| m.max(self.b[i as usize]));
+        if maxw <= 0.0 {
+            return Vec::new();
+        }
+        let thr = maxw * MODE_THRESHOLD;
+        let n_cand = self.active.iter().filter(|&&i| self.b[i as usize] >= thr).count();
+        if n_cand > MODE_CANDIDATE_CAP {
+            return Vec::new();
+        }
+        let mut cells: Vec<(f32, u32)> = self
+            .active
+            .iter()
+            .filter(|&&i| self.b[i as usize] >= thr)
+            .map(|&i| (self.b[i as usize], i))
+            .collect();
+        cells.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let hyps: Vec<(PoseView, f64)> = cells
+            .into_iter()
+            .map(|(w, i)| {
+                let (ix, iy, it) = self.decode(i);
+                let (x, y) = self.cell_center(ix, iy);
+                (PoseView { x, y, yaw_rad: self.theta_center(it) }, w as f64)
+            })
+            .collect();
+        let mut m = modes(&hyps, MODE_MIN_SEP_M);
+        m.truncate(RELOC_MODES);
+        reloc_targets(&m, |x, y| self.field.free_at(x, y), |x, y| self.field.at(x, y))
     }
 
     /// belief の θ 周辺分布を可視化用 OccupancyGrid に描く (未シードなら None)。
@@ -1306,21 +1358,101 @@ pub fn spread_m(hyps: &[(PoseView, f64)]) -> f64 {
 }
 
 /// 重み降順の仮説列 ([`Belief::top_cells`] の出力) を最小間隔 `min_sep_m` で
-/// 間引いた「峰」の数。
+/// 間引いた「峰」。旧 AdaptiveLocalizer の `top_modes` の後継。
+pub fn modes(hyps: &[(PoseView, f64)], min_sep_m: f64) -> Vec<PoseView> {
+    let mut out: Vec<PoseView> = Vec::new();
+    for (p, _) in hyps {
+        if out.iter().all(|q| (p.x - q.x).hypot(p.y - q.y) >= min_sep_m) {
+            out.push(*p);
+        }
+    }
+    out
+}
+
+/// [`modes`] の数。
 ///
 /// 多峰性を**セル数**で測ってはいけない: 全地図 belief のアクティブ集合は
 /// 収束していても数千セルあるので `top_cells(k).len() >= 2` は常に真になり、
 /// それを QMDP の発火条件にすると毎 tick QMDP = follow_controller が一度も
 /// 動かない (tb3 デモで実測: ゴール手前 0.29 m で 302 s 張り付き、この関数で
-/// ゲートすると 22 s で到達)。旧 AdaptiveLocalizer の `top_modes` の後継。
+/// ゲートすると 22 s で到達)。
 pub fn mode_count(hyps: &[(PoseView, f64)], min_sep_m: f64) -> usize {
-    let mut modes: Vec<(f64, f64)> = Vec::new();
-    for (p, _) in hyps {
-        if modes.iter().all(|&(x, y)| (p.x - x).hypot(p.y - y) >= min_sep_m) {
-            modes.push((p.x, p.y));
+    modes(hyps, min_sep_m).len()
+}
+
+/// 能動的再定位の判別変位: 上位モード仮説 {pᵢ} はオドメトリ共有で「同じロボット系
+/// 変位 δ で一緒に動く」ので、δ 先の地図が仮説間で最も違う δ* を選べば、そこへ
+/// 走るだけで観測が仮説を判別する:
+///
+///   δ* = argmax_δ Σ_{i<j} ‖sig_i(δ) − sig_j(δ)‖₁
+///
+/// sig は δ 先周りの尤度場リング標本 (仮説の向きに合わせて回す = 擬似的な期待
+/// スキャン)。全仮説の δ 先が free な δ だけ許す (どの仮説が真でも行ける行き先)。
+/// 返すのは仮説ごとの行き先 1 点。スコア 0 (完全対称) と仮説 1 個以下は空 —
+/// 受動復帰に任せる。
+///
+/// 尤度場は窓つき ([`crate::localize::AdaptiveLocalizer`]) と全地図 ([`Belief`])
+/// で別の型なので、free 判定と尤度参照だけをクロージャで受ける。
+pub fn reloc_targets(
+    modes: &[PoseView],
+    free_at: impl Fn(f64, f64) -> bool,
+    lf_at: impl Fn(f64, f64) -> f64,
+) -> Vec<(f64, f64)> {
+    use std::f64::consts::PI;
+    /// 候補変位の半径 [m]、ロボット系方位の分割数、署名リングの半径 [m]。
+    // ponytail: 定数 3 個 — 実地図でスケール調整が要るなら BeliefConfig へ昇格。
+    const RADII: [f64; 2] = [1.5, 3.0];
+    const HEADINGS: usize = 12;
+    const SIG_R: f64 = 1.0;
+
+    if modes.len() < 2 {
+        return Vec::new();
+    }
+    let displaced = |p: &PoseView, dr: f64, dphi: f64| {
+        let a = p.yaw_rad + dphi;
+        (p.x + dr * a.cos(), p.y + dr * a.sin())
+    };
+    let mut best: Option<(f64, f64, f64)> = None; // (score, dr, dphi)
+    for &dr in &RADII {
+        for k in 0..HEADINGS {
+            let dphi = k as f64 * (2.0 * PI / HEADINGS as f64);
+            if !modes.iter().all(|p| {
+                let (x, y) = displaced(p, dr, dphi);
+                free_at(x, y)
+            }) {
+                continue;
+            }
+            let sigs: Vec<[f64; 8]> = modes
+                .iter()
+                .map(|p| {
+                    let (x, y) = displaced(p, dr, dphi);
+                    let mut s = [0.0; 8];
+                    for (j, sv) in s.iter_mut().enumerate() {
+                        let a = p.yaw_rad + j as f64 * (2.0 * PI / 8.0);
+                        *sv = lf_at(x + SIG_R * a.cos(), y + SIG_R * a.sin());
+                    }
+                    s
+                })
+                .collect();
+            let mut score = 0.0;
+            for i in 0..sigs.len() {
+                for j in (i + 1)..sigs.len() {
+                    for m in 0..8 {
+                        score += (sigs[i][m] - sigs[j][m]).abs();
+                    }
+                }
+            }
+            if best.map_or(true, |(bs, ..)| score > bs) {
+                best = Some((score, dr, dphi));
+            }
         }
     }
-    modes.len()
+    match best {
+        Some((score, dr, dphi)) if score > 0.0 => {
+            modes.iter().map(|p| displaced(p, dr, dphi)).collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// 真値姿勢からの全周スキャンをレイマーチで合成する理想センサ (angle_min = 0)。
@@ -1729,6 +1861,56 @@ mod tests {
         // 重みが片側に寄れば広がりは縮む。
         let skewed = vec![(pose(1.0, 1.0, 0.0), 0.99), (pose(2.0, 1.0, 0.0), 0.01)];
         assert!(spread_m(&skewed) < 0.2, "got {}", spread_m(&skewed));
+    }
+
+    /// reloc_targets: 対称な 2 仮説から「地図が仮説間で違って見える方向」への
+    /// 変位を選ぶこと (能動的再定位の行き先)。北側の一方にだけ障害物クラスタが
+    /// ある地図で、両仮説とも北向きの行き先が返るはず (窓つき側の同名テストの
+    /// 全地図 belief 版 — 峰の取り方だけが違う)。
+    #[test]
+    fn reloc_targets_point_toward_disambiguating_terrain() {
+        // 20m×10m @0.1、開けた空間 + 仮説 A の北にだけ障害物クラスタ。
+        let (w, h) = (200, 100);
+        let mut g = OccupancyGrid {
+            width: w,
+            height: h,
+            resolution: 0.1,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            data: vec![0i8; (w * h) as usize],
+        };
+        for y in 90..96 {
+            for x in 40..70 {
+                g.data[(y * w + x) as usize] = 100;
+            }
+        }
+        let mut loc = Belief::new(&g, 36, &g, BeliefConfig::default());
+        assert!(loc.reloc_targets().is_empty(), "未初期化は空");
+
+        // ロスト状態を直接組む: (5.05, 5.05) と (15.05, 5.05) の 2 仮説 (θ ビン 0)。
+        loc.initialized = true;
+        loc.lost = true;
+        let cell = |wx: f64, wy: f64| {
+            let (ix, iy) = ((wx / 0.1) as i32, (wy / 0.1) as i32);
+            (iy * loc.nx + ix) as u32
+        };
+        for (i, wt) in [(cell(5.05, 5.05), 0.6f32), (cell(15.05, 5.05), 0.4)] {
+            loc.b[i as usize] = wt;
+            loc.active.push(i);
+        }
+        let t = loc.reloc_targets();
+        assert_eq!(t.len(), 2, "仮説ごとに 1 点");
+        for &(x, y) in &t {
+            assert!(y > 6.0, "行き先 ({x:.1}, {y:.1}) が判別地形 (北) を向いていない");
+        }
+        // 同じロボット系変位 δ (両仮説とも θ ビン 0) — 世界系でも同じずれ。
+        assert!(
+            ((t[1].0 - t[0].0) - 10.0).abs() < 0.5,
+            "2 つの行き先は同じ δ で結ばれるはず: {t:?}"
+        );
+        loc.lost = false;
+        assert!(loc.reloc_targets().is_empty(), "非ロストは空 (受動追従に任せる)");
     }
 
     /// ESS が pose のゲートと b_hat の広がり報告を担うこと:

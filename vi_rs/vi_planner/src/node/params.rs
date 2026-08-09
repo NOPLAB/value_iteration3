@@ -413,11 +413,12 @@ pub fn validate(p: &Params) -> Result<U64Solver> {
     // 能動的再定位は判別点を出せる推定器 (adaptive) と密経路が要る。ここで
     // 落とさないと、ロストした瞬間に初めて Unsupported が返って原因が読めない。
     if p.active_reloc {
-        if !matches!(p.localizer.as_str(), "adaptive") {
+        if !matches!(p.localizer.as_str(), "adaptive" | "belief" | "viterbi") {
             return Err(anyhow!(
                 "active_reloc needs a localizer that proposes disambiguating targets, and \
-                 localizer={} does not (only \"adaptive\" implements reloc_targets). Set \
-                 localizer:=adaptive, or leave active_reloc at false.",
+                 localizer={} does not (\"grid\" has no lost state and \"external\" has no \
+                 belief; \"adaptive\", \"belief\" and \"viterbi\" implement reloc_targets). \
+                 Set one of those, or leave active_reloc at false.",
                 p.localizer
             ));
         }

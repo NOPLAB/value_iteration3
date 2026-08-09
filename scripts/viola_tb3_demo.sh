@@ -93,7 +93,7 @@ VI_ARGS=(
     -p transform_tolerance:=0.5          # 規定: 0.5 [s] (TF スタンプの未来日付け)
     -p odom_topic:=odom                  # 規定: odom (publish_tf 用の T_odom→base の出どころ)
     # ── 自己位置推定 ──
-    -p localizer:=grid                 # 規定: external。内蔵は 2 系統:
+    -p localizer:=belief                 # 規定: external。内蔵は 2 系統:
                                          #   窓つき grid | adaptive | adaptive_viterbi
                                          #     (belief_radius の窓だけを持つ。adaptive は観測が合わなく
                                          #      なると粗い広域レベルへ広げて再定位 = 誘拐から復帰でき、
@@ -110,7 +110,7 @@ VI_ARGS=(
     -p belief_motion_sigma_xy:=0.03      # 規定: 0.03 [m/tick] (predict の位置ノイズ)
     -p belief_motion_sigma_theta_deg:=2.0 # 規定: 2.0 [deg/tick]
                                          #   (尤度の床・枝刈り・リセット/ロスト判定は vi_lib 既定で固定)
-    -p scan_quality_gate:=0.25          # 規定: 0.25 — 観測一致度がこれ未満の scan は注入を減衰、0 で無効
+    -p scan_quality_gate:=0.30          # 規定: 0.25 — 観測一致度がこれ未満の scan は注入を減衰、0 で無効
     -p footprint_clear_m:=0.2            # 規定: 0.2 [m] — 注入のたびに機体周囲の local_penalty を消す、0 で無効
     # 上田ら 2023 (4·2·2) のマージン膨張: 自己位置の広がり σ[m] × これ を壁際の帯に足す。
     # house のドア幅 (~0.9m) に対し safety_radius 0.2 が両側で 0.4 を占めるので、σ 0.25 で
@@ -136,9 +136,10 @@ VI_ARGS=(
     -p qmdp:=true                        # 規定: false — belief が多峰の tick だけ QMDP で行動選択
                                          #   (単峰の tick は follow_controller のまま)。多峰性は峰の
                                          #   数で測る — セル数だと全地図 belief では常に真になる。
-    -p active_reloc:=false               # 規定: false — ロスト中に止まって待つ代わりに、仮説を判別する
-                                         #   地点への多目標 VI を解いて QMDP で走る。要 localizer:=adaptive
-                                         #   (判別点を出せるのはこれだけ) + 密ソルバ。
+    -p active_reloc:=true                # 規定: false — ロスト中に止まって待つ代わりに、仮説を判別する
+                                         #   地点への多目標 VI を解いて QMDP で走る。要 adaptive |
+                                         #   belief | viterbi (多峰 belief = 判別点を出せる) + 密ソルバ。
+                                         #   30 s で諦めて受動復帰に戻る。
     # ── スタンドアロン (navigate_to_pose / follow_waypoints) ──
     -p standalone:=true                  # 規定: false — bt_navigator 等の代わりに自前で提供
     -p goal_retry_limit:=3               # 規定: 3 (追従失敗時の投げ直し上限、負で無制限)
@@ -151,12 +152,12 @@ VI_ARGS=(
     -p waypoint_prefetch:=false          # 規定: false — 次の点の価値関数を走行中に解く (メモリ 2 倍)
     -p waypoint_topic:=waypoints         # 規定: waypoints (nav_msgs/Path, transient_local)
     -p waypoint_prefetch_threads:=1      # 規定: 1 (compact 経路のみ効く)
-    -p early_start:=false                # 規定: false — 現在地→ゴールが繋がった時点で solve 打ち切り
+    -p early_start:=true                 # 規定: false — 現在地→ゴールが繋がった時点で solve 打ち切り
     # ── 可視化 ──
     -p value_publish_interval_ms:=500    # 規定: 500 [ms] — value_function / local_window_value /
                                          #   belief の配信間隔。0 = solve 完了時のみ、負で可視化を立てない。
                                          #   belief にも同じ間引きが掛かる (内蔵推定器のときだけ中身が出る)
-    -p cost_drawing_threshold:=60        # 規定: 60 (描画スケール上限、全域スライスと窓で共通)
+    -p cost_drawing_threshold:=80        # 規定: 60 (描画スケール上限、全域スライスと窓で共通)
 )
 ros2 run vi_planner vi_planner --ros-args "${VI_ARGS[@]}" >"$LOG/vi_planner.log" 2>&1 &
 

@@ -152,12 +152,14 @@ impl Loc {
             Loc::Belief(b) => b.top_cells(k),
         }
     }
-    /// 能動的再定位 (`active_reloc`) の行き先候補。多峰 belief を持つ窓つき
-    /// [`vi_planner::core::AdaptiveLocalizer`] だけが出す — 他は空 = 提案なし。
+    /// 能動的再定位 (`active_reloc`) の行き先候補。多峰 belief を持つ推定器
+    /// (窓つき [`vi_planner::core::AdaptiveLocalizer`] と全地図
+    /// [`vi_planner::core::Belief`]) が出す — External は空 = 提案なし。
     pub fn reloc_targets(&self) -> Vec<(f64, f64)> {
         match self {
+            Loc::External(_) => Vec::new(),
             Loc::Windowed(l) => l.reloc_targets(),
-            _ => Vec::new(),
+            Loc::Belief(b) => b.reloc_targets(),
         }
     }
     /// 可視化用の belief グリッド。External は belief を持たないので None
