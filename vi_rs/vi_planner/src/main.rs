@@ -132,6 +132,12 @@ fn main() -> Result<()> {
                 win_pub: node.create_publisher::<nav_msgs::msg::OccupancyGrid>(
                     "local_window_value".reliable().transient_local().keep_last(1),
                 )?,
+                // 自己位置 belief。内蔵推定器 (localizer != external) のときだけ
+                // 中身が出る — 価値関数と同じ Map 表示に重ねて見られる。
+                belief_pub: node.create_publisher::<nav_msgs::msg::OccupancyGrid>(
+                    "belief".reliable().transient_local().keep_last(1),
+                )?,
+                belief_last: Mutex::new(None),
                 clock: node.get_clock(),
                 frame_id: params.global_frame.clone(),
                 threshold_steps: params.cost_drawing_threshold.max(0) as u64,
@@ -171,6 +177,7 @@ fn main() -> Result<()> {
                 if let Some(p) = p {
                     h.publish_est(p);
                 }
+                h.publish_belief();
             },
         )?
     };
@@ -219,6 +226,7 @@ fn main() -> Result<()> {
                 if let Some(p) = est {
                     h.publish_est(p);
                 }
+                h.publish_belief();
                 let mut q = lock(&h.scan_queue);
                 // 制御ループが止まっていても際限なく溜めない (最新を優先)。
                 if q.len() >= 10 {

@@ -24,7 +24,40 @@
 //! 集合を belief の広がりに比例した大きさに保つ。
 
 use crate::bridge::PoseView;
-use crate::msg::{LaserScan, OccupancyGrid};
+use crate::msg::{LaserScan, OccupancyGrid, Quaternion};
+
+/// θ で周辺化済みの質量 `m` (w×h) → 可視化用 OccupancyGrid。最大質量を 98 と
+/// する相対スケールで、価値関数の `value_grid_on` と同じく「そのまま Map 表示に
+/// 流せる」形にする。
+///
+/// 質量ゼロは **0** (-1 ではない): RViz の costmap カラースキームで 0 だけが
+/// 完全透過で、-1 は不透明の灰緑 — belief はほぼ全セルが質量ゼロなので、-1 に
+/// すると地図の上に灰色の膜を張ってしまう。平方根を噛ませてあるのは、収束後の
+/// belief が 1 セルに集中して副次モードが潰れる (= 多峰かどうかが画面で見えない)
+/// のを避けるため。99/100 は同スキームの特別色なので使わない。
+pub fn mass_to_grid(
+    m: &[f32],
+    w: i32,
+    h: i32,
+    res: f64,
+    ox: f64,
+    oy: f64,
+    oq: Quaternion,
+) -> OccupancyGrid {
+    let max = m.iter().copied().fold(0.0f32, f32::max);
+    OccupancyGrid {
+        width: w,
+        height: h,
+        resolution: res,
+        origin_x: ox,
+        origin_y: oy,
+        origin_quat: oq,
+        data: m
+            .iter()
+            .map(|&p| if p > 0.0 { 1 + (97.0 * (p / max).sqrt()) as i8 } else { 0 })
+            .collect(),
+    }
+}
 
 /// [`Belief`] のチューニング。実機はスキャナも床も理想モデルからずれるので、
 /// ノイズ幅は必ずパラメータで残す。
@@ -261,6 +294,8 @@ pub struct Belief {
     t_res_deg: f64,
     ox: f64,
     oy: f64,
+    /// 地図原点の回転 ([`Belief::grid`] が echo するだけ)。
+    oq: Quaternion,
     /// vi_grid の free (data == 0) マスク (2D)。belief の物理拘束。
     free: Vec<bool>,
     n_free: usize,
@@ -321,6 +356,7 @@ impl Belief {
             t_res_deg: 360.0 / nt as f64,
             ox: vi_grid.origin_x,
             oy: vi_grid.origin_y,
+            oq: vi_grid.origin_quat.clone(),
             free,
             n_free,
             b: vec![0.0; n],
@@ -631,6 +667,21 @@ impl Belief {
                 (PoseView { x, y, yaw_rad: self.theta_center(it) }, w as f64)
             })
             .collect()
+    }
+
+    /// belief の θ 周辺分布を可視化用 OccupancyGrid に描く (未シードなら None)。
+    /// 格子は VI と同一 = `value_function` と重ねて見られる。active だけ舐める
+    /// ので、収束後は数百セルぶんの仕事しかしない。
+    pub fn grid(&self) -> Option<OccupancyGrid> {
+        if !self.initialized {
+            return None;
+        }
+        let plane = (self.nx as usize) * (self.ny as usize);
+        let mut m = vec![0f32; plane];
+        for &i in &self.active {
+            m[i as usize % plane] += self.b[i as usize];
+        }
+        Some(mass_to_grid(&m, self.nx, self.ny, self.res, self.ox, self.oy, self.oq.clone()))
     }
 
     // ═══ 内部: 共通機構 ═══
@@ -1615,5 +1666,30 @@ mod tests {
         assert!(loc.ess() < 60.0, "収束後の ESS が大きすぎる: {:.1}", loc.ess());
         assert!(loc.pose().is_some(), "集中した belief は pose を返す");
         assert_eq!(loc.b_hat(4), 0, "集中 ⇔ 下端ビン (ess={:.1})", loc.ess());
+    }
+
+    /// 可視化グリッド: シード前は None、シード後はピークがシード位置に立ち、
+    /// 質量ゼロのセルは 0 (RViz で透過)。
+    #[test]
+    fn grid_draws_the_marginal_with_its_peak_at_the_seed() {
+        let g = walled_grid(60); // 3m×3m @0.05
+        let mut loc = Belief::new(&g, 36, &g, BeliefConfig::default());
+        assert!(loc.grid().is_none(), "シード前はグリッド無し");
+
+        let seed = pose(1.3, 1.4, 0.3);
+        loc.seed(seed);
+        let vg = loc.grid().expect("シード後のグリッド");
+        assert_eq!((vg.width, vg.height), (g.width, g.height), "VI と同じ格子");
+        let (i, &v) = vg.data.iter().enumerate().max_by_key(|(_, &v)| v).unwrap();
+        let (px, py) = (
+            vg.origin_x + (i as i32 % vg.width) as f64 * vg.resolution,
+            vg.origin_y + (i as i32 / vg.width) as f64 * vg.resolution,
+        );
+        assert!(v <= 98, "スケール上限を超えた: {v}");
+        assert!(
+            (px - seed.x).abs() < 0.1 && (py - seed.y).abs() < 0.1,
+            "ピーク ({px:.2}, {py:.2}) がシードから遠い"
+        );
+        assert!(vg.data.iter().any(|&d| d == 0), "質量ゼロのセルが透過 (0) になっていない");
     }
 }

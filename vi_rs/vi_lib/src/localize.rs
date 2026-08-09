@@ -31,8 +31,9 @@
 //!   載せる。窓は平均が中心から離れると整数セルシフトで再センタリングする。
 //! - ROS 配線 (購読・predict の呼び出し) は vi_planner の main.rs 側。
 
+use crate::belief::mass_to_grid;
 use crate::bridge::PoseView;
-use crate::msg::{LaserScan, OccupancyGrid};
+use crate::msg::{LaserScan, OccupancyGrid, Quaternion};
 
 mod viterbi;
 use viterbi::VitState;
@@ -74,6 +75,23 @@ pub trait Localizer: Send {
     fn reloc_targets(&self) -> Vec<(f64, f64)> {
         Vec::new()
     }
+    /// 現在の belief の θ 周辺分布を可視化用 OccupancyGrid に描いたもの
+    /// ([`crate::belief::mass_to_grid`] のスケール)。窓つきの実装では**窓の
+    /// 範囲だけ**の格子で、地図全域とは寸法も原点も違う (RViz は Map 表示が
+    /// メッセージごとに原点を見るのでそのまま重なる)。belief を持たない
+    /// [`ExternalLocalizer`] と未シードは None。
+    fn belief_grid(&self) -> Option<OccupancyGrid> {
+        None
+    }
+}
+
+/// belief バッファ (θ 面優先) を θ で周辺化する。窓つき 2 実装の共有部。
+fn marginal(b: &[f32], plane: usize) -> Vec<f32> {
+    let mut m = vec![0f32; plane];
+    for (i, &w) in b.iter().enumerate() {
+        m[i % plane] += w;
+    }
+    m
 }
 
 /// 現行動作: `pose_topic` の推定を素通しする (既定)。
@@ -166,6 +184,8 @@ struct LikelihoodField {
     res: f64,
     ox: f64,
     oy: f64,
+    /// 地図原点の回転 (可視化グリッドが echo するだけ)。
+    oq: Quaternion,
     lf: Vec<u8>,
     /// free (data == 0) セルの bitset。belief の物理拘束用 — 壁・未知の中の
     /// 姿勢仮説を許さない (尤度場はビームの当たり先しか見ないので、これが
@@ -235,7 +255,16 @@ impl LikelihoodField {
                 (255.0 * (-dm * dm * inv_2s2).exp()).round() as u8
             })
             .collect();
-        Self { w, h, res: g.resolution, ox: g.origin_x, oy: g.origin_y, lf, free }
+        Self {
+            w,
+            h,
+            res: g.resolution,
+            ox: g.origin_x,
+            oy: g.origin_y,
+            oq: g.origin_quat.clone(),
+            lf,
+            free,
+        }
     }
 
     /// セルが free か。地図外は false。
@@ -697,6 +726,24 @@ impl Localizer for GridLocalizer {
                 (PoseView { x, y, yaw_rad: self.theta_center(it) }, w as f64)
             })
             .collect()
+    }
+
+    fn belief_grid(&self) -> Option<OccupancyGrid> {
+        if !self.initialized {
+            return None;
+        }
+        let nw = self.nw;
+        let res = self.field.res;
+        let m = marginal(&self.b, (nw * nw) as usize);
+        Some(mass_to_grid(
+            &m,
+            nw,
+            nw,
+            res,
+            self.field.ox + self.wx0 as f64 * res,
+            self.field.oy + self.wy0 as f64 * res,
+            self.field.oq.clone(),
+        ))
     }
 }
 
@@ -1717,6 +1764,27 @@ impl Localizer for AdaptiveLocalizer {
             })
             .collect()
     }
+
+    /// 現レベルの窓の belief。レベルが上がると寸法も解像度も変わるが、
+    /// メッセージが幾何を全部持つので RViz 側は追従する。
+    fn belief_grid(&self) -> Option<OccupancyGrid> {
+        if !self.initialized {
+            return None;
+        }
+        let l = &self.levels[self.cur];
+        let (nx, ny, res) = (l.nx, l.ny, l.res);
+        let n = self.n_active();
+        let m = marginal(&self.b[..n], (nx * ny) as usize);
+        Some(mass_to_grid(
+            &m,
+            nx,
+            ny,
+            res,
+            self.field.ox + self.wx0 as f64 * res,
+            self.field.oy + self.wy0 as f64 * res,
+            self.field.oq.clone(),
+        ))
+    }
 }
 
 /// 真値姿勢からの全周スキャンをレイマーチで合成する理想センサ (angle_min = 0)。
@@ -2174,5 +2242,34 @@ mod tests {
         let mut al = AdaptiveLocalizer::new(&g, 36, BeliefConfig::default());
         al.set_pose(seed);
         check(al.top_cells(8), "adaptive");
+    }
+
+    /// 窓つき 2 実装の可視化グリッド: シード前は None、シード後は窓の範囲を
+    /// 覆う格子が出て、ピークがシード位置に立つ。
+    #[test]
+    fn belief_grid_covers_the_window_with_its_peak_at_the_seed() {
+        let g = walled_grid(60);
+        let seed = pose(1.5, 1.5, 0.0);
+        let check = |vg: OccupancyGrid, name: &str| {
+            let (i, &v) = vg.data.iter().enumerate().max_by_key(|(_, &v)| v).unwrap();
+            let (px, py) = (
+                vg.origin_x + (i as i32 % vg.width) as f64 * vg.resolution,
+                vg.origin_y + (i as i32 / vg.width) as f64 * vg.resolution,
+            );
+            assert!(v <= 98, "{name}: スケール上限を超えた: {v}");
+            assert!(
+                (px - seed.x).abs() < 0.2 && (py - seed.y).abs() < 0.2,
+                "{name}: ピーク ({px:.2}, {py:.2}) がシードから遠い"
+            );
+        };
+        let mut gl =
+            GridLocalizer::new(&g, 36, BeliefConfig { half_m: 1.0, ..BeliefConfig::default() });
+        assert!(gl.belief_grid().is_none(), "シード前は None");
+        gl.set_pose(seed);
+        check(gl.belief_grid().expect("grid"), "grid");
+
+        let mut al = AdaptiveLocalizer::new(&g, 36, BeliefConfig::default());
+        al.set_pose(seed);
+        check(al.belief_grid().expect("adaptive"), "adaptive");
     }
 }

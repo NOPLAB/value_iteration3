@@ -21,6 +21,11 @@
 #   - map→odom TF は vi_planner が配信 (publish_tf、AMCL の契約の置き換え)。
 #     RViz のロボット・scan は推定姿勢に乗る (真値は Gazebo ウィンドウ)。
 #     ピンク矢印 (viola_pose) は推定そのもの — ロボットモデルと重なるのが正常。
+#   - RViz の Belief 表示 (/belief) が belief の θ 周辺分布。value_function /
+#     local_window_value と同じ Map 表示・同じ間引き (value_publish_interval_ms)
+#     で、質量ゼロは透過・ピークが赤。収束すると 1〜数セルまで縮むので、
+#     広がって見えるのは誘拐やリセットの直後だけ。地図と重なってちらつくときは
+#     Displays で Map か ValueFunction を一時的に切る。
 #
 # 各コンポーネントのログ: out/viola_demo_logs/*.log (無反応のときはまずここ)。
 #
@@ -90,7 +95,7 @@ VI_ARGS=(
     -p transform_tolerance:=0.5          # 規定: 0.5 [s] (TF スタンプの未来日付け)
     -p odom_topic:=odom                  # 規定: odom (publish_tf 用の T_odom→base の出どころ)
     # ── 自己位置推定 ──
-    -p localizer:=belief                 # 規定: external。内蔵は 2 系統:
+    -p localizer:=grid                 # 規定: external。内蔵は 2 系統:
                                          #   窓つき grid | adaptive | adaptive_viterbi
                                          #     (belief_radius の窓だけを持つ。adaptive は観測が合わなく
                                          #      なると粗い広域レベルへ広げて再定位 = 誘拐から復帰でき、
@@ -99,7 +104,7 @@ VI_ARGS=(
                                          #     (窓もレベル機構も無く、VI と同じ格子に belief を全域で持つ)
                                          #   viterbi は observe が全域走査なので tb3 実測 183 ms/tick —
                                          #   追従ループの 40 ms 予算を超える。ベンチ用と割り切る。
-    -p belief_radius:=2.5                # 規定: 2.5 [m] — 窓つき (grid/adaptive) の belief 窓の半径。
+    -p belief_radius:=2.0                # 規定: 2.0 [m] — 窓つき (grid/adaptive) の belief 窓の半径。
                                          #   全地図 (belief/viterbi) では使わない。
     -p belief_sensor_sigma:=0.2          # 規定: 0.2 [m] (尤度場のガウス幅)
     -p belief_beam_step:=10              # 規定: 10 (補正に使うビームの間引き、1 = 全ビーム)
@@ -114,6 +119,9 @@ VI_ARGS=(
                                          #    窓つきは自前の expand/contract カスケードで復帰する)
     -p scan_quality_gate:=0.25           # 規定: 0.25 — 観測一致度がこれ未満の scan は注入を減衰、0 で無効
     -p footprint_clear_m:=0.2            # 規定: 0.2 [m] — 注入のたびに機体周囲の local_penalty を消す、0 で無効
+    -p map_clear_from_scan:=true         # 規定: false — ビームが貫通したセルは地図の壁/膨張帯も反証する
+                                         #   (幽霊壁に囲まれた停止を解く。自己位置がずれていると本物の壁を
+                                         #    消し得るので既定は off)
     # ── 広域 (compute_path_to_pose) ──
     -p max_rollout_steps:=10000          # 規定: 10000 (経路ロールアウトの上限歩数)
     -p start_tolerance:=0.5              # 規定: 0.5 [m] (開始姿勢と地図のずれ許容)
@@ -165,8 +173,10 @@ VI_ARGS=(
     -p waypoint_prefetch_poll_ms:=50     # 規定: 50 [ms]
     -p early_start:=false                # 規定: false — 現在地→ゴールが繋がった時点で solve 打ち切り
     # ── 可視化 ──
-    -p publish_value_function:=true      # 規定: true (value_function トピック、θ=0 スライス)
-    -p value_publish_interval_ms:=500    # 規定: 500 [ms] (solve 途中経過の配信間隔、0 = 完了時のみ)
+    -p publish_value_function:=true      # 規定: true (value_function / local_window_value /
+                                         #   belief トピック。belief は内蔵推定器のときだけ中身が出る)
+    -p value_publish_interval_ms:=500    # 規定: 500 [ms] (solve 途中経過の配信間隔、0 = 完了時のみ。
+                                         #   belief にも同じ間引きが掛かる — 0 では belief も出ない)
     -p cost_drawing_threshold:=60        # 規定: 60 (value_function の描画スケール上限)
     -p window_cost_drawing_threshold:=60 # 規定: 60 (local_window_value 用)
 )

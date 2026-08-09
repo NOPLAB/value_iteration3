@@ -14,6 +14,7 @@ use vi_planner::core::{Belief, Localizer, PlannerCore};
 use rclrs::*;
 
 use super::follow_loop::FollowTuning;
+use super::msg::ros_grid_from;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Value function visualization
@@ -29,6 +30,11 @@ pub struct Viz {
     pub vf_pub: Publisher<nav_msgs::msg::OccupancyGrid>,
     /// ローカルウィンドウの現在方位スライス (追従中、スキャン penalty 込み)。
     pub win_pub: Publisher<nav_msgs::msg::OccupancyGrid>,
+    /// 自己位置 belief の θ 周辺分布 (`localizer` が内蔵推定器のときだけ中身が出る)。
+    pub belief_pub: Publisher<nav_msgs::msg::OccupancyGrid>,
+    /// belief 配信の間引き状態。価値関数と違って「収束」イベントが無く、
+    /// シードとスキャン補正の 2 箇所から呼ばれるので Viz 側に持たせる。
+    pub belief_last: Mutex<Option<Instant>>,
     pub clock: Clock,
     pub frame_id: String,
     /// `value_function` のスケール上限 [ステップ数≒秒]。
@@ -147,6 +153,15 @@ impl Loc {
             _ => Vec::new(),
         }
     }
+    /// 可視化用の belief グリッド。External は belief を持たないので None
+    /// (窓つきは窓ぶんだけ、全地図は VI と同じ格子)。
+    pub fn belief_grid(&self) -> Option<vi_lib::msg::OccupancyGrid> {
+        match self {
+            Loc::External(_) => None,
+            Loc::Windowed(l) => l.belief_grid(),
+            Loc::Belief(b) => b.grid(),
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -191,6 +206,18 @@ impl Handles {
         msg.pose.orientation.z = (p.yaw_rad / 2.0).sin();
         msg.pose.orientation.w = (p.yaw_rad / 2.0).cos();
         let _ = self.est_pub.publish(msg);
+    }
+
+    /// belief を `belief` トピックへ (シードとスキャン補正のたび、
+    /// `value_publish_interval_ms` で間引き)。描画は数百セル〜格子 1 枚ぶんの
+    /// 仕事なので、推定器のロックは取り直して短く握る。
+    pub fn publish_belief(&self) {
+        let Some(v) = self.viz.as_ref() else { return };
+        if !v.due(&mut v.belief_last.lock().unwrap()) {
+            return;
+        }
+        let Some(g) = self.localizer.lock().unwrap().belief_grid() else { return };
+        let _ = v.belief_pub.publish(ros_grid_from(&g, &v.frame_id, v.stamp()));
     }
 
     /// map→odom = T_map→base(推定) · T_odom→base⁻¹ を `/tf` へ (AMCL の契約)。

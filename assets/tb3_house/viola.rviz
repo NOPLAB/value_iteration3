@@ -39,6 +39,16 @@ Visualization Manager:
         Reliability Policy: Reliable
       Color Scheme: costmap
       Alpha: 0.8
+    - Class: rviz_default_plugins/Map
+      Name: Belief
+      Enabled: true
+      Topic:
+        Value: /belief
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Color Scheme: costmap
+      Alpha: 0.9
     - Class: rviz_default_plugins/Path
       Name: Plan
       Enabled: true
