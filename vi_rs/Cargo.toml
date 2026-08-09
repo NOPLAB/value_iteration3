@@ -2,6 +2,16 @@
 resolver = "2"
 members = ["vi_bench", "vi_lib"]
 
+# vi_planner を colcon から見えるようにする。ここは [package] を持たない仮想
+# マニフェストなので colcon_cargo の cargo_workspace が IgnoreLocationException を
+# 投げ、**vi_rs/ 以下のクロールが丸ごと止まる** — 以後に拾われるのは members に
+# 並んだものだけ。vi_planner は自分の空 [workspace] で隔離してあって members に
+# 入れられないので、この節が無いと colcon が「unknown package 'vi_planner'」と
+# 警告するだけで 0 個ビルドし、**exit 0 のまま古いバイナリが残る**。
+# members に足すのと違い cargo の解決には触らないので、隔離はそのまま。
+[workspace.metadata.colcon]
+additional-packages = ["vi_planner"]
+
 [workspace.package]
 edition = "2021"
 rust-version = "1.75"
