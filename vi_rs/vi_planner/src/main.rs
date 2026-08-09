@@ -208,13 +208,14 @@ fn main() -> Result<()> {
     //     スレッドで足りる)。
     let _scan_sub = {
         let h = Arc::clone(&handles);
+        let map_clear = params.map_clear_from_scan;
         node.create_subscription::<sensor_msgs::msg::LaserScan, _>(
             params.scan_topic.as_str().best_effort().keep_last(5),
             move |msg: sensor_msgs::msg::LaserScan| {
                 let scan = vi_scan_from(&msg);
                 let est = {
                     let mut l = lock(&h.localizer);
-                    l.observe(&scan);
+                    l.observe(&scan, map_clear);
                     let p = l.pose();
                     // 無条件代入: belief はロスト中 None を返すので、latest_pose
                     // ごと消して follow ループを「pose なし」停止経路に乗せる

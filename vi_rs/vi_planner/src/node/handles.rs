@@ -114,11 +114,19 @@ impl Loc {
             Loc::Belief(b) => b.predict(v, w_deg, dt),
         }
     }
-    pub fn observe(&mut self, scan: &ViLaserScan) {
+    /// `map_clear` = `map_clear_from_scan`。VI 側と同じ反証を belief の free
+    /// マスクにも当ててから補正する (順序が逆だと、開いた先へ質量を動かすのは
+    /// 次の tick になる)。Windowed 側は未対応 — 必要になったら足す。
+    pub fn observe(&mut self, scan: &ViLaserScan, map_clear: bool) {
         match self {
             Loc::External(_) => {}
             Loc::Windowed(l) => l.observe(scan),
-            Loc::Belief(b) => b.observe(scan),
+            Loc::Belief(b) => {
+                if map_clear {
+                    b.clear_free_from_scan(scan);
+                }
+                b.observe(scan);
+            }
         }
     }
     pub fn pose(&self) -> Option<PoseView> {

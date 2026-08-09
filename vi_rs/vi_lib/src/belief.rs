@@ -246,6 +246,19 @@ impl LikelihoodField {
         self.free[i >> 6] & (1u64 << (i & 63)) != 0
     }
 
+    /// 世界座標のセルを free にする (scan 貫通による地図の反証)。地図外は無視。
+    /// 尤度場 `lf` は触らない — 「壁があるはずの所を通った」は依然として尤度で
+    /// 罰される。開くのは質量を置ける場所だけ。
+    fn mark_free(&mut self, wx: f64, wy: f64) {
+        let x = ((wx - self.ox) / self.res).floor() as i32;
+        let y = ((wy - self.oy) / self.res).floor() as i32;
+        if x < 0 || y < 0 || x >= self.w || y >= self.h {
+            return;
+        }
+        let i = (y * self.w + x) as usize;
+        self.free[i >> 6] |= 1u64 << (i & 63);
+    }
+
     /// 世界座標が free セルに乗っているか。
     #[inline]
     fn free_at(&self, wx: f64, wy: f64) -> bool {
@@ -617,6 +630,38 @@ impl Belief {
         } else if self.lost && self.ess_c < ESS_CONTRACT {
             self.lost = false;
         }
+    }
+
+    /// レーザーが貫通したセルを free 扱いにして、地図の壁を反証する
+    /// (`ValueIteratorLocal::clear_map_from_scan` の belief 側)。
+    ///
+    /// VI 側だけ開けても belief は動けない — 予測 (shift/diffuse) は非 free へ
+    /// 落ちた質量を捨てるので、幽霊壁の向こうへ実機が進んでも推定姿勢は壁の
+    /// 手前に張り付いたままになる。free マスクは VI の `states[].free` とは
+    /// 別のコピーなので、同じ反証をこちらにも当てる必要がある。尤度場は
+    /// 変えないので、開いた場所の重みは地図基準のまま低い。
+    /// 寿命は VI 側と違って永続 — 地図が間違っているならずっと間違っている。
+    pub fn clear_free_from_scan(&mut self, scan: &LaserScan) {
+        let Some(p) = self.mean() else { return };
+        let step = self.res.min(self.field.res) * 0.5;
+        let (nx, ny, ox, oy, res) = (self.nx, self.ny, self.ox, self.oy, self.res);
+        let (free, field) = (&mut self.free, &mut self.field);
+        let mut opened = 0usize;
+        crate::local::walk_beams(scan, p.x, p.y, p.yaw_rad, step, res, |wx, wy| {
+            let ix = ((wx - ox) / res).floor() as i32;
+            let iy = ((wy - oy) / res).floor() as i32;
+            if ix < 0 || iy < 0 || ix >= nx || iy >= ny {
+                return false; // 地図外 — ビームは直進するので戻ってこない
+            }
+            let i = (iy * nx + ix) as usize;
+            if !free[i] {
+                free[i] = true;
+                opened += 1;
+            }
+            field.mark_free(wx, wy);
+            true
+        });
+        self.n_free += opened;
     }
 
     /// 現在の推定姿勢。ロスト ([`Belief::is_lost`]) と未初期化は None。free
@@ -1739,5 +1784,42 @@ mod tests {
             "ピーク ({px:.2}, {py:.2}) がシードから遠い"
         );
         assert!(vg.data.iter().any(|&d| d == 0), "質量ゼロのセルが透過 (0) になっていない");
+    }
+
+    /// 地図の幽霊壁を、ビームが貫通した分だけ belief 側でも開く。VI 側だけ
+    /// 開けても予測が非 free の質量を捨てるので推定姿勢が壁を越えられない。
+    #[test]
+    fn clear_free_from_scan_opens_the_ghost_wall_for_the_belief() {
+        let mut g = walled_grid(60); // 3m×3m @0.05
+        // y = 1.5 m と 2.25 m に幽霊壁を 1 行ずつ (実世界には無い)。ビームは
+        // 手前の 1 本だけを貫通し、奥の 1 本には届かない。
+        for x in 1..59 {
+            g.data[(30 * 60 + x) as usize] = 100;
+            g.data[(45 * 60 + x) as usize] = 100;
+        }
+        let bc = BeliefConfig {
+            beam_step: 1,
+            init_sigma_xy_m: 0.01,
+            init_sigma_theta_deg: 0.5,
+            ..BeliefConfig::default()
+        };
+        let mut loc = Belief::new(&g, 36, &g, bc);
+        loc.seed(pose(1.525, 1.025, std::f64::consts::FRAC_PI_2)); // +y 向き、壁の 0.5 m 手前 (セル中心)
+
+        let free_at = |l: &Belief, x: f64, y: f64| {
+            let ix = ((x - l.ox) / l.res).floor() as i32;
+            let iy = ((y - l.oy) / l.res).floor() as i32;
+            l.free[(iy * l.nx + ix) as usize]
+        };
+        assert!(!free_at(&loc, 1.525, 1.525), "地図では壁");
+
+        // 実世界のスキャン: +y へ 1.2 m 先まで素通り (幽霊壁を貫通)。
+        let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![1.2] };
+        loc.clear_free_from_scan(&scan);
+
+        assert!(free_at(&loc, 1.525, 1.525), "ビームが貫通したセルが開くこと");
+        assert!(loc.field.free_at(1.525, 1.525), "尤度場側の free マスクも開くこと");
+        assert!(!free_at(&loc, 1.525, 2.275), "ヒット点 (2.225 m) より先の壁は開けないこと");
+        assert!(loc.n_free > 0, "free 数が更新されていること");
     }
 }

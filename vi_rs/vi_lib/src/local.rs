@@ -6,6 +6,36 @@ use crate::msg::{LaserScan, OccupancyGrid};
 use crate::params::{PROB_BASE, PROB_BASE_BIT};
 use crate::value_iterator::ValueIterator;
 
+/// 各ビームを始点から「ヒット点の `stop_back` [m] 手前」まで `step` [m] 刻みで
+/// 歩き、通過点の世界座標を `f` に渡す。`f` が false を返したらそのビームは
+/// 打ち切る (格子外に出た等 — ビームは直進するので戻ってこない。これが
+/// `range` が inf のときの無限ループも止める)。
+///
+/// VI 側 (`clear_map_from_scan`) と belief 側 (`Belief::clear_free_from_scan`)
+/// の共有ルーチン。両者は解像度も原点も違う格子を持つので、セル化は呼び側。
+pub fn walk_beams(
+    msg: &LaserScan,
+    x: f64,
+    y: f64,
+    t: f64,
+    step: f64,
+    stop_back: f64,
+    mut f: impl FnMut(f64, f64) -> bool,
+) {
+    for i in 0..msg.ranges.len() {
+        let a = t + msg.angle_increment * i as f64 + msg.angle_min;
+        let (ca, sa) = (a.cos(), a.sin());
+        let stop = msg.ranges[i] - stop_back; // 実物の障害物は開けない
+        let mut s = step;
+        while s < stop {
+            if !f(x + s * ca, y + s * sa) {
+                break;
+            }
+            s += step;
+        }
+    }
+}
+
 pub struct ValueIteratorLocal {
     pub base: ValueIterator,
     pub local_ix_min: i32,
@@ -180,31 +210,6 @@ impl ValueIteratorLocal {
                 d += 0.1;
             }
 
-            // 地図の壁/膨張帯の反証は上の d ループに相乗りできない: 0.1r 刻みの
-            // 9 点では r が大きいほど間隔が空き (r=3m・res=0.05 で 6 セル飛ぶ)、
-            // 開いた穴が繋がらないので通路にならない。ビーム線分をセル刻みで歩く。
-            if self.clear_map_from_scan {
-                let (ca, sa) = (a.cos(), a.sin());
-                let step = res * 0.5;
-                let stop = r - res; // ヒット点の手前まで — 実物の障害物は開けない
-                let mut s = step;
-                while s < stop {
-                    let bx = ((x + s * ca - ox) / res).floor() as i32;
-                    let by = ((y + s * sa - oy) / res).floor() as i32;
-                    // ビームは直進するので、窓を出たら戻らない = 打ち切ってよい。
-                    // range が inf のときの無限ループもこれで止まる。
-                    if !self.in_local_area(bx, by) {
-                        break;
-                    }
-                    for it in 0..nt {
-                        let index = self.base.to_index(bx, by, it) as usize;
-                        self.base.states[index].free = true;
-                        self.base.states[index].penalty = PROB_BASE;
-                    }
-                    s += step;
-                }
-            }
-
             for iix in (ix - 2)..=(ix + 2) {
                 for iiy in (iy - 2)..=(iy + 2) {
                     if !self.in_local_area(iix, iiy) {
@@ -216,6 +221,26 @@ impl ValueIteratorLocal {
                     }
                 }
             }
+        }
+
+        // 地図の壁/膨張帯の反証は上の d ループに相乗りできない: 0.1r 刻みの
+        // 9 点では r が大きいほど間隔が空き (r=3m・res=0.05 で 6 セル飛ぶ)、
+        // 開いた穴が繋がらないので通路にならない。ビーム線分をセル刻みで歩く。
+        if self.clear_map_from_scan {
+            walk_beams(msg, x, y, t, res * 0.5, res, |wx, wy| {
+                let bx = ((wx - ox) / res).floor() as i32;
+                let by = ((wy - oy) / res).floor() as i32;
+                // ビームは直進するので、窓を出たら戻らない = 打ち切ってよい。
+                if !self.in_local_area(bx, by) {
+                    return false;
+                }
+                for it in 0..nt {
+                    let index = self.base.to_index(bx, by, it) as usize;
+                    self.base.states[index].free = true;
+                    self.base.states[index].penalty = PROB_BASE;
+                }
+                true
+            });
         }
     }
 
