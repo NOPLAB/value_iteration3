@@ -43,7 +43,7 @@ pub(crate) fn relax_cell(
     nt: i32,
 ) -> Option<u64> {
     let before = vi.states[idx].total_cost;
-    value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt, &vi.belief);
+    value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt);
     let after = vi.states[idx].total_cost;
     if after < before {
         Some(after)

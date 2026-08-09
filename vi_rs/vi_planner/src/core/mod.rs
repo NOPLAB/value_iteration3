@@ -6,7 +6,7 @@
 //!   - 追従は同じ価値関数の ±1m ウィンドウをスキャンで補正しながら回す
 //!
 //! 狭域 → 広域の伝播 (全域掃き) は [`PlannerCore::sweep_global`]、収束前に
-//! 走り出す早期打ち切りは [`PlannerCore::prepare_goal_with_progress`] の doc に
+//! 走り出す早期走り出しは [`PlannerCore::prepare_goal_with_progress`] の doc に
 //! それぞれ詳細がある (経緯と実測値はリポジトリ CLAUDE.md)。
 //!
 //! # ファイルの分かれ方
@@ -41,10 +41,14 @@ mod prefetch;
 mod tests;
 
 pub use follow::{DwaController, FollowController, FollowKind, GreedyController, MppiController};
-// 自己位置推定は vi_lib::belief の全地図 Belief (アルゴリズムは vi_lib、配線は
-// ノードの分担)。窓つきの旧 localize::* はもう使わない。
-pub use vi_lib::belief::{mode_count, Belief, BeliefConfig};
-pub use vi_lib::value_iterator::BeliefModel;
+// 自己位置推定は 2 系統が併存する (アルゴリズムは vi_lib、配線はノードの分担):
+//   - 窓つき: vi_lib::localize の `Localizer` トレイト (external / grid / adaptive)。
+//   - 全地図: vi_lib::belief の `Belief` (belief / viterbi)。窓もレベル機構も無い。
+// `BeliefConfig` が両側にあるので、全地図側は別名で入れる。
+pub use vi_lib::belief::{mode_count, Belief, BeliefConfig as WholeMapBeliefConfig};
+pub use vi_lib::localize::{
+    AdaptiveLocalizer, BeliefConfig, ExternalLocalizer, GridLocalizer, Localizer,
+};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
@@ -53,8 +57,8 @@ use std::time::{Duration, Instant};
 use vi_lib::bridge::{value_slice_to_occupancy, yaw_to_goal_theta_deg, PoseView};
 use vi_lib::msg::{LaserScan, OccupancyGrid};
 use vi_lib::planner::{
-    densify, pose_to_cell, qmdp_decide, rollout_path_on, PathPose, PolicyView, QmdpDecision,
-    Rollout, RolloutStatus,
+    densify, optimal_action_at, pose_to_cell, qmdp_decide, rollout_path_on, PathPose, PolicyView,
+    QmdpDecision, Rollout, RolloutStatus,
 };
 use vi_lib::solvers::{solve_observed, SolveFlow, SolveObserver, SolveProbe, U64Solver};
 use vi_lib::value_iterator::ValueIterator;
@@ -198,18 +202,17 @@ pub struct PlanConfig {
     pub global_sweep: bool,
 
     // ── 走り出しの短縮 ──
-    /// **機体の現在地からゴールまで方策が繋がった時点で solve を打ち切る**か
-    /// (`false` = 従来どおり収束まで解く)。判定と代償は
-    /// [`PlannerCore::prepare_goal_with_progress`] の「早期打ち切り」を参照。
-    /// 打ち切りには起点が要るので、`from: None` で呼ばれた solve は
-    /// これが true でも最後まで解く。
+    /// **機体の現在地からゴールまで方策が繋がった時点で走り出せるようにする**か
+    /// (`false` = 収束するまで機体を止めておく)。**場を解くのをやめるわけではない**
+    /// — 繋がった時点で場をキャッシュに載せて追従へ渡し、残りは走りながら背景で
+    /// 解き切る (密は全域掃き、compact はタイル修復。どちらも同じ Bellman 更新)。
+    /// 判定と代償は [`PlannerCore::prepare_goal_with_progress`] の「早期走り出し」。
+    /// 起点が要るので、`from: None` で呼ばれた solve はこれが true でも
+    /// 収束するまで返らない。
+    ///
+    /// **背景の解き切りは `global_sweep` が担う**ので、これを立てるなら
+    /// `global_sweep: true` も要る (ノード側は early_start で自動的に立てる)。
     pub early_start: bool,
-
-    // ── belief 次元 (x, y, θ, b) ──
-    /// 価値関数へ足す belief 不確かさ次元。既定 (`nb_levels: 1`) は従来の 3D VI と
-    /// 構成的に同一。`nb_levels > 1` は密経路 + `caps().belief` のソルバ限定
-    /// ([`PlannerCore::prepare_goal_with_progress`] が `Unsupported` で弾く)。
-    pub belief: BeliefModel,
 }
 
 impl PlanConfig {
@@ -233,11 +236,14 @@ pub struct SolveStats {
     /// 先読み ([`Prefetcher`]) が用意しておいた場を受け取ったか。この呼び出しは
     /// solve していない = 走り出しまでの待ちが無かった、という意味。
     pub adopted: bool,
-    /// いま載っている場が**収束前に打ち切ったもの**か (`early_start`)。ゴールまでの
+    /// いま載っている場が**まだ解き終わっていない**か (`early_start`)。ゴールまでの
     /// 経路は繋がっているが、そこから外れた領域は未確定 (compact なら sink が
     /// `MAX_COST` のまま、密なら値が上振れしたまま)。キャッシュヒットのときも
     /// 載っている場の状態を映す。
-    pub truncated: bool,
+    ///
+    /// **永続的な印ではない**: 背景の解き切り ([`PlannerCore::sweep_global`]) が
+    /// 不動点に達した時点で降りる。降りたあとの場は収束まで解いたものと同じ。
+    pub partial: bool,
 }
 
 /// 1 回の plan の統計 (ログ/Feedback 用)。
@@ -246,7 +252,7 @@ pub struct PlanStats {
     pub solved_now: bool,
     pub iters: u32,
     pub adopted: bool,
-    pub truncated: bool,
+    pub partial: bool,
     pub poses: usize,
 }
 
@@ -262,7 +268,7 @@ pub enum PlanError {
     Sink(String),
     /// compact 経路の追従用パッチを構成できなかった (幾何が破綻している)。
     Patch(String),
-    /// この構成では提供できない機能 (compact / Group B ソルバでの belief 次元など)。
+    /// この構成では提供できない機能 (compact での能動的再定位など)。
     Unsupported(&'static str),
 }
 
@@ -306,11 +312,38 @@ struct CachedGoal {
     goal_y: f64,
     goal_t_deg: i32,
     field: Field,
-    /// 収束前に打ち切った場か ([`PlanConfig::early_start`])。**捨てて解き直す判断に
-    /// 要る**: 打ち切った場でロールアウトが通らなかったとき、この印が無いと
-    /// 同じキャッシュを何度でも返して同じ失敗を繰り返す (BT の 1Hz リプランは
-    /// キャッシュヒットなので solve に入らない = 自然には直らない)。
-    truncated: bool,
+    /// まだ解き終わっていない場か ([`PlanConfig::early_start`])。背景の解き切りが
+    /// 不動点に達すると [`PlannerCore::mark_complete`] が降ろす。
+    ///
+    /// **捨てて解き直す判断に要る**: 解き終わる前の場でロールアウトが通らなかった
+    /// とき、この印が無いと同じキャッシュを何度でも返して同じ失敗を繰り返す
+    /// (BT の 1Hz リプランはキャッシュヒットなので solve に入らない = 自然には
+    /// 直らない)。
+    partial: bool,
+}
+
+impl CachedGoal {
+    /// 背景の解き切りが不動点に達した = 場が解き終わった。`partial` の印を降ろす。
+    ///
+    /// 呼ぶのは「全域で Δ=0 の 1 掃きを終えた」ときだけ (密は
+    /// [`PlannerCore::sweep_global`]、compact は待ち行列が空になったタイル修復)。
+    /// 密の場は V ≥ V\* から単調に下がるので Δ=0 の 1 掃き = V\*、compact の
+    /// ブロック Gauss–Seidel も同じ不動点なので、この時点の場は収束まで解いた
+    /// ものと同一。暴走ガードで諦めた修復からは**呼ばない** (場はまだ解け切って
+    /// いないので、`discard_partial` の逃げ道を残しておく必要がある)。
+    fn mark_complete(&mut self) {
+        if !self.partial {
+            return;
+        }
+        self.partial = false;
+        // 走り出しの短縮を使ったときだけ出る 1 行。「走り出したあとちゃんと解き
+        // 切ったのか」を見る手掛かりが他に無い (掃きの done ログは狭域の伝播でも
+        // 出るので区別が付かない)。
+        eprintln!(
+            "vi_planner: the value function is now solved to convergence \
+             (early_start let the robot leave before it was)"
+        );
+    }
 }
 
 /// 全域掃き ([`PlannerCore::sweep_global`]) の再開位置。10 Hz の追従ループと同じ
@@ -369,10 +402,10 @@ fn goal_matches(a: (f64, f64, i32), b: (f64, f64, i32), tol_xy: f64, tol_deg: f6
         && circ_deg_diff(a.2, b.2) as f64 <= tol_deg
 }
 
-/// `from` からゴール圏まで、いまの場の方策だけで辿り着けるか。早期打ち切り
+/// `from` からゴール圏まで、いまの場の方策だけで辿り着けるか。早期走り出し
 /// ([`PlanConfig::early_start`]) の判定はこれ 1 つで、密経路と compact 経路が同じ
 /// 規則を使う (どちらも [`rollout_path_on`] = `plan` が実際に返す経路の作り方そのもの
-/// なので、「打ち切ったのに `plan` が失敗する」がこの判定を通った場では起きない)。
+/// なので、「走り出させたのに `plan` が失敗する」がこの判定を通った場では起きない)。
 fn reaches_goal(p: &dyn PolicyView, cfg: &PlanConfig, from: PoseView) -> bool {
     rollout_path_on(
         p,
@@ -391,13 +424,17 @@ fn reaches_goal(p: &dyn PolicyView, cfg: &PlanConfig, from: PoseView) -> bool {
 /// バンド finalize) ごとに呼ばれ、
 ///   1. cancel (プリエンプト) を観測し、
 ///   2. 途中経過を `on_progress` へ流し (probe の場は要求時にだけ具現化される)、
-///   3. `from` があれば早期打ち切り ([`PlanConfig::early_start`]) を判定する。
+///   3. `from` があれば早期走り出し ([`PlanConfig::early_start`]) を判定する。
 /// 判定は [`reaches_goal`] そのもの = `plan` が実際に返す経路の作り方なので、密でも
-/// compact でも「打ち切ったのに `plan` が失敗する」形の外し方をしない。
+/// compact でも「走り出させたのに `plan` が失敗する」形の外し方をしない。
+///
+/// 3 の `Stop` は**走り出しの合図であって solve の終わりではない**。ここで
+/// ソルバの呼び出しは畳むが、場は解き終わっていない印付きでキャッシュに載り、
+/// 残りは背景の解き切り (`sweep_global`) が同じ Bellman 更新で詰める。
 struct SolveDirector<'a> {
     cfg: &'a PlanConfig,
     cancel: &'a AtomicBool,
-    /// 早期打ち切りの起点 (None = 打ち切らない)。
+    /// 早期走り出しの起点 (None = 収束まで解いてから返す)。
     from: Option<PoseView>,
     on_progress: &'a mut dyn FnMut(&dyn PolicyView),
 }
@@ -421,18 +458,22 @@ impl SolveObserver for SolveDirector<'_> {
     }
 }
 
-/// `(ix, iy, it)` を `ib` 層で見て方策があれば Decision::Action を返す (読み取り専用)。
-/// `nb_levels == 1` では `ib` は常に 0 = 従来と同一。
-fn action_at(vi: &ValueIterator, ix: i32, iy: i32, it: i32, ib: i32) -> Option<Decision> {
-    let ai = PolicyView::action_index_b(vi, ix, iy, it, ib)?;
-    let a = &vi.actions[ai];
-    Some(Decision::Action { id: Some(a.id as usize), fw: a.delta_fw, rot_deg: a.delta_rot })
+/// `(ix, iy, it)` に方策があれば Decision::Action を返す (読み取り専用)。
+fn action_at(vi: &ValueIterator, ix: i32, iy: i32, it: i32) -> Option<Decision> {
+    let id = optimal_action_at(vi, ix, iy, it);
+    if id < 0 {
+        return None;
+    }
+    let a = vi.actions.iter().find(|a| a.id == id)?;
+    Some(Decision::Action { id: Some(id as usize), fw: a.delta_fw, rot_deg: a.delta_rot })
 }
 
-/// 範囲内で final_state か (境界チェック込み)。`ib` 層で見たゴール圏 — b が
-/// `ib_goal` より不確かな層ではゴールが終端にならない (coastal navigation)。
-fn is_final(vi: &ValueIterator, ix: i32, iy: i32, it: i32, ib: i32) -> bool {
-    PolicyView::is_final_b(vi, ix, iy, it, ib)
+/// 範囲内で final_state か (境界チェック込み)。
+fn is_final(vi: &ValueIterator, ix: i32, iy: i32, it: i32) -> bool {
+    vi.in_map_area(ix, iy)
+        && it >= 0
+        && it < vi.cell_num_t
+        && vi.states[vi.to_index(ix, iy, it) as usize].final_state
 }
 
 /// solve 済み場の θ=0 全域スライスを可視化用 OccupancyGrid に描画する (0..=100、
@@ -574,25 +615,33 @@ impl PlannerCore {
     /// 最中なら終わるまで待つ。どちらにせよ最後に**並びの次の点**を注文するので、
     /// 巡回中は「いまのゴールへ走っている間に次のゴールが解けている」状態になる。
     ///
-    /// # 早期打ち切り (`early_start`)
+    /// # 早期走り出し (`early_start`)
     ///
     /// `from` は**機体のいまの姿勢**。[`PlanConfig::early_start`] が true でこれが
-    /// 与えられていると、solve を収束まで回さず「`from` からゴールまで方策が
-    /// 繋がった」時点で止める。判定はロールアウトそのもの — 途中の場の上で
-    /// [`rollout_path_on`] を試し、ゴール圏に着いたら打ち切る。「値がロボットの
+    /// 与えられていると、「`from` からゴールまで方策が繋がった」時点でこの呼び出しが
+    /// 返り、機体が走り出せるようになる。判定はロールアウトそのもの — 途中の場の
+    /// 上で [`rollout_path_on`] を試し、ゴール圏に着いたら返す。「値がロボットの
     /// 近くまで来たか」を距離や値で近似せず、**使う経路が引けたかを直接見る**
     /// (近似だと、経路上の 1 セルだけ未確定で `plan` が失敗する形の外し方をする)。
     ///
-    /// 止めた場でよい理由は経路の側にある。compact 経路の finalize は値の昇順に
-    /// 進むので、sink に載っている列は**最後まで解いたときと同じ値** (未確定の列が
-    /// `MAX_COST` のまま残っているだけ)。密経路は値が上から単調に下がるので、途中の
-    /// 場は常に Bellman の上界 = 貪欲降下は必ず値を下げながらゴールに着く (循環しない)
-    /// — ただし**最短とは限らない**。密で打ち切った場は `global_sweep: true` なら
-    /// 走りながら全域掃きが最後まで詰める。
+    /// **場を解くのはここでやめない。** 返る時点の場は `partial` の印付きで
+    /// キャッシュに載り、残りは機体が走っている間に背景で解き切られる — 密は
+    /// [`PlannerCore::sweep_global`] の全域 Gauss–Seidel、compact は
+    /// [`compact::Repair`] のタイル修復で、どちらも solve と同じ `value_iteration_at`。
+    /// 不動点に達した時点で [`PlannerCore::mark_complete`] が印を降ろし、その場は
+    /// 収束まで解いたものと同一になる (密は V ≥ V\* から単調に下がるので Δ=0 の
+    /// 1 掃き = V\*、compact のブロック Gauss–Seidel も同じ不動点)。伝播の起点が
+    /// 要る compact では、ここで地図を丸ごと修復の待ち行列へ入れる。
     ///
-    /// 代償は「ゴールまでの経路の外は未確定」であること。機体が経路から外れると
-    /// 未確定領域に入り得るので、`plan` のロールアウトが通らなかったときは
-    /// [`PlannerCore::discard_truncated`] で捨てて解き直す道を必ず残しておくこと
+    /// 走り出した直後の場でよい理由は経路の側にある。compact 経路の finalize は値の
+    /// 昇順に進むので、sink に載っている列は**最後まで解いたときと同じ値** (未確定の
+    /// 列が `MAX_COST` のまま残っているだけ)。密経路は値が上から単調に下がるので、
+    /// 途中の場は常に Bellman の上界 = 貪欲降下は必ず値を下げながらゴールに着く
+    /// (循環しない) — ただし解き終わるまでは**最短とは限らない**。
+    ///
+    /// 代償は「解き終わるまでゴールまでの経路の外は未確定」であること。機体が経路から
+    /// 外れると未確定領域に入り得るので、`plan` のロールアウトが通らなかったときは
+    /// [`PlannerCore::discard_partial`] で捨てて解き直す道を必ず残しておくこと
     /// (キャッシュヒットは solve に入らないので、放っておくと同じ失敗が続く)。
     pub fn prepare_goal_with_progress(
         &mut self,
@@ -603,29 +652,14 @@ impl PlannerCore {
     ) -> Result<SolveStats, PlanError> {
         let goal_t_deg = yaw_to_goal_theta_deg(goal.yaw_rad);
         let mut stats =
-            SolveStats { solved_now: false, iters: 0, adopted: false, truncated: false };
-
-        // belief 次元の適用範囲 (ノード側の起動時検証と同じ条件のベルト。素通しすると
-        // vi_lib の solve_observed が assert で落ちる)。
-        if self.cfg.belief.nb_levels > 1 {
-            if self.cfg.use_compact() {
-                return Err(PlanError::Unsupported(
-                    "belief_levels > 1 needs the dense path (the compact sink is 3D)",
-                ));
-            }
-            if !self.cfg.solver.caps().belief {
-                return Err(PlanError::Unsupported(
-                    "belief_levels > 1 needs a solver with caps().belief (solver: frontier2d)",
-                ));
-            }
-        }
+            SolveStats { solved_now: false, iters: 0, adopted: false, partial: false };
 
         if self.cache_matches(&goal, goal_t_deg) {
             // ここも注文の入口。BT は追従中も 1Hz で計画を投げ直すので、最初の
             // 1 回で注文できていなくても (並びがまだ届いていない等) 次の tick で
             // 拾える。同じ点の注文は 2 回目以降 no-op。
             self.request_next(goal);
-            stats.truncated = self.cached.as_ref().is_some_and(|c| c.truncated);
+            stats.partial = self.cached.as_ref().is_some_and(|c| c.partial);
             return Ok(stats);
         }
 
@@ -662,10 +696,10 @@ impl PlannerCore {
             Some(pf) => pf.adopt(goal, goal_t_deg, cancel),
             None => None,
         };
-        // 打ち切りの起点。`early_start` でも起点が無ければ打ち切らない (先読みの
-        // ワーカーがここを通る道でもある — あちらは `prepare_goal` 経由で
-        // `from: None`。次の点を解いている間に機体は動くので、いまの姿勢を起点に
-        // 打ち切った場は着いた頃には使えない)。
+        // 早期走り出しの起点。`early_start` でも起点が無ければ収束まで解いてから
+        // 返す (先読みのワーカーがここを通る道でもある — あちらは `prepare_goal`
+        // 経由で `from: None`。次の点を解いている間に機体は動くので、いまの姿勢を
+        // 起点にした「繋がった」判定は着いた頃には意味がない)。
         let from = self.cfg.early_start.then_some(from).flatten();
 
         let cached = match adopted {
@@ -684,42 +718,55 @@ impl PlannerCore {
                     goal_y: goal.y,
                     goal_t_deg,
                     field,
-                    truncated: stats.truncated,
+                    partial: stats.partial,
                 }
             }
         };
 
         stats.solved_now = true;
-        // 打ち切った密の場は、走りながら全域掃きが最後まで詰める。掃きを回すかの
-        // 判断材料は `dirty` 1 つなので、ここで立てるだけでよい。
-        //
-        // compact で立てないのは、あちらの伝播が「変化した範囲」から広げる形だから。
-        // 立てても待ち行列が空で 1 回空振りするだけで、実際の起点は追従が始まって
-        // 最初の `commit_window` (窓が未確定域をまたいで値が動く) になる。
-        if stats.truncated && !self.cfg.use_compact() {
-            self.dirty = true;
-        }
         self.cached = Some(cached);
+        // 走り出せる形になっただけで、場はまだ解き終わっていない。**残りは走りながら
+        // 背景で解き切る** — 掃きを回すかの判断材料は `dirty` 1 つなので、密経路は
+        // ここで立てるだけでよい。
+        //
+        // compact の伝播は「変化した範囲」から広げる形なので、立てるだけでは待ち行列が
+        // 空で空振りする。未確定域は地図のどこにでもあるので、ここで地図を丸ごと
+        // 待ち行列へ入れて起点にする (確定済みのタイルは 1 パス Δ=0 で抜けるだけ)。
+        //
+        // ponytail: 全タイル投入は「未確定域の輪郭だけ入れる」より無駄がある。
+        // 広域地図で背景の掃きが長すぎたら、finalize 済みの範囲を solve から
+        // 受け取って輪郭のタイルだけ積むこと。
+        if stats.partial {
+            self.dirty = true;
+            if let Some(r) = self.repair.as_mut() {
+                r.enqueue_all();
+            }
+        }
         self.request_next(goal);
         Ok(stats)
     }
 
-    /// 打ち切った (収束前に止めた) 場を捨てる。捨てたら true、収束済みの場や
+    /// まだ解き終わっていない場を捨てる。捨てたら true、解き終わった場や
     /// キャッシュ無しなら false。
     ///
-    /// **これが `early_start` の唯一の逃げ道**。打ち切った場でロールアウトが
+    /// **これが `early_start` の唯一の逃げ道**。解き終わる前の場でロールアウトが
     /// 通らない / 方策が引けないとき、キャッシュが載ったままだと BT が何度
     /// 投げ直しても `prepare_goal_*` はキャッシュヒットで返って同じ失敗を繰り返す。
-    /// 捨てておけば次の要求が最後まで解き直す (`from` を渡さなければ打ち切らない)。
-    pub fn discard_truncated(&mut self) -> bool {
-        if !self.cached.as_ref().is_some_and(|c| c.truncated) {
+    /// 捨てておけば次の要求が解き直す (`from` を渡さなければ収束まで返らない)。
+    pub fn discard_partial(&mut self) -> bool {
+        if !self.cached.as_ref().is_some_and(|c| c.partial) {
             return false;
         }
         self.cached = None;
         if let Some(p) = self.patch.as_mut() {
-            p.at = None; // 打ち切った場から起こしたパッチで走らせない
+            p.at = None; // 解き終わっていない場から起こしたパッチで走らせない
         }
         true
+    }
+
+    /// いま載っている場がまだ解き終わっていないか ([`PlanConfig::early_start`])。
+    pub fn is_partial(&self) -> bool {
+        self.cached.as_ref().is_some_and(|c| c.partial)
     }
 
     /// 先読みへ「いまのゴールはこれ」と伝える (並びの次の点の注文がここで出る)。
@@ -731,7 +778,7 @@ impl PlannerCore {
     }
 
     /// 密経路: `ValueIterator::states` を確保し、[`solve_observed`] + [`SolveDirector`]
-    /// で解く。cancel の観測・途中経過・早期打ち切り (`from` があるとき) はすべて
+    /// で解く。cancel の観測・途中経過・早期走り出し (`from` があるとき) はすべて
     /// solve 内部の境界 (`solve_chunk` 反復ごと) で行われる — 旧実装のチャンク再入
     /// (毎チャンクの再ビルド + 全セル write_back) はもう無い。境界で場を読めることは
     /// ソルバ側の契約 (`SolveProbe::policy`) で、全 `U64Solver` が conformance テストで
@@ -749,8 +796,6 @@ impl PlannerCore {
             return Err(PlanError::Cancelled);
         }
         let mut vi = ValueIteratorLocal::new(self.build.actions.clone(), 1);
-        // **set_map より前**に入れること — states の層数と info はそこで確定する。
-        vi.base.belief = self.cfg.belief.clone();
         vi.set_map_with_occupancy_grid(
             &self.build.grid,
             self.build.theta_cell_num,
@@ -767,7 +812,7 @@ impl PlannerCore {
         let out =
             solve_observed(&mut vi.base, self.cfg.solver, self.cfg.max_solve_iter, &mut director);
         stats.iters = out.iters;
-        stats.truncated = out.stopped;
+        stats.partial = out.stopped;
         if out.cancelled {
             return Err(PlanError::Cancelled);
         }
@@ -775,6 +820,76 @@ impl PlannerCore {
             return Err(PlanError::NotConverged);
         }
         Ok(Field::Dense(Box::new(vi)))
+    }
+
+    /// 能動的再定位の多目標場を用意する: ロスト中の仮説集合の判別点
+    /// ([`Localizer::reloc_targets`]) を**全 θ** の final_state にマークして
+    /// (`ValueIterator::set_goal_region`) 収束まで解き、キャッシュに載せる。
+    /// 以後の [`Self::decide_qmdp`] はこの場を読む — どの仮説が真でも、その仮説に
+    /// とっての判別点へ向かう行動になる。
+    ///
+    /// - キャッシュのゴールは**意図的に本来のゴールと一致しない** (先頭の判別点):
+    ///   復帰後の最初の `prepare_goal` / 計画要求がキャッシュミスで本来のゴールを
+    ///   解き直すので、専用の後始末は要らない。
+    /// - 密経路のみ。compact の sink ソルバは単一ゴール前提なので `Unsupported`
+    ///   を返す — 呼び出し側は受動復帰 (expansion resetting のみ) に任せること。
+    // ponytail: compact 対応は多シードの frontier finalize が要る — 必要になったら。
+    pub fn prepare_reloc_goal(
+        &mut self,
+        targets: &[(f64, f64)],
+        cancel: &AtomicBool,
+    ) -> Result<SolveStats, PlanError> {
+        if self.cfg.use_compact() {
+            return Err(PlanError::Unsupported("active relocalization needs the dense path"));
+        }
+        if targets.is_empty() {
+            return Err(PlanError::Unsupported("no relocalization targets"));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PlanError::Cancelled);
+        }
+        let mut stats =
+            SolveStats { solved_now: false, iters: 0, adopted: false, partial: false };
+        self.cached = None; // 旧キャッシュを先に解放 (prepare_goal と同じ規律)
+        if let Some(ov) = self.penalty.as_mut() {
+            ov.clear();
+        }
+        self.dirty = false;
+
+        let mut vi = ValueIteratorLocal::new(self.build.actions.clone(), 1);
+        vi.set_map_with_occupancy_grid(
+            &self.build.grid,
+            self.build.theta_cell_num,
+            self.build.safety_radius,
+            self.build.safety_radius_penalty,
+            self.build.goal_margin_radius,
+            self.build.goal_margin_theta,
+        );
+        vi.set_local_xy_range(self.build.local_xy_range);
+        // 半径はゴール margin と同じ、ただし最低 1 セルは確実にマークする。
+        let radius = self.build.goal_margin_radius.max(vi.base.xy_resolution);
+        vi.base.set_goal_region(targets, radius);
+
+        let mut director =
+            SolveDirector { cfg: &self.cfg, cancel, from: None, on_progress: &mut |_| {} };
+        let out =
+            solve_observed(&mut vi.base, self.cfg.solver, self.cfg.max_solve_iter, &mut director);
+        stats.iters = out.iters;
+        if out.cancelled {
+            return Err(PlanError::Cancelled);
+        }
+        if !out.converged {
+            return Err(PlanError::NotConverged);
+        }
+        self.cached = Some(CachedGoal {
+            goal_x: targets[0].0,
+            goal_y: targets[0].1,
+            goal_t_deg: 0,
+            field: Field::Dense(Box::new(vi)),
+            partial: false,
+        });
+        stats.solved_now = true;
+        Ok(stats)
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -794,7 +909,7 @@ impl PlannerCore {
 
     /// `plan` の途中経過コールバック付き版 (`prepare_goal_with_progress` と同じ規約)。
     ///
-    /// `start` は早期打ち切り (`early_start`) の起点でもある。打ち切った場で
+    /// `start` は早期走り出し (`early_start`) の起点でもある。解き終わる前の場で
     /// ロールアウトが通らなかったときは**その場で捨てて解き直す** — 失敗を
     /// そのまま返すと、キャッシュに載ったままの場を BT が何度でも引き直して
     /// 同じ失敗を繰り返す。
@@ -808,13 +923,13 @@ impl PlannerCore {
         let mut s = self.prepare_goal_with_progress(goal, Some(start), cancel, on_chunk)?;
 
         let mut r = self.rollout(start);
-        if !r.reached_goal() && self.discard_truncated() {
+        if !r.reached_goal() && self.discard_partial() {
             eprintln!(
-                "vi_planner: the truncated value function (early_start) does not roll out from \
-                 ({:.2}, {:.2}): {:?} — solving this goal to convergence instead",
+                "vi_planner: the not-yet-finished value function (early_start) does not roll out \
+                 from ({:.2}, {:.2}): {:?} — solving this goal to convergence instead",
                 start.x, start.y, r.status
             );
-            // 起点を渡さない = 今度は打ち切らない。先読みが次の点を解いている
+            // 起点を渡さない = 今度は収束まで返らない。先読みが次の点を解いている
             // 最中ならここで取り消されて注文し直しになる (走っている間に解き直す
             // 時間はあるので、失う仕事より繰り返す失敗のほうが高い)。
             s = self.prepare_goal_with_progress(goal, None, cancel, on_chunk)?;
@@ -834,7 +949,7 @@ impl PlannerCore {
                 solved_now: s.solved_now,
                 iters: s.iters,
                 adopted: s.adopted,
-                truncated: s.truncated,
+                partial: s.partial,
                 poses: poses.len(),
             },
         ))
@@ -889,8 +1004,6 @@ impl PlannerCore {
     /// ローカルウィンドウ範囲だけを現在方位の θ スライスで描画した可視化グリッド。
     /// `set_window` 後に呼ぶこと。地図端ではクランプ後の実範囲を使うので、本家
     /// `makeLocalValueFunctionMap` と違い幅とデータ長が常に一致する。
-    // ponytail: 可視化は b=0 スライス固定 ([`value_grid_on`] も同じ)。b̂ 層を見たく
-    // なったら to_index4 に ib を通す。
     pub fn window_value_grid(
         &self,
         pose: PoseView,
@@ -1105,13 +1218,18 @@ impl PlannerCore {
             return (delta, false);
         }
 
-        // 1 掃き完了。丸ごと Δ=0 なら新しい不動点に達している。
+        // 1 掃き完了。丸ごと Δ=0 なら新しい不動点に達している。**早期走り出しで
+        // 途中の場のまま走らせていた場合、これが「解き終わった」瞬間**でもある
+        // (密の場は V ≥ V* から単調に下がるので Δ=0 の 1 掃き = V*)。
         let swept_delta = cur.delta;
         cur.order = (order + 1) % orders;
         cur.pos = 0;
         cur.delta = 0;
         if swept_delta == 0 {
             self.dirty = false;
+            if let Some(c) = self.cached.as_mut() {
+                c.mark_complete();
+            }
         }
         (delta, true)
     }
@@ -1121,10 +1239,6 @@ impl PlannerCore {
     fn refine_pass_until(&mut self, should_stop: impl Fn() -> bool) -> (u64, bool) {
         let Some(vi) = self.local_mut() else { return (0, true) };
         let nt = vi.base.cell_num_t;
-        // b 層も舐める (本家 `local_value_iteration_loop` と同じ。nb_levels==1 では
-        // 1 周 = 従来と同一)。窓の中だけ 4D で精密化しないと、b̂ 層の値だけが
-        // スキャンの penalty を知らないまま残る。
-        let nb = vi.base.belief_levels();
         let mut delta = 0u64;
         for iix in vi.local_ix_min..=vi.local_ix_max {
             if should_stop() {
@@ -1132,10 +1246,8 @@ impl PlannerCore {
             }
             for iiy in vi.local_iy_min..=vi.local_iy_max {
                 for iit in 0..nt {
-                    for ib in 0..nb {
-                        let i = vi.base.to_index4(iix, iiy, iit, ib);
-                        delta = delta.saturating_add(vi.value_iteration_local(i));
-                    }
+                    let i = vi.base.to_index(iix, iiy, iit) as usize;
+                    delta = delta.saturating_add(vi.value_iteration_local(i));
                 }
             }
         }
@@ -1146,13 +1258,9 @@ impl PlannerCore {
     /// 選んだ [`FollowController`] — 既定の greedy は本家 `ViNode::decision` の
     /// `posToAction` 相当 (方策が無ければ近傍借用)、dwa は連続行動。
     /// compact 経路では `set_window` でパッチを起こしてから呼ぶこと。
-    ///
-    /// `ib_hat` は belief 不確かさレベルの推定値 ([`Belief::b_hat`])。`nb_levels == 1`
-    /// では 0 を渡せば従来と同一。
-    pub fn decide(&self, pose: PoseView, ib_hat: i32) -> Decision {
+    pub fn decide(&self, pose: PoseView) -> Decision {
         let Some(local) = self.local() else { return Decision::NoAction };
-        let ib = ib_hat.clamp(0, local.base.belief_levels() - 1);
-        self.follow.decide(&local.base, &self.cfg, pose, ib)
+        self.follow.decide(&local.base, &self.cfg, pose)
     }
 
     /// belief 仮説集合での判断 (QMDP — [`qmdp_decide`])。読む場は [`Self::decide`]
@@ -1161,9 +1269,9 @@ impl PlannerCore {
     /// 有意な仮説が衝突と言う行動しか無ければ `NoAction` (停止)。
     /// `follow_controller` (dwa/mppi) は経由しない — 多峰時は離散 QMDP が優先で、
     /// 単峰時は呼び出し側が [`Self::decide`] へフォールバックする分担。
-    pub fn decide_qmdp(&self, hyps: &[(PoseView, f64)], ib_hat: i32) -> Decision {
+    pub fn decide_qmdp(&self, hyps: &[(PoseView, f64)]) -> Decision {
         let Some(local) = self.local() else { return Decision::NoAction };
-        match qmdp_decide(&local.base, hyps, ib_hat) {
+        match qmdp_decide(&local.base, hyps) {
             QmdpDecision::Goal => Decision::Goal,
             QmdpDecision::Action(ai) => {
                 let a = &local.base.actions[ai];

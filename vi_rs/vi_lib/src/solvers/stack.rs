@@ -66,7 +66,7 @@ pub fn frontier_stack_solve_observed(
             for (ix, iy) in candidates[it].enumerate() {
                 let idx = vi.to_index(ix as i32, iy as i32, it as i32) as usize;
                 let before = vi.states[idx].total_cost;
-                value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt, &vi.belief);
+                value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt);
                 if vi.states[idx].total_cost < before {
                     updates += 1;
                     new_frontier[it].set(ix, iy);

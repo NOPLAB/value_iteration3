@@ -264,6 +264,22 @@ impl Repair {
         }
     }
 
+    /// 地図を丸ごと待ち行列へ入れる。早期走り出し ([`super::PlanConfig::early_start`])
+    /// で未確定のまま走り出した場を背景で解き切るための起点で、そこでしか呼ばない。
+    ///
+    /// 通常の伝播 ([`Self::enqueue_around`]) は「値が動いた範囲」から広げるが、
+    /// 解き終わっていない場では未確定域が地図のどこにでもあるので起点が要る。
+    /// 確定済みのタイルは 1 パスで Δ=0 になって抜けるだけなので、余分な仕事は
+    /// 地図 1 周ぶんに収まる。
+    pub(super) fn enqueue_all(&mut self) {
+        for t in 0..(self.tnx * self.tny) as u32 {
+            if !self.queued[t as usize] {
+                self.queued[t as usize] = true;
+                self.queue.push_back(t);
+            }
+        }
+    }
+
     /// 伝播 1 回ぶんの終わり。訪問数はログ用に写してから畳む。
     fn settle(&mut self) {
         self.last_visits = self.visits;
@@ -617,13 +633,14 @@ impl PlannerCore {
     /// compact (アウトオブコア) 経路: `states` を作らず地図とゴールから直接解き、
     /// 確定出力を sink に置く。進行制御は密経路と同じ [`SolveDirector`] 1 つ —
     /// 境界はバンド finalize ごとで、そこで cancel 観測・途中経過 (`on_chunk`、sink
-    /// ビューの `&dyn PolicyView`)・早期打ち切り ([`super::PlanConfig::early_start`])
+    /// ビューの `&dyn PolicyView`)・早期走り出し ([`super::PlanConfig::early_start`])
     /// が行われる (`cancel` はソルバ内部のラウンド境界でも従来どおり観測される)。
     ///
-    /// 早期打ち切りで**止めた sink はそのまま使える** — finalize は値の昇順に
+    /// 早期走り出しで**返した時点の sink はそのまま使える** — finalize は値の昇順に
     /// 進むので、載っている列は最後まで解いたときと同じ値で、未 finalize の列が
     /// `MAX_COST` のまま残っているだけ。したがって「経路が引けた」= その経路上の
-    /// 列は全部確定済み、になる。
+    /// 列は全部確定済み、になる。残りは走りながら [`Repair`] が同じ不動点まで
+    /// 詰める (待ち行列の起点は `prepare_goal_with_progress` の [`Repair::enqueue_all`])。
     pub(super) fn solve_compact(
         &self,
         goal: &PoseView,
@@ -663,7 +680,7 @@ impl PlannerCore {
             &mut director,
         );
         stats.iters = s.iters;
-        stats.truncated = s.stopped;
+        stats.partial = s.stopped;
         if s.cancelled {
             return Err(PlanError::Cancelled);
         }
@@ -772,6 +789,9 @@ impl PlannerCore {
         let Some(t) = r.queue.pop_front() else {
             r.settle();
             self.dirty = false;
+            // どのタイルも自分の halo に対して Δ=0 = 全域の不動点。早期走り出しで
+            // 未確定のまま走らせていた場は、ここで解き終わったことになる。
+            c.mark_complete();
             return (0, true);
         };
         r.queued[t as usize] = false;
@@ -820,6 +840,7 @@ impl PlannerCore {
         if done {
             r.settle();
             self.dirty = false;
+            c.mark_complete(); // 上の pop_front 側と同じ「全域の不動点」判定
         }
         (delta, done)
     }

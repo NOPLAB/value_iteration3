@@ -21,12 +21,6 @@
 //!   フォールバック時は名目列を捨てる — 場に合っていない列を次 tick に
 //!   持ち越さないため。
 //!
-//! belief 次元 (`nb_levels > 1`) との整合: greedy は方策もゴール判定も b̂ 層
-//! (`ib`) で読む。DWA/MPPI の軌道評価 (`dwa_decide` / `mppi_decide`) は
-//! `PolicyView` の 3 引数版 = **b=0 スライス**のまま — ゴール判定と greedy
-//! フォールバックだけが b̂ 層になる。
-//! (ponytail: b̂ 層の V̂ 補間が要るなら vi_lib::ctrl に value_at_b の口を足す。)
-//!
 //! compact 経路との整合: DWA/MPPI のホライズン (既定 1.0 s × v_max 0.3 m/s =
 //! 0.3 m) は ±1 m ウィンドウの内側に収まり、パッチ外へ出る候補は `value_at` が
 //! `MAX_COST` を返して自然に棄却される (凍結境界の不変条件はそのまま)。
@@ -69,11 +63,9 @@ impl FollowKind {
 ///
 /// 状態を持つ実装 (MPPI の warm start 等) は内部可変性で持つこと — `decide` は
 /// 共有ロックの下で `&self` で呼ばれる。
-/// `ib` は belief 不確かさレベルの推定値 (`Belief::b_hat`)。`nb_levels == 1` では
-/// 常に 0 = 従来と同一。
 pub trait FollowController: Send {
     fn name(&self) -> &'static str;
-    fn decide(&self, vi: &ValueIterator, cfg: &PlanConfig, pose: PoseView, ib: i32) -> Decision;
+    fn decide(&self, vi: &ValueIterator, cfg: &PlanConfig, pose: PoseView) -> Decision;
 }
 
 /// 設定から判断器を組む ([`super::PlannerCore::new`] が呼ぶ)。
@@ -95,13 +87,13 @@ impl FollowController for GreedyController {
         "greedy"
     }
 
-    fn decide(&self, vi: &ValueIterator, cfg: &PlanConfig, pose: PoseView, ib: i32) -> Decision {
+    fn decide(&self, vi: &ValueIterator, cfg: &PlanConfig, pose: PoseView) -> Decision {
         let (ix, iy, it) = pose_to_cell(vi, pose.x, pose.y, pose.yaw_rad);
 
-        if is_final(vi, ix, iy, it, ib) {
+        if is_final(vi, ix, iy, it) {
             return Decision::Goal;
         }
-        if let Some(d) = action_at(vi, ix, iy, it, ib) {
+        if let Some(d) = action_at(vi, ix, iy, it) {
             return d;
         }
 
@@ -113,10 +105,10 @@ impl FollowController for GreedyController {
                     continue;
                 }
                 let (nx, ny) = (ix + dx, iy + dy);
-                let cand = if is_final(vi, nx, ny, it, ib) {
+                let cand = if is_final(vi, nx, ny, it) {
                     Some(Decision::Goal)
                 } else {
-                    action_at(vi, nx, ny, it, ib)
+                    action_at(vi, nx, ny, it)
                 };
                 let Some(cand) = cand else { continue };
                 let d2 = (dx as i64) * (dx as i64) + (dy as i64) * (dy as i64);
@@ -153,9 +145,9 @@ impl FollowController for DwaController {
         "dwa"
     }
 
-    fn decide(&self, vi: &ValueIterator, cfg: &PlanConfig, pose: PoseView, ib: i32) -> Decision {
+    fn decide(&self, vi: &ValueIterator, cfg: &PlanConfig, pose: PoseView) -> Decision {
         let (ix, iy, it) = pose_to_cell(vi, pose.x, pose.y, pose.yaw_rad);
-        if is_final(vi, ix, iy, it, ib) {
+        if is_final(vi, ix, iy, it) {
             return Decision::Goal;
         }
         if let Some(c) = dwa_decide(vi, vi, &self.dwa, pose.x, pose.y, pose.yaw_rad) {
@@ -163,7 +155,7 @@ impl FollowController for DwaController {
         }
         // 候補全滅: 従来の離散 greedy (近傍借用込み) で救済する。膨張域の縁に
         // 掛かった・パッチの縁で評価不能、のような場面でロボットを止めないため。
-        GreedyController.decide(vi, cfg, pose, ib)
+        GreedyController.decide(vi, cfg, pose)
     }
 }
 
@@ -198,9 +190,9 @@ impl FollowController for MppiController {
         "mppi"
     }
 
-    fn decide(&self, vi: &ValueIterator, cfg: &PlanConfig, pose: PoseView, ib: i32) -> Decision {
+    fn decide(&self, vi: &ValueIterator, cfg: &PlanConfig, pose: PoseView) -> Decision {
         let (ix, iy, it) = pose_to_cell(vi, pose.x, pose.y, pose.yaw_rad);
-        if is_final(vi, ix, iy, it, ib) {
+        if is_final(vi, ix, iy, it) {
             return Decision::Goal;
         }
         let mut state = self.state.lock().unwrap();
@@ -212,6 +204,6 @@ impl FollowController for MppiController {
         // 直される)、DWA と同じく離散 greedy で救済する。
         state.reset();
         drop(state);
-        GreedyController.decide(vi, cfg, pose, ib)
+        GreedyController.decide(vi, cfg, pose)
     }
 }

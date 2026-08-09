@@ -19,7 +19,6 @@ pub fn frontier2d_solve_observed(
     obs: &mut dyn SolveObserver,
 ) -> SolveOutcome {
     let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
-    let nb = vi.belief_levels(); // b 層も (ix,iy) 候補ごとにまとめて再評価する
     let (mx, my, _mt) = displacement(vi);
     let (dx, dy) = (mx as u32, my as u32);
     let mut pacer = BoundaryPacer::new(obs);
@@ -33,13 +32,11 @@ pub fn frontier2d_solve_observed(
         for (ix, iy) in candidates.enumerate() {
             let mut u = 0u64;
             for it in 0..nt {
-                for ib in 0..nb {
-                    let idx = vi.to_index4(ix as i32, iy as i32, it, ib);
-                    let before = vi.states[idx].total_cost;
-                    value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt, &vi.belief);
-                    if vi.states[idx].total_cost < before {
-                        u += 1;
-                    }
+                let idx = vi.to_index(ix as i32, iy as i32, it) as usize;
+                let before = vi.states[idx].total_cost;
+                value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt);
+                if vi.states[idx].total_cost < before {
+                    u += 1;
                 }
             }
             if u > 0 {

@@ -28,7 +28,7 @@ fn update_block(
                 for it in 0..nt {
                     let idx = vi.to_index(ix, iy, it) as usize;
                     let before = vi.states[idx].total_cost;
-                    value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt, &vi.belief);
+                    value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt);
                     if vi.states[idx].total_cost < before {
                         updates += 1;
                         changed = true;

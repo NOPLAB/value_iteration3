@@ -7,9 +7,13 @@
 //! 判断に渡す姿勢だけを 3 way で切り替える:
 //!
 //! - `truth`  — 真値をそのまま渡す (理想推定の基準線。follow_ctrl_bench の greedy と同条件)。
-//! - `dead`   — [`vi_lib::belief::Belief`] を predict のみで回す (デッドレコニング。
-//!   correct の寄与を測るアブレーション)。
-//! - `belief` — predict + observe (VIOLA 本来の全地図 belief 推定)。
+//! - `dead`   — [`vi_lib::localize::GridLocalizer`] を predict のみで回す
+//!   (デッドレコニング。correct の寄与を測るアブレーション)。
+//! - `grid`   — predict + observe の**窓つき**ヒストグラム MCL (`GridLocalizer`)。
+//! - `belief` — 同じく predict + observe の**全地図** belief ([`vi_lib::belief::Belief`]、
+//!   `--viterbi` で min-plus 版)。窓つきとの違いは窓の有無だけではなく、幾何を
+//!   スケール後の VI 格子・尤度場を native に取る入れ子まで実ノードと同じになる点
+//!   (`grid` は native 一本)。
 //!
 //! 実行 (v, ω) には毎 tick ガウスノイズが乗る (3 モード共通 — 差は推定だけ)。
 //! 推定器へは指令値を渡す (ノイズを知らない = 実機と同じ)。ゴール判定は実ノード
@@ -38,7 +42,8 @@ use vi_bench::sim::{
 };
 use vi_lib::bridge::PoseView;
 use vi_lib::ctrl::{unicycle_step, CostView};
-use vi_lib::belief::{cast_scan, Belief, BeliefConfig};
+use vi_lib::belief::{Belief, BeliefConfig as WholeBeliefConfig};
+use vi_lib::localize::{cast_scan, BeliefConfig, GridLocalizer, Localizer};
 use vi_lib::params::MAX_COST;
 use vi_lib::planner::{pose_to_cell, PolicyView};
 use vi_lib::solvers::{solve, U64Solver};
@@ -128,7 +133,10 @@ struct Args {
     #[arg(long, default_value_t = 25.0)]
     scan_range: f64,
 
-    /// [`Belief`] のチューニング ([`BeliefConfig`] 対応、実機の校正ノブと同じ)。
+    /// 推定器のチューニング ([`BeliefConfig`] 対応、実機の校正ノブと同じ)。
+    /// `belief_half_m` は窓つき (`grid`) だけに効く。
+    #[arg(long, default_value_t = 2.5)]
+    belief_half_m: f64,
     #[arg(long, default_value_t = 0.2)]
     belief_sigma_m: f64,
     #[arg(long, default_value_t = 10)]
@@ -142,7 +150,7 @@ struct Args {
     #[arg(long, default_value_t = 10.0)]
     init_sigma_theta_deg: f64,
 
-    /// belief を min-plus (MAP / Viterbi) 更新則で回す。
+    /// 全地図 belief (`belief` モード) を min-plus (MAP / Viterbi) 更新則で回す。
     #[arg(long)]
     viterbi: bool,
 
@@ -165,14 +173,51 @@ fn default_map_path() -> PathBuf {
 enum Mode {
     Truth,
     Dead,
-    Belief,
+    Grid,
+    Whole,
 }
 impl Mode {
     fn name(self) -> &'static str {
         match self {
             Mode::Truth => "truth",
             Mode::Dead => "dead",
-            Mode::Belief => "belief",
+            Mode::Grid => "grid",
+            Mode::Whole => "belief",
+        }
+    }
+}
+
+/// 推定器の入れ物。窓つき ([`GridLocalizer`], `Localizer` トレイト) と全地図
+/// ([`Belief`]) は別の型なので、bench の中だけの都合でここに束ねる
+/// (実ノード側の同じ役の enum は `vi_planner::node::handles::Loc`)。
+enum Est {
+    Grid(GridLocalizer),
+    Whole(Box<Belief>),
+}
+
+impl Est {
+    fn predict(&mut self, v: f64, w_deg: f64, dt: f64) {
+        match self {
+            Est::Grid(l) => l.predict(v, w_deg, dt),
+            Est::Whole(b) => b.predict(v, w_deg, dt),
+        }
+    }
+    fn observe(&mut self, scan: &vi_lib::msg::LaserScan) {
+        match self {
+            Est::Grid(l) => l.observe(scan),
+            Est::Whole(b) => b.observe(scan),
+        }
+    }
+    fn pose(&self) -> Option<PoseView> {
+        match self {
+            Est::Grid(l) => l.pose(),
+            Est::Whole(b) => b.pose(),
+        }
+    }
+    fn quality(&self) -> f64 {
+        match self {
+            Est::Grid(l) => l.quality(),
+            Est::Whole(b) => b.quality(),
         }
     }
 }
@@ -229,17 +274,24 @@ fn simulate(
     goal: (f64, f64),
     seed_pose: PoseView,
     bc: BeliefConfig,
+    wbc: WholeBeliefConfig,
     noise_seed: u64,
     args: &Args,
 ) -> RunResult {
     let (mut x, mut y, mut yaw) = start;
     let mut rng = Rng(noise_seed.max(1));
     let mut loc = (mode != Mode::Truth).then(|| {
-        // 幾何 (belief 格子) は VI と同じスケール後の grid、尤度場だけ native。
-        // 実ノードと同じ入れ子 — 旧 GridLocalizer は native 一本だった。
-        let mut l = Belief::new(grid, N_THETA, native, bc);
-        l.seed(seed_pose);
-        l
+        if mode == Mode::Whole {
+            // 幾何 (belief 格子) は VI と同じスケール後の grid、尤度場だけ native。
+            // 実ノードと同じ入れ子 — 窓つきの GridLocalizer は native 一本。
+            let mut b = Belief::new(grid, N_THETA, native, wbc);
+            b.seed(seed_pose);
+            Est::Whole(Box::new(b))
+        } else {
+            let mut l = GridLocalizer::new(native, N_THETA, bc);
+            l.set_pose(seed_pose);
+            Est::Grid(l)
+        }
     });
     let mut r = RunResult {
         mode: mode.name(),
@@ -331,13 +383,8 @@ fn simulate(
 
         if let Some(l) = &mut loc {
             let t0 = Instant::now();
-            // dead は observe を呼ばないので belief 本体は動かず、pose() が残 pend を
-            // 解析加算するだけになる。
-            // ponytail: 累積 pend の直線近似 (初期 yaw で 1 本に伸ばす) なので、
-            // 旧 GridLocalizer の毎 tick シフトより曲線走行に弱い。correct 無しの
-            // 下限を測るアブレーションとしては用途どおり。
             l.predict(v, w_deg, args.tick_s);
-            if mode == Mode::Belief {
+            if mode != Mode::Dead {
                 let scan = cast_scan(
                     native,
                     PoseView { x, y, yaw_rad: yaw },
@@ -443,6 +490,18 @@ fn main() -> ExitCode {
     );
 
     let bc = BeliefConfig {
+        half_m: args.belief_half_m,
+        sensor_sigma_m: args.belief_sigma_m,
+        beam_step: args.beam_step,
+        max_range_m: args.scan_range,
+        motion_sigma_xy_m: args.motion_sigma_xy,
+        motion_sigma_theta_deg: args.motion_sigma_theta_deg,
+        init_sigma_xy_m: args.init_sigma_xy,
+        init_sigma_theta_deg: args.init_sigma_theta_deg,
+        ..BeliefConfig::default()
+    };
+    // 全地図 belief 側の同じノブ (窓の半径だけが無い)。
+    let wbc = WholeBeliefConfig {
         sensor_sigma_m: args.belief_sigma_m,
         beam_step: args.beam_step,
         max_range_m: args.scan_range,
@@ -451,11 +510,17 @@ fn main() -> ExitCode {
         init_sigma_xy_m: args.init_sigma_xy,
         init_sigma_theta_deg: args.init_sigma_theta_deg,
         viterbi: args.viterbi,
-        ..BeliefConfig::default()
+        ..WholeBeliefConfig::default()
     };
     {
-        let probe = Belief::new(&grid, N_THETA, &native, bc);
-        eprintln!("belief: {:.1} MB ({} free cells)", probe.belief_mb(), probe.free_cells());
+        let probe = GridLocalizer::new(&native, N_THETA, bc);
+        let whole = Belief::new(&grid, N_THETA, &native, wbc);
+        eprintln!(
+            "belief: grid {:.1} MB (window) / whole-map {:.1} MB ({} free cells)",
+            probe.belief_mb(),
+            whole.belief_mb(),
+            whole.free_cells()
+        );
     }
 
     // スタート乱択 (follow_ctrl_bench と同じ: free・障害物 2 セル以上・到達可能)。
@@ -506,7 +571,7 @@ fn main() -> ExitCode {
             start.1,
             start.2.to_degrees()
         );
-        for mode in [Mode::Truth, Mode::Dead, Mode::Belief] {
+        for mode in [Mode::Truth, Mode::Dead, Mode::Grid, Mode::Whole] {
             let r = simulate(
                 &vi,
                 &grid,
@@ -516,6 +581,7 @@ fn main() -> ExitCode {
                 (goal_wx, goal_wy),
                 seed_pose,
                 bc,
+                wbc,
                 noise_seed,
                 &args,
             );
@@ -552,7 +618,7 @@ fn main() -> ExitCode {
     println!();
     println!("| mode | reach | bel | bel_err_m | ticks | time_s | len_m | err_rms_m | err_max_m | yaw_rms_deg | quality | loc_us | max_us |");
     println!("|------|-------|-----|-----------|-------|--------|-------|-----------|-----------|-------------|---------|--------|--------|");
-    for mode in ["truth", "dead", "belief"] {
+    for mode in ["truth", "dead", "grid", "belief"] {
         let all: Vec<&RunResult> = results.iter().map(|(_, r)| r).filter(|r| r.mode == mode).collect();
         let ok: Vec<&&RunResult> = all.iter().filter(|r| r.reached).collect();
         // 到達扱い (truth final or 信じて停止) の走行。bel_err は後者の真値誤差平均。

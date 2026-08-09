@@ -70,7 +70,6 @@ fn cfg() -> PlanConfig {
         prefetch_poll_ms: 50,
         global_sweep: true,
         early_start: false,
-        belief: BeliefModel::default(), // nb_levels: 1 = 従来の 3D VI
     }
 }
 
@@ -104,7 +103,7 @@ fn plan_and_follow_share_a_single_solve() {
     // その価値関数のまま追従判断が下せる。
     let robot = pose(0.6, 0.6, 0.0);
     core.set_window(robot);
-    assert!(matches!(core.decide(robot, 0), Decision::Action { .. }));
+    assert!(matches!(core.decide(robot), Decision::Action { .. }));
 
     // 1Hz リプラン相当も solve なし (ロールアウトのみ)。
     let (_, s3) = core.plan(pose(0.8, 0.9, 0.3), goal, &cancel).expect("replan");
@@ -126,7 +125,7 @@ fn follows_policy_to_goal_on_empty_map() {
         let p = pose(x, y, yaw);
         core.set_window(p);
         core.refine_passes(1);
-        match core.decide(p, 0) {
+        match core.decide(p) {
             Decision::Goal => {
                 let d = core.goal_distance(x, y).unwrap();
                 assert!(d <= 0.3, "goal margin: d = {d}");
@@ -166,7 +165,7 @@ fn compact_follows_policy_to_goal() {
             last_at = at;
         }
         core.refine_passes(1);
-        match core.decide(p, 0) {
+        match core.decide(p) {
             Decision::Goal => {
                 let d = core.goal_distance(x, y).unwrap();
                 assert!(d <= 0.3, "goal margin: d = {d}");
@@ -228,7 +227,7 @@ fn compact_recenters_repeatedly_with_an_interior_patch() {
             }
         }
         core.refine_passes(1);
-        match core.decide(p, 0) {
+        match core.decide(p) {
             Decision::Goal => {
                 assert!(hydrations >= 3, "patch must move several times: {hydrations}");
                 assert!(
@@ -271,7 +270,7 @@ fn dwa_follows_to_goal_on_empty_map() {
     for _ in 0..3000 {
         let p = pose(x, y, yaw);
         core.set_window(p);
-        match core.decide(p, 0) {
+        match core.decide(p) {
             Decision::Goal => {
                 let d = core.goal_distance(x, y).unwrap();
                 assert!(d <= 0.3, "goal margin: d = {d}");
@@ -318,7 +317,7 @@ fn dwa_follows_to_goal_on_compact_patch() {
             last_at = at;
         }
         // refine はしない (スキャンを入れないので値は動かない)。decide だけを回す。
-        match core.decide(p, 0) {
+        match core.decide(p) {
             Decision::Goal => {
                 let d = core.goal_distance(x, y).unwrap();
                 assert!(d <= 0.3, "goal margin: d = {d}");
@@ -359,7 +358,7 @@ fn dwa_falls_back_to_greedy_on_unevaluable_cells() {
 
     // 障害物セルの上: DWA は評価不能 → greedy 借用が離散行動 (id: Some) を返す。
     let on_obstacle = pose(20.5 * RES, 20.5 * RES, 0.0);
-    assert!(matches!(core.decide(on_obstacle, 0), Decision::Action { id: Some(_), .. }));
+    assert!(matches!(core.decide(on_obstacle), Decision::Action { id: Some(_), .. }));
 }
 
 /// MPPI (連続行動) でも同じ場でゴール圏まで走り切れること。tick 間状態 (warm
@@ -380,7 +379,7 @@ fn mppi_follows_to_goal_on_empty_map() {
     for _ in 0..3000 {
         let p = pose(x, y, yaw);
         core.set_window(p);
-        match core.decide(p, 0) {
+        match core.decide(p) {
             Decision::Goal => {
                 let d = core.goal_distance(x, y).unwrap();
                 assert!(d <= 0.3, "goal margin: d = {d}");
@@ -418,7 +417,7 @@ fn mppi_falls_back_to_greedy_on_unevaluable_cells() {
     core.prepare_goal(pose(2.5, 2.5, 0.0), &cancel).expect("solve");
 
     let on_obstacle = pose(20.5 * RES, 20.5 * RES, 0.0);
-    assert!(matches!(core.decide(on_obstacle, 0), Decision::Action { id: Some(_), .. }));
+    assert!(matches!(core.decide(on_obstacle), Decision::Action { id: Some(_), .. }));
 }
 
 /// compact 経路の広域側が密経路と同じ経路を返すこと (ロールアウトは sink を読む)。
@@ -501,7 +500,7 @@ fn compact_with_mmap_sink_follows() {
     core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).expect("solve");
     let robot = pose(0.6, 0.6, 0.0);
     core.set_window(robot);
-    assert!(matches!(core.decide(robot, 0), Decision::Action { .. }));
+    assert!(matches!(core.decide(robot), Decision::Action { .. }));
     drop(core);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -558,9 +557,9 @@ fn compact_patch_is_invalidated_on_a_new_goal() {
 
     core.prepare_goal(pose(0.8, 2.4, 0.0), &cancel).expect("new goal");
     assert!(core.patch.as_ref().unwrap().at.is_none(), "stale patch must be dropped");
-    assert_eq!(core.decide(robot, 0), Decision::NoAction, "no policy before set_window");
+    assert_eq!(core.decide(robot), Decision::NoAction, "no policy before set_window");
     core.set_window(robot);
-    assert!(matches!(core.decide(robot, 0), Decision::Action { .. }));
+    assert!(matches!(core.decide(robot), Decision::Action { .. }));
 }
 
 #[test]
@@ -1097,7 +1096,7 @@ fn decide_borrows_action_from_neighbors() {
         solve_only: false,
         follow: strict_follow,
     };
-    assert_eq!(strict_core.decide(on_obstacle, 0), Decision::NoAction);
+    assert_eq!(strict_core.decide(on_obstacle), Decision::NoAction);
     // tolerance 4 (0.2m) なら近傍の行動を借りられる。
     let relaxed_follow = follow::make_controller(&cfg(), &strict_core.build.actions);
     let relaxed_core = PlannerCore {
@@ -1112,7 +1111,7 @@ fn decide_borrows_action_from_neighbors() {
         solve_only: false,
         follow: relaxed_follow,
     };
-    assert!(matches!(relaxed_core.decide(on_obstacle, 0), Decision::Action { .. }));
+    assert!(matches!(relaxed_core.decide(on_obstacle), Decision::Action { .. }));
 }
 
 #[test]
@@ -1646,7 +1645,7 @@ fn a_goal_adopted_as_the_first_one_can_still_be_followed() {
     let start = pose(1.0, 1.0, 0.0);
     fresh.set_window(start);
     assert!(
-        matches!(fresh.decide(start, 0), Decision::Action { .. }),
+        matches!(fresh.decide(start), Decision::Action { .. }),
         "受け取った場の上で方策が読めること"
     );
 }
@@ -1762,49 +1761,97 @@ fn the_core_and_the_prefetcher_cross_threads() {
 // 走り出しの短縮 (core::PlanConfig::early_start)
 //
 // 判定は密経路も compact 経路も同じ (`reaches_goal` = plan が返す経路の作り方
-// そのもの) なので、両者で見るのは「打ち切ったか」ではなく**打ち切った場が
-// 使えるか**にしてある。
+// そのもの) なので、両者で見るのは「早く返ったか」ではなく**返した場で走れるか**に
+// してある。そのうえで「走り出したあと解き切るか」を両経路で 1 本ずつ見る
+// (`*_is_solved_to_convergence_in_the_background`) — 早期走り出しは solve を
+// やめることではないので、そこが崩れると仕様として壊れる。
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn cfg_early() -> PlanConfig {
     PlanConfig { early_start: true, ..cfg() }
 }
 
-/// 密経路の本題: 起点からゴールまで方策が繋がった時点で solve が止まり、
+/// 掃きスレッド (main.rs) の代わりに、`done` か上限まで背景の解き切りを回す。
+/// 呼び出し規約は本物と同じ (`sweep_global` を繰り返し、`is_dirty` で止める)。
+fn finish_in_background(core: &mut PlannerCore, max_calls: usize) {
+    let mut cur = SweepCursor::default();
+    for _ in 0..max_calls {
+        if !core.is_dirty() {
+            return;
+        }
+        core.sweep_global(&mut cur, 5_000);
+    }
+    panic!("the background solve did not converge in {max_calls} calls");
+}
+
+/// 密経路の本題: 起点からゴールまで方策が繋がった時点で solve から返り、
 /// **その場のまま**経路が引けて追従もできること。
 #[test]
-fn early_start_cuts_the_dense_solve_once_the_path_exists() {
+fn early_start_returns_from_the_dense_solve_once_the_path_exists() {
     let goal = pose(0.5, 0.5, 0.0);
     let start = pose(1.5, 1.5, 0.0);
     let cancel = AtomicBool::new(false);
 
     let mut full = PlannerCore::new(build(64), cfg());
     let (_, sf) = full.plan(start, goal, &cancel).expect("full plan");
-    assert!(!sf.truncated);
+    assert!(!sf.partial);
 
     let mut early = PlannerCore::new(build(64), cfg_early());
     let (path, se) = early.plan(start, goal, &cancel).expect("early plan");
-    assert!(se.truncated, "起点まで繋がった時点で止まること");
-    assert!(se.iters < sf.iters, "打ち切ったぶん短いこと: {} vs {}", se.iters, sf.iters);
+    assert!(se.partial, "起点まで繋がった時点で返ること");
+    assert!(se.iters < sf.iters, "走り出しまでが短いこと: {} vs {}", se.iters, sf.iters);
     assert!(path.len() > 2);
 
-    // 打ち切った場でも追従の判断が下せる (方策は収束前でも書き戻されている)。
+    // 解き終わる前の場でも追従の判断が下せる (方策は収束前でも書き戻されている)。
     early.set_window(start);
-    assert!(matches!(early.decide(start, 0), Decision::Action { .. }));
+    assert!(matches!(early.decide(start), Decision::Action { .. }));
 }
 
-/// 打ち切った密の場には「まだ伝播させる仕事がある」印を付ける。走りながら
-/// 全域掃きが最後まで詰めるための唯一の判断材料がこれ (`global_sweep: true`)。
+/// 走り出しただけで solve をやめたわけではない、の本題 (密経路): 背景の全域掃きが
+/// 不動点まで詰め、**収束まで解いた場と bit-exact** になり `partial` が降りること。
 #[test]
-fn a_truncated_dense_field_is_left_dirty_for_the_global_sweep() {
+fn an_early_started_dense_field_is_solved_to_convergence_in_the_background() {
+    let goal = pose(0.5, 0.5, 0.0);
+    let start = pose(1.5, 1.5, 0.0);
+    let cancel = AtomicBool::new(false);
+
+    let mut full = PlannerCore::new(build(64), cfg());
+    full.plan(start, goal, &cancel).expect("full plan");
+
+    let mut early = PlannerCore::new(build(64), cfg_early());
+    let s = early.plan(start, goal, &cancel).expect("early plan").1;
+    assert!(s.partial && early.is_partial());
+    assert!(
+        dense_values(&early) != dense_values(&full),
+        "走り出した時点ではまだ解き終わっていないこと (前提が崩れるとこの試験は無意味)"
+    );
+
+    finish_in_background(&mut early, 100_000);
+    assert!(!early.is_partial(), "解き切ったら印が降りること");
+    assert_eq!(dense_values(&early), dense_values(&full), "収束まで解いた場と一致すること");
+}
+
+/// 密の場の全セルの値 (bit-exact 比較用。θ 層も全部見る — 1 層だけだと打ち切りの
+/// 差が消えて前提の assert が空振りする)。
+fn dense_values(core: &PlannerCore) -> Vec<u64> {
+    let Some(CachedGoal { field: Field::Dense(vi), .. }) = core.cached.as_ref() else {
+        panic!("dense field expected");
+    };
+    vi.base.states.iter().map(|s| s.total_cost).collect()
+}
+
+/// 走り出した密の場には「まだ解き切る仕事がある」印を付ける。背景の全域掃きを
+/// 回すかの唯一の判断材料がこれ (`global_sweep: true`)。
+#[test]
+fn an_early_started_dense_field_is_left_dirty_for_the_global_sweep() {
     let cancel = AtomicBool::new(false);
     let mut core = PlannerCore::new(build(64), cfg_early());
     let s = core
         .plan(pose(1.5, 1.5, 0.0), pose(0.5, 0.5, 0.0), &cancel)
         .expect("plan")
         .1;
-    assert!(s.truncated);
-    assert!(core.is_dirty(), "打ち切った場は掃きに渡すこと");
+    assert!(s.partial);
+    assert!(core.is_dirty(), "解き終わっていない場は掃きに渡すこと");
 
     // 収束まで解いた場は逆に印を持たない (最初の 1 掃きが無駄に回る)。
     let mut done = PlannerCore::new(build(64), cfg());
@@ -1812,21 +1859,21 @@ fn a_truncated_dense_field_is_left_dirty_for_the_global_sweep() {
     assert!(!done.is_dirty());
 }
 
-/// compact 経路: 打ち切った sink には経路に要る列だけが載り、遠くは未確定
+/// compact 経路: 走り出した時点の sink には経路に要る列だけが載り、遠くは未確定
 /// (`MAX_COST`) のまま。**それでも載っている値は最後まで解いたときと同じ** —
 /// finalize が値の昇順に進むので、確定した列は以後動かない。
 ///
-/// 地図が小さいと値域が丸ごと 1 バンドに収まって波が 2 つで終わる (= 打ち切る
+/// 地図が小さいと値域が丸ごと 1 バンドに収まって波が 2 つで終わる (= 早く返る
 /// 隙が無い) ので、ここだけ広めの地図を使う。
 #[test]
-fn early_start_cuts_the_compact_solve_and_leaves_the_far_side_unfinalized() {
+fn early_start_returns_from_the_compact_solve_and_leaves_the_far_side_unfinalized() {
     let goal = pose(1.0, 1.0, 0.0);
     let start = pose(4.0, 4.0, 0.0);
     let cancel = AtomicBool::new(false);
 
     let mut core = PlannerCore::new(build(256), cfg_early_compact());
     let (path, s) = core.plan(start, goal, &cancel).expect("early plan");
-    assert!(s.truncated, "波が残っているうちに止まること");
+    assert!(s.partial, "波が残っているうちに返ること");
     assert!(path.len() > 2);
 
     // 起点まわりは確定済み、地図の反対の隅はまだ。**この 2 つは走り出す前に見る** —
@@ -1835,7 +1882,7 @@ fn early_start_cuts_the_compact_solve_and_leaves_the_far_side_unfinalized() {
     assert!(compact_value_at(&core, start) < MAX_COST, "起点は確定していること");
     assert_eq!(compact_value_at(&core, far), MAX_COST, "遠くは未確定のままのはず");
 
-    // **本題**: 打ち切った場のままゴール圏まで走り切れること (既定の solver は
+    // **本題**: 解き終わる前の場のままゴール圏まで走り切れること (既定の solver は
     // compact なので、実機で通るのはこの経路)。窓は毎 tick 未確定域と確定域の
     // 境目をまたぐので、そこで NoAction になるならここで落ちる。
     let (mut x, mut y, mut yaw) = (start.x, start.y, start.yaw_rad);
@@ -1843,7 +1890,7 @@ fn early_start_cuts_the_compact_solve_and_leaves_the_far_side_unfinalized() {
         let p = pose(x, y, yaw);
         core.set_window(p);
         core.refine_passes(1);
-        match core.decide(p, 0) {
+        match core.decide(p) {
             Decision::Goal => {
                 assert!(core.goal_distance(x, y).unwrap() <= 0.3);
                 return;
@@ -1853,14 +1900,53 @@ fn early_start_cuts_the_compact_solve_and_leaves_the_far_side_unfinalized() {
                 y += fw * yaw.sin();
                 yaw += rot_deg.to_radians();
             }
-            Decision::NoAction => panic!("no action at ({x:.2}, {y:.2}) on the truncated field"),
+            Decision::NoAction => panic!("no action at ({x:.2}, {y:.2}) on the partial field"),
         }
     }
     panic!("did not reach the goal in 2000 steps");
 }
 
+/// 密経路と同じ本題を compact 経路で: 走り出したあとタイル修復が sink を解き切り、
+/// **収束まで解いた sink と bit-exact** になって `partial` が降りること。伝播の
+/// 起点は `prepare_goal_with_progress` が入れる `Repair::enqueue_all` だけで、
+/// **窓を 1 度も動かさずに**解き切れること (= 走行に依存しないこと) も同時に見る。
+#[test]
+fn an_early_started_compact_field_is_solved_to_convergence_in_the_background() {
+    let goal = pose(1.0, 1.0, 0.0);
+    let start = pose(4.0, 4.0, 0.0);
+    let cancel = AtomicBool::new(false);
+
+    let mut full = PlannerCore::new(build(128), cfg_compact());
+    full.plan(start, goal, &cancel).expect("full plan");
+
+    let mut early = PlannerCore::new(build(128), cfg_early_compact());
+    let s = early.plan(start, goal, &cancel).expect("early plan").1;
+    assert!(s.partial && early.is_partial());
+    assert!(
+        compact_values(&early) != compact_values(&full),
+        "走り出した時点ではまだ解き終わっていないこと (前提が崩れるとこの試験は無意味)"
+    );
+
+    finish_in_background(&mut early, 100_000);
+    assert!(!early.is_partial(), "解き切ったら印が降りること");
+    assert_eq!(compact_values(&early), compact_values(&full), "収束まで解いた場と一致すること");
+}
+
 fn cfg_early_compact() -> PlanConfig {
     PlanConfig { early_start: true, ..cfg_compact() }
+}
+
+/// compact の場の全セルの値 (bit-exact 比較用。[`dense_values`] と同じく全 θ 層)。
+fn compact_values(core: &PlannerCore) -> Vec<u64> {
+    let Some(CachedGoal { field: Field::Compact(f), .. }) = core.cached.as_ref() else {
+        panic!("compact field expected");
+    };
+    let (nx, ny, nt) = f.cell_num;
+    (0..ny)
+        .flat_map(|iy| (0..nx).map(move |ix| (ix, iy)))
+        .flat_map(|(ix, iy)| (0..nt).map(move |it| (ix, iy, it)))
+        .map(|(ix, iy, it)| f.sink.read(f.orig(ix, iy, it)).0)
+        .collect()
 }
 
 /// compact の場の `(x, y, θ=0)` の値。未確定の列は `MAX_COST` を返す。
@@ -1873,142 +1959,75 @@ fn compact_value_at(core: &PlannerCore, p: PoseView) -> u64 {
     f.sink.read(f.orig(ix, iy, 0)).0
 }
 
-/// 起点を渡さない solve は `early_start` でも最後まで解く。先読みのワーカーが
-/// 通るのがこの道で、打ち切った場を渡されると困る (次の点に着く頃には機体は
-/// 起点にいない)。
+/// 起点を渡さない solve は `early_start` でも収束まで返らない。先読みのワーカーが
+/// 通るのがこの道で、解き終わっていない場を渡されると困る (次の点に着く頃には
+/// 機体は起点にいない)。
 #[test]
-fn a_solve_without_an_anchor_is_never_cut_short() {
+fn a_solve_without_an_anchor_always_runs_to_convergence() {
     let cancel = AtomicBool::new(false);
     let mut core = PlannerCore::new(build(64), cfg_early());
     let s = core.prepare_goal(pose(0.5, 0.5, 0.0), &cancel).expect("solve");
-    assert!(s.solved_now && !s.truncated);
+    assert!(s.solved_now && !s.partial);
 }
 
-/// 打ち切りの唯一の逃げ道: 経路の外の未確定領域から計画を頼まれたら、
-/// **キャッシュを捨てて解き直す**。返しっぱなしにすると BT が投げ直しても
-/// キャッシュヒットで同じ失敗を繰り返す。
+/// 早期走り出しの唯一の逃げ道: 経路の外の未確定領域から計画を頼まれたら、
+/// **キャッシュを捨てて解き直す** (背景の解き切りが追いつく前に外れた場合)。
+/// 返しっぱなしにすると BT が投げ直してもキャッシュヒットで同じ失敗を繰り返す。
 #[test]
-fn a_truncated_field_that_cannot_be_rolled_out_is_solved_again() {
+fn a_partial_field_that_cannot_be_rolled_out_is_solved_again() {
     let goal = pose(0.3, 0.3, 0.0);
     let cancel = AtomicBool::new(false);
-    // 打ち切りを観測するのはチャンクの切れ目なので、刻みを 1 にして「起点に
-    // 届いた直後」で止める (既定の 16 だと、その 1 チャンクのあいだに波が
+    // 走り出しの判定を観測するのはチャンクの切れ目なので、刻みを 1 にして「起点に
+    // 届いた直後」で返す (既定の 16 だと、その 1 チャンクのあいだに波が
     // 地図の反対側まで行ってしまって未確定領域が残らない)。
     let mut core = PlannerCore::new(build(96), PlanConfig { solve_chunk: 1, ..cfg_early() });
 
     let s1 = core.plan(pose(0.9, 0.9, 0.0), goal, &cancel).expect("plan near").1;
-    assert!(s1.truncated);
+    assert!(s1.partial);
 
-    // 打ち切った時点では届いていない、ゴールからもっと遠い起点。
+    // 走り出した時点では届いていない、ゴールからもっと遠い起点。
     let (path, s2) = core.plan(pose(4.5, 4.5, 0.0), goal, &cancel).expect("plan far");
     assert!(s2.solved_now, "キャッシュを捨てて解き直すこと");
-    assert!(!s2.truncated, "解き直しは打ち切らない");
+    assert!(!s2.partial, "解き直しは収束まで返らない");
     assert!(path.len() > 2);
-    assert!(!core.discard_truncated(), "解き直した場に打ち切りの印は残らない");
+    assert!(!core.discard_partial(), "解き直した場に未完の印は残らない");
 }
 
-/// 収束済みの場は捨てない (`discard_truncated` は打ち切った場だけの逃げ道)。
+/// 解き終わった場は捨てない (`discard_partial` は解けていない場だけの逃げ道)。
 #[test]
-fn discard_truncated_leaves_a_converged_field_alone() {
+fn discard_partial_leaves_a_converged_field_alone() {
     let goal = pose(2.0, 2.0, 0.0);
     let cancel = AtomicBool::new(false);
     let mut core = PlannerCore::new(build(64), cfg());
     core.prepare_goal(goal, &cancel).expect("solve");
-    assert!(!core.discard_truncated());
+    assert!(!core.discard_partial());
     assert!(core.is_cached_goal(goal), "捨てられていないこと");
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// belief 次元 (x, y, θ, b)
-// ──────────────────────────────────────────────────────────────────────────
+/// 能動的再定位: 多目標場が解けて QMDP が乗ること。キャッシュは本来のゴールと
+/// 一致しない (復帰後の最初の要求が解き直す)。compact 構成は Unsupported。
+#[test]
+fn prepare_reloc_goal_serves_qmdp_toward_targets() {
+    let cancel = AtomicBool::new(false);
+    let mut core = PlannerCore::new(build(64), cfg());
+    let targets = [(0.8, 0.8), (2.4, 2.4)];
+    let stats = core.prepare_reloc_goal(&targets, &cancel).expect("reloc field");
+    assert!(stats.solved_now);
+    assert!(!core.is_cached_goal(pose(1.6, 1.6, 0.0)), "本来のゴールとは不一致のはず");
 
-/// 外周を壁で囲った格子 (belief の尤度場が立つように — 全 free だとスキャンが
-/// 何も当たらず補正できない)。
-fn walled(size: i32) -> BuildParams {
-    let mut b = build(size);
-    for i in 0..size {
-        for (x, y) in [(i, 0), (i, size - 1), (0, i), (size - 1, i)] {
-            b.grid.data[(y * size + x) as usize] = 100;
-        }
+    // 2 仮説 QMDP: どちらの仮説にも行動が出る (多目標場の上の走行)。
+    let hyps = [(pose(0.5, 0.5, 0.0), 0.5), (pose(2.7, 2.7, 0.0), 0.5)];
+    match core.decide_qmdp(&hyps) {
+        Decision::Action { .. } => {}
+        d => panic!("expected Action, got {d:?}"),
     }
-    b
-}
+    // 両仮説とも判別点圏内なら Goal (final_state は全 θ)。
+    let at = [(pose(0.8, 0.8, 1.0), 0.5), (pose(2.4, 2.4, 2.0), 0.5)];
+    assert_eq!(core.decide_qmdp(&at), Decision::Goal);
 
-/// `nb_levels` だけを差し替えた [`BeliefModel`]。私有フィールド (info/nx/layer —
-/// set_map が埋める) があるので struct update 構文はクレート外から使えない。
-fn belief_model(nb: i32) -> BeliefModel {
-    let mut m = BeliefModel::default();
-    m.nb_levels = nb;
-    m
-}
-
-/// belief 次元つきの設定。`caps().belief` を持つ密ソルバが要る。
-fn cfg_belief(nb: i32) -> PlanConfig {
-    PlanConfig { solver: U64Solver::Frontier2D, belief: belief_model(nb), ..cfg() }
-}
-
-/// **belief は核の外で生きる**: ゴールを解き直しても推定は素通しで残ること。
-/// 核の中に入れると 30 秒級の solve がロックを握っている間だけ推定が止まり、
-/// 走り出しの瞬間に姿勢が古くなる (だから `Loc` はノード側の別 Mutex にある)。
-#[test]
-fn the_belief_survives_a_goal_re_solve() {
-    let bp = walled(60);
-    let bc = BeliefConfig { beam_step: 1, ..BeliefConfig::default() };
-    let mut belief = Belief::new(&bp.grid, 36, &bp.grid, bc);
-    let truth = pose(1.2, 1.5, 0.5);
-    belief.seed(truth);
-    belief.observe(&vi_lib::belief::cast_scan(&bp.grid, truth, 60, 10.0));
-    let (before, ess) = (belief.pose().expect("seeded"), belief.ess());
-
-    let cancel = AtomicBool::new(false);
-    let mut core = PlannerCore::new(bp.clone(), cfg());
-    core.prepare_goal(pose(2.4, 2.4, 0.0), &cancel).expect("goal A");
-    core.prepare_goal(pose(0.6, 2.4, 0.0), &cancel).expect("goal B");
-
-    let after = belief.pose().expect("still localized");
-    assert_eq!((after.x, after.y, after.yaw_rad), (before.x, before.y, before.yaw_rad));
-    assert_eq!(belief.ess(), ess);
-    // 生きたまま = 解き直しの後も補正が続けられる。
-    belief.observe(&vi_lib::belief::cast_scan(&bp.grid, truth, 60, 10.0));
-    let p = belief.pose().expect("still localized after another scan");
-    assert!((p.x - truth.x).hypot(p.y - truth.y) < 0.3);
-}
-
-/// `decide` は b̂ 層を読む: ゴール上でも「不確かなままでは着いたことにならない」
-/// (`ib_goal` より上の層では final_state ではない = coastal navigation の効き目)。
-#[test]
-fn decide_gates_the_goal_on_the_belief_layer() {
-    let cancel = AtomicBool::new(false);
-    let mut core = PlannerCore::new(walled(48), cfg_belief(3));
-    let goal = pose(1.2, 1.2, 0.0);
-    core.prepare_goal(goal, &cancel).expect("solve with the belief dimension");
-    core.set_window(goal);
-
-    // b̂ = 0 (十分集中) — ゴール圏。
-    assert_eq!(core.decide(goal, 0), Decision::Goal);
-    // 同じ姿勢で b̂ = 2 (ロスト相当) — ゴールにはならない。
-    assert_ne!(core.decide(goal, 2), Decision::Goal);
-}
-
-/// belief 次元を持てない構成は `Unsupported` で弾く (ノード側の起動時検証の
-/// ベルト。素通しすると vi_lib の solve_observed が assert で落ちる)。
-#[test]
-fn belief_levels_needs_a_dense_belief_capable_solver() {
-    let cancel = AtomicBool::new(false);
-    let goal = pose(1.2, 1.2, 0.0);
-
-    // compact (sink は 3D)。
-    let mut compact = PlannerCore::new(
-        build(48),
-        PlanConfig { belief: belief_model(3), ..cfg_compact() },
-    );
-    assert!(matches!(compact.prepare_goal(goal, &cancel), Err(PlanError::Unsupported(_))));
-
-    // Group B の密ソルバ (既定の frontier2d_sparse がこれ)。
-    assert!(!U64Solver::Frontier2DSparse.caps().belief);
-    let mut sparse = PlannerCore::new(
-        build(48),
-        PlanConfig { belief: belief_model(3), ..cfg() },
-    );
-    assert!(matches!(sparse.prepare_goal(goal, &cancel), Err(PlanError::Unsupported(_))));
+    let mut compact = PlannerCore::new(build(64), cfg_compact());
+    assert!(matches!(
+        compact.prepare_reloc_goal(&targets, &cancel),
+        Err(PlanError::Unsupported(_))
+    ));
 }
