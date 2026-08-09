@@ -393,7 +393,7 @@ pub fn run_follow(
             }
             // 自己位置が曖昧なほど壁際のマージンを広げる (文献 4·2·2)。注入の後に
             // 置く — 帯は地図の壁から起こすので、スキャンの塗り直しと打ち消し合わない。
-            core.inflate_by_sigma(sigma, pose);
+            core.inflate_by_sigma(sigma);
             core.refine_for(tuning.refine_budget);
 
             // 可視化グリッドの作成はロック内 (states を読む) / 配信は外。

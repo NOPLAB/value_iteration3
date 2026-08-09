@@ -111,7 +111,6 @@ VI_ARGS=(
     -p belief_motion_sigma_theta_deg:=2.0 # 規定: 2.0 [deg/tick]
                                          #   (尤度の床・枝刈り・リセット/ロスト判定は vi_lib 既定で固定)
     -p scan_quality_gate:=0.30          # 規定: 0.25 — 観測一致度がこれ未満の scan は注入を減衰、0 で無効
-    -p footprint_clear_m:=0.2            # 規定: 0.2 [m] — 注入のたびに機体周囲の local_penalty を消す、0 で無効
     # 上田ら 2023 (4·2·2) のマージン膨張: 自己位置の広がり σ[m] × これ を壁際の帯に足す。
     # house のドア幅 (~0.9m) に対し safety_radius 0.2 が両側で 0.4 を占めるので、σ 0.25 で
     # 既に通れなくなる。有効にするなら通路幅と σ の実測 (viola_pose の広がり) を見てから。

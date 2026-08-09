@@ -66,9 +66,6 @@ pub struct Params {
     /// スキャン注入の品質ゲート: localizer の観測一致度がこれを割ると注入
     /// penalty を quality/gate に比例して減衰 (2 冪量子化)。0 で無効。
     pub scan_quality_gate: f64,
-    /// footprint クリア半径 [m]: スキャン注入のたびに機体位置の周囲の
-    /// local_penalty を消す (真上でゴースト壁が閉じるのを防ぐ)。0 で無効。
-    pub footprint_clear_m: f64,
     /// 自己位置の広がり σ [m] × この係数 を、壁際マージンの膨張量にする
     /// (上田ら 2023 4·2·2 の「マージン m に σ を足す」)。0 で無効。
     /// σ は localizer の上位仮説の RMS 半径なので、`localizer` が external の
@@ -237,9 +234,6 @@ pub fn read_params(node: &Node) -> Result<Params> {
         // vi_lib の reset_quality (と adaptive の expand しきい値) と同じ 0.25。
         // external localizer は quality 1.0 固定なので実質無効。
         scan_quality_gate: p!("scan_quality_gate", f64, 0.25),
-        // ロボットが現にいる場所は free — 注入のたびに footprint を消し、
-        // ゴースト壁が真上で閉じて完全停止する事態を構造的に防ぐ。
-        footprint_clear_m: p!("footprint_clear_m", f64, 0.2),
         // 自己位置が曖昧なほど壁から離れて通る (文献のマージン膨張)。挙動が
         // 変わるので既定 off — 内蔵 localizer と併せて使うこと。
         sigma_margin_gain: p!("sigma_margin_gain", f64, 0.0),

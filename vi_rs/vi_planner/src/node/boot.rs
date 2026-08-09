@@ -337,7 +337,6 @@ pub fn build_core(
         path_spacing: params.path_spacing,
         action_tolerance_cells,
         follow_controller: follow_kind,
-        footprint_clear_m: params.footprint_clear_m,
         sigma_margin_gain: params.sigma_margin_gain,
         map_clear_from_scan: params.map_clear_from_scan,
         dwa_tick_s: 1.0 / params.control_frequency,

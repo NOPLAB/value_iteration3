@@ -92,7 +92,6 @@ VI_ARGS=(
     -p localizer:=external               # 規定: external — pose_topic の外部推定 (emcl2) に乗る。
                                          #   内蔵は belief (全地図 sum-product) / viterbi (同 min-plus)
     -p scan_quality_gate:=0.25           # 規定: 0.25 — external は quality 1.0 固定なので実質無効
-    -p footprint_clear_m:=0.2            # 規定: 0.2 [m] — 注入のたびに機体周囲の local_penalty を消す、0 で無効
     # ── 広域 (compute_path_to_pose) ──
     -p max_rollout_steps:=10000          # 規定: 10000 (経路ロールアウトの上限歩数)
     -p path_spacing:=0.05               # 規定: 0.05 [m] (densify の点間隔)

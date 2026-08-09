@@ -54,7 +54,6 @@ fn cfg() -> PlanConfig {
         path_spacing: RES,
         action_tolerance_cells: 4,
         follow_controller: FollowKind::Greedy,
-        footprint_clear_m: 0.0,
         sigma_margin_gain: 0.0,
         map_clear_from_scan: false,
         dwa_tick_s: 0.1,
@@ -765,39 +764,6 @@ fn observe_scan_gated_attenuates_injection() {
     let (hx, hy, _) = pose_to_cell(&vi.base, 1.5, 1.0, 0.0);
     let hit = vi.base.to_index(hx, hy, 0) as usize;
     assert_eq!(vi.base.states[hit].local_penalty, 256u64 << PROB_BASE_BIT);
-}
-
-/// footprint クリア: 機体の真上に塗られたゴースト壁が注入のたびに消えること。
-#[test]
-fn footprint_clear_erases_penalty_under_robot() {
-    let cancel = AtomicBool::new(false);
-    let robot = pose(1.0, 1.0, 0.0);
-    // 正面 0.1m のヒットは ±2 セルのブロックが機体のセルまで覆う。
-    let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.1] };
-
-    // クリア無効 (既定 0): 機体のセルに 2048 が残る = 閉じ込めの型。
-    let mut core = PlannerCore::new(build(64), cfg());
-    core.prepare_goal(pose(2.5, 1.0, 0.0), &cancel).expect("solve");
-    core.set_window(robot);
-    core.observe_scan(&scan, robot);
-    let (rx, ry, _) = {
-        let vi = core.local().unwrap();
-        pose_to_cell(&vi.base, 1.0, 1.0, 0.0)
-    };
-    {
-        let vi = core.local().unwrap();
-        let idx = vi.base.to_index(rx, ry, 0) as usize;
-        assert_eq!(vi.base.states[idx].local_penalty, 2048u64 << PROB_BASE_BIT);
-    }
-
-    // クリア有効: 同じ注入でも機体の周囲 0.2m は 0 に戻る。
-    let mut core = PlannerCore::new(build(64), PlanConfig { footprint_clear_m: 0.2, ..cfg() });
-    core.prepare_goal(pose(2.5, 1.0, 0.0), &cancel).expect("solve");
-    core.set_window(robot);
-    core.observe_scan(&scan, robot);
-    let vi = core.local().unwrap();
-    let idx = vi.base.to_index(rx, ry, 0) as usize;
-    assert_eq!(vi.base.states[idx].local_penalty, 0);
 }
 
 /// penalty 表が `set_local_cost` の書く値を**丸めずに**持てること

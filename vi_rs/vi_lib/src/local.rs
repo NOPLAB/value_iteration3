@@ -45,9 +45,8 @@ pub struct ValueIteratorLocal {
     pub local_ixy_range: i32,
     pub local_xy_range: f64,
     /// レーザーが貫通したセルの**地図由来**コスト (`free` / `penalty`) も反証するか
-    /// (本家に無い、既定 false)。`clear_local_penalty_around` と同じ理屈を地図側へ
-    /// 当てたもの — ビームが通り抜けた以上そこは空いている。地図が壁と言っている
-    /// なら地図が古いか自己位置がずれているかで、どちらにせよ通れる。
+    /// (本家に無い、既定 false) — ビームが通り抜けた以上そこは空いている。地図が
+    /// 壁と言っているなら地図が古いか自己位置がずれているかで、どちらにせよ通れる。
     /// スキャン由来の証拠がある所しか開けないので「地図を無視して突っ切る」には
     /// ならない。寿命は `local_penalty` と同じ (ゴールを解き直すと戻る)。
     pub clear_map_from_scan: bool,
@@ -116,25 +115,6 @@ impl ValueIteratorLocal {
         self.local_iy_min = 0;
         self.local_ix_max = self.local_ixy_range * 2;
         self.local_iy_max = self.local_ixy_range * 2;
-    }
-
-    /// (x,y) を中心とする半径 `radius_m` の正方形の local_penalty を 0 にする
-    /// (footprint クリア、本家に無い)。ロボットが現にいる場所は free という
-    /// 反証不能な証拠 — スキャンのゴースト壁が機体の真上で閉じるのを防ぐ。
-    pub fn clear_local_penalty_around(&mut self, x: f64, y: f64, radius_m: f64) {
-        let res = self.base.xy_resolution;
-        let cx = ((x - self.base.map_origin_x) / res).floor() as i32;
-        let cy = ((y - self.base.map_origin_y) / res).floor() as i32;
-        let r = (radius_m / res).ceil() as i32;
-        let nt = self.base.cell_num_t;
-        for ix in (cx - r).max(0)..=(cx + r).min(self.base.cell_num_x - 1) {
-            for iy in (cy - r).max(0)..=(cy + r).min(self.base.cell_num_y - 1) {
-                for it in 0..nt {
-                    let idx = self.base.to_index(ix, iy, it) as usize;
-                    self.base.states[idx].local_penalty = 0;
-                }
-            }
-        }
     }
 
     /// 本家 `inLocalArea`。
@@ -492,26 +472,6 @@ mod tests {
         }
         assert_eq!(vi.base.states[margin].penalty, PROB_BASE, "膨張帯も落ちること");
         assert!(!vi.base.states[at[20]].free, "ヒット点は貫通していない — 開けないこと");
-    }
-
-    #[test]
-    fn clear_local_penalty_around_erases_footprint() {
-        let mut vi = ValueIteratorLocal::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
-        let map = free_grid(60, 60);
-        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.2, 10);
-        let scan = LaserScan {
-            angle_min: 0.0,
-            angle_increment: 0.0,
-            ranges: vec![0.1], // ヒット点 (2, 0) — ±2 ブロックがロボットのセルを覆う
-        };
-        vi.set_local_cost(&scan, 0.0, 0.0, 0.0);
-        let robot = vi.base.to_index(0, 0, 0) as usize;
-        assert_eq!(vi.base.states[robot].local_penalty, 2048u64 << PROB_BASE_BIT);
-        vi.clear_local_penalty_around(0.0, 0.0, 0.1);
-        assert_eq!(vi.base.states[robot].local_penalty, 0);
-        // クリア半径の外 (ヒット点の右端) は残る。
-        let outside = vi.base.to_index(4, 0, 0) as usize;
-        assert_eq!(vi.base.states[outside].local_penalty, 2048u64 << PROB_BASE_BIT);
     }
 
     /// inflate_by_sigma: 静的マージンの**外側**にだけ帯が立ち、静的帯の中と

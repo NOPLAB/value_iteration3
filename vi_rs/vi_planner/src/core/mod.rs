@@ -162,20 +162,16 @@ pub struct PlanConfig {
     /// [`FollowKind::Dwa`] / [`FollowKind::Mppi`] = 連続行動)。詳細は
     /// [`follow`] モジュールの doc。
     pub follow_controller: FollowKind,
-    /// footprint クリアの半径 [m] (0 以下で無効)。スキャン注入のたびに機体位置の
-    /// 周囲の local_penalty を消す — ロボットが現にいる場所は free という反証
-    /// 不能な証拠で、ゴースト壁が機体の真上で閉じて完全停止するのを防ぐ。
-    pub footprint_clear_m: f64,
     /// 自己位置の広がり σ [m] に掛けてマージン膨張量にする係数 (0 以下で無効、既定 0)。
     /// 上田ら 2023 (4·2·2) の「マージン `m` に σ を足す」を、状態空間を拡張せずに
     /// ウィンドウの `local_penalty` で作る ([`PlannerCore::inflate_by_sigma`])。
     /// σ は [`vi_lib::belief::spread_m`] が localizer の上位仮説から測る。
     pub sigma_margin_gain: f64,
     /// レーザーが貫通したセルの**地図由来**コスト (`free` / 膨張帯 `penalty`) も
-    /// 反証するか (既定 false)。[`Self::footprint_clear_m`] が機体の真下でやって
-    /// いることを、ビームが通り抜けた範囲まで広げたもの。効くのは「地図には壁が
-    /// あるが実際には無い」— 自己位置がずれている / 地図が古い / ドアが開いた —
-    /// のケースで、ロボットが幽霊壁に囲まれて止まるのを解く。
+    /// 反証するか (既定 false)。ビームが通り抜けた以上そこは空いている、という
+    /// 反証。効くのは「地図には壁があるが実際には無い」— 自己位置がずれている /
+    /// 地図が古い / ドアが開いた — のケースで、ロボットが幽霊壁に囲まれて止まる
+    /// のを解く。
     ///
     /// スキャンが空いていると言った所しか開かないので「地図を無視して突っ切る」
     /// にはならない。逆に、自己位置がずれたまま開けた穴は本物の壁を消し得るので、
@@ -1089,16 +1085,10 @@ impl PlannerCore {
     /// 塗るとゴースト壁がロボットを global 勾配との間に挟んで止める。shift は
     /// [`quality_shift`] で quality から量子化する。0 は `observe_scan` と同一。
     pub fn observe_scan_gated(&mut self, scan: &LaserScan, pose: PoseView, shift: u32) {
-        let clear = self.cfg.footprint_clear_m;
         let map_clear = self.cfg.map_clear_from_scan;
         if let Some(vi) = self.local_mut() {
             vi.clear_map_from_scan = map_clear;
             vi.set_local_cost_attenuated(scan, pose.x, pose.y, pose.yaw_rad, shift);
-            // 注入の後に footprint を消す — 機体の真上に塗られたゴーストが勝たない
-            // ように (harvest より前なので compact の penalty 表にも 0 が写る)。
-            if clear > 0.0 {
-                vi.clear_local_penalty_around(pose.x, pose.y, clear);
-            }
         }
         self.harvest_penalties();
     }
@@ -1109,19 +1099,14 @@ impl PlannerCore {
     ///
     /// 膨張量はウィンドウ半径でクランプする。窓が丸ごと帯になるとロボットが
     /// 出口を失い、`decide` が NoAction を返し続けて停止するため。
-    pub fn inflate_by_sigma(&mut self, sigma_m: f64, pose: PoseView) {
+    pub fn inflate_by_sigma(&mut self, sigma_m: f64) {
         let gain = self.cfg.sigma_margin_gain;
         if gain <= 0.0 || sigma_m <= 0.0 {
             return;
         }
         let extra = (sigma_m * gain).min(self.build.local_xy_range);
-        let clear = self.cfg.footprint_clear_m;
         if let Some(vi) = self.local_mut() {
             vi.inflate_by_sigma(extra);
-            // 帯が機体の真下で閉じると動けなくなる (observe_scan_gated と同じ理由)。
-            if clear > 0.0 {
-                vi.clear_local_penalty_around(pose.x, pose.y, clear);
-            }
         }
         self.harvest_penalties();
     }
