@@ -1,36 +1,28 @@
 #!/usr/bin/env bash
-# VIOLA (vi_planner standalone + 内蔵の全地図 belief + QMDP) を TurtleBot3
-# house (Gazebo classic) で走らせるデモ。ネイティブ RoboStack 環境用。
-# WORLD=world で従来の turtlebot3_world (円柱 3 本、自由空間 19 m²) に戻せる。
+# VIP (vi_planner standalone、自己位置推定は外部 emcl2) を TurtleBot3 house
+# (Gazebo classic) で走らせるデモ。viola_tb3_demo.sh の内蔵 localizer 抜き版。
+# ネイティブ RoboStack 環境用。WORLD=world で従来の turtlebot3_world に戻せる。
 #
-# belief は VI と同じ格子に載る全地図フィールド (窓も多重解像度レベルも無い)。
-# 値反復は belief_levels > 1 で状態を (x, y, θ, b) に広げられるが、この地図では
-# 効かないので 1 のまま — 理由は belief_levels の行を参照。
+#   scripts/ros2_build.sh          # 先にネイティブビルド (vi_planner)
+#   # emcl2 は vi_ros2_ws/src/emcl2_ros2 を同じ ws で一度 colcon ビルドしておく:
+#   #   colcon build --merge-install --packages-select emcl2 ...
+#   scripts/vip_tb3_demo.sh        # Gazebo + map_server + emcl2 + vi_planner + RViz
 #
-#   scripts/ros2_build.sh          # 先にネイティブビルド
-#   scripts/viola_tb3_demo.sh      # Gazebo + map_server + vi_planner + RViz
-#
-# 起動後 (端末に "seeded" が出てから):
-#   - belief は spawn 位置 (-2, -0.5, 0°) に自動シード済み。ずらしたいときは
-#     RViz の「2D Pose Estimate」で撃ち直す (pose_topic = initialpose)。
+# 起動後:
+#   - emcl2 は initial_pose パラメータ (quick_start 設定 = spawn 位置 (-2, -0.5, 0°))
+#     で自己シード済み。ずらしたいときは RViz の「2D Pose Estimate」(/initialpose
+#     は emcl2 が受けてパーティクルを撒き直す)。
 #   - ゴールは RViz の「2D Goal Pose」で投入 — /goal_pose に出るだけなので、
 #     standalone の vi_planner が直接受けて navigate_to_pose と同じ経路で
 #     走らせる (nav2_rviz_plugins は不要)。CLI なら (house のリビング):
 #       ros2 topic pub --once /goal_pose geometry_msgs/msg/PoseStamped \
 #         '{header: {frame_id: map}, pose: {position: {x: -2.0, y: 3.0}}}'
-#   - map→odom TF は vi_planner が配信 (publish_tf、AMCL の契約の置き換え)。
-#     RViz のロボット・scan は推定姿勢に乗る (真値は Gazebo ウィンドウ)。
-#     ピンク矢印 (viola_pose) は推定そのもの — ロボットモデルと重なるのが正常。
+#   - map→odom TF は emcl2 が配信 (AMCL の契約)。vi_planner は mcl_pose を
+#     購読するだけ (localizer=external、publish_tf=false)。
 #
-# 各コンポーネントのログ: out/viola_demo_logs/*.log (無反応のときはまずここ)。
+# 各コンポーネントのログ: out/vip_demo_logs/*.log (無反応のときはまずここ)。
 #
-# house の地図は turtlebot3 に同梱されていないので scripts/gen_house_map.py で
-# 生成する (model.sdf の壁 box を LDS 高さ 0.18 m で水平スライス → ドア上部の
-# 垂れ壁は開口として抜ける)。412x310 @0.05 m、自由空間 308 m²。
-# この設定での実測: (-2, -0.5) → (-2, 3.0) (玄関を抜けてリビング) が 44 s で
-# ゴール到達 (solve 4.87 s、内蔵 belief のみで真値は一切戻していない)。
-#
-# 外部推定と比べたいときは scripts/vip_tb3_demo.sh (localizer=external + emcl2)。
+# 内蔵推定版 (scripts/viola_tb3_demo.sh) との比較用。
 set -euo pipefail
 WORLD="${WORLD:-house}"   # house | world — launch 名と assets/tb3_$WORLD/ に対応
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,7 +30,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 set +u; . "$REPO_ROOT/vi_ros2_ws/install/local_setup.sh"; set -u
 export TURTLEBOT3_MODEL=burger
 
-LOG="$REPO_ROOT/out/viola_demo_logs"
+LOG="$REPO_ROOT/out/vip_demo_logs"
 mkdir -p "$LOG"
 
 # 前回の残骸 gzserver/gzclient が居ると新しい gzserver が即死する (exit 255)。
@@ -55,10 +47,19 @@ ros2 run nav2_map_server map_server --ros-args \
     -p yaml_filename:="$REPO_ROOT/assets/tb3_$WORLD/map.yaml" \
     -p use_sim_time:=true >"$LOG/map_server.log" 2>&1 &
 
+# 外部自己位置推定: emcl2 (expansion resetting MCL)。quick_start 設定は
+# initial_pose = TB3 の spawn 位置 (house/world 共通) (-2, -0.5, 0°) 込み。/map を
+# transient_local で購読し、mcl_pose と map→odom TF を配信する。
+ros2 run emcl2 emcl2_node --ros-args \
+    --params-file "$REPO_ROOT/vi_ros2_ws/install/share/emcl2/config/emcl2_quick_start.param.yaml" \
+    -p use_sim_time:=true >"$LOG/emcl2.log" 2>&1 &
+
 # vi_planner の全パラメータ (main.rs の宣言順)。値はこのデモの設定で、各行の
 # コメントが規定値。規定値から変えているのは use_sim_time / map_wait_sec /
-# pose_topic / publish_tf / localizer / follow_controller / qmdp / standalone
-# のみ。
+# follow_controller / standalone のみ。内蔵 belief 系のパラメータ
+# (belief_* / qmdp) は localizer=external では未使用なので省略 — 内蔵推定を
+# 使う構成は viola_tb3_demo.sh 参照。値反復の belief 次元 (belief_levels) も
+# 内蔵推定が b̂ を供給しないと使えないので、ここでは規定の 1 (= 3D) のまま。
 VI_ARGS=(
     -p use_sim_time:=true                # 規定: false (ROS 標準) — Gazebo の /clock に乗る
     # ── ソルバ / 地図 ──
@@ -84,35 +85,15 @@ VI_ARGS=(
     # ── ゴール判定 / 姿勢・TF ──
     -p goal_tolerance_xy:=0.25           # 規定: 0.25 [m] (navigate_to_pose の達成判定)
     -p goal_tolerance_deg:=10.0          # 規定: 10.0 [deg]
-    -p pose_topic:=initialpose           # 規定: mcl_pose — 内蔵 belief では手動シード口
+    -p pose_topic:=mcl_pose              # 規定: mcl_pose — emcl2 の推定出力をそのまま使う
     -p global_frame:=map                 # 規定: map
-    -p publish_tf:=true                  # 規定: false — map→odom TF を配信 (AMCL の契約の置き換え)
-    -p transform_tolerance:=0.5          # 規定: 0.5 [s] (TF スタンプの未来日付け)
-    -p odom_topic:=odom                  # 規定: odom (publish_tf 用の T_odom→base の出どころ)
+    -p publish_tf:=false                 # 規定: false — map→odom TF は emcl2 が配信 (併用禁止)
+    -p transform_tolerance:=0.5          # 規定: 0.5 [s] (publish_tf 用、ここでは未使用)
+    -p odom_topic:=odom                  # 規定: odom (publish_tf 用、ここでは未使用)
     # ── 自己位置推定 ──
-    -p localizer:=belief                 # 規定: external | belief (全地図 sum-product) | viterbi (同 min-plus)
-                                         #   viterbi は observe が全域走査なので tb3 実測 183 ms/tick —
-                                         #   追従ループの 40 ms 予算を超える。ベンチ用と割り切る。
-    -p belief_sensor_sigma:=0.2          # 規定: 0.2 [m] (尤度場のガウス幅)
-    -p belief_beam_step:=10              # 規定: 10 (補正に使うビームの間引き、1 = 全ビーム)
-    -p belief_max_range:=25.0            # 規定: 25.0 [m] (これより遠いレンジは補正に使わない)
-    -p belief_motion_sigma_xy:=0.03      # 規定: 0.03 [m/tick] (predict の位置ノイズ)
-    -p belief_motion_sigma_theta_deg:=2.0 # 規定: 2.0 [deg/tick]
-    -p belief_z_min:=0.05                # 規定: 0.05 (ビーム尤度の床)
-    -p belief_weight_skip_ratio:=0.0001  # 規定: 1e-4 (補正で読む重みの相対しきい値)
-    -p belief_reset_quality:=0.25        # 規定: 0.25 — 観測一致度がこれを割ると free 一様を混ぜて再定位
-    -p belief_lost_ess:=500.0            # 規定: 500.0 — belief の有効セル数がこれを超えたらロスト
-    -p belief_levels:=1                  # 規定: 1 = b 次元なし。>1 で状態が (x,y,θ,b) になり、
-                                         #   ゴールは b ≤ 0 の層でしか成立しない (方策自体が先に
-                                         #   定位しに行く)。要 solver:=frontier2d + 非 compact、
-                                         #   メモリと solve 時間はレベル数倍。
-                                         #   tb3 では効かないので 1 のまま: 自由空間 19 m² が全て
-                                         #   壁の近傍で、どこを通っても同じだけ定位できる。実測
-                                         #   (bench_map --belief-levels 4 --scale 2 --solver frontier2d)
-                                         #   で 4 層とも到達可能・層間の平均値差 0.1% 未満、solve は
-                                         #   0.23 s → 1.04 s。効くのは「見通しの良い広間と特徴の多い
-                                         #   廊下が選べる」広い地図。
-    -p scan_quality_gate:=0.25           # 規定: 0.25 — 観測一致度がこれ未満の scan は注入を減衰、0 で無効
+    -p localizer:=external               # 規定: external — pose_topic の外部推定 (emcl2) に乗る。
+                                         #   内蔵は belief (全地図 sum-product) / viterbi (同 min-plus)
+    -p scan_quality_gate:=0.25           # 規定: 0.25 — external は quality 1.0 固定なので実質無効
     -p footprint_clear_m:=0.2            # 規定: 0.2 [m] — 注入のたびに機体周囲の local_penalty を消す、0 で無効
     # ── 広域 (compute_path_to_pose) ──
     -p max_rollout_steps:=10000          # 規定: 10000 (経路ロールアウトの上限歩数)
@@ -130,7 +111,7 @@ VI_ARGS=(
     -p busy_ticks_before_stop:=3         # 規定: 3 (ロック取れず連続 n tick で停止指令)
     -p patch_slack_cells:=2              # 規定: 2 (compact パッチの寸法スラック)
     -p repair_interior_cells:=16         # 規定: 16 (修復タイルの interior 一辺)
-    -p follow_controller:=mppi         # 規定: greedy (本家 decision) | dwa | mppi
+    -p follow_controller:=mppi           # 規定: greedy (本家 decision) | dwa | mppi
     -p dwa_horizon_s:=1.0                # 規定: 1.0 [s] (DWA/MPPI の前方シミュレーション)
     -p dwa_n_v:=7                        # 規定: 7 (DWA の v 候補数)
     -p dwa_n_w:=11                       # 規定: 11 (DWA の ω 候補数)
@@ -139,9 +120,6 @@ VI_ARGS=(
     -p mppi_lambda:=1.0                  # 規定: 1.0 (softmax 温度)
     -p mppi_sigma_v:=0.0                 # 規定: 0.0 = 行動集合から自動
     -p mppi_sigma_w_deg:=0.0             # 規定: 0.0 = 行動集合から自動
-    -p qmdp:=true                        # 規定: false — belief が多峰の tick だけ QMDP で行動選択
-                                         #   (単峰の tick は follow_controller のまま)。多峰性は峰の
-                                         #   数で測る — セル数だと全地図 belief では常に真になる。
     # ── スタンドアロン (navigate_to_pose / follow_waypoints) ──
     -p standalone:=true                  # 規定: false — bt_navigator 等の代わりに自前で提供
     -p goal_retry_limit:=3               # 規定: 3 (追従失敗時の投げ直し上限、負で無制限)
@@ -174,21 +152,7 @@ rviz2 -d "$REPO_ROOT/assets/tb3_$WORLD/viola.rviz" >"$LOG/rviz.log" 2>&1 &
 # (一発勝負にすると空振り → /map が出ず vi_planner が map 待ちで死ぬ)。
 for _ in $(seq 1 30); do
     if ros2 run nav2_util lifecycle_bringup map_server >>"$LOG/lifecycle.log" 2>&1; then
-        echo "viola_demo: map_server active"
-        break
-    fi
-    sleep 2
-done
-
-# belief の自動シード: vi_planner の購読が立ってから撃つ (それ以前は消える)。
-for _ in $(seq 1 60); do
-    # トピック未出現のうちは ros2 topic info が非ゼロ終了する (set -e に殺させない)
-    n="$(ros2 topic info /initialpose 2>/dev/null | sed -n 's/Subscription count: //p' || true)"
-    if [ "${n:-0}" -ge 1 ]; then
-        ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
-            '{header: {frame_id: map}, pose: {pose: {position: {x: -2.0, y: -0.5}}}}' \
-            >"$LOG/seed.log" 2>&1
-        echo "viola_demo: seeded belief at spawn (-2.0, -0.5) — RViz の Nav2 Goal でゴールを撃てます"
+        echo "vip_demo: map_server active — emcl2 は spawn 位置に自己シード済み、RViz の 2D Goal Pose でゴールを撃てます"
         break
     fi
     sleep 2
