@@ -1059,6 +1059,7 @@ fn decide_borrows_action_from_neighbors() {
         patch: core.patch.take(),
         penalty: core.penalty.take(),
         repair: core.repair.take(),
+        sweep: Default::default(),
         dirty: false,
         prefetch: None,
         solve_only: false,
@@ -1074,6 +1075,7 @@ fn decide_borrows_action_from_neighbors() {
         patch: strict_core.patch,
         penalty: strict_core.penalty,
         repair: strict_core.repair,
+        sweep: Default::default(),
         dirty: false,
         prefetch: None,
         solve_only: false,
@@ -1146,23 +1148,27 @@ fn corridor(size: i32, y_lo: i32, y_hi: i32) -> BuildParams {
     b
 }
 
-/// 全域掃きを `n` 回まわす (カーソルは持ち回す = ロックを手放しながら進める形)。
-fn sweep_n(core: &mut PlannerCore, cur: &mut SweepCursor, n: usize) {
-    for _ in 0..n {
-        while !core.sweep_global(cur, usize::MAX).1 {}
+/// 全域伝播を不動点まで進める (掃きスレッドの呼び出し規約と同じ:
+/// `done` まで繰り返す)。戻り値は消費した呼び出し回数。
+fn propagate(core: &mut PlannerCore) -> usize {
+    let mut calls = 0;
+    while !core.sweep_global(usize::MAX).1 {
+        calls += 1;
+        assert!(calls < 100_000, "全域伝播が終わらない");
     }
+    calls
 }
 
 /// **この機能の本題。** 狭域が注入した local_penalty は、ローカル精密化だけでは
-/// ウィンドウ (±1m) の外へ出ない。全域掃きを通して初めて広域の価値関数が動く。
+/// ウィンドウ (±1m) の外へ出ない。全域伝播を通して初めて広域の価値関数が動く。
 ///
 /// 通路の真ん中を塞ぎ、ウィンドウの外にある西側のセルの価値を 3 時点で見る:
-/// solve 直後 → 局所精密化の後 (変わらない) → 全域掃きの後 (上がる)。
+/// solve 直後 → 局所精密化の後 (変わらない) → 全域伝播の後 (上がる)。
 ///
-/// **1 掃きで届く**ことを見ている。この地図での実測は 1 掃き目で +12%、30 掃きで
-/// ほぼ収束、数値的な完全収束 (Δ=0) は約 80 掃き。運用上は収束を待つ必要はない —
-/// 掃くたび不動点へ単調に近づき、経路が変わるのは遥かに手前なので、背景掃きは
-/// 予算内で回し続ければよい (`sweep_global` の呼び出し規約)。
+/// 伝播 1 回でそのまま不動点まで行くので、2 回目は何もせずに返る (印が落ちている)。
+/// かつては地図を丸ごと掃く実装で、1 掃き = 1 パスだったため「1 掃きで +12%、
+/// 30 掃きでほぼ収束、Δ=0 まで約 80 掃き」という刻みだった。いまは能動集合が
+/// 空になるまでを 1 回と数えるので、刻みではなく到達点を見る。
 #[test]
 fn local_penalty_reaches_the_global_field_only_after_a_global_sweep() {
     // 通路は iy 20..=30 (0.55m 幅)、ゴールは東の端。
@@ -1202,22 +1208,15 @@ fn local_penalty_reaches_the_global_field_only_after_a_global_sweep() {
     );
     assert!(core.is_dirty(), "狭域が場を動かしたら印が立つこと");
 
-    // 1 掃きで広域に届くこと。
-    let mut cur = SweepCursor::default();
-    sweep_n(&mut core, &mut cur, 1);
-    let after_one = value_at(&core, west);
-    assert!(
-        after_one > before,
-        "1 掃きで広域の価値が上がっていること: before={before}, after={after_one}"
-    );
+    // 伝播 1 回で広域に届き、そこが不動点であること。
+    propagate(&mut core);
+    let after = value_at(&core, west);
+    assert!(after > before, "全域へ伝播していない: before={before}, after={after}");
+    assert!(!core.is_dirty(), "不動点に達したら印は落ちること");
 
-    // 掃くほど不動点へ近づく (単調)。
-    sweep_n(&mut core, &mut cur, 29);
-    let after_thirty = value_at(&core, west);
-    assert!(
-        after_thirty > after_one,
-        "掃くほど不動点へ近づくこと: 1 掃き={after_one}, 30 掃き={after_thirty}"
-    );
+    // 2 回目は何もしない (空回りしていたらここで気づく)。
+    assert_eq!(propagate(&mut core), 0, "不動点のあとに掃く仕事は無いこと");
+    assert_eq!(value_at(&core, west), after, "2 回目で値が動かないこと");
 }
 
 /// 新しい不動点に達したら印が落ちて掃きが止まること (背景スレッドが収束後も
@@ -1235,76 +1234,104 @@ fn sweeping_stops_once_the_field_settles() {
     core.refine_for(Duration::from_secs(5));
     assert!(core.is_dirty());
 
-    let mut cur = SweepCursor::default();
-    let mut sweeps = 0;
-    while core.is_dirty() && sweeps < 500 {
-        if core.sweep_global(&mut cur, usize::MAX).1 {
-            sweeps += 1;
-        }
-    }
+    let calls = propagate(&mut core);
     assert!(!core.is_dirty(), "新しい不動点に達したら印は落ちること");
-    assert!(sweeps > 0 && sweeps < 500, "有限回で収束すること (sweeps={sweeps})");
+    assert!(calls > 0, "少なくとも 1 チャンクは掃くこと");
 }
 
-/// カーソルを持ち回してチャンクに切っても、1 掃きの結果は一気に掃いたときと
-/// 同じになること (ロックを手放しながら進めるための性質)。
+/// 通路を塞いだ場を、窓ごと動かしてから伝播させる。テストごとに同じ状況を作る。
+fn blocked_corridor(size: i32, robot: PoseView) -> PlannerCore {
+    let mut core = PlannerCore::new(corridor(size, 20, 30), cfg());
+    let cancel = AtomicBool::new(false);
+    core.prepare_goal(pose(2.8, 1.25, 0.0), &cancel).expect("solve");
+    core.set_window(robot);
+    for k in -3..=3 {
+        let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.55] };
+        core.observe_scan(&scan, pose(robot.x, robot.y, k as f64 * 0.12));
+    }
+    core.refine_for(Duration::from_secs(5));
+    core
+}
+
+/// チャンクに切っても伝播の結果は一気に回したときと同じになること
+/// (ロックを手放しながら進めるための性質)。
 #[test]
 fn chunked_sweeping_covers_the_same_cells_as_one_pass() {
-    let goal = pose(2.0, 2.0, 0.0);
-    let cancel = AtomicBool::new(false);
+    let robot = pose(1.5, 1.25, 0.0);
 
-    let mut whole = PlannerCore::new(build(48), cfg());
-    whole.prepare_goal(goal, &cancel).expect("solve");
-    let mut cur = SweepCursor::default();
-    let (_, done) = whole.sweep_global(&mut cur, usize::MAX);
-    assert!(done, "max_cells が全体以上なら 1 回で掃き終わること");
+    let mut whole = blocked_corridor(64, robot);
+    assert!(whole.is_dirty(), "掃く仕事がないと比較にならない");
+    propagate(&mut whole);
 
-    let mut chunked = PlannerCore::new(build(48), cfg());
-    chunked.prepare_goal(goal, &cancel).expect("solve");
-    let mut cur = SweepCursor::default();
-    let mut chunks = 0;
-    loop {
-        let (_, done) = chunked.sweep_global(&mut cur, 1000);
-        chunks += 1;
-        if done {
-            break;
-        }
-        assert!(chunks < 10_000, "チャンク掃きが終わらない");
-    }
-    assert!(chunks > 1, "1000 セル刻みなら複数チャンクに分かれること");
+    let mut chunked = blocked_corridor(64, robot);
+    let chunks = propagate(&mut chunked);
+    assert!(chunks > 1, "刻まずに終わったら「チャンクに切っても」を見ていない");
 
     let (a, b) = (whole.local().unwrap(), chunked.local().unwrap());
     assert_eq!(
         a.base.states.iter().map(|s| s.total_cost).collect::<Vec<_>>(),
         b.base.states.iter().map(|s| s.total_cost).collect::<Vec<_>>(),
-        "チャンクに切っても 1 掃きの結果は変わらないこと"
+        "チャンクに切っても伝播の結果は変わらないこと"
     );
 }
 
-/// 1 掃き終わるごとに掃き順を次へ回すこと (伝播方向が偏らないように)。
+/// **能動集合であることの本題**: 1 回の伝播の仕事量が、**実際に値が動いたセル数**に
+/// 比例すること (地図の広さではなく)。
+///
+/// かつてここは地図を丸ごと Gauss–Seidel していて、窓ひとつぶんの変化にも毎回
+/// nx·ny·nθ 状態を掃き、しかも不動点まで数十周した。いまは値が動いたセルを遷移の
+/// 届く距離だけ膨張させた範囲しか掃かない。
+///
+/// 見るのは絶対量ではなく**比**。「影響範囲が狭ければ安い」は地図とシナリオ次第で
+/// (開けた地図でゴール手前を塞げば影響範囲は地図の大半になる)、比のほうが実装の
+/// 性質そのものを表す。実測 (この地図): 64/96/128 角で 1 セルあたり 13.9 / 11.3 /
+/// 11.1 訪問 — 地図が 4 倍になっても比は動かない。上限 30 はその倍以上の余裕で、
+/// 「全域を毎ラウンド掃く」実装に戻ったら (比が周回数まで跳ねて) 落ちる。
 #[test]
-fn sweeps_rotate_through_the_sweep_orders() {
-    let mut core = PlannerCore::new(build(32), cfg());
-    let cancel = AtomicBool::new(false);
-    core.prepare_goal(pose(1.0, 1.0, 0.0), &cancel).expect("solve");
-    let orders = core.local().unwrap().base.sweep_orders.len();
-    assert!(orders > 1);
+fn a_propagation_costs_in_proportion_to_what_actually_changed() {
+    for size in [64, 128] {
+        let mut core = PlannerCore::new(build(size), cfg());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(0.5, 0.5, 0.0), &cancel).expect("solve");
 
-    let mut cur = SweepCursor::default();
-    for i in 0..orders {
-        assert_eq!(cur.order, i, "掃き順は 1 掃きごとに進むこと");
-        let (_, done) = core.sweep_global(&mut cur, usize::MAX);
-        assert!(done);
+        let robot = pose(1.5, 1.5, 0.0);
+        core.set_window(robot);
+        for k in -3..=3 {
+            let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.4] };
+            core.observe_scan(&scan, pose(robot.x, robot.y, k as f64 * 0.12));
+        }
+        core.refine_for(Duration::from_secs(5));
+        assert!(core.is_dirty(), "狭域が場を動かしていないと何も測れない");
+
+        let before = dense_values(&core);
+        propagate(&mut core);
+        let after = dense_values(&core);
+        let (visits, unit) = core.sweep_work();
+        assert_eq!(unit, "cells", "密経路の単位はセル");
+
+        let (nx, ny, nt) = {
+            let vi = core.local().unwrap();
+            let b = &vi.base;
+            (b.cell_num_x as usize, b.cell_num_y as usize, b.cell_num_t as usize)
+        };
+        // 値が動いた 2D セル数 (θ 層はまとめて 1 セルと数える = 訪問の単位に合わせる)。
+        let moved = (0..nx * ny)
+            .filter(|c| (0..nt).any(|t| before[c * nt + t] != after[c * nt + t]))
+            .count();
+        assert!(moved > 0, "[{size}] 何も動いていないなら比が測れない");
+        assert!(moved < nx * ny, "[{size}] 地図が丸ごと動いたら「影響範囲」の話にならない");
+        assert!(
+            visits < moved * 30,
+            "[{size}] 動いた {moved} セルに対して訪問が {visits} — 能動集合が効いていない"
+        );
     }
-    assert_eq!(cur.order, 0, "一周したら戻ること");
 }
 
 /// 修復を待ち行列が空になるまで進める。戻り値は消費したタイル訪問数。
 fn repair_until_settled(core: &mut PlannerCore, max_visits: usize) -> usize {
-    let mut cur = SweepCursor::default();
     let mut visits = 0;
     while core.is_dirty() && visits < max_visits {
-        core.sweep_global(&mut cur, usize::MAX);
+        core.sweep_global(usize::MAX);
         visits += 1;
     }
     assert!(!core.is_dirty(), "{max_visits} 訪問では修復が終わらない");
@@ -1345,10 +1372,9 @@ fn compact_global_propagation_matches_the_dense_global_sweep() {
         vi.base.states[vi.base.to_index(west.0, west.1, west.2) as usize].total_cost
     };
     block(&mut dense);
-    let mut cur = SweepCursor::default();
     let mut sweeps = 0;
     while dense.is_dirty() && sweeps < 400 {
-        if dense.sweep_global(&mut cur, usize::MAX).1 {
+        if dense.sweep_global(usize::MAX).1 {
             sweeps += 1;
         }
     }
@@ -1415,7 +1441,6 @@ fn a_full_width_block_raises_the_value_far_outside_the_window() {
     let ranges: Vec<f64> = (0..37).map(|i| 0.55 / (a0 + inc * i as f64).cos()).collect();
     let scan = LaserScan { angle_min: a0, angle_increment: inc, ranges };
 
-    let mut cur = SweepCursor::default();
     let mut visits = 0usize;
     let mut settled = None;
     for round in 0..300 {
@@ -1427,7 +1452,7 @@ fn a_full_width_block_raises_the_value_far_outside_the_window() {
             if !core.is_dirty() {
                 break;
             }
-            core.sweep_global(&mut cur, usize::MAX);
+            core.sweep_global(usize::MAX);
             visits += 1;
         }
         if !core.is_dirty() {
@@ -1541,8 +1566,7 @@ fn repair_tile_is_not_allocated_when_the_sweep_is_off() {
 
     // 掃きを呼んでも何もせず、印だけ落として返ること (呼び出し側が空回りしない)。
     core.dirty = true;
-    let mut cur = SweepCursor::default();
-    assert_eq!(core.sweep_global(&mut cur, usize::MAX), (0, true));
+    assert_eq!(core.sweep_global(usize::MAX), (0, true));
     assert!(!core.is_dirty());
 }
 
@@ -1742,12 +1766,11 @@ fn cfg_early() -> PlanConfig {
 /// 掃きスレッド (main.rs) の代わりに、`done` か上限まで背景の解き切りを回す。
 /// 呼び出し規約は本物と同じ (`sweep_global` を繰り返し、`is_dirty` で止める)。
 fn finish_in_background(core: &mut PlannerCore, max_calls: usize) {
-    let mut cur = SweepCursor::default();
     for _ in 0..max_calls {
         if !core.is_dirty() {
             return;
         }
-        core.sweep_global(&mut cur, 5_000);
+        core.sweep_global(5_000);
     }
     panic!("the background solve did not converge in {max_calls} calls");
 }

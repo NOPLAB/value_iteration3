@@ -5,7 +5,7 @@
 //!   - `plan_*` は解決済み価値関数の貪欲ロールアウト
 //!   - 追従は同じ価値関数の ±1m ウィンドウをスキャンで補正しながら回す
 //!
-//! 狭域 → 広域の伝播 (全域掃き) は [`PlannerCore::sweep_global`]、収束前に
+//! 狭域 → 広域の伝播 (全域伝播) は [`PlannerCore::sweep_global`]、収束前に
 //! 走り出す早期走り出しは [`PlannerCore::prepare_goal_with_progress`] の doc に
 //! それぞれ詳細がある (経緯と実測値はリポジトリ CLAUDE.md)。
 //!
@@ -64,7 +64,11 @@ use vi_lib::solvers::{solve_observed, SolveFlow, SolveObserver, SolveProbe, U64S
 use vi_lib::value_iterator::ValueIterator;
 use vi_lib::{Action, ValueIteratorLocal};
 
-use compact::{new_patch, new_repair, CompactField, Patch, PenaltyOverlay, Repair};
+use vi_lib::bitboard::Bitboard2D;
+
+use compact::{
+    new_patch, new_repair, transition_reach, CompactField, Patch, PenaltyOverlay, Repair,
+};
 pub use prefetch::Prefetcher;
 
 /// 他スレッドの panic で毒された Mutex もそのまま使い続けて取る。この核の場も
@@ -209,7 +213,7 @@ pub struct PlanConfig {
     pub prefetch_poll_ms: u64,
 
     // ── 狭域 → 広域の全域伝播 ──
-    /// 全域掃き ([`PlannerCore::sweep_global`]) を回すか。compact 経路では
+    /// 全域伝播 ([`PlannerCore::sweep_global`]) を回すか。compact 経路では
     /// これが false のとき修復タイル ([`compact::Repair`], 数 MB) を確保しない。
     pub global_sweep: bool,
 
@@ -337,11 +341,10 @@ struct CachedGoal {
 impl CachedGoal {
     /// 背景の解き切りが不動点に達した = 場が解き終わった。`partial` の印を降ろす。
     ///
-    /// 呼ぶのは「全域で Δ=0 の 1 掃きを終えた」ときだけ (密は
+    /// 呼ぶのは「伝播の能動集合が空になった」ときだけ (密は
     /// [`PlannerCore::sweep_global`]、compact は待ち行列が空になったタイル修復)。
-    /// 密の場は V ≥ V\* から単調に下がるので Δ=0 の 1 掃き = V\*、compact の
-    /// ブロック Gauss–Seidel も同じ不動点なので、この時点の場は収束まで解いた
-    /// ものと同一。暴走ガードで諦めた修復からは**呼ばない** (場はまだ解け切って
+    /// どちらも「どのセルも動かなかった」= Bellman 作用素の不動点 = V\* なので、
+    /// この時点の場は収束まで解いたものと同一。暴走ガードで諦めた修復からは**呼ばない** (場はまだ解け切って
     /// いないので、`discard_partial` の逃げ道を残しておく必要がある)。
     fn mark_complete(&mut self) {
         if !self.partial {
@@ -358,17 +361,57 @@ impl CachedGoal {
     }
 }
 
-/// 全域掃き ([`PlannerCore::sweep_global`]) の再開位置。10 Hz の追従ループと同じ
-/// `Mutex<PlannerCore>` を共有するので、掃きはチャンクに切ってロックを手放しながら
-/// 進める。その「続き」を呼び出し側が持つための値。
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SweepCursor {
-    /// `sweep_orders` のどれを掃いているか。1 掃き終わるごとに次へ回す。
-    order: usize,
-    /// その掃き順の中の位置。
+/// 密経路の全域伝播 (能動集合) の作業場。
+///
+/// **地図を丸ごと掃かない。** あるセルの値が動くのは、遷移先の値かペナルティが
+/// 動いたときだけなので、動いたセルを遷移の届く距離だけ膨張させた範囲を掃けば
+/// 取りこぼさない。仕事量は地図の広さではなく**変化が広がった範囲**で決まる
+/// (compact 側のタイル修復 [`compact::Repair`] と同じ考えで、粒度がタイルでは
+/// なくセル)。空フロンティア = どのセルも動かなかった = 不動点。
+///
+/// 10 Hz の追従ループと同じ `Mutex<PlannerCore>` を共有するので、1 ラウンドを
+/// 走り切らずチャンクに切ってロックを手放す。その「続き」がこの構造体。
+#[derive(Default)]
+struct DenseSweep {
+    /// **次の**ラウンドの種。前のラウンドで値が動いたセルと、狭域が外から
+    /// 積んだ矩形が入る (2D。θ 層は候補セルごとにまとめて評価するので持たない)。
+    pending: Option<Bitboard2D>,
+    /// いま処理中のラウンドの候補セル (種を `reach` だけ膨張させて列挙したもの)。
+    cands: Vec<(u32, u32)>,
+    /// `cands` の次に見る位置。
     pos: usize,
-    /// 今の 1 掃きでこれまでに積んだ Δ 合計 (1 掃き丸ごとで 0 なら収束)。
-    delta: u64,
+    /// いまの伝播で評価した候補セル数 (キューが空になると畳む)。
+    visits: usize,
+    /// 直近の伝播 1 回ぶんの評価セル数 (ログ用に `visits` を畳む前に写す)。
+    last_visits: usize,
+    /// 遷移が届くセル数。幾何だけで決まるので初回に測って持ち回す。
+    reach: Option<u32>,
+}
+
+impl DenseSweep {
+    /// グローバルセル矩形 `(x0, x1, y0, y1)` (両端含む) を次ラウンドの種に加える。
+    fn seed_rect(&mut self, nx: i32, ny: i32, (x0, x1, y0, y1): (i32, i32, i32, i32)) {
+        let bb = self.pending.get_or_insert_with(|| Bitboard2D::new(nx as u32, ny as u32));
+        for iy in y0.max(0)..=y1.min(ny - 1) {
+            for ix in x0.max(0)..=x1.min(nx - 1) {
+                bb.set(ix as u32, iy as u32);
+            }
+        }
+    }
+
+    /// 伝播 1 回ぶんの終わり。評価数はログ用に写してから畳む。
+    fn settle(&mut self) {
+        self.last_visits = self.visits;
+        self.visits = 0;
+    }
+
+    /// 掃く仕事を捨てる (ゴールを解き直したとき)。`reach` は幾何なので残す。
+    fn clear(&mut self) {
+        self.pending = None;
+        self.cands.clear();
+        self.pos = 0;
+        self.settle();
+    }
 }
 
 pub struct PlannerCore {
@@ -384,6 +427,8 @@ pub struct PlannerCore {
     penalty: Option<PenaltyOverlay>,
     /// compact 経路の全域伝播の作業場 (密経路と `global_sweep: false` では None)。
     repair: Option<Repair>,
+    /// 密経路の全域伝播の作業場 (compact では使わない)。`repair` の密版。
+    sweep: DenseSweep,
     /// 狭域が共有場を動かしたか。`refine_for` が Δ>0 を出すと立ち、全域掃きが
     /// Δ=0 で 1 周し終えると落ちる。全域掃きを回すかの唯一の判断材料
     /// (「狭域が通れないと言っている」を別途検出する必要はない — 通れないなら
@@ -531,6 +576,7 @@ impl PlannerCore {
             patch: None,
             penalty,
             repair: None,
+            sweep: DenseSweep::default(),
             dirty: false,
             prefetch: None,
             solve_only: false,
@@ -638,12 +684,12 @@ impl PlannerCore {
     ///
     /// **場を解くのはここでやめない。** 返る時点の場は `partial` の印付きで
     /// キャッシュに載り、残りは機体が走っている間に背景で解き切られる — 密は
-    /// [`PlannerCore::sweep_global`] の全域 Gauss–Seidel、compact は
-    /// [`compact::Repair`] のタイル修復で、どちらも solve と同じ `value_iteration_at`。
-    /// 不動点に達した時点で [`PlannerCore::mark_complete`] が印を降ろし、その場は
-    /// 収束まで解いたものと同一になる (密は V ≥ V\* から単調に下がるので Δ=0 の
-    /// 1 掃き = V\*、compact のブロック Gauss–Seidel も同じ不動点)。伝播の起点が
-    /// 要る compact では、ここで地図を丸ごと修復の待ち行列へ入れる。
+    /// [`PlannerCore::sweep_global`] の能動集合、compact は [`compact::Repair`] の
+    /// タイル修復で、どちらも solve と同じ `value_iteration_at`。能動集合が空に
+    /// なった時点で [`PlannerCore::mark_complete`] が印を降ろし、その場は収束まで
+    /// 解いたものと同一になる。**伝播は「動いたところ」から広げる形なので、印を
+    /// 立てるだけでは空振りする** — 未確定域は地図のどこにでもあるので、密は地図を
+    /// 丸ごと種に積み (`seed_sweep_all`)、compact は丸ごと修復の待ち行列へ入れる。
     ///
     /// 走り出した直後の場でよい理由は経路の側にある。compact 経路の finalize は値の
     /// 昇順に進むので、sink に載っている列は**最後まで解いたときと同じ値** (未確定の
@@ -688,6 +734,7 @@ impl PlannerCore {
         // 持ち越さない (持ち越すと最初の 1 掃きが必ず無駄に回る)。待ち行列に残った
         // タイルも同じで、前のゴールの場を修復しても意味がない。
         self.dirty = false;
+        self.sweep.clear();
         if let Some(r) = self.repair.as_mut() {
             r.clear();
         }
@@ -750,8 +797,9 @@ impl PlannerCore {
         // 受け取って輪郭のタイルだけ積むこと。
         if stats.partial {
             self.dirty = true;
-            if let Some(r) = self.repair.as_mut() {
-                r.enqueue_all();
+            match self.repair.as_mut() {
+                Some(r) => r.enqueue_all(),
+                None => self.seed_sweep_all(),
             }
         }
         self.request_next(goal);
@@ -867,6 +915,7 @@ impl PlannerCore {
             ov.clear();
         }
         self.dirty = false;
+        self.sweep.clear();
 
         let mut vi = ValueIteratorLocal::new(self.build.actions.clone(), 1);
         vi.set_map_with_occupancy_grid(
@@ -1125,6 +1174,12 @@ impl PlannerCore {
             // 書き戻す先が無い Δ でも掃きスレッドを起こしてしまう。
             if pass_delta > 0 && !self.cfg.use_compact() {
                 self.dirty = true;
+                // ponytail: `global_sweep: false` だと掃きスレッドが立たないので、
+                // ここで積んだ種は誰も引き取らない。地図 1 枚ぶんのビットボード
+                // (19F scale 2 で 16 KB) が飽和するだけの有界な空振りなので、
+                // `dirty` を立てるほうと揃えてそのままにしてある。気になるなら
+                // 両方まとめて `cfg.global_sweep` で塞ぐこと。
+                self.seed_sweep_window();
             }
             if stopped || pass_delta == 0 {
                 // compact 経路は窓を sink へ返して初めて共有場になる。予算切れでも
@@ -1147,8 +1202,8 @@ impl PlannerCore {
     // ──────────────────────────────────────────────────────────────────────
     // 狭域 → 広域: 共有場の全域掃き
     //
-    // 入口は `sweep_global` 1 つ。密はここで全域 Gauss–Seidel、compact は
-    // `compact::` 側の `repair_one_tile` (タイル修復) へ分岐する。
+    // 入口は `sweep_global` 1 つ。密はここでセル単位の能動集合、compact は
+    // `compact::` 側の `repair_one_tile` (タイル単位の能動集合) へ分岐する。
     // ──────────────────────────────────────────────────────────────────────
 
     /// 狭域が共有場を動かしてから、まだ全域へ伝播させ切っていないか。
@@ -1156,30 +1211,37 @@ impl PlannerCore {
         self.dirty
     }
 
-    /// compact 経路: 直近の伝播 1 回で処理したタイル数 (密経路では None)。
+    /// 直近の伝播 1 回で処理した量と、その単位。ログ用。
     ///
-    /// compact の「1 掃き」は地図の大きさで決まらず、変化が及んだ範囲で決まる。
-    /// 経過時間だけ出しても速いのか仕事が少なかったのか読めないので、ログには
-    /// これを添えること。
-    pub fn sweep_tiles(&self) -> Option<usize> {
-        self.repair.as_ref().map(|r| r.last_visits)
+    /// どちらの経路でも「1 回の伝播」の仕事量は**地図の大きさで決まらず、変化が
+    /// 及んだ範囲で決まる**。経過時間だけ出しても速いのか仕事が少なかったのか
+    /// 読めないので、ログにはこれを添えること。
+    pub fn sweep_work(&self) -> (usize, &'static str) {
+        match self.repair.as_ref() {
+            Some(r) => (r.last_visits, "tiles"),
+            None => (self.sweep.last_visits, "cells"),
+        }
     }
 
-    /// compact 経路: 進行中の伝播の進み具合 `(これまでの訪問数, 残りタイル数)`。
-    /// 伝播していないときと密経路では None。
+    /// 進行中の伝播の進み具合 `(これまでの処理数, 残り)`。伝播していないときは None。
     ///
     /// **走行中は待ち行列がまず空にならない**。壁が窓 (±1m) に入っていれば
-    /// `set_local_cost` が毎 tick penalty を塗り直すので `commit_window` が動き、
-    /// 次の伝播を積む (実測: 壁が窓の中にある通路を 100 秒走って、待ち行列が
-    /// 空だったのは 1000 tick 中 13 回だけ)。つまり `sweep_tiles` の「1 回終わった」
-    /// ログはほぼ出ない — 掃きが動いているかはこちらで見ること。
-    pub fn repair_progress(&self) -> Option<(usize, usize)> {
-        let r = self.repair.as_ref()?;
-        (!r.queue.is_empty()).then_some((r.visits, r.queue.len()))
+    /// `set_local_cost` が毎 tick penalty を塗り直すので次の伝播が積まれる
+    /// (実測: 壁が窓の中にある通路を 100 秒走って、待ち行列が空だったのは
+    /// 1000 tick 中 13 回だけ)。つまり「1 回終わった」ログはほぼ出ない —
+    /// 掃きが動いているかはこちらで見ること。
+    pub fn sweep_progress(&self) -> Option<(usize, usize)> {
+        if let Some(r) = self.repair.as_ref() {
+            return (!r.queue.is_empty()).then_some((r.visits, r.queue.len()));
+        }
+        let sw = &self.sweep;
+        let queued = sw.cands.len() - sw.pos
+            + sw.pending.as_ref().map_or(0, |b| b.popcount() as usize);
+        (queued > 0).then_some((sw.visits, queued))
     }
 
-    /// 共有価値関数を全域で最大 `max_cells` セルぶん掃き進める (Gauss–Seidel)。
-    /// 戻り値は `(このチャンクの Δ 合計, 1 掃きを終えたか)`。
+    /// 共有価値関数の全域伝播を最大 `max_cells` 状態ぶん進める。
+    /// 戻り値は `(このチャンクの Δ 合計, 伝播が終わったか)`。
     ///
     /// # これが狭域 → 広域のフィードバック経路そのもの
     ///
@@ -1190,74 +1252,137 @@ impl PlannerCore {
     /// いた。20m 先から降りてくるロールアウトは塞がった通路へ降り続け、着いてから
     /// 初めて気づいて `decide` が NoAction を返すか貪欲降下が往復する。
     ///
-    /// ここで同じ `states` を全域 Gauss–Seidel で掃けば、その値の上昇が外へ
-    /// 広がり、広域の経路が自然に迂回へ変わる。新しい Bellman 更新は書かず
-    /// `value_iteration_at` をそのまま使うので、狭域・広域・solve の 3 者は
-    /// 同一の更新式のままになる (vi_rs 側には手を入れない)。
+    /// # 掃くのは「変化が届く範囲」だけ (能動集合)
+    ///
+    /// かつてはここで地図を丸ごと Gauss–Seidel していたが、あるセルの値が動くのは
+    /// 遷移先の値かペナルティが動いたときだけなので、**動いたセルを遷移の届く距離
+    /// だけ膨張させた範囲**を掃けば取りこぼさない ([`DenseSweep`])。窓ひとつぶんの
+    /// 変化に地図 1 周ぶんの仕事をしていたのをやめた形で、compact 側のタイル修復と
+    /// 同じ考え方に揃う。更新式は `value_iteration_at` そのままなので、狭域・広域・
+    /// solve の 3 者は同一の Bellman 更新のまま (vi_rs 側には手を入れない)。
+    ///
+    /// 種を積むのは 2 箇所だけ: 窓で値が動いたとき (`refine_for`) と、早期走り出しで
+    /// 未確定の場を渡されたとき (地図を丸ごと積む)。空になったら不動点。
+    ///
+    /// **切り捨ての注意**: Bellman 更新は `cost >> PROB_BASE_BIT` で切り捨てるので、
+    /// 不動点は厳密には 1 LSB 幅の区間になる (上から降りてきた場と下から上がってきた
+    /// 場が 1〜2 単位ずれ得る)。掃く順を変えても同じ値に落ちることは
+    /// `vi_lib` 側の `conformance_resweep_propagates_a_raised_penalty` が全ソルバで
+    /// ゲートしており、実地図でも全走査順と bit 一致することを確認してある。
     ///
     /// # 呼び出し規約
     ///
-    /// 10 Hz の追従ループと同じ `Mutex<PlannerCore>` を共有するので、**1 掃きを
-    /// ロックの中で走り切らせないこと**。`cur` を持ち回してチャンクごとに
-    /// ロックを手放す (`run_follow` は `try_lock` に 3 回続けて失敗するとロボットを
-    /// 止める)。1 掃き終わるごとに掃き順を次へ回すので、伝播方向は偏らない。
+    /// 10 Hz の追従ループと同じ `Mutex<PlannerCore>` を共有するので、**伝播を
+    /// ロックの中で走り切らせないこと**。`done` か予算切れまで繰り返し呼び、
+    /// 予算が切れたらロックを手放す (`run_follow` は `try_lock` に 3 回続けて
+    /// 失敗するとロボットを止める)。
     ///
     /// # compact 経路ではタイル 1 枚を修復する
     ///
-    /// compact に全域の `states` は無いので、[`compact::Repair`] のタイルを 1 枚だけ処理して
-    /// 返る (`max_cells` と `cur` は使わない)。`done` は待ち行列が空になったとき。
-    /// 呼び出し規約は密経路と同じ — 呼び出し側は `done` か予算切れまで繰り返す。
+    /// compact に全域の `states` は無いので、[`compact::Repair`] のタイルを 1 枚だけ
+    /// 処理して返る (`max_cells` は使わない)。`done` は待ち行列が空になったとき。
     ///
     /// 1 呼び出しの仕事は「ハイドレート + 高々 2 パス + 書き戻し」で頭打ちなので、
     /// ロックを握る時間は予算 + タイル 1 枚ぶんに収まる (0.25 m/cell で数十 ms、
     /// 追従ループが `try_lock` に 3 回失敗する 300 ms には余裕がある)。
-    pub fn sweep_global(&mut self, cur: &mut SweepCursor, max_cells: usize) -> (u64, bool) {
+    pub fn sweep_global(&mut self, max_cells: usize) -> (u64, bool) {
         if self.cfg.use_compact() {
             return self.repair_one_tile();
         }
+        // 別フィールドなので分割して借りる (`set_window` と同じ手)。
+        let sw = &mut self.sweep;
+        let dirty = &mut self.dirty;
         let Some(c) = self.cached.as_mut() else { return (0, true) };
         let Field::Dense(vi) = &mut c.field else {
-            self.dirty = false;
+            *dirty = false;
             return (0, true);
         };
+        let (nx, ny, nt) = (vi.base.cell_num_x, vi.base.cell_num_y, vi.base.cell_num_t);
+        // 膨張量は遷移の届く最大セル数。幾何だけで決まるので初回に測る。
+        //
+        // 64 以上はクランプ**しない**。足りない膨張は能動集合が前駆を取りこぼす
+        // ということで、症状は「伝播が早く終わって遠方の場が古いまま」— まさに
+        // この実装が潰した黙って壊れる形になる。`Bitboard2D::dilate` の panic の
+        // ほうが安全なので、届かないと分かった時点で落とす (compact 側がパッチの
+        // 凍結境界を起動時に assert するのと同じ規律)。遷移が 64 セル飛ぶ設定は
+        // 現実には無い (0.05 m/cell でも数セル)。
+        let reach = *sw.reach.get_or_insert_with(|| {
+            let r = transition_reach(&vi.base);
+            assert!(
+                (1..64).contains(&r),
+                "transition reach {r} cells is outside what the 2D dilation can express;                  the active set would silently under-propagate"
+            );
+            r as u32
+        });
 
-        let orders = vi.base.sweep_orders.len();
-        if orders == 0 {
-            self.dirty = false;
-            return (0, true);
-        }
-        // ゴールが変わってもセル数は変わらない (地図が同じ) ので、持ち越した
-        // カーソルは掃きの途中から再開するだけで害はない。念のため丸める。
-        let order = cur.order % orders;
-        let len = vi.base.sweep_orders[order].len();
-        let start = cur.pos.min(len);
-        let end = start.saturating_add(max_cells.max(1)).min(len);
-
-        let mut delta = 0u64;
-        for k in start..end {
-            let i = vi.base.sweep_orders[order][k] as usize;
-            delta = delta.saturating_add(vi.base.value_iteration_at(i));
-        }
-        cur.delta = cur.delta.saturating_add(delta);
-        cur.pos = end;
-        if end < len {
-            return (delta, false);
-        }
-
-        // 1 掃き完了。丸ごと Δ=0 なら新しい不動点に達している。**早期走り出しで
-        // 途中の場のまま走らせていた場合、これが「解き終わった」瞬間**でもある
-        // (密の場は V ≥ V* から単調に下がるので Δ=0 の 1 掃き = V*)。
-        let swept_delta = cur.delta;
-        cur.order = (order + 1) % orders;
-        cur.pos = 0;
-        cur.delta = 0;
-        if swept_delta == 0 {
-            self.dirty = false;
-            if let Some(c) = self.cached.as_mut() {
-                c.mark_complete();
+        // ラウンドの切り替え。種が空なら不動点に達している。
+        if sw.pos >= sw.cands.len() {
+            sw.cands.clear();
+            sw.pos = 0;
+            match sw.pending.take() {
+                Some(seed) if seed.popcount() > 0 => {
+                    sw.cands.extend(seed.dilate(reach, reach).enumerate());
+                }
+                _ => {
+                    sw.settle();
+                    *dirty = false;
+                    // どのセルも動かなかった = 全域の不動点。早期走り出しで未確定の
+                    // まま走らせていた場は、ここで解き終わったことになる。
+                    c.mark_complete();
+                    return (0, true);
+                }
             }
         }
-        (delta, true)
+
+        // 予算は「状態」数で受ける (候補セル 1 つあたり θ 層ぶんの更新が走る)。
+        let end = (sw.pos + (max_cells / nt.max(1) as usize).max(1)).min(sw.cands.len());
+        let next = sw.pending.get_or_insert_with(|| Bitboard2D::new(nx as u32, ny as u32));
+        let mut delta = 0u64;
+        for &(ix, iy) in &sw.cands[sw.pos..end] {
+            let mut moved = false;
+            for it in 0..nt {
+                let i = vi.base.to_index(ix as i32, iy as i32, it) as usize;
+                let d = vi.base.value_iteration_at(i);
+                moved |= d > 0;
+                delta = delta.saturating_add(d);
+            }
+            if moved {
+                next.set(ix, iy);
+            }
+        }
+        sw.visits += end - sw.pos;
+        sw.pos = end;
+        (delta, false)
+    }
+
+    /// 密経路: ローカルウィンドウを全域伝播の種に積む。狭域が共有場を書き換えた
+    /// とき (`refine_for` で Δ>0) に呼ぶ。
+    ///
+    /// 積むのは動いたセルではなく**窓の矩形まるごと**。膨張がその外周 ±reach を
+    /// 拾うので、「窓の縁のセルの penalty が変わったせいで値が動く、窓の外の
+    /// 前駆セル」も取りこぼさない (窓の中だけを積むと、その前駆が種から外れる)。
+    fn seed_sweep_window(&mut self) {
+        let sw = &mut self.sweep;
+        let Some(c) = self.cached.as_ref() else { return };
+        let Field::Dense(vi) = &c.field else { return };
+        let (nx, ny) = (vi.base.cell_num_x, vi.base.cell_num_y);
+        let rect = (vi.local_ix_min, vi.local_ix_max, vi.local_iy_min, vi.local_iy_max);
+        sw.seed_rect(nx, ny, rect);
+    }
+
+    /// 密経路: 地図を丸ごと種に積む。早期走り出し ([`PlanConfig::early_start`]) で
+    /// 未確定のまま走り出した場を背景で解き切るための起点で、そこでしか呼ばない
+    /// (compact 側の [`compact::Repair::enqueue_all`] と同じ役割)。
+    ///
+    /// 通常の伝播は「値が動いた範囲」から広げるが、解き終わっていない場では
+    /// 未確定域が地図のどこにでもあるので起点が要る。確定済みのセルは 1 ラウンドで
+    /// Δ=0 になって抜けるだけなので、余分な仕事は地図 1 周ぶんに収まる。
+    fn seed_sweep_all(&mut self) {
+        let sw = &mut self.sweep;
+        let Some(c) = self.cached.as_ref() else { return };
+        let Field::Dense(vi) = &c.field else { return };
+        let (nx, ny) = (vi.base.cell_num_x, vi.base.cell_num_y);
+        sw.seed_rect(nx, ny, (0, nx - 1, 0, ny - 1));
     }
 
     /// ウィンドウ 1 パス。`should_stop` は x 列ごとに観測し、途中打ち切り時は

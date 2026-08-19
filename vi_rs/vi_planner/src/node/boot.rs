@@ -211,6 +211,13 @@ pub fn build_core(
     // 密が実際に確保するのは `states` (State 56 B/state) だけではない。
     // `set_sweep_orders` が掃き順を 6 本ぶん持つ (`[0..3]` 各 total、`[4]` 1.5×total、
     // `[5]` 0.5×total = 合わせて 6.0×total の i32) ので +24 B/state。
+    //
+    // ponytail: 全域伝播が能動集合になったので、**このノードは sweep_orders を
+    // もう読まない** (`core::sweep_global`)。それでも 24 B/state 乗っているのは
+    // `set_map_with_occupancy_grid` が無条件に作るため。落とすなら vi_lib 側に
+    // 「掃き順を作らない」入口が要り、`solvers::original` (= Reference /
+    // StreamMimic) はそれを使えなくなる。19F scale 2 で 210 MB の話なので、
+    // 密で大きい地図を回したくなったら手を付ける価値がある。
     // 19F を map_scale 2 で解いたときの実測は 654.8 MB (states 444.7 + orders 210.1) で、
     // 56 B/state だけで見積もると 4 割以上足りない。compact は確定出力 12 B/state だけ。
     let states_gb = nstates as f64 * 80.0 / 1e9;

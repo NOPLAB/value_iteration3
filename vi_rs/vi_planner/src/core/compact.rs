@@ -27,8 +27,8 @@
 //!
 //! # 全域伝播はタイル修復で回す ([`Repair`])
 //!
-//! 密経路の [`PlannerCore::sweep_global`] は全域の `states` + `sweep_orders` を
-//! 要求するので compact では使えない。代わりに sink を**タイル単位**で起こして掃く。
+//! 密経路の [`PlannerCore::sweep_global`] は全域の `states` を要求するので compact
+//! では使えない。代わりに sink を**タイル単位**で起こして掃く。
 //! 1 タイル = 更新する interior (既定 16 セル角) + 遷移が届く距離 `reach` の halo。
 //! halo を凍結境界にして interior だけを掃き、変わった列を sink へ返し、変化の
 //! 外接矩形から `reach` セル以内のタイルを待ち行列へ入れ直す。キューが空になったら
@@ -199,10 +199,11 @@ impl PenaltyOverlay {
 
 /// compact 経路の全域伝播 (タイル修復) の作業場。密経路では作らない。
 ///
-/// 密経路の `sweep_global` は全域の `states` を Gauss–Seidel で掃くが、compact に
-/// あるのは 12 B/state の sink だけなので、地図をタイルに切って 1 枚ずつ起こしては
-/// 掃いて書き戻す。**ブロック Gauss–Seidel** なので、キューが空になったときの場は
-/// 全域掃きと同じ不動点になる (更新式は `value_iteration_at` そのまま)。
+/// 密経路の `sweep_global` は `states` の上で能動集合を回すが、compact にあるのは
+/// 12 B/state の sink だけなので、地図をタイルに切って 1 枚ずつ起こしては掃いて
+/// 書き戻す。**ブロック Gauss–Seidel** なので、キューが空になったときの場は密の
+/// 伝播と同じ不動点になる (更新式は `value_iteration_at` そのまま)。粒度が
+/// 「セル」ではなく「タイル」なだけで、能動集合であることは密と同じ。
 ///
 /// タイル = 更新する interior (`interior` セル角) + 凍結する halo (`halo` = 遷移が
 /// 届く距離 `reach`)。halo があるので interior のセルの遷移先はすべてタイル内に
@@ -551,8 +552,8 @@ fn commit_states(
 }
 
 /// 局所座標の矩形 `[x0..=x1] x [y0..=y1]` を Gauss–Seidel で 1 パス掃き、Δ 合計を返す。
-/// 掃き向きは 4 通りから選ぶ (タイルは毎回起こし直すので `sweep_orders` のような
-/// 索引表は持たない — 掃き順は毎回この 2 つの bool で決める)。
+/// 掃き向きは 4 通りから選ぶ (タイルは毎回起こし直すので索引表は持たない —
+/// 掃き順は毎回この 2 つの bool で決める)。
 fn sweep_rect(
     vi: &mut ValueIterator,
     (x0, x1, y0, y1): (i32, i32, i32, i32),
@@ -817,8 +818,7 @@ impl PlannerCore {
 
         // interior のタイル局所座標。halo は読むだけ (凍結境界)。
         let rect = (r.halo, r.halo + (gx1 - gx0), r.halo, r.halo + (gy1 - gy0));
-        // 掃き向きは訪問ごとに回して伝播方向を偏らせない (密経路が
-        // `sweep_orders` を順に使うのと同じ意図)。
+        // 掃き向きは訪問ごとに回して伝播方向を偏らせない。
         let mut delta = sweep_rect(&mut r.vi, rect, nt, r.visits & 1 == 0, r.visits & 2 == 0);
         if delta > 0 {
             // 動いたタイルだけ 2 パス目を掃いてから返す。動かないタイル
