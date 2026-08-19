@@ -56,13 +56,14 @@ use std::time::{Duration, Instant};
 
 use vi_lib::bridge::{value_slice_to_occupancy, yaw_to_goal_theta_deg, PoseView};
 use vi_lib::msg::{LaserScan, OccupancyGrid};
+use vi_lib::params::MAX_COST;
 use vi_lib::planner::{
     densify, optimal_action_at, pose_to_cell, qmdp_decide, rollout_path_on, PathPose, PolicyView,
     QmdpDecision, Rollout, RolloutStatus,
 };
 use vi_lib::solvers::{solve_observed, SolveFlow, SolveObserver, SolveProbe, U64Solver};
 use vi_lib::value_iterator::ValueIterator;
-use vi_lib::{Action, ValueIteratorLocal};
+use vi_lib::{Action, LocalShapeConfig, ValueIteratorLocal};
 
 use vi_lib::bitboard::Bitboard2D;
 
@@ -115,7 +116,11 @@ pub struct BuildParams {
     pub goal_margin_radius: f64,
     pub goal_margin_theta: i32,
     /// 追従のローカルウィンドウ半径 [m] (本家 `ValueIteratorLocal` は 1.0 固定)。
+    /// `local_shape.range_m` と同じ値 — compact パッチの寸法計算が読む。
     pub local_xy_range: f64,
+    /// 追従ウィンドウの形状・寸法・変形制限 ([`LocalShapeConfig`])。
+    /// 既定は本家と同じ地図軸の等方矩形。
+    pub local_shape: LocalShapeConfig,
     /// compact パッチの寸法スラック [セル] (`half = 2*win + reach + slack`)。
     pub patch_slack_cells: i32,
     /// 修復タイルの interior の 1 辺 [セル]。大きいほど 1 訪問あたりの halo の
@@ -864,7 +869,7 @@ impl PlannerCore {
             self.build.goal_margin_radius,
             self.build.goal_margin_theta,
         );
-        vi.set_local_xy_range(self.build.local_xy_range);
+        vi.set_local_shape(self.build.local_shape);
         vi.base.set_goal(goal.x, goal.y, goal_t_deg);
 
         let mut director =
@@ -926,7 +931,7 @@ impl PlannerCore {
             self.build.goal_margin_radius,
             self.build.goal_margin_theta,
         );
-        vi.set_local_xy_range(self.build.local_xy_range);
+        vi.set_local_shape(self.build.local_shape);
         // 半径はゴール margin と同じ、ただし最低 1 セルは確実にマークする。
         let radius = self.build.goal_margin_radius.max(vi.base.xy_resolution);
         vi.base.set_goal_region(targets, radius);
@@ -1082,8 +1087,13 @@ impl PlannerCore {
         let mut slice = vec![0u64; w * h];
         for iy in y0..=y1 {
             for ix in x0..=x1 {
-                slice[(iy - y0) as usize * w + (ix - x0) as usize] =
-                    vi.base.states[vi.base.to_index(ix, iy, it) as usize].total_cost;
+                // 形の外は MAX_COST = RViz では -1 (未知) になり、窓の形がそのまま
+                // 見える。専用のセンチネルは要らない。
+                slice[(iy - y0) as usize * w + (ix - x0) as usize] = if vi.in_local_area(ix, iy) {
+                    vi.base.states[vi.base.to_index(ix, iy, it) as usize].total_cost
+                } else {
+                    MAX_COST
+                };
             }
         }
         Some(OccupancyGrid {
@@ -1108,7 +1118,7 @@ impl PlannerCore {
         let overlay = self.penalty.as_ref();
         let Some(c) = self.cached.as_mut() else { return };
         match &mut c.field {
-            Field::Dense(vi) => vi.set_local_window(pose.x, pose.y),
+            Field::Dense(vi) => vi.set_local_window(pose.x, pose.y, pose.yaw_rad),
             Field::Compact(f) => {
                 let Some(p) = patch.as_mut() else { return };
                 let res = f.resolution;
@@ -1117,7 +1127,7 @@ impl PlannerCore {
                 if p.needs_recenter(gx, gy) {
                     p.hydrate(f, build, overlay, (gx - p.half, gy - p.half));
                 }
-                p.vi.set_local_window(pose.x, pose.y);
+                p.vi.set_local_window(pose.x, pose.y, pose.yaw_rad);
             }
         }
     }
@@ -1146,14 +1156,15 @@ impl PlannerCore {
     /// (上田ら 2023 4·2·2 のマージン膨張 — [`PlanConfig::sigma_margin_gain`])。
     /// `set_window` の後、`refine_for` の前に 1 tick 1 回呼ぶ。
     ///
-    /// 膨張量はウィンドウ半径でクランプする。窓が丸ごと帯になるとロボットが
-    /// 出口を失い、`decide` が NoAction を返し続けて停止するため。
+    /// 膨張量はウィンドウの**最小**半軸でクランプする。窓が丸ごと帯になると
+    /// ロボットが出口を失い、`decide` が NoAction を返し続けて停止するため。
+    /// 異方・変形する形状では一番細い方向が先に埋まるので、そこで測る。
     pub fn inflate_by_sigma(&mut self, sigma_m: f64) {
         let gain = self.cfg.sigma_margin_gain;
         if gain <= 0.0 || sigma_m <= 0.0 {
             return;
         }
-        let extra = (sigma_m * gain).min(self.build.local_xy_range);
+        let extra = (sigma_m * gain).min(self.build.local_shape.min_radius_m());
         if let Some(vi) = self.local_mut() {
             vi.inflate_by_sigma(extra);
         }
@@ -1396,6 +1407,10 @@ impl PlannerCore {
                 return (delta, true);
             }
             for iiy in vi.local_iy_min..=vi.local_iy_max {
+                // 窓の形は `in_local_area` 一点で決まる (スキャン注入と同じ判定)。
+                if !vi.in_local_area(iix, iiy) {
+                    continue;
+                }
                 for iit in 0..nt {
                     let i = vi.base.to_index(iix, iiy, iit) as usize;
                     delta = delta.saturating_add(vi.value_iteration_local(i));

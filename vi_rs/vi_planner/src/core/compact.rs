@@ -314,9 +314,13 @@ pub(super) fn new_patch(build: &BuildParams) -> Result<Patch, PlanError> {
     if res <= 0.0 {
         return Err(PlanError::Patch(format!("planner grid resolution is {res}")));
     }
-    let win = (build.local_xy_range / res) as i32; // ValueIteratorLocal と同じ式
-                                               // 遷移の x/y 変位の上界。`cell_delta` はセル内オフセット (0..res) を足してから
-                                               // floor するので、正側は floor(|fw|/res)、負側は -floor(|fw|/res)-1 まで届く。
+    // ウィンドウの外接半径。**`set_local_shape` 後の `local_ixy_range` と同じ式**
+    // (下の不変条件検査がその値と `half` を突き合わせるので、別々に計算しては
+    // いけない — 楕円/カプセルの変形ぶんだけ食い違い、凍結境界がウィンドウの
+    // 内側に入る)。
+    let win = build.local_shape.bbox_cells(res);
+    // 遷移の x/y 変位の上界。`cell_delta` はセル内オフセット (0..res) を足してから
+    // floor するので、正側は floor(|fw|/res)、負側は -floor(|fw|/res)-1 まで届く。
     let max_fw = build.actions.iter().map(|a| a.delta_fw.abs()).fold(0.0f64, f64::max);
     let reach_bound = (max_fw / res).floor() as i32 + 1;
     let half = 2 * win + reach_bound + build.patch_slack_cells;
@@ -342,7 +346,7 @@ pub(super) fn new_patch(build: &BuildParams) -> Result<Patch, PlanError> {
         build.goal_margin_radius,
         build.goal_margin_theta,
     );
-    vi.set_local_xy_range(build.local_xy_range);
+    vi.set_local_shape(build.local_shape);
 
     // 凍結境界の成立条件: ウィンドウ内のセルの遷移先がパッチに収まること。
     // 解析上界ではなく遷移表の実測で確かめる (1 セル足りないと、ある方位でだけ
@@ -355,6 +359,15 @@ pub(super) fn new_patch(build: &BuildParams) -> Result<Patch, PlanError> {
              (half = {half} cells) at {res:.3} m/cell; action_forward_m is too large"
         )));
     }
+    // パッチは窓の寸法の 2 乗で効く。0.05 m/cell の地図で local_xy_range を 2 m に
+    // したり ellipse/capsule で ratio_max を上げたりすると数百 MB に届くので、
+    // 黙って確保しない (`win + reach >= half` の門は half を win から作る以上
+    // 構造上鳴らない — 気付く手掛かりはこのログだけ)。
+    let mb = (side as f64).powi(2) * vi.base.cell_num_t as f64 * 56.0 / (1024.0 * 1024.0);
+    eprintln!(
+        "vi_planner: follow patch {side}x{side}x{} = {mb:.1} MB          (window {win} + transition reach {reach} cells at {res:.3} m/cell)",
+        vi.base.cell_num_t
+    );
     Ok(Patch { vi, half, reach, at: None })
 }
 

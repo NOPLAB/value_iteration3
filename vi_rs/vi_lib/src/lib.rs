@@ -23,7 +23,7 @@ pub mod value_iterator;
 pub use value_iterator::{GridLayers, ValueIterator};
 pub mod local;
 
-pub use local::ValueIteratorLocal;
+pub use local::{LocalShape, LocalShapeConfig, ValueIteratorLocal};
 pub mod solvers;
 
 // 収束済み方策から経路 (世界座標の姿勢列) を生成するプランナ層。
