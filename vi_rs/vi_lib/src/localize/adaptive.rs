@@ -935,6 +935,7 @@ impl Localizer for AdaptiveLocalizer {
             &self.top_modes(RELOC_MODES, 2),
             |x, y| self.field.free_at(x, y),
             |x, y| self.field.at(x, y),
+            self.cfg.reloc_scale,
         )
     }
 

@@ -96,6 +96,11 @@ pub struct BeliefConfig {
     /// (廊下方向の広がりで数百セル) が進入しきい値を超え、ラッチが永久に
     /// 降りなくなる。
     pub contract_ess: f64,
+    /// 判別変位探索 ([`reloc_targets`]) の幾何スケール。基準 (1.0) は屋内向け
+    /// (変位 1.5/3.0 m、署名リング 1.0 m)。クリアランス数 m 級の屋外地図では
+    /// 尤度場の台 (~σ) にリングが届かず全候補スコア 0 になるので上げる
+    /// (津田沼 0.15 m 格子で 4.0 が目安)。
+    pub reloc_scale: f64,
     /// min-plus (MAP / Viterbi) 更新則で回す。全期間 min-plus (レベル切替なし)。
     pub viterbi: bool,
 }
@@ -115,6 +120,7 @@ impl Default for BeliefConfig {
             reset_quality: 0.25,
             lost_ess: 500.0,
             contract_ess: 50.0,
+            reloc_scale: 1.0,
             viterbi: false,
         }
     }
@@ -769,7 +775,12 @@ impl Belief {
             .collect();
         let mut m = modes(&hyps, MODE_MIN_SEP_M);
         m.truncate(RELOC_MODES);
-        reloc_targets(&m, |x, y| self.field.free_at(x, y), |x, y| self.field.at(x, y))
+        reloc_targets(
+            &m,
+            |x, y| self.field.free_at(x, y),
+            |x, y| self.field.at(x, y),
+            self.cfg.reloc_scale,
+        )
     }
 
     /// belief の θ 周辺分布を可視化用 OccupancyGrid に描く (未シードなら None)。
@@ -1403,13 +1414,19 @@ pub fn reloc_targets(
     modes: &[PoseView],
     free_at: impl Fn(f64, f64) -> bool,
     lf_at: impl Fn(f64, f64) -> f64,
+    scale: f64,
 ) -> Vec<(f64, f64)> {
     use std::f64::consts::PI;
     /// 候補変位の半径 [m]、ロボット系方位の分割数、署名リングの半径 [m]。
-    // ponytail: 定数 3 個 — 実地図でスケール調整が要るなら BeliefConfig へ昇格。
+    /// いずれも `scale` ([`BeliefConfig::reloc_scale`]) 倍で使う: 基準値は
+    /// 屋内 (TB3 級、壁まで 1〜2 m) 向けで、尤度場の台は σ 程度 (~1 m) しか
+    /// ないため、クリアランス 3 m 級の屋外道路では署名リングが全モードで
+    /// 0 になりスコア 0 (= 判別不能扱い) に潰れる — 屋外はスケールを上げる。
     const RADII: [f64; 2] = [1.5, 3.0];
     const HEADINGS: usize = 12;
     const SIG_R: f64 = 1.0;
+    let radii = [RADII[0] * scale, RADII[1] * scale];
+    let sig_r = SIG_R * scale;
 
     if modes.len() < 2 {
         return Vec::new();
@@ -1419,7 +1436,7 @@ pub fn reloc_targets(
         (p.x + dr * a.cos(), p.y + dr * a.sin())
     };
     let mut best: Option<(f64, f64, f64)> = None; // (score, dr, dphi)
-    for &dr in &RADII {
+    for &dr in &radii {
         for k in 0..HEADINGS {
             let dphi = k as f64 * (2.0 * PI / HEADINGS as f64);
             if !modes.iter().all(|p| {
@@ -1435,7 +1452,7 @@ pub fn reloc_targets(
                     let mut s = [0.0; 8];
                     for (j, sv) in s.iter_mut().enumerate() {
                         let a = p.yaw_rad + j as f64 * (2.0 * PI / 8.0);
-                        *sv = lf_at(x + SIG_R * a.cos(), y + SIG_R * a.sin());
+                        *sv = lf_at(x + sig_r * a.cos(), y + sig_r * a.sin());
                     }
                     s
                 })

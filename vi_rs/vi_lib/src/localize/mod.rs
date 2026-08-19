@@ -156,6 +156,10 @@ pub struct BeliefConfig {
     /// 広い地図の全域レベルでは既定 (50) が小さすぎて降りられないことがある
     /// (津田沼級で実測プラトー ~900)。GridLocalizer は無視する。
     pub contract_ess: f64,
+    /// [`AdaptiveLocalizer`] 用: 判別変位探索 ([`crate::belief::reloc_targets`])
+    /// の幾何スケール。基準 (1.0) は屋内向け — 屋外は上げる (同関数の doc)。
+    /// GridLocalizer は無視する。
+    pub reloc_scale: f64,
     /// [`AdaptiveLocalizer`] 用: 全域レベルを min-plus (Viterbi / MAP) で回す
     /// (localize/adaptive/viterbi.rs の doc)。窓レベルの追跡は sum-product のままで、
     /// ロスト中の全域推定だけが max-product に替わる。GridLocalizer は無視する。
@@ -177,6 +181,7 @@ impl Default for BeliefConfig {
             weight_skip_ratio: 1e-4,
             expand_quality: 0.25,
             contract_ess: 50.0,
+            reloc_scale: 1.0,
             viterbi: false,
         }
     }
