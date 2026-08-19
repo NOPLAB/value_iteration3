@@ -45,7 +45,17 @@
 //! 既知の結果 (2026-08-20): 静止した受動復帰は全滅する — 廊下は並進対称で
 //! 原理的に判別不能 (ESS ~900 で凍結)、特徴的な交差点でも尤度飽和の同値セル塊
 //! (~236) が contract_ess (既定 50) に届かず、contract を塊より上げると多峰の
-//! まま解放して誤姿勢を返す。設計上の解は能動的再定位 (`active_reloc`) 側。
+//! まま解放して誤姿勢を返す。
+//!
+//! 能動的再定位 (`--active-reloc`、本家 follow_loop のロスト分岐の写像 —
+//! 判別場は主フィールドを in place で張り替え、re-lock 後に解き直す) も
+//! 同日計測で出荷状態では機能しない。原因 3 段: (1) 判別変位の幾何が屋内定数
+//! で屋外は全候補スコア 0 → `reloc_scale` (BeliefConfig へ昇格、津田沼 4.0)
+//! で解消; (2) QMDP が生 top-64 セル評価で veto ロック (NoAction 94%) —
+//! モード集約 (`--qmdp-modes` 実験) で belief は解消、adaptive は粗レベル仮説
+//! の非 free 写像で残る; (3) belief はリセット過渡の一時集中で ESS 解除が
+//! 早発し誤姿勢を返す (未修正)。K1 廊下は scale 4 でも targets 空 — 判別点
+//! (交差点) は数十 m 先で δ≤12 m の局所探索では原理的に届かない。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -63,7 +73,7 @@ use vi_lib::ctrl::{unicycle_step, CostView};
 use vi_lib::belief::{Belief, BeliefConfig as WholeBeliefConfig};
 use vi_lib::localize::{cast_scan, AdaptiveLocalizer, BeliefConfig, GridLocalizer, Localizer};
 use vi_lib::params::MAX_COST;
-use vi_lib::planner::{pose_to_cell, PolicyView};
+use vi_lib::planner::{pose_to_cell, qmdp_decide, PolicyView, QmdpDecision};
 use vi_lib::solvers::{solve, U64Solver};
 use vi_lib::{OccupancyGrid, Quaternion, ValueIterator};
 
@@ -207,6 +217,27 @@ struct Args {
     #[arg(long, default_value_t = 50.0)]
     contract_ess: f64,
 
+    /// ロスト中に判別点の多目標場を解いて QMDP で走る能動的再定位
+    /// (実ノードの `active_reloc` 相当)。reloc_targets を持つ adaptive / belief
+    /// でだけ意味がある。判別場の solve は sim 時間 0 で完了し、実時間コストは
+    /// reloc_solve_s として別掲する (実ノードでは solve 中ロボットは停止)。
+    #[arg(long)]
+    active_reloc: bool,
+    /// 能動的再定位を諦めるまでの時間 [s] (本家 RELOC_TIMEOUT_SEC = 30)。
+    #[arg(long, default_value_t = 30.0)]
+    reloc_timeout_s: f64,
+    /// 判別変位探索の幾何スケール (`BeliefConfig::reloc_scale`)。1.0 = 屋内基準。
+    /// 屋外道路 (クリアランス数 m) では署名リングが尤度場に届かずスコア 0 に
+    /// 潰れるので上げる (津田沼は 4.0 目安)。
+    #[arg(long, default_value_t = 1.0)]
+    reloc_scale: f64,
+    /// 【実験】QMDP へ渡す仮説を生の top-64 セルでなく 1 m 分離のモード
+    /// (重みはモードへ集約、上位 4 個) にする。キャンパス級の多峰 belief では
+    /// 生セルが 27 モードに散って veto ロック (NoAction 94%) になる — その
+    /// 提案修正の検証用で、実ノードの挙動 (top-64) とは異なる。
+    #[arg(long)]
+    qmdp_modes: bool,
+
     /// CSV 出力先 (省略時は標準出力の表のみ)。
     #[arg(long)]
     out: Option<PathBuf>,
@@ -330,6 +361,18 @@ impl Est {
             Est::Whole(b) => b.ess(),
         }
     }
+    fn top_cells(&self, k: usize) -> Vec<(PoseView, f64)> {
+        match self {
+            Est::Win(l) => l.top_cells(k),
+            Est::Whole(b) => b.top_cells(k),
+        }
+    }
+    fn reloc_targets(&self) -> Vec<(f64, f64)> {
+        match self {
+            Est::Win(l) => l.reloc_targets(),
+            Est::Whole(b) => b.reloc_targets(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -373,6 +416,12 @@ struct RunResult {
     lost_us_sum: f64,
     lost_us_max: f64,
     lost_us_ticks: u64,
+    /// 能動的再定位 (--active-reloc): 判別場の構築+solve の実時間合計 [s]
+    /// (sim 時間には入れない — 実ノードでは solve 中ロボットは停止)、solve
+    /// 回数、ロスト中に QMDP で走った距離 [m]。
+    reloc_solve_s: f64,
+    reloc_solves: u32,
+    reloc_dist_m: f64,
 }
 
 impl RunResult {
@@ -401,9 +450,30 @@ fn wrap_rad(d: f64) -> f64 {
     (d + PI).rem_euclid(2.0 * PI) - PI
 }
 
+/// 重み降順の仮説セル列を `sep` [m] 分離のモードへ集約する (重みはモードの
+/// 代表セルに合算、上位 `k` モードまで — あぶれた新モードの質量は僅少なので
+/// 捨てる)。`--qmdp-modes` 実験用。
+fn thin_to_modes(hyps: &[(PoseView, f64)], sep: f64, k: usize) -> Vec<(PoseView, f64)> {
+    let mut out: Vec<(PoseView, f64)> = Vec::new();
+    for &(p, w) in hyps {
+        if let Some((_, ow)) = out
+            .iter_mut()
+            .find(|(q, _)| ((q.x - p.x).powi(2) + (q.y - p.y).powi(2)).sqrt() < sep)
+        {
+            *ow += w;
+        } else if out.len() < k {
+            out.push((p, w));
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn simulate(
-    vi: &ValueIterator,
+    // 能動的再定位が判別場を **in place** で張り替える (実ノードのキャッシュ
+    // 差し替えと同じ「一度に 1 枚」規律 — 第 2 フィールドは RAM に載らない)
+    // ため &mut。run の出口で必ず主ゴールの場に戻す。
+    vi: &mut ValueIterator,
     grid: &OccupancyGrid,
     native: &OccupancyGrid,
     // 障害物までの距離場 (chamfer_dist、3 = 1 セル)。grid と同じ格子。
@@ -416,6 +486,8 @@ fn simulate(
     wbc: WholeBeliefConfig,
     noise_seed: u64,
     kidnap: Option<Kidnap>,
+    solver: U64Solver,
+    goal_radius: f64,
     traj: Option<&mut String>,
     args: &Args,
 ) -> RunResult {
@@ -468,8 +540,23 @@ fn simulate(
         lost_us_sum: 0.0,
         lost_us_max: 0.0,
         lost_us_ticks: 0,
+        reloc_solve_s: 0.0,
+        reloc_solves: 0,
+        reloc_dist_m: 0.0,
     };
     let mut starve = 0usize;
+    // 能動的再定位 (実ノードの Reloc::Idle/Driving/GaveUp に対応)。判別場は
+    // ロスト 1 回につき 1 度だけ、主フィールドを in place で張り替えて解く。
+    let mut field_is_reloc = false;
+    let mut reloc_ticks = 0u32;
+    let mut reloc_gave_up = false;
+    // QMDP 決定の内訳 (診断用: 判別場が立ったのに走らないときの切り分け)。
+    let (mut qn_goal, mut qn_act, mut qn_noact) = (0u32, 0u32, 0u32);
+    let reloc_ticks_limit = (args.reloc_timeout_s / args.tick_s).ceil() as u32;
+    /// 本家 follow_loop の近接ガード [m] (姿勢が無く local_penalty を置けない間の停止距離)。
+    const RELOC_STOP_RANGE: f64 = 0.35;
+    /// 本家 follow_loop の QMDP 仮説上限。
+    const QMDP_TOP_K: usize = 64;
     // 復帰判定のストリーク (連続 tick 数と開始 tick) / lost 連続カウンタ。
     let mut relock_streak = 0usize;
     let mut relock_streak_from = 0usize;
@@ -497,12 +584,15 @@ fn simulate(
             r.collided = true;
             break;
         }
-        if vi.is_final(tix, tiy, tit) {
+        if !field_is_reloc && vi.is_final(tix, tiy, tit) {
+            // 判別場の final は再定位の行き先であってゴールではない。
             r.reached = true;
             break;
         }
+        let mut clr_now = f64::INFINITY;
         if let Some(&d) = chamfer.get((tiy * grid.width + tix) as usize) {
             let c = d as f64 / 3.0 * grid.resolution; // chamfer は 3-4 重み (3 = 1 セル)
+            clr_now = c;
             r.clear_min_m = r.clear_min_m.min(c);
             r.clear_sum_m += c;
             r.clear_samples += 1;
@@ -544,11 +634,17 @@ fn simulate(
                 if r.detect_tick.is_none() {
                     r.detect_tick = Some(t - at);
                 }
-                lost_run += 1;
-                if lost_run > lost_abort_ticks {
-                    r.lost_gave_up = true;
-                    r.ticks += 1;
-                    break;
+                // 能動的再定位が生きている間は「静止のまま判別不能」に数えない
+                // (走って判別しに行っている最中なので)。
+                let reloc_live =
+                    args.active_reloc && !reloc_gave_up && reloc_ticks < reloc_ticks_limit;
+                if !reloc_live {
+                    lost_run += 1;
+                    if lost_run > lost_abort_ticks {
+                        r.lost_gave_up = true;
+                        r.ticks += 1;
+                        break;
+                    }
                 }
             } else {
                 lost_run = 0;
@@ -575,7 +671,20 @@ fn simulate(
         // 成功を宣言する — 真値が final でなければ「信じて止まった」となり、
         // そのときの真値のゴール中心距離を final_err_m に残す。
         let mut cmd: Option<(f64, f64)> = None;
+        let mut from_reloc = false;
         if let Some(e) = est {
+            // pose が戻った — 本来のゴールを解き直して通常追従へ (本家の再ロック後
+            // re-solve と Reloc::Idle 復帰)。
+            if field_is_reloc {
+                let t0 = Instant::now();
+                vi.set_goal(goal.0, goal.1, args.goal_theta_deg as i32);
+                solve(vi, solver, args.max_iters);
+                r.reloc_solve_s += t0.elapsed().as_secs_f64();
+                r.reloc_solves += 1;
+                field_is_reloc = false;
+            }
+            reloc_ticks = 0;
+            reloc_gave_up = false;
             let (ix, iy, it) = pose_to_cell(vi, e.x, e.y, e.yaw_rad);
             if in_field(vi, ix, iy, it) {
                 match greedy_decide(vi, ix, iy, it, args.action_tolerance_cells) {
@@ -586,6 +695,63 @@ fn simulate(
                     }
                     GreedyOut::Act(fw, rot) => cmd = Some((fw, rot)),
                     GreedyOut::NoAction => {}
+                }
+            }
+        } else if args.active_reloc && !reloc_gave_up && reloc_ticks < reloc_ticks_limit {
+            // ロスト中の能動的再定位 (本家 follow_loop のロスト分岐を写す):
+            // 仮説 2 個以上 + 近接ガードのとき、初回は判別点の多目標場を解き、
+            // 以後は QMDP で判別点へ走る。Goal/NoAction は止まって観測を待つ。
+            if let Some(l) = &loc {
+                reloc_ticks += 1;
+                let mut hyps = l.top_cells(QMDP_TOP_K);
+                if args.qmdp_modes {
+                    hyps = thin_to_modes(&hyps, 1.0, 4);
+                }
+                // 近接ガードは chamfer クリアランスで代用 (本家は生スキャン最近接)。
+                if hyps.len() >= 2 && clr_now >= RELOC_STOP_RANGE {
+                    if !field_is_reloc {
+                        let targets = l.reloc_targets();
+                        if reloc_ticks % 50 == 1 {
+                            // 判別場が立たない理由の診断 (モード数は top-64 の近似)。
+                            eprintln!(
+                                "  [reloc] t={t} hyps={} modes={} targets={} ess={:.0}",
+                                hyps.len(),
+                                vi_lib::belief::mode_count(&hyps, 1.0),
+                                targets.len(),
+                                l.ess(),
+                            );
+                        }
+                        if !targets.is_empty() {
+                            // 主フィールドを判別場に張り替える (実ノードのキャッシュ
+                            // 差し替え相当 — 第 2 フィールドは確保しない)。
+                            let t0 = Instant::now();
+                            vi.set_goal_region(&targets, goal_radius.max(grid.resolution));
+                            let st = solve(vi, solver, args.max_iters);
+                            r.reloc_solve_s += t0.elapsed().as_secs_f64();
+                            r.reloc_solves += 1;
+                            field_is_reloc = true;
+                            if !st.converged {
+                                // 収束しない判別場では走らない — 主ゴールへ戻して諦める。
+                                vi.set_goal(goal.0, goal.1, args.goal_theta_deg as i32);
+                                solve(vi, solver, args.max_iters);
+                                field_is_reloc = false;
+                                reloc_gave_up = true;
+                            }
+                        }
+                    }
+                    if field_is_reloc {
+                        match qmdp_decide(vi, &hyps) {
+                            QmdpDecision::Action(i) => {
+                                qn_act += 1;
+                                let (fw, rot) = vi.action_delta(i);
+                                cmd = Some((fw, rot));
+                                from_reloc = true;
+                            }
+                            // Goal = 判別点に到着 / NoAction — 止まって観測を待つ。
+                            QmdpDecision::Goal => qn_goal += 1,
+                            QmdpDecision::NoAction => qn_noact += 1,
+                        }
+                    }
                 }
             }
         }
@@ -601,7 +767,11 @@ fn simulate(
             let w_exec = w_deg + args.noise_w_deg * rng.gauss();
             let (nx, ny, nyaw) =
                 unicycle_step(x, y, yaw, v_exec, w_exec.to_radians(), args.tick_s);
-            r.path_len_m += ((nx - x).powi(2) + (ny - y).powi(2)).sqrt();
+            let d = ((nx - x).powi(2) + (ny - y).powi(2)).sqrt();
+            r.path_len_m += d;
+            if from_reloc {
+                r.reloc_dist_m += d;
+            }
             (x, y, yaw) = (nx, ny, nyaw);
             Some((v, w_deg))
         } else {
@@ -640,6 +810,15 @@ fn simulate(
             }
         }
         r.ticks += 1;
+    }
+    // 判別場のまま終わった run (LOST 等) は主ゴールへ戻す — 次の run が同じ
+    // フィールドを共有するための不変条件。
+    if field_is_reloc {
+        vi.set_goal(goal.0, goal.1, args.goal_theta_deg as i32);
+        solve(vi, solver, args.max_iters);
+    }
+    if r.reloc_solves > 0 {
+        eprintln!("  [reloc] qmdp decisions: act={qn_act} goal={qn_goal} noaction={qn_noact}");
     }
     r
 }
@@ -765,6 +944,7 @@ fn main() -> ExitCode {
         init_sigma_xy_m: args.init_sigma_xy,
         init_sigma_theta_deg: args.init_sigma_theta_deg,
         contract_ess: args.contract_ess,
+        reloc_scale: args.reloc_scale,
         ..BeliefConfig::default()
     };
     // 全地図 belief 側の同じノブ (窓の半径だけが無い)。
@@ -779,6 +959,7 @@ fn main() -> ExitCode {
         viterbi: args.viterbi,
         lost_ess: args.lost_ess,
         contract_ess: args.contract_ess,
+        reloc_scale: args.reloc_scale,
         ..WholeBeliefConfig::default()
     };
     {
@@ -894,7 +1075,7 @@ fn main() -> ExitCode {
                     .as_ref()
                     .map(|_| String::from("t,x,y,yaw,est_x,est_y,est_yaw,quality,ess\n"));
                 let r = simulate(
-                    &vi,
+                    &mut vi,
                     &grid,
                     &native,
                     &chamfer,
@@ -906,6 +1087,8 @@ fn main() -> ExitCode {
                     wbc,
                     noise_seed,
                     *kd,
+                    solver,
+                    goal_radius,
                     traj_buf.as_mut(),
                     &args,
                 );
@@ -917,8 +1100,16 @@ fn main() -> ExitCode {
                     }
                 }
                 let recovery = if r.kidnapped {
+                    let reloc = if r.reloc_solves > 0 {
+                        format!(
+                            "  reloc solve={:.1}s x{} drive={:.1}m",
+                            r.reloc_solve_s, r.reloc_solves, r.reloc_dist_m
+                        )
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "  det={} lock={} lost_us={:.0}/{:.0}",
+                        "  det={} lock={} lost_us={:.0}/{:.0}{}",
                         r.detect_tick
                             .map(|t| format!("{:.1}s", t as f64 * args.tick_s))
                             .unwrap_or_else(|| "-".into()),
@@ -927,6 +1118,7 @@ fn main() -> ExitCode {
                             .unwrap_or_else(|| "-".into()),
                         r.lost_us_sum / r.lost_us_ticks.max(1) as f64,
                         r.lost_us_max,
+                        reloc,
                     )
                 } else {
                     String::new()
@@ -994,8 +1186,8 @@ fn main() -> ExitCode {
     // (誘拐なし・到達走行) との差 — 誘拐が走行全体に上乗せしたコスト。
     if !kidnaps.is_empty() {
         println!();
-        println!("| spec | mode | reach | detect | t_detect_s | relock | t_relock_s | lost_us_avg | lost_us_max | extra_time_s | extra_len_m |");
-        println!("|------|------|-------|--------|------------|--------|------------|-------------|-------------|--------------|-------------|");
+        println!("| spec | mode | reach | detect | t_detect_s | relock | t_relock_s | lost_us_avg | lost_us_max | reloc_solve_s | reloc_drive_m | extra_time_s | extra_len_m |");
+        println!("|------|------|-------|--------|------------|--------|------------|-------------|-------------|---------------|---------------|--------------|-------------|");
         for (label, _) in kidnaps.iter() {
             for &mode in &modes {
                 let all: Vec<&RunResult> = results
@@ -1034,7 +1226,7 @@ fn main() -> ExitCode {
                     )
                 };
                 println!(
-                    "| {label} | {} | {}/{} | {}/{} | {:.1} | {}/{} | {:.1} | {:.0} | {:.0} | {:.1} | {:.1} |",
+                    "| {label} | {} | {}/{} | {}/{} | {:.1} | {}/{} | {:.1} | {:.0} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} |",
                     mode.name(),
                     ok,
                     all.len(),
@@ -1046,6 +1238,8 @@ fn main() -> ExitCode {
                     mean(lock.iter().copied()),
                     mean(all.iter().map(|r| r.lost_us_sum / r.lost_us_ticks.max(1) as f64)),
                     all.iter().map(|r| r.lost_us_max).fold(0.0f64, f64::max),
+                    mean(all.iter().map(|r| r.reloc_solve_s)),
+                    mean(all.iter().map(|r| r.reloc_dist_m)),
                     extra_t,
                     extra_len,
                 );
@@ -1060,7 +1254,7 @@ fn main() -> ExitCode {
             }
         }
         let mut csv = String::from(
-            "start,spec,mode,outcome,final_err_m,ticks,time_s,len_m,clr_min_m,clr_avg_m,err_rms_m,err_max_m,yaw_rms_deg,quality,loc_us_avg,loc_us_max,t_detect_s,t_relock_s,lost_us_avg,lost_us_max\n",
+            "start,spec,mode,outcome,final_err_m,ticks,time_s,len_m,clr_min_m,clr_avg_m,err_rms_m,err_max_m,yaw_rms_deg,quality,loc_us_avg,loc_us_max,t_detect_s,t_relock_s,lost_us_avg,lost_us_max,reloc_solve_s,reloc_solves,reloc_dist_m\n",
         );
         for (si, label, r) in &results {
             let outcome = if r.reached {
@@ -1081,7 +1275,7 @@ fn main() -> ExitCode {
             let opt_s =
                 |t: Option<usize>| t.map(|t| format!("{:.2}", t as f64 * args.tick_s)).unwrap_or_default();
             csv.push_str(&format!(
-                "{si},{label},{},{outcome},{:.3},{},{:.1},{:.2},{:.3},{:.3},{:.4},{:.4},{:.2},{:.3},{:.2},{:.1},{},{},{:.1},{:.1}\n",
+                "{si},{label},{},{outcome},{:.3},{},{:.1},{:.2},{:.3},{:.3},{:.4},{:.4},{:.2},{:.3},{:.2},{:.1},{},{},{:.1},{:.1},{:.2},{},{:.2}\n",
                 r.mode,
                 r.final_err_m,
                 r.ticks,
@@ -1099,6 +1293,9 @@ fn main() -> ExitCode {
                 opt_s(r.relock_tick),
                 r.lost_us_sum / r.lost_us_ticks.max(1) as f64,
                 r.lost_us_max,
+                r.reloc_solve_s,
+                r.reloc_solves,
+                r.reloc_dist_m,
             ));
         }
         if let Err(e) = std::fs::write(path, csv) {
