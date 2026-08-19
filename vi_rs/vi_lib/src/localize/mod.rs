@@ -151,6 +151,11 @@ pub struct BeliefConfig {
     /// 粗いレベルへ広げる (EMCL の expansion resetting 相当)。0 以下で多重解像度を
     /// 無効化 (L0 のみ = GridLocalizer と同じ固定窓)。GridLocalizer は無視する。
     pub expand_quality: f64,
+    /// [`AdaptiveLocalizer`] 用: ESS (有効セル数 = 1/Σb²) がこれを下回ったら
+    /// 1 段細かいレベルへ降りる (contract)。**現在レベルの絶対セル数**なので、
+    /// 広い地図の全域レベルでは既定 (50) が小さすぎて降りられないことがある
+    /// (津田沼級で実測プラトー ~900)。GridLocalizer は無視する。
+    pub contract_ess: f64,
     /// [`AdaptiveLocalizer`] 用: 全域レベルを min-plus (Viterbi / MAP) で回す
     /// (localize/adaptive/viterbi.rs の doc)。窓レベルの追跡は sum-product のままで、
     /// ロスト中の全域推定だけが max-product に替わる。GridLocalizer は無視する。
@@ -171,6 +176,7 @@ impl Default for BeliefConfig {
             z_min: 0.05,
             weight_skip_ratio: 1e-4,
             expand_quality: 0.25,
+            contract_ess: 50.0,
             viterbi: false,
         }
     }

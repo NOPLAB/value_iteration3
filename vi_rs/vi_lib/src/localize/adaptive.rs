@@ -18,8 +18,6 @@ const COARSE: [(i32, i32, usize); 2] = [(4, 2, 2), (10, 3, 4)];
 const EWMA_BETA: f64 = 0.3;
 /// レベル遷移後、次の遷移までに最低限挟む observe 回数 (振動防止)。
 const MIN_DWELL: u32 = 3;
-/// ESS (有効セル数 = 1/Σb²) がこれを下回ったら 1 段細かいレベルへ降りる。
-const ESS_CONTRACT: f64 = 50.0;
 /// expansion で free 一様分布と混ぜる質量比 (EMCL の resetting 相当)。
 const MIX_UNIFORM: f32 = 0.5;
 /// 能動的再定位 ([`Localizer::reloc_targets`]) の判別に使う上位モード数
@@ -597,7 +595,7 @@ impl AdaptiveLocalizer {
         }
         if self.q_ewma < self.cfg.expand_quality && self.cur + 1 < self.levels.len() {
             self.expand(self.cur + 1);
-        } else if self.cur > 0 && self.ess() < ESS_CONTRACT {
+        } else if self.cur > 0 && self.ess() < self.cfg.contract_ess {
             self.contract(self.cur - 1, scan);
         }
     }

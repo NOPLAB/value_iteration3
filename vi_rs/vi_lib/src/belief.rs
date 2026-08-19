@@ -89,6 +89,13 @@ pub struct BeliefConfig {
     /// ESS ([`Belief::ess`] = 1/Σb²) がこれ超で [`Belief::pose`] = None
     /// (= ロスト)。
     pub lost_ess: f64,
+    /// ロスト解除 (再集中) とみなす ESS — これ未満でラッチが降りる。`lost_ess`
+    /// と同じく**絶対セル数**なので、広い地図では両方を地図スケールに合わせて
+    /// 上げる (進入/解除の 10 倍ヒステリシスを保つのが目安)。TB3 級の既定
+    /// (500/50) はキャンパス級 (津田沼 0.15 m 格子) では健全な追跡状態の ESS
+    /// (廊下方向の広がりで数百セル) が進入しきい値を超え、ラッチが永久に
+    /// 降りなくなる。
+    pub contract_ess: f64,
     /// min-plus (MAP / Viterbi) 更新則で回す。全期間 min-plus (レベル切替なし)。
     pub viterbi: bool,
 }
@@ -107,6 +114,7 @@ impl Default for BeliefConfig {
             weight_skip_ratio: 1e-4,
             reset_quality: 0.25,
             lost_ess: 500.0,
+            contract_ess: 50.0,
             viterbi: false,
         }
     }
@@ -116,8 +124,6 @@ impl Default for BeliefConfig {
 const EWMA_BETA: f64 = 0.3;
 /// リセットで free 一様分布と混ぜる質量比 (EMCL の resetting 相当)。
 const MIX_UNIFORM: f32 = 0.5;
-/// ロスト解除 (再集中) とみなす ESS (旧 AdaptiveLocalizer の ESS_CONTRACT)。
-const ESS_CONTRACT: f64 = 50.0;
 /// [`Belief::b_hat`] の下端アンカー: 「十分集中」とみなす ESS。
 // ponytail: 定数、必要なら BeliefConfig へ昇格。
 const TIGHT_ESS: f64 = 30.0;
@@ -346,7 +352,7 @@ pub struct Belief {
     /// で発火する一様混合リセットが同じ observe 内で q_ewma を書き戻すので、
     /// observe から戻った時点では「合っていなかった」証拠も消えている。
     /// 立つ: 観測不一致 (q_ewma < reset_quality) か belief 拡大 (ess > lost_ess)。
-    /// 降りる: 再集中 (ess < [`ESS_CONTRACT`]) かつ観測が合っている
+    /// 降りる: 再集中 (ess < [`BeliefConfig::contract_ess`]) かつ観測が合っている
     /// (旧 AdaptiveLocalizer の contract 条件と同じ)。
     lost: bool,
 }
@@ -635,7 +641,7 @@ impl Belief {
         self.recompute_ess();
         if mismatched || self.ess_c > self.cfg.lost_ess {
             self.lost = true;
-        } else if self.lost && self.ess_c < ESS_CONTRACT {
+        } else if self.lost && self.ess_c < self.cfg.contract_ess {
             self.lost = false;
         }
     }
