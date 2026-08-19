@@ -52,10 +52,20 @@
 //! 同日計測で出荷状態では機能しない。原因 3 段: (1) 判別変位の幾何が屋内定数
 //! で屋外は全候補スコア 0 → `reloc_scale` (BeliefConfig へ昇格、津田沼 4.0)
 //! で解消; (2) QMDP が生 top-64 セル評価で veto ロック (NoAction 94%) —
-//! モード集約 (`--qmdp-modes` 実験) で belief は解消、adaptive は粗レベル仮説
-//! の非 free 写像で残る; (3) belief はリセット過渡の一時集中で ESS 解除が
-//! 早発し誤姿勢を返す (未修正)。K1 廊下は scale 4 でも targets 空 — 判別点
-//! (交差点) は数十 m 先で δ≤12 m の局所探索では原理的に届かない。
+//! `vi_lib::belief::weighted_modes` への集約で belief は解消 (この bench の
+//! reloc 分岐は集約が既定。実ノード follow_loop は未配線)、adaptive は
+//! 粗レベル仮説の非 free 写像で残る; (3) belief のリセット過渡の一時集中で
+//! ESS 解除が早発し誤姿勢を返す → 解除条件に単峰ゲート (`mode_count` ≤ 1)
+//! を追加して解消。K1 廊下は scale 4 でも targets 空 — 判別点 (交差点) は
+//! 数十 m 先で δ≤12 m の局所探索では原理的に届かない。
+//!
+//! (2)(3) の解消後も K4 は未達で、残る本丸は**判別機動の実行**: 静止~回転だけ
+//! だと belief は誤エイリアスへ単峰 (quality 0.99) で収束し (28.3 m ずれ —
+//! belief 内部からは検出不能)、収束レースに負ける。QMDP は多目標場の最寄り
+//! 割当がモード間で食い違い回頭が拮抗 (223 act で 0.3 m)、open-loop δ*
+//! (`--reloc-openloop`) は真値が top-4 モードに無いと壁際へ寄り近接ガード
+//! (0.35 m) とデッドロック (0.8 m で停止)。エイリアス下で実行可能な判別機動の
+//! 設計が次のイテレーション。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -231,12 +241,13 @@ struct Args {
     /// 潰れるので上げる (津田沼は 4.0 目安)。
     #[arg(long, default_value_t = 1.0)]
     reloc_scale: f64,
-    /// 【実験】QMDP へ渡す仮説を生の top-64 セルでなく 1 m 分離のモード
-    /// (重みはモードへ集約、上位 4 個) にする。キャンパス級の多峰 belief では
-    /// 生セルが 27 モードに散って veto ロック (NoAction 94%) になる — その
-    /// 提案修正の検証用で、実ノードの挙動 (top-64) とは異なる。
+    /// 【実験】判別変位 δ* を多目標 VI + QMDP でなく open-loop (上位モードから
+    /// 最寄り判別点へ回頭 → 前進) で実行する。δ* は全仮説共通のロボット系変位
+    /// なので、どの仮説が真でも同じ操舵でよい — 多目標場の最寄り割当がモード間で
+    /// 食い違い回頭が拮抗する (回転だけで誤エイリアスに収束し負ける) 問題の
+    /// 切り分け用。判別場の solve (~17 s×2) も不要になる。
     #[arg(long)]
-    qmdp_modes: bool,
+    reloc_openloop: bool,
 
     /// CSV 出力先 (省略時は標準出力の表のみ)。
     #[arg(long)]
@@ -450,23 +461,6 @@ fn wrap_rad(d: f64) -> f64 {
     (d + PI).rem_euclid(2.0 * PI) - PI
 }
 
-/// 重み降順の仮説セル列を `sep` [m] 分離のモードへ集約する (重みはモードの
-/// 代表セルに合算、上位 `k` モードまで — あぶれた新モードの質量は僅少なので
-/// 捨てる)。`--qmdp-modes` 実験用。
-fn thin_to_modes(hyps: &[(PoseView, f64)], sep: f64, k: usize) -> Vec<(PoseView, f64)> {
-    let mut out: Vec<(PoseView, f64)> = Vec::new();
-    for &(p, w) in hyps {
-        if let Some((_, ow)) = out
-            .iter_mut()
-            .find(|(q, _)| ((q.x - p.x).powi(2) + (q.y - p.y).powi(2)).sqrt() < sep)
-        {
-            *ow += w;
-        } else if out.len() < k {
-            out.push((p, w));
-        }
-    }
-    out
-}
 
 #[allow(clippy::too_many_arguments)]
 fn simulate(
@@ -550,6 +544,8 @@ fn simulate(
     let mut field_is_reloc = false;
     let mut reloc_ticks = 0u32;
     let mut reloc_gave_up = false;
+    // --reloc-openloop: ロスト 1 回ぶんの凍結判別点 (pose 復帰で捨てる)。
+    let mut reloc_frozen: Option<Vec<(f64, f64)>> = None;
     // QMDP 決定の内訳 (診断用: 判別場が立ったのに走らないときの切り分け)。
     let (mut qn_goal, mut qn_act, mut qn_noact) = (0u32, 0u32, 0u32);
     let reloc_ticks_limit = (args.reloc_timeout_s / args.tick_s).ceil() as u32;
@@ -685,6 +681,7 @@ fn simulate(
             }
             reloc_ticks = 0;
             reloc_gave_up = false;
+            reloc_frozen = None;
             let (ix, iy, it) = pose_to_cell(vi, e.x, e.y, e.yaw_rad);
             if in_field(vi, ix, iy, it) {
                 match greedy_decide(vi, ix, iy, it, args.action_tolerance_cells) {
@@ -703,12 +700,50 @@ fn simulate(
             // 以後は QMDP で判別点へ走る。Goal/NoAction は止まって観測を待つ。
             if let Some(l) = &loc {
                 reloc_ticks += 1;
-                let mut hyps = l.top_cells(QMDP_TOP_K);
-                if args.qmdp_modes {
-                    hyps = thin_to_modes(&hyps, 1.0, 4);
-                }
+                // QMDP へは生の top-64 でなくモード集約を渡す (vi_lib 側の
+                // (b) 修正 — 生セルはキャンパス級の多峰で veto ロックする)。
+                let hyps = vi_lib::belief::weighted_modes(&l.top_cells(QMDP_TOP_K), 1.0, 4);
                 // 近接ガードは chamfer クリアランスで代用 (本家は生スキャン最近接)。
-                if hyps.len() >= 2 && clr_now >= RELOC_STOP_RANGE {
+                if args.reloc_openloop && hyps.len() >= 2 && clr_now >= RELOC_STOP_RANGE {
+                    // open-loop 実行: δ* は全仮説共通のロボット系変位なので、
+                    // 上位モードの座標系で最寄り判別点へ回頭 → 前進すればよい
+                    // (どの仮説が真でも同じ操舵)。predict が回すのはモードの
+                    // yaw も同じなので、毎 tick 上位モードから引き直す。
+                    if reloc_frozen.is_none() {
+                        let targets = l.reloc_targets();
+                        if reloc_ticks % 50 == 1 {
+                            eprintln!(
+                                "  [reloc] t={t} hyps={} targets={} (openloop)",
+                                hyps.len(),
+                                targets.len(),
+                            );
+                        }
+                        if !targets.is_empty() {
+                            reloc_frozen = Some(targets);
+                        }
+                    }
+                    if let (Some(ts), Some(&(mp, _))) = (&reloc_frozen, hyps.first()) {
+                        let (tx, ty) = ts
+                            .iter()
+                            .copied()
+                            .min_by(|a, b| {
+                                (a.0 - mp.x)
+                                    .hypot(a.1 - mp.y)
+                                    .total_cmp(&(b.0 - mp.x).hypot(b.1 - mp.y))
+                            })
+                            .unwrap();
+                        let d = (tx - mp.x).hypot(ty - mp.y);
+                        let ang = wrap_rad((ty - mp.y).atan2(tx - mp.x) - mp.yaw_rad);
+                        cmd = if d < 0.5 {
+                            None // 判別点に到着 — 止まって観測を待つ
+                        } else if ang.abs() > 0.3 {
+                            Some((0.0, 20.0 * ang.signum()))
+                        } else {
+                            Some((0.3, 0.0))
+                        };
+                        from_reloc = cmd.is_some();
+                    }
+                } else if hyps.len() >= 2 && clr_now >= RELOC_STOP_RANGE {
                     if !field_is_reloc {
                         let targets = l.reloc_targets();
                         if reloc_ticks % 50 == 1 {
