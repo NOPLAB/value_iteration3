@@ -1,6 +1,23 @@
 //! Frontier2D の u64 版。`vi_algorithm/src/frontier/f2d.rs` を本家 u64 モデルへ移植。
 //! 空間 2D フロンティア: 活性 (ix,iy) が現れたら全 θ 層を再評価する。dilation は空間のみで
 //! 安い代わりに per-cell 仕事量が N_THETA 倍。収束値・方策は Reference = 本家と bit-exact。
+//!
+//! # 伝播は値が「動いた」ら行う (下がったときだけ、ではない)
+//!
+//! 白紙 (`MAX_COST`) から解く限り値は単調に下がるので、伝播の条件を「下がった」に
+//! しても「動いた」にしても挙動は同じ。**違うのは解き終わった場を掃き直すとき**で、
+//! 走行中に注入される `local_penalty` は値を上げる向きにも働く
+//! (`ValueIteratorLocal::set_local_cost` はヒット点にコストを足し、光線が抜けた
+//! 自由空間のコストは半減させる)。条件が「下がった」だと上昇は黙って伝播せず、
+//! エラーも出ないまま遠方の場が古い値のまま残る。
+//!
+//! 能動集合の健全性はどちらの向きでも同じ理屈で立つ: あるセルの値が動くのは
+//! 遷移先の値かペナルティが動いたときだけなので、動いたセルを `displacement` だけ
+//! 膨張させた範囲を再評価すれば取りこぼさない。空フロンティア = 不動点。
+//!
+//! なお同じ「下がったときだけ」の条件は frontier3d / stack / block / sparse / fused /
+//! par 系にも残っている。あちらは白紙から解く用途しか無いので実害は無いが、
+//! **収束後の場を掃き直す用途に転用するならここと同じ直しが要る**。
 
 use crate::solvers::observe::{
     BoundaryPacer, InPlaceProbe, SolveFlow, SolveObserver, SolveOutcome,
@@ -33,9 +50,10 @@ pub fn frontier2d_solve_observed(
             let mut u = 0u64;
             for it in 0..nt {
                 let idx = vi.to_index(ix as i32, iy as i32, it) as usize;
-                let before = vi.states[idx].total_cost;
-                value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt);
-                if vi.states[idx].total_cost < before {
+                // `value_iteration_raw` の戻り値は |Δ| なので、上下どちらの変化も拾う
+                // (モジュール doc 参照)。白紙からの solve では `< before` と完全に
+                // 同じ挙動 = Reference と bit-exact のまま。
+                if value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt) > 0 {
                     u += 1;
                 }
             }

@@ -32,9 +32,11 @@ pub fn frontier3d_solve_observed(
         let mut new_frontier = Bitboard3D::new(nx as u32, ny as u32, nt as u32);
         for (ix, iy, it) in candidates.enumerate() {
             let idx = vi.to_index(ix as i32, iy as i32, it as i32) as usize;
-            let before = vi.states[idx].total_cost;
-            value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt);
-            if vi.states[idx].total_cost < before {
+            // 値が「動いた」ら伝播する。白紙からの solve では値は単調に下がるので
+            // `< before` と同じ挙動 (Reference と bit-exact) だが、収束後の掃き直しでは
+            // local_penalty が値を**上げる**ので、下降しか追わないと伝播が黙って
+            // 止まる (`SolverCaps::resweep`)。`value_iteration_raw` の戻り値は |Δ|。
+            if value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt) > 0 {
                 updates += 1;
                 new_frontier.set(ix, iy, it);
             }

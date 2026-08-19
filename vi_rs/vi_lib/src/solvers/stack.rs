@@ -65,9 +65,8 @@ pub fn frontier_stack_solve_observed(
         for it in 0..nt_us {
             for (ix, iy) in candidates[it].enumerate() {
                 let idx = vi.to_index(ix as i32, iy as i32, it as i32) as usize;
-                let before = vi.states[idx].total_cost;
-                value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt);
-                if vi.states[idx].total_cost < before {
+                // 値が「動いた」ら伝播する (向きの話は `SolverCaps::resweep` の doc)。
+                if value_iteration_raw(&mut vi.states, &vi.actions, idx, nx, ny, nt) > 0 {
                     updates += 1;
                     new_frontier[it].set(ix, iy);
                 }

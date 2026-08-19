@@ -316,7 +316,11 @@ pub fn frontier2d_sparse_solve_observed(
                             min_cost = c;
                         }
                     }
-                    if min_cost < before {
+                    // 値が「動いた」ら伝播する。白紙からの solve では値は単調に
+                    // 下がるので `< before` と同じ挙動 (Reference と bit-exact) だが、
+                    // 収束後の掃き直しでは local_penalty が値を**上げる**ので、
+                    // 下降しか追わないと伝播が黙って止まる (`SolverCaps::resweep`)。
+                    if min_cost != before {
                         // claim したブロック内のセル = 単一書き手。
                         cp_atomic[pad_idx].store(
                             min_cost.wrapping_add(pen_self),

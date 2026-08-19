@@ -70,7 +70,8 @@ fn compute_round(
                                     min_cost = c;
                                 }
                             }
-                            if min_cost < before {
+                            // 値が「動いた」ら伝播 (`SolverCaps::resweep` の doc)。
+                            if min_cost != before {
                                 ups.push((pad_idx, min_cost, ixu, iyu));
                             }
                         }

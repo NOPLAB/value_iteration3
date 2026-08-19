@@ -93,7 +93,8 @@ pub fn frontier2d_par_unsafe_solve_observed(
                     min_cost = c;
                 }
             }
-            if min_cost < before {
+            // 値が「動いた」ら伝播 (向きの話は `SolverCaps::resweep` の doc)。
+            if min_cost != before {
                 hot_atomic[pad_idx][0].store(min_cost, Ordering::Relaxed);
                 ups += 1;
                 cell_changed = true;

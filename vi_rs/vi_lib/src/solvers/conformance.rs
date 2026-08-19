@@ -14,6 +14,9 @@
 //!    (priority 系は従来これが不可能だった)。
 //! 5. **Stop 健全性 (early_start)**: 「起点からゴールへ方策が繋がった」時点で `Stop`
 //!    した場の上で、実際に `rollout_path_on` がゴールへ着く。
+//! 6. **掃き直し** (`caps().resweep`): 収束後の場に `local_penalty` を足して同じ
+//!    ソルバを再度回すと、全走査で同じことをした場と一致する (値が**上がる**向きの
+//!    伝播)。false を宣言したソルバは対象外。
 //!
 //! Reference 固定点 (本家全走査) が全ソルバ共通のオラクル。
 
@@ -345,4 +348,72 @@ fn caps_expectations() {
     assert_eq!(compact.partial, Partiality::ExactPrefix);
     assert!(Frontier2DSparse.caps().parallel);
     assert!(!Frontier2D.caps().out_of_core);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 6. 掃き直し: 収束後の場に後から入った penalty を伝播できるか (caps().resweep)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// 掃き直しで建てる壁の列と強さ。ゴール (セル (2,2)) の向こう側を塞ぐので、
+/// その先のセルは迂回できず値が必ず上がる。
+const RESWEEP_WALL_IX: i32 = 3;
+const RESWEEP_BUMP: u64 = crate::params::PROB_BASE * 2048;
+
+/// 素の場を `solver` で解く → 壁を建てる → **同じ solver でもう一度解く**。
+/// 戻り値は `(掃き直した場, 壁を建てる前の値)`。
+fn resweep_with(w: i32, h: i32, occ: &[i8], solver: U64Solver) -> (ValueIterator, Vec<u64>) {
+    let mut vi = make_vi(w, h, occ.to_vec());
+    solve(&mut vi, solver, MAX_ITER);
+    let clean: Vec<u64> = vi.states.iter().map(|s| s.total_cost).collect();
+    for s in vi.states.iter_mut() {
+        if s.ix == RESWEEP_WALL_IX {
+            s.local_penalty = RESWEEP_BUMP;
+        }
+    }
+    solve(&mut vi, solver, MAX_ITER);
+    (vi, clean)
+}
+
+/// **収束後の場に後から `local_penalty` が入っても、全走査と同じところまで
+/// 掃き直せること** ([`crate::solvers::SolverCaps::resweep`])。
+///
+/// これは白紙から解く能力とは別の性質で、走行中のロボットが要求するのはこちら。
+/// 伝播条件が「値が下がったときだけ」のソルバは、1 ラウンド目で活性集合が空に
+/// なって**黙って**古い値を残すので、ここで落ちる。
+///
+/// # オラクルは「同じ場を全走査で掃き直したもの」
+///
+/// 「最初から壁を建てて解いた場」と比べては**いけない**。Bellman 作用素は
+/// `cost >> PROB_BASE_BIT` で切り捨てるため、循環依存のあるセルでは不動点が
+/// 1 LSB 幅の区間になり、上から降りてきたときと下から上がってきたときで最終値が
+/// 1〜2 単位 (3e9 のうち) 食い違う。切り捨ての性質であって伝播の問題ではないので、
+/// 比較は**同じ向きから寄せた場どうし**で行う。
+#[test]
+fn conformance_resweep_propagates_a_raised_penalty() {
+    for (map_name, w, h, occ) in standard_maps() {
+        let (truth, clean) = resweep_with(w, h, &occ, U64Solver::Reference);
+
+        // 前提: 壁で実際に値が上がっていること。ここが空振りすると、下の一致は
+        // 「どちらも何も伝播しなかった」でも通ってしまう。
+        let risen = (0..truth.states.len())
+            .filter(|&i| truth.states[i].total_cost < REACH)
+            .filter(|&i| truth.states[i].total_cost > clean[i])
+            .count();
+        assert!(risen > 0, "[{map_name}] 壁で値が上がっていない — この試験は何も見ていない");
+
+        for (name, solver) in all_solvers() {
+            if !solver.caps().resweep {
+                continue;
+            }
+            let (got, _) = resweep_with(w, h, &occ, solver);
+            let bad = (0..truth.states.len())
+                .filter(|&i| truth.states[i].total_cost < REACH)
+                .filter(|&i| truth.states[i].total_cost != got.states[i].total_cost)
+                .count();
+            assert_eq!(
+                bad, 0,
+                "[{map_name}/{name}] 掃き直しが全走査に届いていないセルが {bad} 個                  (値を上げる向きの伝播が落ちている)"
+            );
+        }
+    }
 }

@@ -415,6 +415,27 @@ pub struct SolverCaps {
     pub out_of_core: bool,
     /// マルチスレッド (`VI_THREADS`) を使うか。
     pub parallel: bool,
+    /// **収束後の場を掃き直せるか** — 解き終わった `states` に後から
+    /// `local_penalty` を足して同じソルバを再度回したとき、全走査 (Reference) と
+    /// 同じ不動点まで届くか。
+    ///
+    /// 白紙から解く限り値は `MAX_COST` から単調に下がるので、「値が下がったら
+    /// 伝播する」という条件で足りる。**掃き直しでは向きが逆になる**:
+    /// `ValueIteratorLocal::set_local_cost` はヒット点にコストを足して値を
+    /// 上げるので、下降しか追わないソルバは 1 ラウンドで活性集合が空になり、
+    /// 掃いた気になったまま古い値を残す (エラーは出ない)。
+    ///
+    /// false になるのは条件式では直らない 2 系統:
+    /// - アウトオブコア (`Frontier2DSparseCompact`): 確定値は別配列へ書き出して
+    ///   ブロックを解放するので、緩和し直す対象がそもそも残っていない。
+    /// - 優先度キュー (`PriorityLabelSetting` / `PriorityLabelCorrecting`):
+    ///   値の昇順に確定していく前提が上昇で崩れる (押し込んだラベルが stale に
+    ///   なって伝播が死ぬ)。上昇を扱うには rhs 値と二重キーが要る = D\* Lite /
+    ///   LPA\* の系統で、別アルゴリズム。
+    ///
+    /// 使い道は `vi_planner` の狭域 → 広域フィードバック (走行中にレーザーが窓の
+    /// 中へ建てた壁を地図全域へ広げる掃き直し)。
+    pub resweep: bool,
 }
 
 impl U64Solver {
@@ -430,6 +451,11 @@ impl U64Solver {
         SolverCaps {
             exact,
             partial,
+            // 掃き直せないのは確定 + 退避の compact と、昇順確定の優先度キュー系。
+            resweep: !matches!(
+                *self,
+                Frontier2DSparseCompact { .. } | PriorityLabelSetting | PriorityLabelCorrecting
+            ),
             out_of_core: matches!(self, Frontier2DSparseCompact { .. }),
             parallel: matches!(
                 self,

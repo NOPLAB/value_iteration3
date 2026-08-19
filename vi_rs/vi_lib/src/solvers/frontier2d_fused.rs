@@ -311,7 +311,8 @@ pub fn frontier2d_fused_solve_observed(
                     min_cost = c;
                 }
             }
-            if min_cost < before {
+            // 値が「動いた」ら伝播 (向きの話は `SolverCaps::resweep` の doc)。
+            if min_cost != before {
                 cp_atomic[pad_idx].store(min_cost.wrapping_add(pen_self), Ordering::Relaxed);
                 ups += 1;
                 cell_changed = true;
