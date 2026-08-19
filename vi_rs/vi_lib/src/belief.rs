@@ -166,6 +166,8 @@ const MODE_THRESHOLD: f32 = 0.05;
 const MODE_MIN_SEP_M: f64 = 1.0;
 const RELOC_MODES: usize = 4;
 const MODE_CANDIDATE_CAP: usize = 4096;
+/// ロスト解除の単峰判定に見る上位セル数 (QMDP に渡すのと同じ規模)。
+const UNIMODAL_TOP_K: usize = 64;
 
 /// 3 点カーネル [a, 1-2a, a] の a。1 tick σ [セル] のランダムウォーク分散
 /// (2a セル²) を合わせる (旧 GridLocalizer::blur_a)。累積 tick 分の a は
@@ -359,7 +361,9 @@ pub struct Belief {
     /// observe から戻った時点では「合っていなかった」証拠も消えている。
     /// 立つ: 観測不一致 (q_ewma < reset_quality) か belief 拡大 (ess > lost_ess)。
     /// 降りる: 再集中 (ess < [`BeliefConfig::contract_ess`]) かつ観測が合っている
-    /// (旧 AdaptiveLocalizer の contract 条件と同じ)。
+    /// (旧 AdaptiveLocalizer の contract 条件と同じ)、**かつ単峰**
+    /// ([`mode_count`] ≤ 1 — 離れたエイリアスに分かれたままの「集中」で
+    /// 降ろすと誤姿勢を返す。津田沼 K4 で実測)。
     lost: bool,
 }
 
@@ -647,7 +651,15 @@ impl Belief {
         self.recompute_ess();
         if mismatched || self.ess_c > self.cfg.lost_ess {
             self.lost = true;
-        } else if self.lost && self.ess_c < self.cfg.contract_ess {
+        } else if self.lost
+            && self.ess_c < self.cfg.contract_ess
+            && mode_count(&self.top_cells(UNIMODAL_TOP_K), MODE_MIN_SEP_M) <= 1
+        {
+            // 解除は「集中」だけでは足りない — リセット直後の過渡や尤度飽和の
+            // プラトーでは、遠く離れたエイリアスに分かれたまま ESS だけが
+            // しきい値を横切る (津田沼で実測: 解除された平均姿勢が 80〜130 m
+            // ずれる)。単峰まで確認してから降ろす。多峰のままなら lost を
+            // 維持して能動的再定位 (reloc_targets) に判別させる。
             self.lost = false;
         }
     }
@@ -1397,6 +1409,32 @@ pub fn mode_count(hyps: &[(PoseView, f64)], min_sep_m: f64) -> usize {
     modes(hyps, min_sep_m).len()
 }
 
+/// [`modes`] の重み保存版: 重み降順の仮説セル列を `min_sep_m` 分離の峰へ
+/// 集約する (各セルの質量は最寄りの峰の代表セルに合算、峰は上位 `k` 個まで —
+/// あぶれた新峰の質量は僅少なので捨てる)。
+///
+/// QMDP へ渡す仮説集合はこれを使うこと。生の top-k セルは広い地図の多峰
+/// belief では数十峰に散り、Q の薄まりと veto の積み上げで `qmdp_decide` が
+/// NoAction に張り付く (津田沼のロスト中で実測 94% — 集約で 0 になる)。
+/// 屋内級の地図では top-k ≒ 少数峰なのでどちらでも同じ。
+pub fn weighted_modes(
+    hyps: &[(PoseView, f64)],
+    min_sep_m: f64,
+    k: usize,
+) -> Vec<(PoseView, f64)> {
+    let mut out: Vec<(PoseView, f64)> = Vec::new();
+    for &(p, w) in hyps {
+        if let Some((_, ow)) =
+            out.iter_mut().find(|(q, _)| (p.x - q.x).hypot(p.y - q.y) < min_sep_m)
+        {
+            *ow += w;
+        } else if out.len() < k {
+            out.push((p, w));
+        }
+    }
+    out
+}
+
 /// 能動的再定位の判別変位: 上位モード仮説 {pᵢ} はオドメトリ共有で「同じロボット系
 /// 変位 δ で一緒に動く」ので、δ 先の地図が仮説間で最も違う δ* を選べば、そこへ
 /// 走るだけで観測が仮説を判別する:
@@ -1934,6 +1972,62 @@ mod tests {
         );
         loc.lost = false;
         assert!(loc.reloc_targets().is_empty(), "非ロストは空 (受動追従に任せる)");
+    }
+
+    /// ロスト解除は「集中」(ESS < contract) だけでは降りない — 離れた
+    /// エイリアス 2 峰に集中したままの belief (津田沼 K4 の飽和プラトーで実測
+    /// した形) は多峰なので lost を維持し、単峰に戻ってから解除すること。
+    #[test]
+    fn lost_release_requires_unimodal() {
+        // 素の正方形の壁だけ (内部ブロックなし) — 180° 回転対称なので
+        // (0.8, 0.8, 0°) と (2.2, 2.2, 180°) は観測で判別できないエイリアス。
+        let size = 60;
+        let mut g = OccupancyGrid {
+            width: size,
+            height: size,
+            resolution: 0.05,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            data: vec![0i8; (size * size) as usize],
+        };
+        for i in 0..size {
+            for (x, y) in [(i, 0), (i, size - 1), (0, i), (size - 1, i)] {
+                g.data[(y * size + x) as usize] = 100;
+            }
+        }
+        let bc = BeliefConfig { beam_step: 4, init_sigma_xy_m: 0.1, ..BeliefConfig::default() };
+        let mut loc = Belief::new(&g, 36, &g, bc);
+        let truth = pose(0.8, 0.8, 0.0);
+        loc.seed(truth);
+        let scan = cast_scan(&g, truth, 36, 8.0);
+        for _ in 0..4 {
+            loc.observe(&scan); // q_ewma を安定させる
+        }
+        assert!(loc.pose().is_some());
+
+        // 対称エイリアスに同量の質量を注入 — 集中 (ESS 小) だが 2 峰。
+        // ラッチを立てて解除条件だけを試す。
+        loc.lost = true;
+        let peak = loc.active.iter().map(|&i| loc.b[i as usize]).fold(0.0f32, f32::max);
+        let it = (180.0 / (360.0 / 36.0)) as i32; // θ ビン 18
+        let (ix, iy) = ((2.2 / loc.res) as i32, (2.2 / loc.res) as i32);
+        let alias = ((it * loc.ny + iy) * loc.nx + ix) as u32;
+        loc.b[alias as usize] = peak;
+        loc.active.push(alias);
+        loc.observe(&scan);
+        assert!(
+            loc.ess() < loc.cfg.contract_ess,
+            "前提: 2 峰でも集中はしている (ess={:.1})",
+            loc.ess()
+        );
+        assert!(loc.pose().is_none(), "多峰のままの解除は誤姿勢を返す — 降りてはいけない");
+
+        // エイリアスを消せば単峰 — 通常どおり解除する。
+        loc.b[alias as usize] = 0.0;
+        loc.observe(&scan);
+        loc.observe(&scan);
+        assert!(loc.pose().is_some(), "単峰 + 集中 + 観測一致で解除するはず");
     }
 
     /// ESS が pose のゲートと b_hat の広がり報告を担うこと:
