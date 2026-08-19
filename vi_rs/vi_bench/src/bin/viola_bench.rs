@@ -28,6 +28,24 @@
 //! cargo run --release -p vi_bench --bin viola_bench -- \
 //!     --starts 6 --goal-x 202.73 --goal-y 27.23
 //! ```
+//!
+//! 誘拐 (kidnapped robot) ベンチ: `--kidnap` で走行中の真値だけを瞬間移動させ、
+//! 復帰時間 (t_detect = pose None / t_relock = 誤差 < relock_err_m の連続) と
+//! lost 中の計算コストを測る。津田沼では既定センサ (25 m / 36 本) だと開けた
+//! 区間で観測が痩せて通常走行すら誤ロックで破綻するので、`--scan-range 60
+//! --beam-step 5` が前提 (2026-08-20 計測の構成):
+//! ```text
+//! cargo run --release -p vi_bench --bin viola_bench -- \
+//!     --goal-x 202.73 --goal-y 27.23 \
+//!     --start-x 150 --start-y 33 --start-theta-deg 0 \
+//!     --kidnap "label=K1,t=30,x=100,y=35,yaw=90" \
+//!     --modes grid,adaptive,belief --trials 3 --max-ticks 9000 \
+//!     --scan-range 60 --beam-step 5
+//! ```
+//! 既知の結果 (2026-08-20): 静止した受動復帰は全滅する — 廊下は並進対称で
+//! 原理的に判別不能 (ESS ~900 で凍結)、特徴的な交差点でも尤度飽和の同値セル塊
+//! (~236) が contract_ess (既定 50) に届かず、contract を塊より上げると多峰の
+//! まま解放して誤姿勢を返す。設計上の解は能動的再定位 (`active_reloc`) 側。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -43,7 +61,7 @@ use vi_bench::sim::{
 use vi_lib::bridge::PoseView;
 use vi_lib::ctrl::{unicycle_step, CostView};
 use vi_lib::belief::{Belief, BeliefConfig as WholeBeliefConfig};
-use vi_lib::localize::{cast_scan, BeliefConfig, GridLocalizer, Localizer};
+use vi_lib::localize::{cast_scan, AdaptiveLocalizer, BeliefConfig, GridLocalizer, Localizer};
 use vi_lib::params::MAX_COST;
 use vi_lib::planner::{pose_to_cell, PolicyView};
 use vi_lib::solvers::{solve, U64Solver};
@@ -105,6 +123,32 @@ struct Args {
     #[arg(long, default_value_t = 60.0)]
     max_start_m: f64,
 
+    /// 固定スタート [m]/[deg] (両方指定で乱択の代わりにこの 1 点を `--trials` 回)。
+    #[arg(long)]
+    start_x: Option<f64>,
+    #[arg(long)]
+    start_y: Option<f64>,
+    #[arg(long, default_value_t = 0.0)]
+    start_theta_deg: f64,
+    /// 固定スタート時の試行数 (ノイズ・シードずらしだけ変えて繰り返す)。
+    #[arg(long, default_value_t = 1)]
+    trials: usize,
+
+    /// 誘拐シナリオ `label=K1,t=30,x=100,y=35,yaw=90` (繰り返し可、yaw は絶対 [deg])。
+    /// 指定すると各シナリオに加えて誘拐なしの `base` も走る。
+    #[arg(long = "kidnap")]
+    kidnap: Vec<String>,
+
+    /// 走らせるモード (カンマ区切り: truth,dead,grid,adaptive,belief)。
+    #[arg(long, default_value = "truth,dead,grid,belief")]
+    modes: String,
+
+    /// 復帰 (re-lock) 判定: 推定誤差しきい値 [m] とその連続 tick 数。
+    #[arg(long, default_value_t = 1.0)]
+    relock_err_m: f64,
+    #[arg(long, default_value_t = 20)]
+    relock_hold_ticks: usize,
+
     /// 制御周期 [s] / 1 走行の tick 上限。
     #[arg(long, default_value_t = 0.1)]
     tick_s: f64,
@@ -154,9 +198,22 @@ struct Args {
     #[arg(long)]
     viterbi: bool,
 
+    /// 全地図 belief のロスト進入 / 解除 ESS。**絶対セル数**なので地図スケール
+    /// 依存 — 既定 (500/50) は TB3 級。津田沼 0.15 m 格子では健全な追跡の ESS
+    /// が進入しきい値を超えてラッチが永久に降りなくなるため、両方を上げる
+    /// (進入/解除 10 倍ヒステリシスを保つ)。
+    #[arg(long, default_value_t = 500.0)]
+    lost_ess: f64,
+    #[arg(long, default_value_t = 50.0)]
+    contract_ess: f64,
+
     /// CSV 出力先 (省略時は標準出力の表のみ)。
     #[arg(long)]
     out: Option<PathBuf>,
+
+    /// 軌跡 CSV の出力ディレクトリ (run ごとに traj_<spec>_<mode>_<start>.csv)。
+    #[arg(long)]
+    traj_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -174,6 +231,7 @@ enum Mode {
     Truth,
     Dead,
     Grid,
+    Adaptive,
     Whole,
 }
 impl Mode {
@@ -182,42 +240,94 @@ impl Mode {
             Mode::Truth => "truth",
             Mode::Dead => "dead",
             Mode::Grid => "grid",
+            Mode::Adaptive => "adaptive",
             Mode::Whole => "belief",
         }
     }
+    fn from_name(s: &str) -> Option<Mode> {
+        Some(match s {
+            "truth" => Mode::Truth,
+            "dead" => Mode::Dead,
+            "grid" => Mode::Grid,
+            "adaptive" => Mode::Adaptive,
+            "belief" => Mode::Whole,
+            _ => return None,
+        })
+    }
+}
+
+/// 誘拐シナリオ: `at_tick` で真値だけを瞬間移動させる (推定器は知らない)。
+#[derive(Clone, Copy)]
+struct Kidnap {
+    at_tick: usize,
+    x: f64,
+    y: f64,
+    yaw_rad: f64,
+}
+
+/// `label=K1,t=30,x=100,y=35,yaw=90` を (label, Kidnap) に。yaw は絶対 [deg]。
+fn parse_kidnap(s: &str, tick_s: f64) -> Result<(String, Kidnap), String> {
+    let (mut label, mut t, mut x, mut y, mut yaw) = (None, None, None, None, 90.0f64);
+    for part in s.split(',') {
+        let (k, v) = part.split_once('=').ok_or_else(|| format!("bad part: {part}"))?;
+        let v = v.trim();
+        match k.trim() {
+            "label" => label = Some(v.to_string()),
+            "t" => t = v.parse::<f64>().ok(),
+            "x" => x = v.parse::<f64>().ok(),
+            "y" => y = v.parse::<f64>().ok(),
+            "yaw" => yaw = v.parse::<f64>().map_err(|e| e.to_string())?,
+            other => return Err(format!("unknown key: {other}")),
+        }
+    }
+    let (Some(t), Some(x), Some(y)) = (t, x, y) else {
+        return Err("t=, x=, y= are required".into());
+    };
+    Ok((
+        label.unwrap_or_else(|| "kidnap".into()),
+        Kidnap { at_tick: (t / tick_s).round() as usize, x, y, yaw_rad: yaw.to_radians() },
+    ))
 }
 
 /// 推定器の入れ物。窓つき ([`GridLocalizer`], `Localizer` トレイト) と全地図
 /// ([`Belief`]) は別の型なので、bench の中だけの都合でここに束ねる
 /// (実ノード側の同じ役の enum は `vi_planner::node::handles::Loc`)。
 enum Est {
-    Grid(GridLocalizer),
+    /// 窓つき系 ([`GridLocalizer`] / [`AdaptiveLocalizer`]、`Localizer` トレイト)。
+    Win(Box<dyn Localizer>),
     Whole(Box<Belief>),
 }
 
 impl Est {
     fn predict(&mut self, v: f64, w_deg: f64, dt: f64) {
         match self {
-            Est::Grid(l) => l.predict(v, w_deg, dt),
+            Est::Win(l) => l.predict(v, w_deg, dt),
             Est::Whole(b) => b.predict(v, w_deg, dt),
         }
     }
     fn observe(&mut self, scan: &vi_lib::msg::LaserScan) {
         match self {
-            Est::Grid(l) => l.observe(scan),
+            Est::Win(l) => l.observe(scan),
             Est::Whole(b) => b.observe(scan),
         }
     }
     fn pose(&self) -> Option<PoseView> {
         match self {
-            Est::Grid(l) => l.pose(),
+            Est::Win(l) => l.pose(),
             Est::Whole(b) => b.pose(),
         }
     }
     fn quality(&self) -> f64 {
         match self {
-            Est::Grid(l) => l.quality(),
+            Est::Win(l) => l.quality(),
             Est::Whole(b) => b.quality(),
+        }
+    }
+    /// belief の広がり (全地図のみ — 窓つきはトレイトが出していない)。
+    fn ess(&self) -> f64 {
+        match self {
+            Est::Win(_) => f64::NAN,
+            Est::Whole(b) => b.ess(),
         }
     }
 }
@@ -249,6 +359,20 @@ struct RunResult {
     clear_min_m: f64,
     clear_sum_m: f64,
     clear_samples: u64,
+    /// 誘拐シナリオの復帰計測 (kidnap 指定時のみ有効)。tick は誘拐からの相対。
+    kidnapped: bool,
+    /// lost 宣言 (pose() が None になった最初の tick)。grid はロスト状態を
+    /// 持たないので None のまま。
+    detect_tick: Option<usize>,
+    /// 復帰: 推定誤差 < relock_err_m が relock_hold_ticks 連続した最初の tick。
+    relock_tick: Option<usize>,
+    /// lost (pose None) が連続しすぎて打ち切った (静止スキャンだけでは判別
+    /// できないケース — 実ノードなら active_reloc の出番)。
+    lost_gave_up: bool,
+    /// 誘拐 → 復帰確定までの窓の推定計算時間 (復帰コスト)。
+    lost_us_sum: f64,
+    lost_us_max: f64,
+    lost_us_ticks: u64,
 }
 
 impl RunResult {
@@ -291,21 +415,30 @@ fn simulate(
     bc: BeliefConfig,
     wbc: WholeBeliefConfig,
     noise_seed: u64,
+    kidnap: Option<Kidnap>,
+    traj: Option<&mut String>,
     args: &Args,
 ) -> RunResult {
+    let mut traj = traj;
     let (mut x, mut y, mut yaw) = start;
     let mut rng = Rng(noise_seed.max(1));
-    let mut loc = (mode != Mode::Truth).then(|| {
-        if mode == Mode::Whole {
+    let mut loc = (mode != Mode::Truth).then(|| match mode {
+        Mode::Whole => {
             // 幾何 (belief 格子) は VI と同じスケール後の grid、尤度場だけ native。
             // 実ノードと同じ入れ子 — 窓つきの GridLocalizer は native 一本。
             let mut b = Belief::new(grid, N_THETA, native, wbc);
             b.seed(seed_pose);
             Est::Whole(Box::new(b))
-        } else {
+        }
+        Mode::Adaptive => {
+            let mut l = AdaptiveLocalizer::new(native, N_THETA, bc);
+            l.set_pose(seed_pose);
+            Est::Win(Box::new(l))
+        }
+        _ => {
             let mut l = GridLocalizer::new(native, N_THETA, bc);
             l.set_pose(seed_pose);
-            Est::Grid(l)
+            Est::Win(Box::new(l))
         }
     });
     let mut r = RunResult {
@@ -328,10 +461,32 @@ fn simulate(
         clear_min_m: f64::INFINITY,
         clear_sum_m: 0.0,
         clear_samples: 0,
+        kidnapped: kidnap.is_some(),
+        detect_tick: None,
+        relock_tick: None,
+        lost_gave_up: false,
+        lost_us_sum: 0.0,
+        lost_us_max: 0.0,
+        lost_us_ticks: 0,
     };
     let mut starve = 0usize;
+    // 復帰判定のストリーク (連続 tick 数と開始 tick) / lost 連続カウンタ。
+    let mut relock_streak = 0usize;
+    let mut relock_streak_from = 0usize;
+    let mut lost_run = 0usize;
+    // 静止スキャンだけで判別できないときの打ち切り (60 s)。実ノードなら
+    // active_reloc が動く領分で、この bench では受動復帰だけを測る。
+    let lost_abort_ticks = (60.0 / args.tick_s) as usize;
 
-    for _ in 0..args.max_ticks {
+    for t in 0..args.max_ticks {
+        // 誘拐: 真値だけを瞬間移動 (推定器は predict/observe の系列しか知らない)。
+        if let Some(k) = kidnap {
+            if t == k.at_tick {
+                (x, y, yaw) = (k.x, k.y, k.yaw_rad);
+            }
+        }
+        let after_kidnap = kidnap.map(|k| t >= k.at_tick).unwrap_or(false);
+        let recovering = after_kidnap && r.relock_tick.is_none();
         // 物理イベント (地図外・衝突・ゴール到達) は真値で判定する。
         let (tix, tiy, tit) = pose_to_cell(vi, x, y, yaw);
         if !in_field(vi, tix, tiy, tit) {
@@ -367,6 +522,55 @@ fn simulate(
             r.quality_sum += loc.as_ref().map(|l| l.quality()).unwrap_or(1.0);
         }
 
+        if let Some(buf) = traj.as_deref_mut() {
+            use std::fmt::Write;
+            let (ex, ey, eyaw) = est
+                .map(|e| (e.x, e.y, e.yaw_rad))
+                .unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+            let _ = writeln!(
+                buf,
+                "{t},{x:.3},{y:.3},{:.4},{ex:.3},{ey:.3},{eyaw:.4},{:.2},{:.0}",
+                yaw,
+                loc.as_ref().map(|l| l.quality()).unwrap_or(1.0),
+                loc.as_ref().map(|l| l.ess()).unwrap_or(f64::NAN),
+            );
+        }
+
+        // 誘拐後の復帰計測。detect = pose None (lost 宣言)、relock = 推定誤差 <
+        // relock_err_m が relock_hold_ticks 連続 (その最初の tick を数える)。
+        if after_kidnap && loc.is_some() {
+            let at = kidnap.unwrap().at_tick;
+            if est.is_none() {
+                if r.detect_tick.is_none() {
+                    r.detect_tick = Some(t - at);
+                }
+                lost_run += 1;
+                if lost_run > lost_abort_ticks {
+                    r.lost_gave_up = true;
+                    r.ticks += 1;
+                    break;
+                }
+            } else {
+                lost_run = 0;
+            }
+            if r.relock_tick.is_none() {
+                let locked = est
+                    .map(|e| ((e.x - x).powi(2) + (e.y - y).powi(2)).sqrt() < args.relock_err_m)
+                    .unwrap_or(false);
+                if locked {
+                    if relock_streak == 0 {
+                        relock_streak_from = t;
+                    }
+                    relock_streak += 1;
+                    if relock_streak >= args.relock_hold_ticks {
+                        r.relock_tick = Some(relock_streak_from - at);
+                    }
+                } else {
+                    relock_streak = 0;
+                }
+            }
+        }
+
         // 推定姿勢で方策を引く。推定上のゴールなら実ノードと同じく停止して
         // 成功を宣言する — 真値が final でなければ「信じて止まった」となり、
         // そのときの真値のゴール中心距離を final_err_m に残す。
@@ -386,28 +590,37 @@ fn simulate(
             }
         }
 
-        let Some((v, w_deg)) = cmd else {
-            // 推定が引けない tick はロボットを止める (実機の no-action と同じ)。
-            starve += 1;
-            r.ticks += 1;
-            if starve > 50 {
-                r.starved = true;
-                break;
+        // cmd が引けない tick はロボットを止める (実機の no-action と同じ) が、
+        // スキャンの correct は実ノード同様に止まらない — observe は毎 tick 呼ぶ
+        // (predict は動いた tick だけ、本家の呼び出し規約)。lost 中 (pose None)
+        // の停止は policy 飢餓に数えない — それは復帰待ちであって故障ではない。
+        let moved = if let Some((v, w_deg)) = cmd {
+            starve = 0;
+            // 実行 (真値側) にはノイズが乗り、推定器は指令値しか知らない。
+            let v_exec = v + args.noise_v * rng.gauss();
+            let w_exec = w_deg + args.noise_w_deg * rng.gauss();
+            let (nx, ny, nyaw) =
+                unicycle_step(x, y, yaw, v_exec, w_exec.to_radians(), args.tick_s);
+            r.path_len_m += ((nx - x).powi(2) + (ny - y).powi(2)).sqrt();
+            (x, y, yaw) = (nx, ny, nyaw);
+            Some((v, w_deg))
+        } else {
+            if est.is_some() {
+                starve += 1;
+                if starve > 50 {
+                    r.starved = true;
+                    r.ticks += 1;
+                    break;
+                }
             }
-            continue;
+            None
         };
-        starve = 0;
-
-        // 実行 (真値側) にはノイズが乗り、推定器は指令値しか知らない。
-        let v_exec = v + args.noise_v * rng.gauss();
-        let w_exec = w_deg + args.noise_w_deg * rng.gauss();
-        let (nx, ny, nyaw) = unicycle_step(x, y, yaw, v_exec, w_exec.to_radians(), args.tick_s);
-        r.path_len_m += ((nx - x).powi(2) + (ny - y).powi(2)).sqrt();
-        (x, y, yaw) = (nx, ny, nyaw);
 
         if let Some(l) = &mut loc {
             let t0 = Instant::now();
-            l.predict(v, w_deg, args.tick_s);
+            if let Some((v, w_deg)) = moved {
+                l.predict(v, w_deg, args.tick_s);
+            }
             if mode != Mode::Dead {
                 let scan = cast_scan(
                     native,
@@ -420,6 +633,11 @@ fn simulate(
             let us = t0.elapsed().as_secs_f64() * 1e6;
             r.loc_us_sum += us;
             r.loc_us_max = r.loc_us_max.max(us);
+            if recovering {
+                r.lost_us_sum += us;
+                r.lost_us_max = r.lost_us_max.max(us);
+                r.lost_us_ticks += 1;
+            }
         }
         r.ticks += 1;
     }
@@ -428,6 +646,30 @@ fn simulate(
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    let modes: Vec<Mode> = {
+        let mut v = Vec::new();
+        for name in args.modes.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let Some(m) = Mode::from_name(name) else {
+                eprintln!("error: unknown mode {name}");
+                return ExitCode::from(2);
+            };
+            v.push(m);
+        }
+        v
+    };
+    let kidnaps: Vec<(String, Kidnap)> = {
+        let mut v = Vec::new();
+        for s in &args.kidnap {
+            match parse_kidnap(s, args.tick_s) {
+                Ok(k) => v.push(k),
+                Err(e) => {
+                    eprintln!("error: bad --kidnap {s}: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        v
+    };
     let map_path = args.map.clone().unwrap_or_else(default_map_path);
     eprintln!("loading map: {}", map_path.display());
     let map = match pgm::load(&map_path) {
@@ -522,6 +764,7 @@ fn main() -> ExitCode {
         motion_sigma_theta_deg: args.motion_sigma_theta_deg,
         init_sigma_xy_m: args.init_sigma_xy,
         init_sigma_theta_deg: args.init_sigma_theta_deg,
+        contract_ess: args.contract_ess,
         ..BeliefConfig::default()
     };
     // 全地図 belief 側の同じノブ (窓の半径だけが無い)。
@@ -534,6 +777,8 @@ fn main() -> ExitCode {
         init_sigma_xy_m: args.init_sigma_xy,
         init_sigma_theta_deg: args.init_sigma_theta_deg,
         viterbi: args.viterbi,
+        lost_ess: args.lost_ess,
+        contract_ess: args.contract_ess,
         ..WholeBeliefConfig::default()
     };
     {
@@ -547,12 +792,31 @@ fn main() -> ExitCode {
         );
     }
 
+    // 誘拐先の妥当性 (free であること) を先に検証する。
+    for (label, k) in &kidnaps {
+        let (ix, iy, it) = pose_to_cell(&vi, k.x, k.y, k.yaw_rad);
+        if !in_field(&vi, ix, iy, it) || !CostView::free_at(&vi, ix, iy) {
+            eprintln!("error: kidnap {label} destination ({}, {}) is not free", k.x, k.y);
+            return ExitCode::from(2);
+        }
+    }
+
     // スタート乱択 (follow_ctrl_bench と同じ: free・障害物 2 セル以上・到達可能)。
+    // --start-x/--start-y があれば固定スタートを --trials 回。
     let chamfer = chamfer_dist(&occ, ow, oh);
     let mut rng = Rng(args.seed.max(1));
     let mut starts: Vec<(f64, f64, f64)> = Vec::new();
+    if let (Some(sx), Some(sy)) = (args.start_x, args.start_y) {
+        let yaw = args.start_theta_deg.to_radians();
+        let (ix, iy, it) = pose_to_cell(&vi, sx, sy, yaw);
+        if !in_field(&vi, ix, iy, it) || vi.value_at(ix, iy, it) >= MAX_COST {
+            eprintln!("error: fixed start ({sx}, {sy}) has no policy (unreachable or blocked)");
+            return ExitCode::from(2);
+        }
+        starts = vec![(sx, sy, yaw); args.trials.max(1)];
+    }
     let mut attempts = 0u64;
-    while starts.len() < args.starts && attempts < 2_000_000 {
+    while starts.len() < args.starts && args.start_x.is_none() && attempts < 2_000_000 {
         attempts += 1;
         let ix = rng.below(ow as u64) as i32;
         let iy = rng.below(oh as u64) as i32;
@@ -577,7 +841,34 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let mut results: Vec<(usize, RunResult)> = Vec::new();
+    // シナリオ: 誘拐なしの base + 各誘拐先。--kidnap なしなら従来どおり base のみ。
+    let scenarios: Vec<(String, Option<Kidnap>)> = if kidnaps.is_empty() {
+        vec![("base".to_string(), None)]
+    } else {
+        std::iter::once(("base".to_string(), None))
+            .chain(kidnaps.iter().map(|(l, k)| (l.clone(), Some(*k))))
+            .collect()
+    };
+
+    fn outcome_str(r: &RunResult) -> String {
+        if r.reached {
+            "reached".to_string()
+        } else if r.believed_goal {
+            format!("GOAL_BEL({:.2} m)", r.final_err_m)
+        } else if r.collided {
+            "COLLIDED".to_string()
+        } else if r.out_of_map {
+            "OUT_OF_MAP".to_string()
+        } else if r.lost_gave_up {
+            "LOST".to_string()
+        } else if r.starved {
+            "NO_ACTION".to_string()
+        } else {
+            "TIMEOUT".to_string()
+        }
+    }
+
+    let mut results: Vec<(usize, String, RunResult)> = Vec::new();
     for (si, &start) in starts.iter().enumerate() {
         // シードのずらし (方向乱択、モード間で共通)。
         let phi = rng.unit() * 2.0 * std::f64::consts::PI;
@@ -595,79 +886,171 @@ fn main() -> ExitCode {
             start.1,
             start.2.to_degrees()
         );
-        for mode in [Mode::Truth, Mode::Dead, Mode::Grid, Mode::Whole] {
-            let r = simulate(
-                &vi,
-                &grid,
-                &native,
-                &chamfer,
-                mode,
-                start,
-                (goal_wx, goal_wy),
-                seed_pose,
-                bc,
-                wbc,
-                noise_seed,
-                &args,
-            );
-            let outcome = if r.reached {
-                "reached".to_string()
-            } else if r.believed_goal {
-                format!("GOAL_BEL({:.2} m)", r.final_err_m)
-            } else if r.collided {
-                "COLLIDED".to_string()
-            } else if r.out_of_map {
-                "OUT_OF_MAP".to_string()
-            } else if r.starved {
-                "NO_ACTION".to_string()
-            } else {
-                "TIMEOUT".to_string()
-            };
-            println!(
-                "  {:5}: {outcome:16} ticks={:5} ({:6.1} s)  len={:6.1} m  clr min={:4.2}/avg={:4.2} m  err rms={:5.3}/max={:5.3} m  yaw rms={:5.1} deg  qual={:4.2}  loc={:7.1}/{:.0} us",
-                r.mode,
-                r.ticks,
-                r.ticks as f64 * args.tick_s,
-                r.path_len_m,
-                r.clear_min_m,
-                r.clear_mean_m(),
-                r.err_rms_m(),
-                r.err_max_m,
-                r.yaw_rms_deg(),
-                r.quality_mean(),
-                r.loc_us_sum / r.ticks.max(1) as f64,
-                r.loc_us_max,
-            );
-            results.push((si, r));
+        for (label, kd) in &scenarios {
+            for &mode in &modes {
+                let t_run = Instant::now();
+                let mut traj_buf = args
+                    .traj_dir
+                    .as_ref()
+                    .map(|_| String::from("t,x,y,yaw,est_x,est_y,est_yaw,quality,ess\n"));
+                let r = simulate(
+                    &vi,
+                    &grid,
+                    &native,
+                    &chamfer,
+                    mode,
+                    start,
+                    (goal_wx, goal_wy),
+                    seed_pose,
+                    bc,
+                    wbc,
+                    noise_seed,
+                    *kd,
+                    traj_buf.as_mut(),
+                    &args,
+                );
+                if let (Some(dir), Some(buf)) = (&args.traj_dir, traj_buf) {
+                    let _ = std::fs::create_dir_all(dir);
+                    let p = dir.join(format!("traj_{label}_{}_{si}.csv", mode.name()));
+                    if let Err(e) = std::fs::write(&p, buf) {
+                        eprintln!("warning: failed to write traj: {e}");
+                    }
+                }
+                let recovery = if r.kidnapped {
+                    format!(
+                        "  det={} lock={} lost_us={:.0}/{:.0}",
+                        r.detect_tick
+                            .map(|t| format!("{:.1}s", t as f64 * args.tick_s))
+                            .unwrap_or_else(|| "-".into()),
+                        r.relock_tick
+                            .map(|t| format!("{:.1}s", t as f64 * args.tick_s))
+                            .unwrap_or_else(|| "-".into()),
+                        r.lost_us_sum / r.lost_us_ticks.max(1) as f64,
+                        r.lost_us_max,
+                    )
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  {label:5}/{:8}: {:16} ticks={:5} ({:6.1} s)  len={:6.1} m  clr min={:4.2}/avg={:4.2} m  err rms={:5.3}/max={:5.3} m  yaw rms={:5.1} deg  qual={:4.2}  loc={:7.1}/{:.0} us{}  [wall {:.0} s]",
+                    r.mode,
+                    outcome_str(&r),
+                    r.ticks,
+                    r.ticks as f64 * args.tick_s,
+                    r.path_len_m,
+                    r.clear_min_m,
+                    r.clear_mean_m(),
+                    r.err_rms_m(),
+                    r.err_max_m,
+                    r.yaw_rms_deg(),
+                    r.quality_mean(),
+                    r.loc_us_sum / r.ticks.max(1) as f64,
+                    r.loc_us_max,
+                    recovery,
+                    t_run.elapsed().as_secs_f64(),
+                );
+                results.push((si, label.clone(), r));
+            }
         }
     }
 
     println!();
-    println!("| mode | reach | bel | bel_err_m | ticks | time_s | len_m | clr_min_m | clr_avg_m | err_rms_m | err_max_m | yaw_rms_deg | quality | loc_us | max_us |");
-    println!("|------|-------|-----|-----------|-------|--------|-------|-----------|-----------|-----------|-----------|-------------|---------|--------|--------|");
-    for mode in ["truth", "dead", "grid", "belief"] {
-        let all: Vec<&RunResult> = results.iter().map(|(_, r)| r).filter(|r| r.mode == mode).collect();
-        let ok: Vec<&&RunResult> = all.iter().filter(|r| r.reached).collect();
-        // 到達扱い (truth final or 信じて停止) の走行。bel_err は後者の真値誤差平均。
-        let bel: Vec<&&RunResult> = all.iter().filter(|r| r.believed_goal && !r.reached).collect();
-        println!(
-            "| {mode} | {}/{} | {} | {:.2} | {:.0} | {:.1} | {:.1} | {:.2} | {:.2} | {:.3} | {:.3} | {:.1} | {:.2} | {:.1} | {:.0} |",
-            ok.len(),
-            all.len(),
-            bel.len(),
-            mean(bel.iter().map(|r| r.final_err_m)),
-            mean(ok.iter().map(|r| r.ticks as f64)),
-            mean(ok.iter().map(|r| r.ticks as f64 * args.tick_s)),
-            mean(ok.iter().map(|r| r.path_len_m)),
-            all.iter().map(|r| r.clear_min_m).fold(f64::INFINITY, f64::min),
-            mean(all.iter().map(|r| r.clear_mean_m())),
-            mean(all.iter().map(|r| r.err_rms_m())),
-            all.iter().map(|r| r.err_max_m).fold(0.0f64, f64::max),
-            mean(all.iter().map(|r| r.yaw_rms_deg())),
-            mean(all.iter().map(|r| r.quality_mean())),
-            mean(all.iter().map(|r| r.loc_us_sum / r.ticks.max(1) as f64)),
-            all.iter().map(|r| r.loc_us_max).fold(0.0f64, f64::max),
-        );
+    println!("| spec | mode | reach | bel | bel_err_m | ticks | time_s | len_m | clr_min_m | clr_avg_m | err_rms_m | err_max_m | yaw_rms_deg | quality | loc_us | max_us |");
+    println!("|------|------|-------|-----|-----------|-------|--------|-------|-----------|-----------|-----------|-----------|-------------|---------|--------|--------|");
+    for (label, _) in &scenarios {
+        for &mode in &modes {
+            let all: Vec<&RunResult> = results
+                .iter()
+                .filter(|(_, l, r)| l == label && r.mode == mode.name())
+                .map(|(_, _, r)| r)
+                .collect();
+            let ok: Vec<&&RunResult> = all.iter().filter(|r| r.reached).collect();
+            // 到達扱い (truth final or 信じて停止) の走行。bel_err は後者の真値誤差平均。
+            let bel: Vec<&&RunResult> =
+                all.iter().filter(|r| r.believed_goal && !r.reached).collect();
+            println!(
+                "| {label} | {} | {}/{} | {} | {:.2} | {:.0} | {:.1} | {:.1} | {:.2} | {:.2} | {:.3} | {:.3} | {:.1} | {:.2} | {:.1} | {:.0} |",
+                mode.name(),
+                ok.len(),
+                all.len(),
+                bel.len(),
+                mean(bel.iter().map(|r| r.final_err_m)),
+                mean(ok.iter().map(|r| r.ticks as f64)),
+                mean(ok.iter().map(|r| r.ticks as f64 * args.tick_s)),
+                mean(ok.iter().map(|r| r.path_len_m)),
+                all.iter().map(|r| r.clear_min_m).fold(f64::INFINITY, f64::min),
+                mean(all.iter().map(|r| r.clear_mean_m())),
+                mean(all.iter().map(|r| r.err_rms_m())),
+                all.iter().map(|r| r.err_max_m).fold(0.0f64, f64::max),
+                mean(all.iter().map(|r| r.yaw_rms_deg())),
+                mean(all.iter().map(|r| r.quality_mean())),
+                mean(all.iter().map(|r| r.loc_us_sum / r.ticks.max(1) as f64)),
+                all.iter().map(|r| r.loc_us_max).fold(0.0f64, f64::max),
+            );
+        }
+    }
+
+    // 復帰集計 (誘拐シナリオがあるときだけ)。extra_* は同モードの base
+    // (誘拐なし・到達走行) との差 — 誘拐が走行全体に上乗せしたコスト。
+    if !kidnaps.is_empty() {
+        println!();
+        println!("| spec | mode | reach | detect | t_detect_s | relock | t_relock_s | lost_us_avg | lost_us_max | extra_time_s | extra_len_m |");
+        println!("|------|------|-------|--------|------------|--------|------------|-------------|-------------|--------------|-------------|");
+        for (label, _) in kidnaps.iter() {
+            for &mode in &modes {
+                let all: Vec<&RunResult> = results
+                    .iter()
+                    .filter(|(_, l, r)| l == label && r.mode == mode.name())
+                    .map(|(_, _, r)| r)
+                    .collect();
+                let ok = all.iter().filter(|r| r.reached).count();
+                let det: Vec<f64> = all
+                    .iter()
+                    .filter_map(|r| r.detect_tick)
+                    .map(|t| t as f64 * args.tick_s)
+                    .collect();
+                let lock: Vec<f64> = all
+                    .iter()
+                    .filter_map(|r| r.relock_tick)
+                    .map(|t| t as f64 * args.tick_s)
+                    .collect();
+                // 終端成功 = truth final か believed-goal 停止 (実ノードの成功宣言)。
+                // ゴール半径ちょうど外の GOAL_BEL(0.5 m) を弾かないため後者も含める。
+                let done = |r: &RunResult| r.reached || r.believed_goal;
+                let base: Vec<&RunResult> = results
+                    .iter()
+                    .filter(|(_, l, r)| l == "base" && r.mode == mode.name() && (r.reached || r.believed_goal))
+                    .map(|(_, _, r)| r)
+                    .collect();
+                let reached: Vec<&&RunResult> = all.iter().filter(|r| done(r)).collect();
+                let (extra_t, extra_len) = if base.is_empty() || reached.is_empty() {
+                    (f64::NAN, f64::NAN)
+                } else {
+                    (
+                        mean(reached.iter().map(|r| r.ticks as f64 * args.tick_s))
+                            - mean(base.iter().map(|r| r.ticks as f64 * args.tick_s)),
+                        mean(reached.iter().map(|r| r.path_len_m))
+                            - mean(base.iter().map(|r| r.path_len_m)),
+                    )
+                };
+                println!(
+                    "| {label} | {} | {}/{} | {}/{} | {:.1} | {}/{} | {:.1} | {:.0} | {:.0} | {:.1} | {:.1} |",
+                    mode.name(),
+                    ok,
+                    all.len(),
+                    det.len(),
+                    all.len(),
+                    mean(det.iter().copied()),
+                    lock.len(),
+                    all.len(),
+                    mean(lock.iter().copied()),
+                    mean(all.iter().map(|r| r.lost_us_sum / r.lost_us_ticks.max(1) as f64)),
+                    all.iter().map(|r| r.lost_us_max).fold(0.0f64, f64::max),
+                    extra_t,
+                    extra_len,
+                );
+            }
+        }
     }
 
     if let Some(path) = &args.out {
@@ -677,9 +1060,9 @@ fn main() -> ExitCode {
             }
         }
         let mut csv = String::from(
-            "start,mode,outcome,final_err_m,ticks,time_s,len_m,clr_min_m,clr_avg_m,err_rms_m,err_max_m,yaw_rms_deg,quality,loc_us_avg,loc_us_max\n",
+            "start,spec,mode,outcome,final_err_m,ticks,time_s,len_m,clr_min_m,clr_avg_m,err_rms_m,err_max_m,yaw_rms_deg,quality,loc_us_avg,loc_us_max,t_detect_s,t_relock_s,lost_us_avg,lost_us_max\n",
         );
-        for (si, r) in &results {
+        for (si, label, r) in &results {
             let outcome = if r.reached {
                 "reached"
             } else if r.believed_goal {
@@ -688,13 +1071,17 @@ fn main() -> ExitCode {
                 "collided"
             } else if r.out_of_map {
                 "out_of_map"
+            } else if r.lost_gave_up {
+                "lost"
             } else if r.starved {
                 "no_action"
             } else {
                 "timeout"
             };
+            let opt_s =
+                |t: Option<usize>| t.map(|t| format!("{:.2}", t as f64 * args.tick_s)).unwrap_or_default();
             csv.push_str(&format!(
-                "{si},{},{outcome},{:.3},{},{:.1},{:.2},{:.3},{:.3},{:.4},{:.4},{:.2},{:.3},{:.2},{:.1}\n",
+                "{si},{label},{},{outcome},{:.3},{},{:.1},{:.2},{:.3},{:.3},{:.4},{:.4},{:.2},{:.3},{:.2},{:.1},{},{},{:.1},{:.1}\n",
                 r.mode,
                 r.final_err_m,
                 r.ticks,
@@ -708,6 +1095,10 @@ fn main() -> ExitCode {
                 r.quality_mean(),
                 r.loc_us_sum / r.ticks.max(1) as f64,
                 r.loc_us_max,
+                opt_s(r.detect_tick),
+                opt_s(r.relock_tick),
+                r.lost_us_sum / r.lost_us_ticks.max(1) as f64,
+                r.lost_us_max,
             ));
         }
         if let Err(e) = std::fs::write(path, csv) {
