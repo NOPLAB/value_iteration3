@@ -1,6 +1,6 @@
 //! 全地図 belief 推定器 — VIOLA の「belief を VI の状態へ」の推定側。
 //!
-//! 旧 範囲 belief (localize.rs の GridLocalizer の窓 / AdaptiveLocalizer の
+//! 旧 範囲 belief (localize の GridLocalizer の窓 / AdaptiveLocalizer の
 //! 多重解像度レベル) の後継。belief をプランナの [`crate::ValueIterator`] と
 //! **同一の格子** (map_scale 適用後の nx×ny×θ) に全域で持つ — 窓の再センタ
 //! リングもレベル遷移も無く、推定の状態空間と計画の状態空間が 1:1 に対応する
@@ -16,7 +16,7 @@
 //! - 毎 tick の全面シフト predict → O(1) の移動量累積 + observe 冒頭の一括
 //!   flush (アクティブセルだけの scatter)。全域を毎 tick 舐めない。
 //! - viterbi (min-plus / MAP) はロスト時の特殊モードではなく全期間の更新則
-//!   (旧 localize/viterbi.rs の doc にある VI Bellman 掃引との同型性は
+//!   (旧 localize/adaptive/viterbi.rs の doc にある VI Bellman 掃引との同型性は
 //!   そのまま)。
 //!
 //! アクティブ集合: `b[i] > 0` のセル添字を `active` に持ち、predict の flush・
