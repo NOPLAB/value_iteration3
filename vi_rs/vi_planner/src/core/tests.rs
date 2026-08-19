@@ -3,6 +3,7 @@ use super::*;
 use std::sync::atomic::AtomicBool;
 // compact 側だけが使う型は core::compact へ移したので、テストからは直接入れる。
 use vi_lib::msg::Quaternion;
+use vi_lib::{LocalShape, LocalShapeConfig};
 use vi_lib::params::{MAX_COST, PROB_BASE_BIT};
 use vi_lib::solvers::frontier2d_sparse_compact::{CompactSink, RamSink};
 
@@ -37,6 +38,7 @@ fn build(size: i32) -> BuildParams {
         goal_margin_radius: 0.2,
         goal_margin_theta: 180,
         local_xy_range: 1.0,
+        local_shape: LocalShapeConfig { range_m: 1.0, ..Default::default() },
         patch_slack_cells: 2,
         repair_interior_cells: 16,
     }
@@ -1015,6 +1017,62 @@ fn compact_commit_writes_nothing_when_the_window_is_settled() {
     core.observe_scan(&scan, robot);
     core.refine_passes(2);
     assert!(writes.load(Ordering::Relaxed) > 0, "動いたぶんは書くこと");
+}
+
+/// 窓の形が**プランナ側**の掃き (`refine_pass_until`) と可視化 (`window_value_grid`)
+/// にも効いていること。vi_lib の `in_local_area` そのものは local.rs で見ているが、
+/// この 2 つはそことは別の、ここにあるループなので別に押さえる。
+#[test]
+fn window_shape_masks_the_local_sweep_and_the_viz_grid() {
+    // pose(1.6, 1.6) → 中心セル 32、半径 1.0 m = 20 セル → 外接矩形 12..=52。
+    // 角 (52,52) は円の外 (中心から 29 セル)、(51,32) は円の中。
+    let corner = (52, 52);
+    let on_axis = (51, 32);
+    let value_at = |c: &PlannerCore, (ix, iy): (i32, i32)| {
+        let vi = c.local().unwrap();
+        vi.base.states[vi.base.to_index(ix, iy, 0) as usize].total_cost
+    };
+    for shape in [LocalShape::Square, LocalShape::Circle] {
+        let mut b = build(64);
+        b.local_shape = LocalShapeConfig { shape, range_m: 1.0, ..Default::default() };
+        let mut core = PlannerCore::new(b, cfg());
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(2.0, 2.0, 0.0), &cancel).expect("solve");
+        let robot = pose(1.6, 1.6, 0.0);
+        core.set_window(robot);
+        core.refine_passes(2); // 均す
+
+        let before = (value_at(&core, corner), value_at(&core, on_axis));
+        // 外接矩形いっぱいに penalty を立てる。掃かれたセルだけ値が上がる
+        // (`value_iteration_at` は遷移先の local_penalty を読むので、矩形を
+        // まるごと塗れば矩形内のどのセルも必ず動く)。
+        {
+            let vi = core.local_mut().unwrap();
+            let nt = vi.base.cell_num_t;
+            assert_eq!((vi.local_ix_min, vi.local_ix_max), (12, 52), "{shape:?}: 外接矩形");
+            for ix in vi.local_ix_min..=vi.local_ix_max {
+                for iy in vi.local_iy_min..=vi.local_iy_max {
+                    for it in 0..nt {
+                        let i = vi.base.to_index(ix, iy, it) as usize;
+                        vi.base.states[i].local_penalty = 2048u64 << PROB_BASE_BIT;
+                    }
+                }
+            }
+        }
+        core.refine_passes(1);
+        let after = (value_at(&core, corner), value_at(&core, on_axis));
+        assert!(after.1 > before.1, "{shape:?}: マスクの中は掃かれること");
+
+        let grid = core.window_value_grid(robot, 0).expect("viz grid");
+        let at_corner = grid.data[((corner.1 - 12) * grid.width + (corner.0 - 12)) as usize];
+        if shape == LocalShape::Square {
+            assert!(after.0 > before.0, "square: 角も掃かれること (本家の矩形)");
+            assert_ne!(at_corner, -1, "square: 角も描かれること");
+        } else {
+            assert_eq!(after.0, before.0, "circle: 角は掃かないこと");
+            assert_eq!(at_corner, -1, "circle: 角は未知 = 窓の形が見えること");
+        }
+    }
 }
 
 /// 障害物・ペナルティ変化の無いウィンドウは 1 パスで Δ=0 になり、

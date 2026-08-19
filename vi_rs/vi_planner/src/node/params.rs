@@ -15,6 +15,7 @@ use anyhow::{anyhow, Result};
 use std::sync::Arc;
 
 use vi_lib::solvers::U64Solver;
+use vi_lib::LocalShape;
 
 use vi_planner::core::FollowKind;
 
@@ -76,8 +77,16 @@ pub struct Params {
     pub max_rollout_steps: i64,
     pub path_spacing: f64,
     // ── 狭域 (follow_path) ──
-    /// ローカルウィンドウ半径 [m] (本家 ValueIteratorLocal は 1.0 固定)。
+    /// ローカルウィンドウの前後半径 [m] (本家 ValueIteratorLocal は 1.0 固定)。
     pub local_xy_range: f64,
+    /// ローカルウィンドウの横半径 [m]。0 = `local_xy_range` と同じ (等方)。
+    pub local_xy_range_lat: f64,
+    /// ウィンドウ形状 ("square" / "circle" / "ellipse" / "capsule")。
+    pub local_shape: String,
+    /// 前後半軸の倍率上限 (ellipse / capsule のみ)。1.0 で変形なし。
+    pub local_shape_ratio_max: f64,
+    /// 半軸の変化率上限 [m/s]。
+    pub local_shape_slew_per_sec: f64,
     pub follow: bool,
     pub scan_topic: String,
     pub control_frequency: f64,
@@ -248,6 +257,14 @@ pub fn read_params(node: &Node) -> Result<Params> {
         // 追従が見る・スキャンで補正するウィンドウの半径。広げると 1 tick の
         // refine 対象と compact パッチ (辺 ∝ 2×半径) が大きくなる。
         local_xy_range: p!("local_xy_range", f64, 1.0),
+        // 窓の形。既定 square は本家そのもの (地図軸の矩形)。lat を別に与えれば
+        // 「前後 2m × 左右 1m」のような異方の窓になる。ellipse / capsule は
+        // 走行方向に応じて前後の半軸が伸縮する (面積は一定 — 前に伸びたぶん
+        // 後ろが縮む)。凹形状は入れないこと (LocalShape の doc 参照)。
+        local_xy_range_lat: p!("local_xy_range_lat", f64, 0.0),
+        local_shape: p!("local_shape", Arc<str>, "square".into()).to_string(),
+        local_shape_ratio_max: p!("local_shape_ratio_max", f64, 1.5),
+        local_shape_slew_per_sec: p!("local_shape_slew_per_sec", f64, 1.0),
         // follow_path サーバを立てるか。false は nav2_controller (controller_server) と
         // 組む構成 — 立てると follow_path のサーバが 2 つになるため。false のとき
         // このノードは compute_path_to_pose 専用になる。
@@ -383,6 +400,24 @@ pub fn validate(p: &Params) -> Result<U64Solver> {
     }
     if p.local_xy_range <= 0.0 {
         return Err(anyhow!("local_xy_range must be > 0, got {}", p.local_xy_range));
+    }
+    if p.local_xy_range_lat < 0.0 {
+        return Err(anyhow!(
+            "local_xy_range_lat must be >= 0 (0 = same as local_xy_range), got {}",
+            p.local_xy_range_lat
+        ));
+    }
+    if LocalShape::from_name(&p.local_shape).is_none() {
+        return Err(anyhow!(
+            "unknown local_shape: {} (expected \"square\", \"circle\", \"ellipse\" or \"capsule\")",
+            p.local_shape
+        ));
+    }
+    if p.local_shape_ratio_max < 1.0 {
+        return Err(anyhow!(
+            "local_shape_ratio_max must be >= 1.0, got {}",
+            p.local_shape_ratio_max
+        ));
     }
     // standalone は navigate_to_pose / follow_waypoints が追従本体を回すので
     // follow を切る組み合わせは成立しない。

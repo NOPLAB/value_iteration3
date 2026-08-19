@@ -16,7 +16,7 @@ use vi_lib::bridge::{
     OccupancyGridView,
 };
 use vi_lib::solvers::U64Solver;
-use vi_lib::Action;
+use vi_lib::{Action, LocalShape, LocalShapeConfig};
 
 use vi_planner::core::{
     AdaptiveLocalizer, Belief, BeliefConfig, BuildParams, FollowKind, GridLocalizer, PlanConfig,
@@ -314,6 +314,24 @@ pub fn build_core(
         goal_margin_radius: params.goal_margin_radius,
         goal_margin_theta: params.goal_margin_theta_deg as i32,
         local_xy_range: params.local_xy_range,
+        local_shape: LocalShapeConfig {
+            // validate() 済みなので必ず解ける。
+            shape: LocalShape::from_name(&params.local_shape).unwrap_or_default(),
+            range_m: params.local_xy_range,
+            lat_m: params.local_xy_range_lat,
+            ratio_max: params.local_shape_ratio_max,
+            // vi_lib 側は時間を持たない (テストを決定的にするため) ので、
+            // 制御周期で割って「1 tick あたり」に直してから渡す。
+            slew_m: params.local_shape_slew_per_sec / params.control_frequency,
+            // 「全速で 1 tick 進んだときの変位」= 正規化の基準。行動の delta_fw は
+            // 本家の変換で linear.x [m/s] になるので、周期で割ると変位になる。
+            fw_ref_m: params
+                .action_list
+                .iter()
+                .map(|(_, fw, _)| fw.abs())
+                .fold(0.0f64, f64::max)
+                / params.control_frequency,
+        },
         patch_slack_cells: PATCH_SLACK_CELLS,
         repair_interior_cells: REPAIR_INTERIOR_CELLS,
     };
