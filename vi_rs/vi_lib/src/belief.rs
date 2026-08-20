@@ -270,6 +270,24 @@ const RELEASE_HOLD_OBS: u32 = 10;
 /// ESS ゲートが再リセットを長時間抑止していたからで、疎な候補集合は数観測で
 /// ESS を割ってしまう)。creep 0.3 m/s + 0.2 m ゲートなら ~15 観測の淘汰窓。
 const MATCH_RETRY_M: f64 = 3.0;
+/// ローカル再マッチの探索半径 [m]: 追跡からの最初の不一致は「推定の近傍に
+/// いるが滑った」一時破綻の可能性がまずある — その近傍のブロックだけで
+/// 引き直す。検出遅れ (q_ewma) 中のドリフトを覆う値 (津田沼 K4 ルート対照
+/// run の err max ~2.2 m)。
+const LOCAL_REMATCH_R_M: f64 = 5.0;
+/// ローカル再マッチの採用比: 近傍最良が全域最良のこの比以上ならローカル
+/// 注入を選ぶ。**絶対しきい値にしないこと** — 破綻が起きる低特徴区間では
+/// どのスコアも低い上、絶対線を一度でも超える誤アンカーは局所再注入で
+/// 全域補正から永久に保護されてしまう (津田沼 K4 ルートで実測: 絶対線 0.5
+/// で err max 130 m へ悪化)。比較なら、本物の誘拐では旧位置近傍が全域に
+/// 大きく見劣りして自然に全域再シードへ落ちる。比は**寛容に**取る: 追跡中と
+/// いう事前分布は強く、一時破綻の現場では近傍が真値スケール (~0.7) を出して
+/// いても、地図のどこかに単発スキャン 0.98 の偶然エイリアスがほぼ常に存在
+/// する (津田沼 K4 ルートで実測 — 0.8 比はそれに負けて全域注入 = churn に
+/// 戻った)。誤ってローカルを取った場合の損失は 1 レート制限周期 (3 m) の
+/// 遅延だけ (lost 分岐の再リセットは常に全域) で、誤って全域を取った場合の
+/// 遠方エイリアス churn より桁違いに安い。
+const LOCAL_REMATCH_ACCEPT: f32 = 0.5;
 
 /// 3 点カーネル [a, 1-2a, a] の a。1 tick σ [セル] のランダムウォーク分散
 /// (2a セル²) を合わせる (旧 GridLocalizer::blur_a)。累積 tick 分の a は
@@ -941,13 +959,42 @@ impl Belief {
                     self.enter_uniform_free();
                 }
             } else if self.cfg.global_match {
-                // 追跡からの最初の不一致 (誘拐検出・誤解除後の破綻) も informed
-                // に: mix_uniform は free 一様 30M セルを flood し (次の observe
-                // が最大 ~14 s)、候補集合の淘汰の記憶も流してしまう — マッチ
-                // 候補の 0.5 混合に載せ替える (EMCL の expansion resetting の
-                // 提案分布をスキャンマッチにした形。追跡ピークは 1−α で残る)。
+                // 追跡からの最初の不一致 (一時破綻 or 誘拐検出) も informed に:
+                // mix_uniform は free 一様 30M セルを flood し (次の observe が
+                // 最大 ~14 s)、候補集合の淘汰の記憶も流してしまう — マッチ候補の
+                // 等化混合に載せ替える (EMCL の expansion resetting の提案分布を
+                // スキャンマッチにした形)。注入は**比較採用**: 推定近傍
+                // ([`LOCAL_REMATCH_R_M`]) だけの候補と全域の候補を同じ LUT で
+                // 採点し、近傍最良が全域最良に見劣りしなければ近傍だけを注入
+                // する。低特徴区間の追跡の滑り (津田沼 K4 ルートで誘拐なしでも
+                // 起きる一時破綻) では真値近傍がスキャンを全域と同格に説明する
+                // ので、遠方エイリアスの注入 (復帰サイクル churn の源) を避け
+                // られる。本物の誘拐では旧位置近傍が全域に大きく見劣りして
+                // 従来どおり全域再シードに落ちる ([`LOCAL_REMATCH_ACCEPT`] の
+                // doc — 絶対しきい値は誤アンカーを保護して逆効果)。レート制限は
+                // どちらの注入にもかかる (毎不一致の再注入は淘汰の記憶を壊す)。
                 if self.move_since_match >= MATCH_RETRY_M {
-                    self.match_reseed(&beams);
+                    if let Some(p) = self.mean() {
+                        let local = self.match_candidates(&beams, Some((p.x, p.y)));
+                        let global = self.match_candidates(&beams, None);
+                        let lb = local.iter().map(|c| c.0).fold(0.0f32, f32::max);
+                        let gb = global.iter().map(|c| c.0).fold(0.0f32, f32::max);
+                        let take_local = lb > 0.0 && lb >= LOCAL_REMATCH_ACCEPT * gb;
+                        eprintln!(
+                            "belief: rematch {} from tracking @ ({:.1}, {:.1}) — local \
+                             {lb:.2} vs global {gb:.2}",
+                            if take_local { "local" } else { "global" },
+                            p.x,
+                            p.y,
+                        );
+                        if take_local {
+                            self.reseed_with(&local);
+                        } else {
+                            self.reseed_with(&global);
+                        }
+                    } else {
+                        self.match_reseed(&beams);
+                    }
                     return;
                 }
             } else {
@@ -1718,6 +1765,19 @@ impl Belief {
     /// 従来どおり単峰性 (+ 質量シェア) + probation の分業で、候補が全部外れ
     /// なら quality 破綻 → 次の (別視点の) スキャンで再マッチ。
     fn match_reseed(&mut self, beams: &[(f64, f64)]) {
+        let cands = self.match_candidates(beams, None);
+        self.reseed_with(&cands);
+    }
+
+    /// マッチ候補の計算 (belief には触らない共有部)。`window = Some((x, y))`
+    /// で探索をその近傍 [`LOCAL_REMATCH_R_M`] のブロックに絞る — 追跡からの
+    /// 一時破綻 (誘拐でない滑り) を、全域マッチの遠方エイリアス注入なしで
+    /// 引き直すローカル再マッチ用。
+    fn match_candidates(
+        &mut self,
+        beams: &[(f64, f64)],
+        window: Option<(f64, f64)>,
+    ) -> Vec<(f32, u32)> {
         if self.match_pool.is_none() {
             self.match_pool = Some(self.build_match_pool());
         }
@@ -1762,6 +1822,11 @@ impl Belief {
             for (bi, &(bx0, by0)) in pool.free_blocks.iter().enumerate() {
                 let cwx = self.ox + (bx0 as f64 + s as f64 * 0.5) * self.res;
                 let cwy = self.oy + (by0 as f64 + s as f64 * 0.5) * self.res;
+                if let Some((wx0, wy0)) = window {
+                    if (cwx - wx0).hypot(cwy - wy0) > LOCAL_REMATCH_R_M + block_r {
+                        continue;
+                    }
+                }
                 for it in 0..nt {
                     let sc = score(cwx, cwy, it as usize * m, &lut_c);
                     coarse.push((sc, bi as u32 * nt as u32 + it as u32));
@@ -1796,14 +1861,18 @@ impl Belief {
             }
             fine
         };
-        // ── 再シード (可変借用): 全とっかえでなく既存 belief と等化混合する —
-        // 生存仮説 (真値含む) の淘汰の記憶を保持しつつ、枯れた領域へ候補を
-        // 再注入する (粒子フィルタの注入リサンプリングのヒストグラム版)。
-        // 既存が空 (初期化・fail_probation 後) なら全量新規。
+        cands
+    }
+
+    /// 候補集合からの再シード (可変借用側): 全とっかえでなく既存 belief と
+    /// 等化混合する — 生存仮説 (真値含む) の淘汰の記憶を保持しつつ、枯れた
+    /// 領域へ候補を再注入する (粒子フィルタの注入リサンプリングのヒストグラム
+    /// 版)。既存が空 (初期化・fail_probation 後) なら全量新規。
+    fn reseed_with(&mut self, cands: &[(f32, u32)]) {
         let (nx, ny, nt) = (self.nx, self.ny, self.nt);
         let mut newc: Vec<u32> = Vec::with_capacity(cands.len() * 8);
         let mut best = 0.0f32;
-        for &(sc, iu) in &cands {
+        for &(sc, iu) in cands {
             best = best.max(sc);
             let (ix, iy, it) = self.decode(iu);
             // 3×3×3 の塊 (軸重み [0.5, 1, 0.5] の積) — shift/diffuse の
@@ -3141,6 +3210,64 @@ mod tests {
             }
         }
         assert!(ok, "マッチ再シードから再定位しない (ess={:.0})", loc.ess());
+    }
+
+    /// ローカル再マッチの窓: `match_candidates(.., Some(center))` の候補は
+    /// 全て center の近傍に収まり、窓なしはそれより遠くへも張る。追跡破綻の
+    /// 一次対応が遠方エイリアスを注入しないことの契約。
+    #[test]
+    fn local_rematch_window_bounds_candidates() {
+        let g = tenm_grid();
+        let bc = BeliefConfig {
+            beam_step: 4,
+            global_match: true,
+            lost_sigma_per_m: 0.02,
+            ..BeliefConfig::default()
+        };
+        let mut loc = Belief::new(&g, 36, &g, bc);
+        let truth = pose(8.0, 8.0, 2.0);
+        loc.seed(truth);
+        let scan = cast_scan(&g, truth, 180, 12.0);
+        let beams: Vec<(f64, f64)> = scan
+            .ranges
+            .iter()
+            .enumerate()
+            .step_by(4)
+            .filter_map(|(i, &r)| {
+                (r.is_finite() && r > 0.0)
+                    .then(|| (scan.angle_min + scan.angle_increment * i as f64, r))
+            })
+            .collect();
+        let win = loc.match_candidates(&beams, Some((truth.x, truth.y)));
+        assert!(!win.is_empty(), "真値近傍に候補がない");
+        // ブロック代表で絞るので余裕はブロック対角ぶん。
+        let slack = LOCAL_REMATCH_R_M + 2.0 * MATCH_STRIDE_CELLS as f64 * loc.res;
+        let far = win
+            .iter()
+            .map(|&(_, iu)| {
+                let (ix, iy, _) = loc.decode(iu);
+                let (cx, cy) = loc.cell_center(ix, iy);
+                (cx - truth.x).hypot(cy - truth.y)
+            })
+            .fold(0.0f64, f64::max);
+        assert!(far <= slack, "窓外の候補が漏れた: {far:.1} m > {slack:.1} m");
+        let all = loc.match_candidates(&beams, None);
+        // 正しい場所での引き直しは全域最良に見劣りしない (比較採用が成立する)。
+        let best = win.iter().map(|c| c.0).fold(0.0f32, f32::max);
+        let best_all = all.iter().map(|c| c.0).fold(0.0f32, f32::max);
+        assert!(
+            best > 0.0 && best >= LOCAL_REMATCH_ACCEPT * best_all,
+            "真値近傍の最良 {best:.2} が全域最良 {best_all:.2} に見劣りする"
+        );
+        let far_all = all
+            .iter()
+            .map(|&(_, iu)| {
+                let (ix, iy, _) = loc.decode(iu);
+                let (cx, cy) = loc.cell_center(ix, iy);
+                (cx - truth.x).hypot(cy - truth.y)
+            })
+            .fold(0.0f64, f64::max);
+        assert!(far_all > slack, "窓なしが窓ありと同じ範囲しか張っていない");
     }
 
     /// ロスト中の相関観測ゲート: 静止のままの再スキャンは積分されない
