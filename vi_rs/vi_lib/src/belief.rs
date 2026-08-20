@@ -101,6 +101,15 @@ pub struct BeliefConfig {
     /// 尤度場の台 (~σ) にリングが届かず全候補スコア 0 になるので上げる
     /// (津田沼 0.15 m 格子で 4.0 が目安)。
     pub reloc_scale: f64,
+    /// ロスト中の観測積分ゲート (AMCL の update_min_d / update_min_a 相当):
+    /// 前回積分からの並進 [m] と回頭 [deg] が**両方**しきい値未満のスキャンは
+    /// 読み捨てる。静止・微動のまま毎スキャン積分すると、強く相関した証拠を
+    /// 独立扱いで指数的に過大計上し、判別機動が判別視点へ着く前に belief が
+    /// 誤エイリアスへ単峰収束してしまう (津田沼で実測: 回頭 ~15 s で誤単峰)。
+    /// 0 (既定) = ゲートなし = 従来挙動 — 静止反復観測での受動復帰 (一意な
+    /// 幾何の小地図では有効) を保つ。使うときは両方をセットで。
+    pub lost_update_min_d_m: f64,
+    pub lost_update_min_a_deg: f64,
     /// min-plus (MAP / Viterbi) 更新則で回す。全期間 min-plus (レベル切替なし)。
     pub viterbi: bool,
 }
@@ -121,6 +130,8 @@ impl Default for BeliefConfig {
             lost_ess: 500.0,
             contract_ess: 50.0,
             reloc_scale: 1.0,
+            lost_update_min_d_m: 0.0,
+            lost_update_min_a_deg: 0.0,
             viterbi: false,
         }
     }
@@ -605,13 +616,25 @@ impl Belief {
             self.enter_uniform_free();
         }
         let lost = self.is_lost();
+        // ロスト中の相関観測ゲート (config doc 参照): 前回積分から動いていない
+        // スキャンは読み捨てる — flush もせず運動を貯め続ける。
+        if lost
+            && (self.cfg.lost_update_min_d_m > 0.0 || self.cfg.lost_update_min_a_deg > 0.0)
+            && self.pend_f.abs() < self.cfg.lost_update_min_d_m
+            && self.pend_rot_deg.abs() < self.cfg.lost_update_min_a_deg
+        {
+            return;
+        }
         self.flush();
         if self.active.is_empty() {
             // flush で全質量が壁・地図外へ抜けた — 全滅復旧。
             self.enter_uniform_free();
         }
         // ビーム収集 (`set_local_cost` と同じ世界角規約: ビーム角 = yaw +
-        // angle_min + i·inc)。ロスト中は 4 倍間引き。
+        // angle_min + i·inc)。ロスト中は 4 倍間引き。相関観測ゲート有効時に
+        // 「まれに全ビームで」も試したが、証拠を濃くすると誤エイリアスへの
+        // 収束も速くなるだけだった (津田沼 K4 で実測 — 弁別できない曖昧性は
+        // レートやビーム数では割れない) 上に observe が最大 23 s に膨らむ。
         // ponytail: ロスト中の observe は全域走査 — TB3 級で数十 ms/scan、
         // キャンパス級は秒単位。上限を上げるなら θ 間引き → coarse-to-fine
         // ゲートの順。
@@ -2028,6 +2051,33 @@ mod tests {
         loc.observe(&scan);
         loc.observe(&scan);
         assert!(loc.pose().is_some(), "単峰 + 集中 + 観測一致で解除するはず");
+    }
+
+    /// ロスト中の相関観測ゲート: 静止のままの再スキャンは積分されない
+    /// (pend が flush されない)。しきい値を超えて動けば積分される。
+    #[test]
+    fn lost_gate_skips_stationary_scans() {
+        let g = tenm_grid();
+        let bc = BeliefConfig {
+            beam_step: 4,
+            lost_update_min_d_m: 0.2,
+            lost_update_min_a_deg: 30.0,
+            ..BeliefConfig::default()
+        };
+        let mut loc = Belief::new(&g, 36, &g, bc);
+        let truth = pose(2.5, 2.0, 0.4);
+        loc.seed(truth);
+        let scan = cast_scan(&g, truth, 90, 12.0);
+        loc.observe(&scan); // 非ロスト — ゲートは効かない (従来どおり積分)
+        assert_eq!(loc.pend_ticks, 0, "非ロストの観測は flush される");
+
+        loc.lost = true;
+        loc.predict(0.1, 0.0, 0.1); // 0.01 m — しきい値未満
+        loc.observe(&scan);
+        assert_eq!(loc.pend_ticks, 1, "ロスト中の静止スキャンは読み捨て (flush されない)");
+        loc.predict(0.3, 0.0, 1.0); // +0.3 m — しきい値超え
+        loc.observe(&scan);
+        assert_eq!(loc.pend_ticks, 0, "動いたら積分される");
     }
 
     /// ESS が pose のゲートと b_hat の広がり報告を担うこと:

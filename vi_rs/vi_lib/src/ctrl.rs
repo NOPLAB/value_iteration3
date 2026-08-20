@@ -37,9 +37,103 @@
 //! 壁から離れる暗黙のマージンを持つので、しきい値なしのまま。
 
 use crate::action::Action;
+use crate::msg::LaserScan;
 use crate::params::{MAX_COST, PROB_BASE};
 use crate::planner::PolicyView;
 use crate::value_iterator::ValueIterator;
+
+/// ロスト中の判別機動 (creep): **実スキャンだけ**で安全に並進し続ける
+/// 反射制御。能動的再定位の実行器。
+///
+/// 多目標 VI + QMDP は多峰仮説の最寄りターゲット割当が食い違って回頭が拮抗し、
+/// open-loop δ* は真値が上位モードに含まれないと壁際で近接ガードとデッドロック
+/// する (2026-08-20 津田沼で実測) — どちらも「静止・回転のうちに belief が誤
+/// エイリアスへ単峰収束する」収束レースに負けた。安全判定を仮説地図でなく
+/// スキャン (真値の環境そのもの) に置き、常に並進を優先するのがこの設計:
+///
+/// 1. 行き先方位 = `preferred_rad` (δ* の方位、ロボット系。十分開いていれば)、
+///    なければ全周で最も開けた方位 (同率なら前方寄り — 無駄な回頭をしない)。
+/// 2. 方位差が大きければ回頭、向いたら前進 (前方の開きに応じて徐行)。
+///
+/// `preferred_rad` が無くても動くのが要点 — 廊下の並進曖昧性は δ 探索では
+/// 判別点を出せない (判別地形は数十 m 先) が、開けた方向へ這い続ければ廊下端・
+/// 交差点で観測が勝手にエイリアスを割る。返り値は本家 action 単位
+/// (`delta_fw` [m], `delta_rot` [deg])。(0, 0) は「スキャンが空 = 動けない」。
+pub fn lost_creep(scan: &LaserScan, preferred_rad: Option<f64>, max_range: f64) -> (f64, f64) {
+    use std::f64::consts::PI;
+    /// 方位の開き = その方位 ±CONE の最小レンジ。前進 / 徐行 / 回頭整合のしきい値。
+    // ponytail: 定数 — ロボット寸法依存が出たら引数化。
+    const CONE_RAD: f64 = 0.44; // ±25°
+    const GO_CLEAR_M: f64 = 1.2;
+    const CREEP_CLEAR_M: f64 = 0.6;
+    const ALIGN_RAD: f64 = 0.35;
+    const FW: f64 = 0.3;
+    const CREEP_FW: f64 = 0.15;
+    const ROT_DEG: f64 = 20.0;
+
+    let n = scan.ranges.len() as isize;
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let wrap = |a: f64| (a + PI).rem_euclid(2.0 * PI) - PI;
+    let inc = scan.angle_increment.abs().max(1e-9);
+    let r = |i: isize| -> f64 {
+        let v = scan.ranges[i.rem_euclid(n) as usize];
+        if v.is_finite() && v > 0.0 {
+            v.min(max_range)
+        } else {
+            max_range // 無効・無反射 = そこに何も見えていない = 開いている扱い
+        }
+    };
+    let cone = (CONE_RAD / inc).ceil() as isize;
+    let idx_of = |b: f64| ((b - scan.angle_min).rem_euclid(2.0 * PI) / inc).round() as isize;
+    let open_at = |b: f64| (-cone..=cone).map(|d| r(idx_of(b) + d)).fold(f64::INFINITY, f64::min);
+
+    let target = match preferred_rad {
+        Some(b) if open_at(b) > GO_CLEAR_M => wrap(b),
+        _ => {
+            // 十分開いた (GO_CLEAR 超) 方位のうち回頭が最小のもの。「開き最大」
+            // にすると路地で前後が拮抗して勝者が揺れ、後方が勝つたびに一周
+            // 回る (津田沼で実測: 前進が瞬きだけになる) — 並進はどの方向でも
+            // エイリアスを割るので、開きが足りるなら回頭最小を選ぶ。どの方位も
+            // 足りなければ最大の開き (同率なら前方寄り)。
+            let mut best_clear: Option<f64> = None;
+            let mut best_any = (0.0f64, f64::NEG_INFINITY);
+            let step = cone.max(1);
+            let mut i = 0isize;
+            while i < n {
+                let b = wrap(scan.angle_min + i as f64 * inc);
+                let o = open_at(b);
+                if o > GO_CLEAR_M && best_clear.map_or(true, |bb: f64| b.abs() < bb.abs()) {
+                    best_clear = Some(b);
+                }
+                if o > best_any.1 + 1e-9
+                    || ((o - best_any.1).abs() <= 1e-9 && b.abs() < best_any.0.abs())
+                {
+                    best_any = (b, o);
+                }
+                i += step;
+            }
+            best_clear.unwrap_or(best_any.0)
+        }
+    };
+    if target.abs() > ALIGN_RAD {
+        // ほぼ真後ろ (|target| ≈ π) は wrap で符号が毎 tick 反転し、±ROT の
+        // チャタリングで回り切れない (津田沼 K4 で実測: yaw が 90±3° に 160 s
+        // 張り付く)。後方目標は左回り固定で 1 方向へ回り切る。
+        let dir = if target.abs() > 2.0 { 1.0 } else { target.signum() };
+        return (0.0, ROT_DEG * dir);
+    }
+    let front = open_at(0.0);
+    if front > GO_CLEAR_M {
+        (FW, 0.0)
+    } else if front > CREEP_CLEAR_M {
+        (CREEP_FW, 0.0)
+    } else {
+        // 向いた先も塞がっている (全周が狭い袋小路など) — 決定的に左回頭で脱出。
+        (0.0, ROT_DEG)
+    }
+}
 
 /// 衝突・ペナルティ判定に使う地図コスト面。`free`/`penalty` は θ 非依存なので
 /// 2 次元 (ix, iy) で読む。compact 経路ではパッチ/静的地図から実装できる。
@@ -587,6 +681,35 @@ mod tests {
 
     const RES: f64 = 0.05;
     const NT: i32 = 60;
+
+    /// [`lost_creep`]: 開いていれば前進、前方が塞がれば開いた側へ回頭、
+    /// preferred (δ* の方位) が開いていればそちらへ回頭すること。
+    #[test]
+    fn lost_creep_steers_toward_open_space() {
+        let scan = |f: &dyn Fn(f64) -> f64| LaserScan {
+            angle_min: 0.0,
+            angle_increment: std::f64::consts::PI / 180.0,
+            ranges: (0..360).map(|i| f((i as f64).to_radians())).collect(),
+        };
+        // 全周 10 m — 前方が最も開いた同率なので回頭せず前進。
+        let (fw, rot) = lost_creep(&scan(&|_| 10.0), None, 60.0);
+        assert!(fw > 0.0 && rot == 0.0, "全周が開いていれば前進: ({fw}, {rot})");
+        // 前方 ±30° だけ 0.4 m — 開いた側 (それ以外) へ回頭。
+        let blocked = scan(&|b| {
+            let d = (b + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI)
+                - std::f64::consts::PI;
+            if d.abs() < 0.52 { 0.4 } else { 10.0 }
+        });
+        let (fw, rot) = lost_creep(&blocked, None, 60.0);
+        assert!(fw == 0.0 && rot != 0.0, "前方が塞がれば回頭: ({fw}, {rot})");
+        // preferred = 真後ろ (開いている) — そちらへ回頭。
+        let (fw, rot) = lost_creep(&scan(&|_| 10.0), Some(std::f64::consts::PI), 60.0);
+        assert!(fw == 0.0 && rot != 0.0, "preferred へ回頭: ({fw}, {rot})");
+        // preferred が塞がっていれば無視して開いた方向 (前方) へ — 前進。
+        let back_blocked = scan(&|b| if (b - std::f64::consts::PI).abs() < 0.52 { 0.4 } else { 10.0 });
+        let (fw, rot) = lost_creep(&back_blocked, Some(std::f64::consts::PI), 60.0);
+        assert!(fw > 0.0 && rot == 0.0, "塞がった preferred は無視: ({fw}, {rot})");
+    }
 
     fn actions() -> Vec<Action> {
         vec![
