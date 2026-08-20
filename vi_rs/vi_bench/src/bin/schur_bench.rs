@@ -73,6 +73,12 @@ struct Args {
     /// (クエリ側の変更を再検証するときの再ビルド回避)。
     #[arg(long, default_value_t = false)]
     reuse: bool,
+
+    /// 前計算を GPU (vi_lib::solvers::schur_gpu, 要 feature "gpu") で行う。
+    /// W は CPU 版とバイト一致しない (停止則の差 — schur_gpu docs 参照) が、
+    /// 上界性と exactify の固定点は同一。
+    #[arg(long, default_value_t = false)]
+    gpu: bool,
 }
 
 fn default_map_path() -> PathBuf {
@@ -425,6 +431,13 @@ fn main() -> ExitCode {
                 let a = vi_lib::solvers::schur::SchurArtifact::load(&art_path).expect("load artifact");
                 eprintln!("(reuse: loaded artifact in {:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
                 a
+            } else if args.gpu {
+                #[cfg(feature = "gpu")]
+                {
+                    vi_lib::solvers::schur_gpu::build_gpu(&vi, &cfg).expect("GPU build")
+                }
+                #[cfg(not(feature = "gpu"))]
+                panic!("--gpu には --features gpu でのビルドが必要");
             } else {
                 build(&vi, &cfg)
             };

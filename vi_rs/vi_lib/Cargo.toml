@@ -7,6 +7,15 @@ rust-version.workspace = true
 [dependencies]
 # frontier2d_sparse_compact::MmapSink (確定出力のディスク mmap) 用。
 memmap2 = { workspace = true }
+# schur_gpu (feature "cuda")。dynamic-loading なのでビルドに CUDA は不要、
+# 実行時に nvcuda/nvrtc を dlopen する。feature off なら依存ごと消える。
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+    "std", "driver", "nvrtc", "dynamic-loading", "cuda-12080",
+] }
+
+[features]
+# NVIDIA GPU での Schur 前計算 (solvers::schur_gpu)。要 CUDA 12.x ドライバー。
+cuda = ["dep:cudarc"]
 
 [dev-dependencies]
 # bitboard の property test を駆動する (旧 vi_algorithm の dev-dep から移設)。

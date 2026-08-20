@@ -28,6 +28,8 @@ pub mod observe;
 pub mod original;
 pub mod pyramid;
 pub mod schur;
+#[cfg(feature = "cuda")]
+pub mod schur_gpu;
 pub mod stack;
 pub mod stream;
 pub mod priority;

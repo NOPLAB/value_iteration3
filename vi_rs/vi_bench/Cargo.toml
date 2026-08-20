@@ -10,6 +10,10 @@ rust-version.workspace = true
 vi_lib = { path = "../vi_lib" }
 clap         = { workspace = true }
 
+[features]
+# schur_bench --gpu (vi_lib::solvers::schur_gpu) を有効化する。
+gpu = ["vi_lib/cuda"]
+
 [dev-dependencies]
 # criterion ベンチ (benches/) 専用。src からは参照しない。
 criterion = { workspace = true }

@@ -54,10 +54,6 @@ const PORTAL_SPACING: i32 = 16;
 /// 通常 5〜20 パスで安定する — それを大きく超える遅い尾は早期打ち切り
 /// (残る値は下降途中 = 上界なので健全)。
 const TILE_MAX_ITER: u32 = 64;
-/// ポータル値がこのラウンド数変化しなければタイルソルブを打ち切る。
-/// 早期 Stop の値は途中の下降場 = 上界なので、W が上界であるという設計上の
-/// 契約 (上界性・exactify の bit-exact 性) はそのまま — 損なうのは W の質だけ。
-const STABLE_ROUNDS: u32 = 3;
 /// アーティファクトファイルの magic。
 const MAGIC: &[u8; 8] = b"VISCHUR1";
 
@@ -135,13 +131,13 @@ pub struct SchurArtifact {
 impl SchurArtifact {
     /// タイル領域 (interior + halo) の左下グローバルセル。
     #[inline]
-    fn domain_origin(&self, tx: i32, ty: i32) -> (i32, i32) {
+    pub(crate) fn domain_origin(&self, tx: i32, ty: i32) -> (i32, i32) {
         (tx * self.tile - self.halo, ty * self.tile - self.halo)
     }
 
     /// ミニ VI の一辺 [セル]。
     #[inline]
-    fn side(&self) -> i32 {
+    pub(crate) fn side(&self) -> i32 {
         self.tile + 2 * self.halo
     }
 
@@ -404,9 +400,13 @@ impl TileVi {
 // 前計算 (build)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// ポータル配置 + タイルごとの通過行列を前計算する。`src` は states 構築済み
-/// (dense) であること。ゴールは見ない — 成果物はゴール非依存。
-pub fn build(src: &ValueIterator, cfg: &SchurConfig) -> SchurArtifact {
+/// ポータル配置 + 空タイルの成果物骨格。CPU ([`build`]) と GPU
+/// (`schur_gpu::build_gpu`) のビルダーで共有 — 配置が同一なので、成果物は
+/// タイルソルブの実装だけが違う同一スキーマになる。
+pub(crate) fn place_portals(
+    src: &ValueIterator,
+    cfg: &SchurConfig,
+) -> (SchurArtifact, Vec<Vec<u32>>) {
     assert!(!src.states.is_empty(), "SchurArtifact::build needs dense states");
     let (nx, ny, nt) = (src.cell_num_x, src.cell_num_y, src.cell_num_t);
     let (mx, my, _mt) = displacement(src);
@@ -517,11 +517,18 @@ pub fn build(src: &ValueIterator, cfg: &SchurConfig) -> SchurArtifact {
         portals,
         tiles: vec![TileEdges { portals: Vec::new(), w: Vec::new() }; (tnx * tny) as usize],
     };
+    (art, tile_portals)
+}
+
+/// ポータル配置 + タイルごとの通過行列を前計算する。`src` は states 構築済み
+/// (dense) であること。ゴールは見ない — 成果物はゴール非依存。
+pub fn build(src: &ValueIterator, cfg: &SchurConfig) -> SchurArtifact {
+    let (art, tile_portals) = place_portals(src, cfg);
 
     // ── タイルごとの通過行列。タイル間は完全独立なのでスレッド並列
     //    (これが FPGA 複数 CU に割れる、という主張の CPU 版)。
     let nthr = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
-    let tids: Vec<i32> = (0..tnx * tny).collect();
+    let tids: Vec<i32> = (0..art.tnx * art.tny).collect();
     let chunk = tids.len().div_ceil(nthr).max(1);
     let art_ref = &art;
     let tp_ref = &tile_portals;
@@ -1014,19 +1021,17 @@ pub fn schur_solve_observed(
 // テスト
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// schur / schur_gpu のテストで共有するフィクスチャ。
 #[cfg(test)]
-mod tests {
+pub(crate) mod testfix {
     use super::*;
     use crate::action::Action;
     use crate::msg::OccupancyGrid;
-    use crate::planner::rollout_path_on;
-    use crate::solvers::NullObserver;
-    use crate::solvers::test_support::{run_reference_to_fixed_point, REACH};
 
     /// reach 1 の小行動 (fw 0.05 m @ 0.05 m/cell)。8×8 conformance 地図では
     /// 標準行動の reach 6 がタイルを地図ごと呑み込んで合成が自明化するため、
     /// 実タイル合成はこちらで踏む。
-    fn small_actions() -> Vec<Action> {
+    pub(crate) fn small_actions() -> Vec<Action> {
         vec![
             Action::new("fw", 0.05, 0.0, 0),
             Action::new("back", -0.05, 0.0, 1),
@@ -1039,7 +1044,7 @@ mod tests {
 
     /// x=12 の縦壁に y∈{8,9} のドア。tile=6 で 4×3 タイル、ドアが界面線上に
     /// 乗る (区間被覆ポータルの検証)。ゴールは左室。
-    fn corridor_vi() -> ValueIterator {
+    pub(crate) fn corridor_vi() -> ValueIterator {
         let (w, h) = (24i32, 18i32);
         let mut occ = vec![0i8; (w * h) as usize];
         for y in 0..h {
@@ -1062,9 +1067,18 @@ mod tests {
         vi
     }
 
-    fn cfg() -> SchurConfig {
+    pub(crate) fn cfg() -> SchurConfig {
         SchurConfig { tile: 6, portal_thetas: 4 }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::testfix::{cfg, corridor_vi};
+    use crate::planner::rollout_path_on;
+    use crate::solvers::NullObserver;
+    use crate::solvers::test_support::{run_reference_to_fixed_point, REACH};
 
     #[test]
     fn composition_is_upper_bound_and_rollout_sound() {
