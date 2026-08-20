@@ -103,6 +103,9 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
     }
 
     let ctx = CudaContext::new(0)?;
+    // 既定のスピン待ち同期は GPU 待ちホストスレッドが 1 コアを 100% 専有する。
+    // パスループは同期待ちが大半なのでブロッキング同期で寝かせる (性能影響なし)。
+    ctx.set_blocking_synchronize()?;
     let stream = ctx.default_stream();
     let module = ctx.load_module(compile_ptx(KERNEL_SRC)?)?;
     let k_init = module.load_function("vi_init")?;
