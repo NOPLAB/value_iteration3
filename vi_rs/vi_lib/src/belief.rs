@@ -244,6 +244,18 @@ const MATCH_STRIDE_CELLS: i32 = 8;
 /// 候補数に伸びる — 16384 枝 ≈ active 40 万セル ≈ flatten の 1.3% で、
 /// observe は依然 ~0.2 s (4096 では真値の取りこぼしが残った、津田沼で実測)。
 const MATCH_BRANCHES: usize = 16384;
+/// global_match のロスト淘汰の証拠強度の上限: 観測の重み乗数を gm^pow に
+/// する (quality は gm のまま)。pow は固定でなく**焼きなまし** — 再マッチ
+/// からの走行距離 [`MATCH_ANNEAL_M`] ごとに 1 → この上限へ上がる。固定だと
+/// 両立しない (津田沼で実測): 1 (テンパリングのみ) は勝者がノイズでフリップ
+/// して解除のピーク保持が満ちず真値で凍結、8 固定は注入直後の真値が離散化
+/// ノイズの増幅で即殺される (実効 σ が 1/√pow に狭まる — σ を √pow 広げると
+/// ガウス部分が打ち消し合って中立化するだけ、これも実測)。「軟らかく開始
+/// (注入直後を保護) → 走るほど硬化 (決着)」で、3 m のレート制限と噛み合う。
+/// 上限 8 は gm=0.05 でも 4e-11 で f32 に収まる中庸。
+const LOST_EVIDENCE_POW: i32 = 8;
+/// 焼きなましの距離刻み [m]: pow = 1 + (前回マッチからの走行 / この値)。
+const MATCH_ANNEAL_M: f64 = 0.5;
 /// global_match の解除に要求するピーク保持: argmax ピークが 1 m 以内に
 /// 留まったまま (ゲートを通った) 観測がこれだけ連続するまで解除しない。
 /// 0.2 m ゲートなら ~2 m の creep に相当。誤ピークの勝者は再マッチ・淘汰の
@@ -1476,6 +1488,8 @@ impl Belief {
     fn sum_observe(&mut self, beams: &[(f64, f64)], lut: Option<&[[f32; 256]]>) -> f64 {
         let z_min = self.cfg.z_min;
         let m_inv = 1.0 / beams.len() as f64;
+        // 焼きなまし強度は observe 内で一定 (global_match のロスト経路のみ有効)。
+        let apow = if self.cfg.global_match { self.anneal_pow() } else { 1 };
         // 追跡経路の未知端点クランプ / ロスト経路の証拠不足の頭打ち定数。
         let unk_l = z_min + (1.0 - z_min) * UNKNOWN_L;
         // ビーム角は加法定理で回す (セルごとに全ビームの sin/cos を呼ばない)。
@@ -1533,7 +1547,21 @@ impl Belief {
                 } else {
                     unk_l
                 };
-                (s, s)
+                // global_match: 淘汰の**重み**は「未知ビーム = 中立」で数え
+                // 直し、焼きなまし乗する: (Π_known l^(1/M) · unk_l^((M−E)/M))^apow。
+                // E 正規化の gm は少数ビーム候補ほど高分散で、良く合う数ビーム
+                // の縁セル (gm ~0.9) が全証拠の真値 (gm ~0.7) を恒常的に上回る
+                // (津田沼 K4 の北東フリンジで実測 — probation q=0.63 の高品質
+                // エイリアスの正体)。中立記数なら証拠が薄いほど主張も薄く、
+                // ゼロ証拠セルのタダ乗り (乗数 1) も起きない。quality (検出・
+                // probation のしきい値系) は E 正規化 gm のまま。
+                let bwv = if self.cfg.global_match {
+                    (prod * unk_l.powf((bt.len() - known as usize) as f64 * m_inv))
+                        .powf(apow as f64)
+                } else {
+                    s
+                };
+                (s, bwv)
             } else {
                 (prod.powf(m_inv), prod)
             };
@@ -1645,6 +1673,13 @@ impl Belief {
                 })
             })
             .collect()
+    }
+
+    /// 焼きなましの現在の証拠強度 (1..=[`LOST_EVIDENCE_POW`]) —
+    /// 前回マッチからの走行距離で硬化する ([`MATCH_ANNEAL_M`])。
+    #[inline]
+    fn anneal_pow(&self) -> i32 {
+        (1 + (self.move_since_match / MATCH_ANNEAL_M) as i32).clamp(1, LOST_EVIDENCE_POW)
     }
 
     /// [`MatchPool`] の構築 (初回マッチで 1 度だけ): free セルを含む belief
@@ -1862,6 +1897,8 @@ impl Belief {
     /// b = exp(δmin − δ) を実体化する。戻り値は quality (従来と同じ
     /// 「前回 b 加重のビーム幾何平均尤度」— しきい値系をそのまま使う)。
     fn vit_observe(&mut self, beams: &[(f64, f64)], lut: Option<&[[f32; 256]]>) -> f64 {
+        // 焼きなまし強度 (sum 側と同じ、borrow の都合で先に取る)。
+        let apow = if self.cfg.global_match { self.anneal_pow() } else { 1 };
         let (nx, ny, nt) = (self.nx, self.ny, self.nt);
         let n = (nx as usize) * (ny as usize) * (nt as usize);
         let (ox, oy, res, t_res) = (self.ox, self.oy, self.res, self.t_res_deg);
@@ -1926,7 +1963,15 @@ impl Belief {
                         } else {
                             unk_l
                         };
-                        (s, s)
+                        // sum 側と同じ「未知 = 中立」記数 + 焼きなまし
+                        // (min-plus では cost に -ln が掛かる)。
+                        let cv = if self.cfg.global_match {
+                            (prod * unk_l.powf((bt.len() - known as usize) as f64 * m_inv))
+                                .powf(apow as f64)
+                        } else {
+                            s
+                        };
+                        (s, cv)
                     } else {
                         (prod.powf(m_inv), prod)
                     };

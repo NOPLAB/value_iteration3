@@ -129,15 +129,24 @@
 //! テンパリング床で頭打ち) の両側に外れる → 相対峰 (max の 5%) + ピーク保持
 //! 10 観測; (e) 検出時 mix_uniform の 30M セル flood (~14 s) → informed
 //! 再マッチ; (f) 復帰中の方策飢餓 NO_ACTION 死 → 解除を棄却して再マッチ。
-//! 結果: relock K2 57.4 s / K1 235.7 s (flatten 56.3 / 806.8 s)、ロスト中
-//! コストは実機圏内。ただし K3/K4 は relock せず (junction の残存第 2 峰が
-//! 相対峰条件を割らない / 廊下軸スライドは端方向ビームがレンジ外だと原理的に
-//! 不可観測)、relock 後の再ロスト リトライが走行予算を食い、ゴール到達 0/4
-//! (途中ラウンドでは K1・K3 到達 — 解除政策の匙加減で入れ替わる)。現状の
-//! 分業: **flatten = 遅いが確実 (ベンチ・オフライン) / global_match = 実機
-//! コストで復帰が速いが解除政策が未成熟**。次の一手は creep を reloc_targets
-//! (判別点) へ向ける統合 — 乱歩でなく判別に向かって走れば、保持条件は
-//! 早く満ちる。
+//! さらに 2 段の追い込みで確定 (2026-08-20 最終): (g) 証拠強度は固定でなく
+//! **焼きなまし** (gm^pow、pow = 1 → 8 を再マッチからの走行距離で) — 軟らかい
+//! 固定は勝者フリップで保持が満ちず真値で凍結、硬い固定は注入直後の真値を
+//! 離散化ノイズ増幅で即殺し、σ√pow 補償はガウス部分が打ち消して中立化する
+//! (全部実測); (h) **重みは「未知ビーム = 中立」で記数し直す** — E 正規化 gm
+//! は少数ビーム候補ほど高分散で、良く合う 5/72 ビームの縁セル (gm ~0.9) が
+//! 全証拠の真値 (~0.7) を恒常的に上回る (北東フリンジの高品質エイリアス、
+//! probation q=0.63 の正体)。quality は E 正規化 gm のまま (検出しきい値系は
+//! 不変)。判別点は到着ごとに引き直す (凍結保持は残りのエピソードを盲目の
+//! 乱歩にする)。安全ゲートは前進成分のみ抑止 (全停止は正直な近接旋回を
+//! 飢餓 → 再ロストへ落とす)。
+//! 結果 (--probation-min-q 0.4 --reloc-timeout-s 900 --max-ticks 18000):
+//! **relock 4/4 — K2 17.6 / K3 23.1 / K1 24.2 / K4 41.7 s** (flatten: 56.3 /
+//! 576 / 806.8 / 96.9 s — 3〜30 倍高速)、K1・K3 はゴール到達 (K1 err rms
+//! 0.92 m / clr min 0.90 m)。K2 は tick 上限時点で真値へ再収束中、K4 は後半の
+//! 再ロスト エピソードが遠方エイリアスに絡まり reloc タイムアウト凍結で
+//! LOST。残る failure mode は「relock 後の再ロストの一部が長引く」ことと、
+//! タイムアウト後の静止が相関ゲートで belief まで凍らせる give-up 動作。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -681,6 +690,13 @@ fn simulate(
     let mut reloc_frozen: Option<Vec<(f64, f64)>> = None;
     // lost_creep の回頭コミット (前 tick の回頭成分 — 前進 / pose 復帰で 0)。
     let mut creep_rot = 0.0f64;
+    // ロスト解除からの経過 tick (安全ゲート・飢餓棄却のスコープ)。初回 relock
+    // で切れる recovering と違い、後続の再ロスト解除にも毎回窓が開く。
+    // usize::MAX = まだ一度もロストしていない (base 走行はゲート対象外)。
+    let mut post_release = usize::MAX;
+    let mut was_none = false;
+    /// 解除後、安全ゲートと飢餓棄却が有効な窓 [tick] (60 s)。
+    const RELEASE_GUARD_TICKS: usize = 600;
     // δ* の実行状態 (残距離 [m], ロボット系方位 [rad])。凍結時に上位モードから
     // 1 度だけ落とし、以後は指令オドメトリで更新する — 上位モードの同一性は
     // エイリアス間で毎 tick 入れ替わるので、モードから引き直すと方位が振動して
@@ -743,6 +759,17 @@ fn simulate(
             None => Some(PoseView { x, y, yaw_rad: yaw }),
             Some(l) => l.pose(),
         };
+        // 解除後窓の追跡 (None → Some 遷移で開く)。
+        if loc.is_some() {
+            if est.is_none() {
+                was_none = true;
+            } else if was_none {
+                was_none = false;
+                post_release = 0;
+            } else if post_release != usize::MAX {
+                post_release = post_release.saturating_add(1);
+            }
+        }
         if let (Some(e), Some(_)) = (est, &loc) {
             let d = ((e.x - x).powi(2) + (e.y - y).powi(2)).sqrt();
             r.err_sq_sum += d * d;
@@ -876,15 +903,19 @@ fn simulate(
             // の復帰走行で壁 0.15 m まで詰めて衝突、の対策)。誘拐前の base 走行
             // と検出前の盲走行には触れない — 検出のダイナミクスを変えない。
             let verifying = loc.as_ref().map(|l| l.in_probation()).unwrap_or(false)
-                || (recovering && r.detect_tick.is_some());
-            if let (Some((fw, _)), true, Some(s)) = (cmd, verifying, scan.as_ref()) {
+                || (recovering && r.detect_tick.is_some())
+                || post_release < RELEASE_GUARD_TICKS;
+            if let (Some((fw, rot)), true, Some(s)) = (cmd, verifying, scan.as_ref()) {
                 if fw > 0.0
                     && min_range_ahead(s, 30f64.to_radians(), args.scan_range) < RECOVERY_GUARD_M
                 {
                     if starve == 0 {
                         eprintln!("  [guard] t={t} 前方障害物 — 前進抑止 (検証中)");
                     }
-                    cmd = None;
+                    // 前進成分だけ殺す — 方策の回頭は通す。正直な近接旋回まで
+                    // 全停止すると飢餓 → 棄却 → 再ロストの悪循環になる。回頭も
+                    // 無い = 壁へ真っ直ぐ、だけを停止 (飢餓経路 = 誤姿勢の証拠)。
+                    cmd = if rot != 0.0 { Some((0.0, rot)) } else { None };
                 }
             }
         } else if args.active_reloc && !reloc_gave_up && reloc_ticks < reloc_ticks_limit {
@@ -905,10 +936,13 @@ fn simulate(
                         let targets = l.reloc_targets();
                         if !targets.is_empty() {
                             // δ* を (残距離, ロボット系方位) へ 1 度だけ落とす。
+                            // 既に居る (< 1 m) 判別点は除く — 到着直後の
+                            // 引き直しが同じ点を選んで凍結スラッシュしない。
                             if let Some(&(mp, _)) = hyps.first() {
                                 if let Some((tx, ty)) = targets
                                     .iter()
                                     .copied()
+                                    .filter(|&(tx, ty)| (tx - mp.x).hypot(ty - mp.y) > 1.0)
                                     .min_by(|a, b| {
                                         (a.0 - mp.x)
                                             .hypot(a.1 - mp.y)
@@ -1028,7 +1062,8 @@ fn simulate(
                     // エイリアスの quality はバーの上に留まり得る) のは同じく
                     // 誤姿勢の外部証拠なので、死なずに再マッチへ回す。
                     let reject = loc.as_ref().map(|l| l.in_probation()).unwrap_or(false)
-                        || (recovering && matches!(loc.as_ref(), Some(Est::Whole(_))));
+                        || ((recovering || post_release < RELEASE_GUARD_TICKS)
+                            && matches!(loc.as_ref(), Some(Est::Whole(_))));
                     if reject {
                         if let Some(l) = &mut loc {
                             eprintln!("  [prob] t={t} 方策飢餓 → 解除を棄却して lost へ");
@@ -1051,7 +1086,13 @@ fn simulate(
             *b = wrap_rad(by.atan2(bx) - (w_deg.to_radians()) * args.tick_s);
             *d = bx.hypot(by);
             if *d < 0.5 {
-                reloc_delta = None; // 判別点に到着 — 以後は開けた方向へ這う
+                // 判別点に到着 — 凍結も解き、次の tick に**今の** belief から
+                // 次の判別点を引き直す。到着後に凍結を保つ旧挙動は、その lost
+                // エピソードの残りを盲目の乱歩にしていた (津田沼 K3/K4 で実測:
+                // frozen=true / pref=None のまま 180 m 這って収束せず — 1 点
+                // 見ただけでは割れない多峰は連続で見に行かないと割れない)。
+                reloc_delta = None;
+                reloc_frozen = None;
             }
         }
 
