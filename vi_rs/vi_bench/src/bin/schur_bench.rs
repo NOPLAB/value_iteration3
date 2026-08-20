@@ -634,7 +634,12 @@ fn main() -> ExitCode {
             let t0 = Instant::now();
             let st = solve(&mut vi, U64Solver::Frontier2DParUnsafe, 1_000_000);
             let t_exact = t0.elapsed().as_secs_f64() * 1e3;
-            assert!(st.converged);
+            // flap ゾーン (wrap 振動域) が広い地図では点ごとの固定点が無く、
+            // frontier が空にならない (tsudanuma scale1 で実測 375k セル)。
+            // 落とすと build 数時間分の計測が消えるので警告して mismatch は出す。
+            if !st.converged {
+                eprintln!("exactify: NOT converged ({} iters) — flap 振動とみなし残差のまま集計", st.iters);
+            }
             let mut mm_v = 0u64;
             let mut mm_p = 0u64;
             let mut mm_max = 0u64;
