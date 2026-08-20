@@ -135,6 +135,16 @@ pub struct BeliefConfig {
     /// 偶然の最良適合セルに 0.4 m で永久に殺される (winner's curse — 津田沼
     /// K4 で実測)。observe 内コメント参照。
     pub lost_sigma_per_m: f64,
+    /// ロスト中の再シードを flatten (free 一様) でなく**全域相関スキャンマッチ**
+    /// ([`Belief::match_reseed`] — Olson の correlative matching を 2 段に潰した
+    /// もの) にする: ブロック σ 繰り込みの粗採点で粗ブロック × 全 θ を刈り、
+    /// 生き残った枝ごとに真の σ の勝者セルへガウス塊を張る。flatten の「全
+    /// free × θ がアクティブ」(キャンパス級で ~3 千万仮説、observe 数十秒)
+    /// が「枝勝者の塊」(~10 万仮説、observe 数十 ms + マッチ 1 回 ~0.5 s) に
+    /// なり、belief は追跡と検証 (probation) に専念する分業。候補に真値が
+    /// 入らなくても quality 破綻 → 別視点のスキャンで再マッチするリトライ
+    /// ループに落ちる。false (既定) = 従来の flatten。
+    pub global_match: bool,
     /// min-plus (MAP / Viterbi) 更新則で回す。全期間 min-plus (レベル切替なし)。
     pub viterbi: bool,
 }
@@ -160,6 +170,7 @@ impl Default for BeliefConfig {
             probation_obs: 0,
             probation_min_q: 0.4,
             lost_sigma_per_m: 0.0,
+            global_match: false,
             viterbi: false,
         }
     }
@@ -221,6 +232,32 @@ const RELOC_MODES: usize = 4;
 const MODE_CANDIDATE_CAP: usize = 4096;
 /// ロスト解除の単峰判定に見る上位セル数 (QMDP に渡すのと同じ規模)。
 const UNIMODAL_TOP_K: usize = 64;
+
+/// 全域マッチャ ([`BeliefConfig::global_match`]) の定数: 粗探索ブロックの辺
+/// [belief セル] / 粗枝 (ブロック × θ) の生存数。再シードは**枝ごとの勝者
+/// 1 セル**を全部張る — 「全体 top-K セル」は高得点プラトー 1 領域が席を
+/// 独占して真値が 1 席も取れない winner's curse の再来 (津田沼で実測:
+/// 全 4 ケースで真値の重み 0 のまま) なので、空間多様性は枝の粒度で保証する。
+// ponytail: 定数。地図規模で調整が要るなら BeliefConfig へ昇格。
+const MATCH_STRIDE_CELLS: i32 = 8;
+/// 粗枝の生存数。淘汰の頑健性 (真値が枝刈り線・候補落ちで死なない確率) は
+/// 候補数に伸びる — 16384 枝 ≈ active 40 万セル ≈ flatten の 1.3% で、
+/// observe は依然 ~0.2 s (4096 では真値の取りこぼしが残った、津田沼で実測)。
+const MATCH_BRANCHES: usize = 16384;
+/// global_match の解除に要求するピーク保持: argmax ピークが 1 m 以内に
+/// 留まったまま (ゲートを通った) 観測がこれだけ連続するまで解除しない。
+/// 0.2 m ゲートなら ~2 m の creep に相当。誤ピークの勝者は再マッチ・淘汰の
+/// たびにテレポートするのに対し真値ピークは何百 tick も動かない (津田沼で
+/// 実測) — 一瞬の誤単峰に解除すると probation の 20〜60 m 誤走行が走行予算を
+/// 吸収する。
+const RELEASE_HOLD_OBS: u32 = 10;
+/// 再マッチのレート制限 [m]: 前回マッチからこれだけ並進するまで、quality
+/// 不一致でも belief を触らない (観測の淘汰に任せる)。毎不一致で再マッチすると
+/// 反証済みエイリアスが毎回復活して勝者がテレポートを繰り返し、真値の蓄積
+/// 優位が育たない (津田沼で実測 — flatten が機能したのは 3 千万セルの淘汰中
+/// ESS ゲートが再リセットを長時間抑止していたからで、疎な候補集合は数観測で
+/// ESS を割ってしまう)。creep 0.3 m/s + 0.2 m ゲートなら ~15 観測の淘汰窓。
+const MATCH_RETRY_M: f64 = 3.0;
 
 /// 3 点カーネル [a, 1-2a, a] の a。1 tick σ [セル] のランダムウォーク分散
 /// (2a セル²) を合わせる (旧 GridLocalizer::blur_a)。累積 tick 分の a は
@@ -332,19 +369,6 @@ impl LikelihoodField {
         Self { w, h, res: g.resolution, ox: g.origin_x, oy: g.origin_y, lf, dist, unk, free }
     }
 
-    /// 世界座標の最近障害物距離のインデックス (0..=255、セル単位)。地図外は
-    /// 255 (= 遠い) — [`LikelihoodField::at`] の「地図外は尤度 0」と実質同じ
-    /// 側に落ちる (LUT[255] は z_min に対して無視できる)。
-    #[inline]
-    fn dist_idx(&self, wx: f64, wy: f64) -> usize {
-        let x = ((wx - self.ox) / self.res).floor() as i32;
-        let y = ((wy - self.oy) / self.res).floor() as i32;
-        if x < 0 || y < 0 || x >= self.w || y >= self.h {
-            return 255;
-        }
-        self.dist[(y * self.w + x) as usize] as usize
-    }
-
     /// 世界座標が unknown セルか (追跡経路の [`UNKNOWN_L`] クランプ用)。地図外
     /// は false — 追跡では地図外端点を従来どおり床に落とす (base 追跡はそれで
     /// 成立しており、クランプを広げる理由がない)。
@@ -419,6 +443,21 @@ impl LikelihoodField {
     }
 }
 
+/// 全域マッチャの粗探索プール (一度だけ構築)。
+///
+/// 当初は距離場のブロック min-pool (スコアの真の上界) を持っていたが、3.6 m
+/// 窓の min は密集域で全ビーム距離 ~0 → 上界 ~1.0 の同点プラトーになり、
+/// 同点タイブレークの枝選抜から真値が落ちる (津田沼で実測)。粗段は
+/// ブロック中心の**実距離**をブロック半径ぶん膨らませた σ で採点する方式
+/// (Olson の correlative matching の粗レベル標準) に変え、pool は free
+/// ブロック一覧だけ残った。
+struct MatchPool {
+    /// free セルを 1 つ以上含む belief ブロックの原点 (belief セル座標)。
+    /// ponytail: clear_free_from_scan が後から開けたセルは反映されない —
+    /// 幽霊壁の開放で新たに free になるブロックはマッチ候補から漏れる。
+    free_blocks: Vec<(i32, i32)>,
+}
+
 /// 全地図 belief ヒストグラム — 「belief を VI の状態へ」の推定側。
 ///
 /// belief は VI と同一の格子 (vi_grid = map_scale 適用後の占有格子 × θ ビン)
@@ -487,6 +526,13 @@ pub struct Belief {
     /// 確認からの並進の累積 [m] ([`BeliefConfig::probation_obs`])。
     probation: u32,
     prob_move: f64,
+    /// 全域マッチャの粗探索プール (global_match 時のみ、初回マッチで遅延構築)。
+    match_pool: Option<MatchPool>,
+    /// 前回の match_reseed からの並進 [m] ([`MATCH_RETRY_M`] のレート制限用)。
+    move_since_match: f64,
+    /// 解除のピーク保持カウンタとその anchor ([`RELEASE_HOLD_OBS`])。
+    rel_hold: u32,
+    rel_anchor: Option<(f64, f64)>,
 }
 
 impl Belief {
@@ -532,6 +578,10 @@ impl Belief {
             lost: false,
             probation: 0,
             prob_move: 0.0,
+            match_pool: None,
+            move_since_match: 0.0,
+            rel_hold: 0,
+            rel_anchor: None,
         }
     }
 
@@ -713,6 +763,29 @@ impl Belief {
         self.recompute_ess();
     }
 
+    /// belief を**空**のロスト状態にする (global_match の再シード待ち)。次の
+    /// observe が全滅復旧の経路でそのスキャンから [`Belief::match_reseed`] を
+    /// 回す。flatten (enter_uniform_free) と違い、全 free × θ の flush/observe
+    /// を一度も実体化しない — スキャンを持たない呼び出し元
+    /// ([`Belief::fail_probation`]) の flatten 代替。
+    fn enter_lost_empty(&mut self) {
+        for &i in &self.active {
+            self.b[i as usize] = 0.0;
+        }
+        self.active.clear();
+        if self.cfg.viterbi {
+            self.delta.fill(f32::INFINITY);
+        }
+        self.pend_f = 0.0;
+        self.pend_rot_deg = 0.0;
+        self.pend_ticks = 0;
+        self.initialized = true;
+        self.q_ewma = self.cfg.reset_quality;
+        self.lost = true;
+        self.probation = 0;
+        self.ess_c = 0.0;
+    }
+
     /// 予測 (実行した速度指令 1 tick ぶん): O(1) の累積のみ。実際のシフト +
     /// 拡散は observe 冒頭の flush が一括適用する。
     pub fn predict(&mut self, v: f64, w_deg: f64, dt: f64) {
@@ -729,7 +802,13 @@ impl Belief {
     pub fn observe(&mut self, scan: &LaserScan) {
         if !self.initialized {
             // 未シード: 最初のスキャンから大域一様で立ち上がる (大域初期化)。
-            self.enter_uniform_free();
+            // global_match は一様を張らず、下の全滅復旧経路でスキャンマッチ
+            // から立ち上がる。
+            if self.cfg.global_match {
+                self.enter_lost_empty();
+            } else {
+                self.enter_uniform_free();
+            }
         }
         let lost = self.is_lost();
         // ロスト中の相関観測ゲート (config doc 参照): 前回積分から動いていない
@@ -744,8 +823,10 @@ impl Belief {
         // probation の並進カウント用: この flush で消費する変位 (符号なし)。
         let moved_m = self.pend_f.abs();
         self.flush();
-        if self.active.is_empty() {
-            // flush で全質量が壁・地図外へ抜けた — 全滅復旧。
+        self.move_since_match += moved_m;
+        if self.active.is_empty() && !self.cfg.global_match {
+            // flush で全質量が壁・地図外へ抜けた — 全滅復旧。global_match は
+            // ビーム収集後にスキャンマッチで復旧する (下)。
             self.enter_uniform_free();
         }
         // ビーム収集 (`set_local_cost` と同じ世界角規約: ビーム角 = yaw +
@@ -755,8 +836,11 @@ impl Belief {
         // レートやビーム数では割れない) 上に observe が最大 23 s に膨らむ。
         // ponytail: ロスト中の observe は全域走査 — TB3 級で数十 ms/scan、
         // キャンパス級は秒単位。上限を上げるなら θ 間引き → coarse-to-fine
-        // ゲートの順。
-        let step = self.cfg.beam_step.max(1) * if lost { 4 } else { 1 };
+        // ゲートの順。global_match は active が疎な候補集合 (~10 万セル) なので
+        // 間引きのコスト根拠が消える — 全ビームで弁別を取る (テンパリングは
+        // 幾何平均なのでビーム数を変えてもレンジ圧縮は不変)。
+        let step = self.cfg.beam_step.max(1)
+            * if lost && !self.cfg.global_match { 4 } else { 1 };
         let max_r = self.cfg.max_range_m;
         let beams: Vec<(f64, f64)> = scan
             .ranges
@@ -769,6 +853,15 @@ impl Belief {
             })
             .collect();
         if beams.is_empty() {
+            return;
+        }
+        if self.active.is_empty() {
+            // global_match の全滅復旧 (fail_probation の enter_lost_empty も
+            // ここに来る): flatten でなくスキャンマッチで再シードし、この
+            // observe はそこで終える — マッチ自体がこのスキャンの採点。
+            if self.cfg.global_match {
+                self.match_reseed(&beams);
+            }
             return;
         }
         // ロスト中の観測モデル (lost_sigma_per_m > 0 で有効)。ビームごとに
@@ -784,23 +877,7 @@ impl Belief {
         //     (lost_update_min_d/a) と同じ「相関証拠を独立扱いで過大計上しない」
         //     をスキャン内の 18 ビームにも適用した形。
         let lut: Option<Vec<[f32; 256]>> =
-            (lost && self.cfg.lost_sigma_per_m > 0.0).then(|| {
-                let res = self.field.res;
-                let z_min = self.cfg.z_min;
-                let m_inv = 1.0 / beams.len() as f64;
-                beams
-                    .iter()
-                    .map(|&(_, r)| {
-                        let s = self.cfg.sensor_sigma_m + self.cfg.lost_sigma_per_m * r;
-                        let inv_2s2 = 1.0 / (2.0 * s * s);
-                        std::array::from_fn(|d| {
-                            let dm = d as f64 * res;
-                            let l = (-dm * dm * inv_2s2).exp();
-                            (z_min + (1.0 - z_min) * l).powf(m_inv) as f32
-                        })
-                    })
-                    .collect()
-            });
+            (lost && self.cfg.lost_sigma_per_m > 0.0).then(|| self.lost_lut(&beams, 0.0));
         let quality = if self.cfg.viterbi {
             self.vit_observe(&beams, lut.as_deref())
         } else {
@@ -809,8 +886,13 @@ impl Belief {
         self.quality = quality;
         self.q_ewma = (1.0 - EWMA_BETA) * self.q_ewma + EWMA_BETA * quality;
         if self.active.is_empty() {
-            // 尤度が全セルでアンダーフローする等の全滅 — 一様から出直す。
-            self.enter_uniform_free();
+            // 尤度が全セルでアンダーフローする等の全滅 — 一様から出直す
+            // (global_match はスキャンマッチから)。
+            if self.cfg.global_match {
+                self.match_reseed(&beams);
+            } else {
+                self.enter_uniform_free();
+            }
             return;
         }
         // ラッチ条件は mix_uniform の**前**に確定させる — リセットは q_ewma を
@@ -833,8 +915,29 @@ impl Belief {
                 // 注入粒子はリサンプリングで対等になるが、ヒストグラム +
                 // 相対枝刈りでは桁が合わない)。未ロストの最初の mix は残す —
                 // 誤警報 (追跡中の一時的な不一致) なら生き残ったピークが
-                // 次の観測で回復する。
-                self.enter_uniform_free();
+                // 次の観測で回復する。global_match は平坦化の代わりに
+                // このスキャン (別視点) で候補を引き直す — リトライの本体。
+                // ただし [`MATCH_RETRY_M`] のレート制限つき: 並進が足りない
+                // うちは belief に触らず観測の淘汰に任せる (毎不一致の再マッチ
+                // は反証済みエイリアスを復活させ、真値の蓄積優位を壊す)。
+                if self.cfg.global_match {
+                    if self.move_since_match >= MATCH_RETRY_M {
+                        self.match_reseed(&beams);
+                        return;
+                    }
+                } else {
+                    self.enter_uniform_free();
+                }
+            } else if self.cfg.global_match {
+                // 追跡からの最初の不一致 (誘拐検出・誤解除後の破綻) も informed
+                // に: mix_uniform は free 一様 30M セルを flood し (次の observe
+                // が最大 ~14 s)、候補集合の淘汰の記憶も流してしまう — マッチ
+                // 候補の 0.5 混合に載せ替える (EMCL の expansion resetting の
+                // 提案分布をスキャンマッチにした形。追跡ピークは 1−α で残る)。
+                if self.move_since_match >= MATCH_RETRY_M {
+                    self.match_reseed(&beams);
+                    return;
+                }
             } else {
                 self.mix_uniform();
             }
@@ -843,15 +946,19 @@ impl Belief {
         if mismatched || self.ess_c > self.cfg.lost_ess {
             self.lost = true;
             self.probation = 0;
-        } else if self.lost && mode_count(&self.top_cells(UNIMODAL_TOP_K), MODE_MIN_SEP_M) <= 1 {
+            self.rel_hold = 0;
+            self.rel_anchor = None;
+        } else if self.lost && self.try_release() {
             // 解除は**単峰性のみ**で判定する (多峰のままなら lost を維持して
             // 能動的再定位に判別させる)。かつては ess < contract_ess も要求して
             // いたが、E 正規化 + テンパリングの軟化した観測モデルでは勝者の
             // 質量シェアが ~1% で頭打ちし、ESS は数千のまま二度と 50 を割らない
             // (津田沼 K4 で実測: 真値が 127 s 間 argmax なのに解除されず
             // タイムアウト)。固定 ESS しきい値は地図スケールにも追従しない。
-            // 誤単峰への早すぎる解除は probation (probation_obs) が受け持つ —
-            // 解除を安くして検証を走行に置くのが分業。
+            // global_match はさらに**ピーク保持** ([`RELEASE_HOLD_OBS`]) を課す
+            // (try_release doc 参照)。誤単峰への早すぎる解除は probation
+            // (probation_obs) が受け持つ — 解除を安くして検証を走行に置くのが
+            // 分業。
             self.lost = false;
             if self.cfg.probation_obs > 0 {
                 // 仮解除 — 検証走行の予測整合を見てから確定する。解除を
@@ -884,9 +991,15 @@ impl Belief {
     /// 呼び出し側が「誤姿勢で方策が引けない」等の外部証拠で落とすのにも使う。
     /// 半量 mix ([`Belief::mix_uniform`]) でないのは、mix 後も ESS が contract
     /// を割ったままで解除↔失敗が観測 1 回ごとに振動するため — 全域一様へ
-    /// 戻して出直す (誤った証拠は捨てるのが正しい)。
+    /// 戻して出直す (誤った証拠は捨てるのが正しい)。global_match はスキャンを
+    /// 持たないここでは空にするだけ — 次の observe の全滅復旧経路が、その
+    /// スキャンでマッチ再シードする。
     pub fn fail_probation(&mut self) {
-        self.enter_uniform_free();
+        if self.cfg.global_match {
+            self.enter_lost_empty();
+        } else {
+            self.enter_uniform_free();
+        }
     }
 
     /// レーザーが貫通したセルを free 扱いにして、地図の壁を反証する
@@ -1026,30 +1139,9 @@ impl Belief {
         if !self.initialized || !self.lost {
             return Vec::new();
         }
-        let maxw = self.active.iter().fold(0.0f32, |m, &i| m.max(self.b[i as usize]));
-        if maxw <= 0.0 {
+        let Some(hyps) = self.strong_hyps() else {
             return Vec::new();
-        }
-        let thr = maxw * MODE_THRESHOLD;
-        let n_cand = self.active.iter().filter(|&&i| self.b[i as usize] >= thr).count();
-        if n_cand > MODE_CANDIDATE_CAP {
-            return Vec::new();
-        }
-        let mut cells: Vec<(f32, u32)> = self
-            .active
-            .iter()
-            .filter(|&&i| self.b[i as usize] >= thr)
-            .map(|&i| (self.b[i as usize], i))
-            .collect();
-        cells.sort_by(|a, b| b.0.total_cmp(&a.0));
-        let hyps: Vec<(PoseView, f64)> = cells
-            .into_iter()
-            .map(|(w, i)| {
-                let (ix, iy, it) = self.decode(i);
-                let (x, y) = self.cell_center(ix, iy);
-                (PoseView { x, y, yaw_rad: self.theta_center(it) }, w as f64)
-            })
-            .collect();
+        };
         let mut m = modes(&hyps, MODE_MIN_SEP_M);
         m.truncate(RELOC_MODES);
         reloc_targets(
@@ -1058,6 +1150,86 @@ impl Belief {
             |x, y| self.field.at(x, y),
             self.cfg.reloc_scale,
         )
+    }
+
+    /// 最大重みの [`MODE_THRESHOLD`] 倍以上のセルを重み降順の仮説列に。候補が
+    /// [`MODE_CANDIDATE_CAP`] 超 (= belief が一様に近く峰がまだ無い) と全滅は
+    /// None。[`Belief::reloc_targets`] と [`Belief::release_unimodal`] の共通部。
+    fn strong_hyps(&self) -> Option<Vec<(PoseView, f64)>> {
+        let maxw = self.active.iter().fold(0.0f32, |m, &i| m.max(self.b[i as usize]));
+        if maxw <= 0.0 {
+            return None;
+        }
+        let thr = maxw * MODE_THRESHOLD;
+        let n_cand = self.active.iter().filter(|&&i| self.b[i as usize] >= thr).count();
+        if n_cand > MODE_CANDIDATE_CAP {
+            return None;
+        }
+        let mut cells: Vec<(f32, u32)> = self
+            .active
+            .iter()
+            .filter(|&&i| self.b[i as usize] >= thr)
+            .map(|&i| (self.b[i as usize], i))
+            .collect();
+        cells.sort_by(|a, b| b.0.total_cmp(&a.0));
+        Some(
+            cells
+                .into_iter()
+                .map(|(w, i)| {
+                    let (ix, iy, it) = self.decode(i);
+                    let (x, y) = self.cell_center(ix, iy);
+                    (PoseView { x, y, yaw_rad: self.theta_center(it) }, w as f64)
+                })
+                .collect(),
+        )
+    }
+
+    /// 解除の単峰判定。flatten 経路は従来どおり top-64 セルの mode_count。
+    /// global_match は**相対峰**判定: 最大重みの 5% 以上の峰が 1 つだけなら
+    /// 解除。絶対量 (top-64 の質量シェアや ESS) はテンパリング床の広い裾で
+    /// セルあたり重みが ~0.7% で頭打ちして成立しない (津田沼 K1 で実測: 真値が
+    /// argmax ratio 0.99 のまま解除されず凍結)。相対峰なら「真値が max の 10%
+    /// で生存中の誤単峰」(旧 top-64 判定の穴) も競合峰として塞がる。
+    fn release_unimodal(&self) -> bool {
+        if !self.cfg.global_match {
+            return mode_count(&self.top_cells(UNIMODAL_TOP_K), MODE_MIN_SEP_M) <= 1;
+        }
+        match self.strong_hyps() {
+            Some(h) => mode_count(&h, MODE_MIN_SEP_M) <= 1,
+            None => false,
+        }
+    }
+
+    /// 解除判定の入口。単峰 ([`Belief::release_unimodal`]) に加え、global_match
+    /// では**ピーク保持** ([`RELEASE_HOLD_OBS`]) を課す: argmax ピークが
+    /// [`MODE_MIN_SEP_M`] 以内に留まる観測が連続するまで解除しない。誤ピーク
+    /// の勝者は再マッチ・淘汰のたびにテレポートするのに対し、真値ピークは
+    /// 何百 tick も動かない (津田沼で実測: ratio 0.99 が 175 tick) — 「勝者の
+    /// 持続」が真偽を分ける安価な信号で、これが無いと一瞬の誤単峰への解除 →
+    /// probation の誤走行 → 棄却のサイクルが走行予算を吸収する。
+    fn try_release(&mut self) -> bool {
+        if !self.release_unimodal() {
+            self.rel_hold = 0;
+            return false;
+        }
+        if !self.cfg.global_match {
+            return true;
+        }
+        let Some((pk, _)) = self.strong_hyps().and_then(|h| h.first().copied()) else {
+            self.rel_hold = 0;
+            return false;
+        };
+        let held = self
+            .rel_anchor
+            .is_some_and(|(ax, ay)| (pk.x - ax).hypot(pk.y - ay) <= MODE_MIN_SEP_M);
+        self.rel_hold = if held { self.rel_hold + 1 } else { 1 };
+        self.rel_anchor = Some((pk.x, pk.y));
+        if self.rel_hold >= RELEASE_HOLD_OBS {
+            self.rel_hold = 0;
+            true
+        } else {
+            false
+        }
     }
 
     /// belief の θ 周辺分布を可視化用 OccupancyGrid に描く (未シードなら None)。
@@ -1447,6 +1619,229 @@ impl Belief {
         }
         // リセット直後に再リセットしない。
         self.q_ewma = self.cfg.reset_quality;
+    }
+
+    // ═══ 内部: 全域マッチャ (global_match) ═══
+
+    /// ロスト観測モデルのビーム別 LUT (距離インデックス 256 段 → 尤度)。
+    /// 距離比例 σ ([`BeliefConfig::lost_sigma_per_m`]) とスキャン内テンパリング
+    /// (1/M 乗) を焼き込む — observe のロスト経路 (observe 内コメント参照) と
+    /// [`Belief::match_reseed`] が共有。`extra_sigma_m` はマッチャの粗段が
+    /// ブロック中心 1 点でブロック内全姿勢を代表するための σ 繰り込み
+    /// (端点はブロック半径ぶん振れる — 距離比例 σ と同じ発想)。
+    fn lost_lut(&self, beams: &[(f64, f64)], extra_sigma_m: f64) -> Vec<[f32; 256]> {
+        let res = self.field.res;
+        let z_min = self.cfg.z_min;
+        let m_inv = 1.0 / beams.len() as f64;
+        beams
+            .iter()
+            .map(|&(_, r)| {
+                let s = self.cfg.sensor_sigma_m + self.cfg.lost_sigma_per_m * r + extra_sigma_m;
+                let inv_2s2 = 1.0 / (2.0 * s * s);
+                std::array::from_fn(|d| {
+                    let dm = d as f64 * res;
+                    let l = (-dm * dm * inv_2s2).exp();
+                    (z_min + (1.0 - z_min) * l).powf(m_inv) as f32
+                })
+            })
+            .collect()
+    }
+
+    /// [`MatchPool`] の構築 (初回マッチで 1 度だけ): free セルを含む belief
+    /// ブロックの一覧。
+    fn build_match_pool(&self) -> MatchPool {
+        let s = MATCH_STRIDE_CELLS;
+        let mut free_blocks = Vec::new();
+        for by0 in (0..self.ny).step_by(s as usize) {
+            for bx0 in (0..self.nx).step_by(s as usize) {
+                'blk: for iy in by0..(by0 + s).min(self.ny) {
+                    for ix in bx0..(bx0 + s).min(self.nx) {
+                        if self.free[(iy * self.nx + ix) as usize] {
+                            free_blocks.push((bx0, by0));
+                            break 'blk;
+                        }
+                    }
+                }
+            }
+        }
+        MatchPool { free_blocks }
+    }
+
+    /// 全域相関スキャンマッチによる再シード — ロスト中の flatten
+    /// (enter_uniform_free) の置き換え ([`BeliefConfig::global_match`])。
+    ///
+    /// 粗段: free ブロック中心 × 全 θ を「σ をブロック半径ぶん膨らませた」
+    /// E 正規化ロストモデルで採点し、上位 [`MATCH_BRANCHES`] 枝を残す
+    /// (correlative matching の粗レベル標準 — min-pool 上界は密集域で同点
+    /// プラトーになり弁別しない)。詳細段: 各生存枝のブロック内 free セルを
+    /// 真の σ で採点し、**枝ごとの勝者 1 セル**に 3×3×3 の塊を張る (全体
+    /// top-K セルはプラトー 1 領域が席を独占して真値が落ちる — 空間多様性は
+    /// 枝の粒度で保証する)。重み ∝ スコア — テンパリング済みなので 1 スキャン
+    /// で過剰に確信しない。張り方は全とっかえでなく既存 belief との**等化
+    /// 混合** (下のコメント参照) で、呼び出しは [`MATCH_RETRY_M`] でレート
+    /// 制限される — どちらも生存仮説の淘汰の記憶を守るため。lost ラッチは維持 — 解除は
+    /// 従来どおり単峰性 (+ 質量シェア) + probation の分業で、候補が全部外れ
+    /// なら quality 破綻 → 次の (別視点の) スキャンで再マッチ。
+    fn match_reseed(&mut self, beams: &[(f64, f64)]) {
+        if self.match_pool.is_none() {
+            self.match_pool = Some(self.build_match_pool());
+        }
+        let s = MATCH_STRIDE_CELLS;
+        // ブロック中心代表の σ 繰り込み = ブロックの半対角 [m]。
+        let block_r = s as f64 * self.res * std::f64::consts::FRAC_1_SQRT_2;
+        let lut_c = self.lost_lut(beams, block_r);
+        let lut_f = self.lost_lut(beams, 0.0);
+        // ── 候補計算 (共有借用のみ) ──
+        let cands: Vec<(f32, u32)> = {
+            let pool = self.match_pool.as_ref().unwrap();
+            let f = &self.field;
+            let (nt, m) = (self.nt, beams.len());
+            // θ ビン × ビームの端点オフセットを前計算 (粗・詳細で共有)。
+            let mut offs = Vec::with_capacity(nt as usize * m);
+            for it in 0..nt {
+                let th = self.theta_center(it);
+                for &(ba, r) in beams {
+                    let a = th + ba;
+                    offs.push((r * a.cos(), r * a.sin()));
+                }
+            }
+            let unk_l = (self.cfg.z_min + (1.0 - self.cfg.z_min) * UNKNOWN_L) as f32;
+            // observe のロスト経路と同じ E 正規化採点 (LUT だけ粗・詳細で違う)。
+            let score = |wx: f64, wy: f64, ob: usize, lut: &[[f32; 256]]| -> f32 {
+                let (mut prod, mut known) = (1.0f64, 0u32);
+                for (bi2, lt) in lut.iter().enumerate() {
+                    let (ox2, oy2) = offs[ob + bi2];
+                    if let Some(d) = f.known_dist(wx + ox2, wy + oy2) {
+                        prod *= lt[d] as f64;
+                        known += 1;
+                    }
+                }
+                if known >= LOST_MIN_KNOWN {
+                    prod.powf(m as f64 / known as f64) as f32
+                } else {
+                    unk_l
+                }
+            };
+            let mut coarse: Vec<(f32, u32)> =
+                Vec::with_capacity(pool.free_blocks.len() * nt as usize);
+            for (bi, &(bx0, by0)) in pool.free_blocks.iter().enumerate() {
+                let cwx = self.ox + (bx0 as f64 + s as f64 * 0.5) * self.res;
+                let cwy = self.oy + (by0 as f64 + s as f64 * 0.5) * self.res;
+                for it in 0..nt {
+                    let sc = score(cwx, cwy, it as usize * m, &lut_c);
+                    coarse.push((sc, bi as u32 * nt as u32 + it as u32));
+                }
+            }
+            if coarse.len() > MATCH_BRANCHES {
+                coarse.select_nth_unstable_by(MATCH_BRANCHES - 1, |a, b| b.0.total_cmp(&a.0));
+                coarse.truncate(MATCH_BRANCHES);
+            }
+            let mut fine: Vec<(f32, u32)> = Vec::with_capacity(coarse.len());
+            for &(_, code) in &coarse {
+                let (bi, it) = ((code / nt as u32) as usize, (code % nt as u32) as i32);
+                let (bx0, by0) = pool.free_blocks[bi];
+                let ob = it as usize * m;
+                // 枝の勝者 1 セル (真の σ で採点し直す)。
+                let mut best: Option<(f32, u32)> = None;
+                for iy in by0..(by0 + s).min(self.ny) {
+                    for ix in bx0..(bx0 + s).min(self.nx) {
+                        if !self.free[(iy * self.nx + ix) as usize] {
+                            continue;
+                        }
+                        let (cx, cy) = self.cell_center(ix, iy);
+                        let sc = score(cx, cy, ob, &lut_f);
+                        if best.map_or(true, |(b, _)| sc > b) {
+                            best = Some((sc, bidx2(self.nx, self.ny, ix, iy, it) as u32));
+                        }
+                    }
+                }
+                if let Some(w) = best {
+                    fine.push(w);
+                }
+            }
+            fine
+        };
+        // ── 再シード (可変借用): 全とっかえでなく既存 belief と等化混合する —
+        // 生存仮説 (真値含む) の淘汰の記憶を保持しつつ、枯れた領域へ候補を
+        // 再注入する (粒子フィルタの注入リサンプリングのヒストグラム版)。
+        // 既存が空 (初期化・fail_probation 後) なら全量新規。
+        let (nx, ny, nt) = (self.nx, self.ny, self.nt);
+        let mut newc: Vec<u32> = Vec::with_capacity(cands.len() * 8);
+        let mut best = 0.0f32;
+        for &(sc, iu) in &cands {
+            best = best.max(sc);
+            let (ix, iy, it) = self.decode(iu);
+            // 3×3×3 の塊 (軸重み [0.5, 1, 0.5] の積) — shift/diffuse の
+            // trilinear が動ける最小の広がり。scratch に組み立てる (全ゼロ
+            // 不変を fold 時に復元)。
+            for (dt, wt) in [(-1i32, 0.5f32), (0, 1.0), (1, 0.5)] {
+                let jt = (it + dt + nt) % nt;
+                for (dy, wy) in [(-1i32, 0.5f32), (0, 1.0), (1, 0.5)] {
+                    let jy = iy + dy;
+                    if jy < 0 || jy >= ny {
+                        continue;
+                    }
+                    for (dx, wx) in [(-1i32, 0.5f32), (0, 1.0), (1, 0.5)] {
+                        let jx = ix + dx;
+                        if jx < 0 || jx >= nx || !self.free[(jy * nx + jx) as usize] {
+                            continue;
+                        }
+                        deposit(
+                            &mut self.scratch,
+                            &mut newc,
+                            bidx2(nx, ny, jx, jy, jt),
+                            sc * wt * wy * wx,
+                        );
+                    }
+                }
+            }
+        }
+        let new_max: f32 = newc.iter().map(|&j| self.scratch[j as usize]).fold(0.0, f32::max);
+        if new_max > 0.0 {
+            // 等化混合: 生存 belief の最大セルを新候補の最大セルに揃えてから
+            // 足す。定数比 (0.5/0.5) の混合は、濃縮した生存ピーク (誘拐検出時の
+            // 誤追跡ゴースト、max ~0.3) に対し注入候補が ~1e-4 で入り、初回
+            // observe の相対枝刈り (max × weight_skip_ratio) が候補を皆殺しに
+            // する — flatten 時代に全平坦化で潰したゴースト持ち越しの再来
+            // (津田沼 K4 で実測: 真値の注入重みが枝刈り線上)。等化なら相対
+            // 順位 (淘汰の記憶) は残り、正しい追跡ピークはマッチ自身が高スコア
+            // で再提案するので失うものはない。
+            let old_max = self.active.iter().map(|&i| self.b[i as usize]).fold(0.0, f32::max);
+            if old_max > 0.0 {
+                let sf = new_max / old_max;
+                for &i in &self.active {
+                    self.b[i as usize] *= sf;
+                }
+            }
+            for &j in &newc {
+                let ju = j as usize;
+                let add = self.scratch[ju];
+                self.scratch[ju] = 0.0; // 全ゼロ不変の復元
+                if add > 0.0 {
+                    if self.b[ju] == 0.0 {
+                        self.active.push(j);
+                    }
+                    self.b[ju] += add;
+                }
+            }
+        } else {
+            for &j in &newc {
+                self.scratch[j as usize] = 0.0;
+            }
+        }
+        self.normalize_active();
+        if self.cfg.viterbi {
+            self.vit_enter();
+        }
+        self.initialized = true;
+        self.lost = true;
+        self.probation = 0;
+        self.move_since_match = 0.0;
+        // 最良候補のスコアを quality に残す (診断用 — E 正規化済みの幾何平均
+        // 尤度と同じスケール)。リセット直後に再リセットしないのは flatten と同じ。
+        self.quality = best as f64;
+        self.q_ewma = self.cfg.reset_quality;
+        self.recompute_ess();
     }
 
     // ═══ 内部: min-plus (viterbi) ═══
@@ -2658,6 +3053,49 @@ mod tests {
             (0.35..0.7).contains(&q_d),
             "深部フリンジは中立で頭打ちのはず (d={q_d:.3})"
         );
+    }
+
+    /// global_match: flatten の代わりに全域スキャンマッチで再シードすること。
+    /// 疎な候補集合 (top-K 塊 ≪ free×θ — flatten の置き換えコスト契約) に
+    /// 真値近傍の仮説が入り、以後は通常の observe だけで正しく再定位する。
+    #[test]
+    fn global_match_reseeds_sparse_and_relocalizes() {
+        let g = tenm_grid();
+        let bc = BeliefConfig {
+            beam_step: 4,
+            global_match: true,
+            lost_sigma_per_m: 0.02,
+            ..BeliefConfig::default()
+        };
+        let mut loc = Belief::new(&g, 36, &g, bc);
+        let truth = pose(8.0, 8.0, 2.0);
+        let scan = cast_scan(&g, truth, 180, 12.0);
+        // 未シード → enter_lost_empty → 全滅復旧経路で match_reseed。
+        loc.observe(&scan);
+        // コスト契約: active は枝数 × 塊 (≤27 セル) で頭打ち — flatten の
+        // 全 free×θ に戻らない。小地図では全枝が生存して flatten に近づくが、
+        // キャンパス級 (枝 ~120 万) では 1〜2% に落ちるのがこの上限の意味。
+        let flat = loc.free_cells() * 36;
+        assert!(
+            !loc.active.is_empty() && loc.active.len() <= MATCH_BRANCHES * 27,
+            "再シードが候補上限を超えた: active={} (flatten なら {flat})",
+            loc.active.len(),
+        );
+        let (tw, mw, _) = loc.probe_weight(truth);
+        assert!(tw > 0.0, "真値近傍に候補が張られていない (max={mw:.2e})");
+        // 以後は通常の observe (ロストモデル) が候補を選別して解除する。
+        let mut ok = false;
+        for _ in 0..150 {
+            loc.predict(0.0, 0.0, 0.1);
+            loc.observe(&scan);
+            if let Some(p) = loc.pose() {
+                if (p.x - truth.x).hypot(p.y - truth.y) < 0.4 {
+                    ok = true;
+                    break;
+                }
+            }
+        }
+        assert!(ok, "マッチ再シードから再定位しない (ess={:.0})", loc.ess());
     }
 
     /// ロスト中の相関観測ゲート: 静止のままの再スキャンは積分されない

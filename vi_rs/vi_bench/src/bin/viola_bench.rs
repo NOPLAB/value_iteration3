@@ -113,6 +113,31 @@
 //! K2 広場 56.3 s (後続の再ロストからの復帰走行中に衝突 — 安全性は次の課題)、
 //! K3 576 s / K1 廊下 806.8 s (並進対称を破るのに複数サイクル要、ゴールは
 //! tick 予算切れ)。ロスト中 observe は平坦化後の全域走査で最大 ~20 s。
+//!
+//! 全域相関スキャンマッチ (`--global-match` → `BeliefConfig::global_match`、
+//! 2026-08-20 後半): flatten の全域走査コスト (ロスト中 observe 最大 ~20 s =
+//! 実機 40 ms 予算の 500 倍) を、粗ブロック σ 繰り込み × 全 θ → 枝勝者シード
+//! の 2 段マッチ (1 回 ~1〜3 s) + 疎な候補集合の observe (~5〜40 ms) に
+//! 置き換える新アーキテクチャ。8 ラウンドの計測反復で潰した設計問題:
+//! (a) min-pool 上界は密集域で同点プラトー化し真値が候補に入らない →
+//! ブロック中心の実距離 + ブロック半径の σ 繰り込み; (b) 全体 top-K セル
+//! 選抜は高得点プラトーが席を独占する winner's curse の再来 → 枝 (ブロック
+//! × θ) ごとの勝者 1 セル; (c) 毎不一致の再マッチが淘汰の記憶を破壊し勝者が
+//! テレポート → 3 m レート制限 + 等化混合 (定数比 0.5 混合は検出時ゴースト
+//! max ~0.3 が注入候補 ~1e-4 を相対枝刈りで皆殺しにする); (d) top-64 単峰
+//! 判定が塊構造で誤爆 (真値 10% 生存中に解除) と凍結 (シェア・ESS 系は
+//! テンパリング床で頭打ち) の両側に外れる → 相対峰 (max の 5%) + ピーク保持
+//! 10 観測; (e) 検出時 mix_uniform の 30M セル flood (~14 s) → informed
+//! 再マッチ; (f) 復帰中の方策飢餓 NO_ACTION 死 → 解除を棄却して再マッチ。
+//! 結果: relock K2 57.4 s / K1 235.7 s (flatten 56.3 / 806.8 s)、ロスト中
+//! コストは実機圏内。ただし K3/K4 は relock せず (junction の残存第 2 峰が
+//! 相対峰条件を割らない / 廊下軸スライドは端方向ビームがレンジ外だと原理的に
+//! 不可観測)、relock 後の再ロスト リトライが走行予算を食い、ゴール到達 0/4
+//! (途中ラウンドでは K1・K3 到達 — 解除政策の匙加減で入れ替わる)。現状の
+//! 分業: **flatten = 遅いが確実 (ベンチ・オフライン) / global_match = 実機
+//! コストで復帰が速いが解除政策が未成熟**。次の一手は creep を reloc_targets
+//! (判別点) へ向ける統合 — 乱歩でなく判別に向かって走れば、保持条件は
+//! 早く満ちる。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -313,6 +338,12 @@ struct Args {
     /// 端点を振るぶんの繰り込み。θ ビン半幅 3° ≒ 0.05 が目安。0 = 従来。
     #[arg(long, default_value_t = 0.0)]
     lost_sigma_per_m: f64,
+    /// flatten の代わりに全域相関スキャンマッチで再シード
+    /// (`BeliefConfig::global_match` — belief/viterbi のみ)。ロスト中 observe の
+    /// 全域走査 (津田沼で最大 ~20 s) を「マッチ 1 回 (~0.5 s) + 疎な top-K
+    /// 候補集合」に置き換える。
+    #[arg(long)]
+    global_match: bool,
 
     /// CSV 出力先 (省略時は標準出力の表のみ)。
     #[arg(long)]
@@ -545,6 +576,20 @@ fn wrap_rad(d: f64) -> f64 {
     (d + PI).rem_euclid(2.0 * PI) - PI
 }
 
+/// 前方 ±half_rad のビーム最小レンジ [m] (復帰走行の安全ゲート用)。
+fn min_range_ahead(scan: &vi_lib::msg::LaserScan, half_rad: f64, max_r: f64) -> f64 {
+    let mut m = max_r;
+    for (i, &r) in scan.ranges.iter().enumerate() {
+        if !(r.is_finite() && r > 0.0 && r <= max_r) {
+            continue;
+        }
+        if wrap_rad(scan.angle_min + scan.angle_increment * i as f64).abs() <= half_rad {
+            m = m.min(r);
+        }
+    }
+    m
+}
+
 
 #[allow(clippy::too_many_arguments)]
 fn simulate(
@@ -646,6 +691,10 @@ fn simulate(
     let reloc_ticks_limit = (args.reloc_timeout_s / args.tick_s).ceil() as u32;
     /// 本家 follow_loop の近接ガード [m] (姿勢が無く local_penalty を置けない間の停止距離)。
     const RELOC_STOP_RANGE: f64 = 0.35;
+    /// 復帰走行 (probation / re-lock 前) の前方安全距離 [m]。truth 走行が保つ壁
+    /// クリアランス (最小 0.45 m) を邪魔しない範囲で、誤 belief の突進 (K2 の
+    /// 0.15 m 衝突) を止める。
+    const RECOVERY_GUARD_M: f64 = 0.5;
     /// 本家 follow_loop の QMDP 仮説上限。
     const QMDP_TOP_K: usize = 64;
     // 復帰判定のストリーク (連続 tick 数と開始 tick) / lost 連続カウンタ。
@@ -782,6 +831,11 @@ fn simulate(
             }
         }
 
+        // 真値スキャン (creep / 復帰走行ゲート / observe で共有 — tick に 1 回)。
+        let scan = (loc.is_some() && mode != Mode::Dead).then(|| {
+            cast_scan(native, PoseView { x, y, yaw_rad: yaw }, args.scan_beams, args.scan_range)
+        });
+
         // 推定姿勢で方策を引く。推定上のゴールなら実ノードと同じく停止して
         // 成功を宣言する — 真値が final でなければ「信じて止まった」となり、
         // そのときの真値のゴール中心距離を final_err_m に残す。
@@ -813,6 +867,24 @@ fn simulate(
                     }
                     GreedyOut::Act(fw, rot) => cmd = Some((fw, rot)),
                     GreedyOut::NoAction => {}
+                }
+            }
+            // 復帰走行の安全ゲート (実機の反射層): 姿勢がまだ検証中 — probation
+            // 中か、lost 検出後まだ re-lock していない — の間は、前方 ±30° の
+            // スキャンが近いのに前進する指令を握り潰す。cmd=None は既存の飢餓
+            // 経路に落ち、probation なら 50 tick で失敗 → 再拡散 (K2: 誤 belief
+            // の復帰走行で壁 0.15 m まで詰めて衝突、の対策)。誘拐前の base 走行
+            // と検出前の盲走行には触れない — 検出のダイナミクスを変えない。
+            let verifying = loc.as_ref().map(|l| l.in_probation()).unwrap_or(false)
+                || (recovering && r.detect_tick.is_some());
+            if let (Some((fw, _)), true, Some(s)) = (cmd, verifying, scan.as_ref()) {
+                if fw > 0.0
+                    && min_range_ahead(s, 30f64.to_radians(), args.scan_range) < RECOVERY_GUARD_M
+                {
+                    if starve == 0 {
+                        eprintln!("  [guard] t={t} 前方障害物 — 前進抑止 (検証中)");
+                    }
+                    cmd = None;
                 }
             }
         } else if args.active_reloc && !reloc_gave_up && reloc_ticks < reloc_ticks_limit {
@@ -853,14 +925,10 @@ fn simulate(
                         }
                     }
                     let preferred = reloc_delta.map(|(_, b)| b);
-                    let scan = cast_scan(
-                        native,
-                        PoseView { x, y, yaw_rad: yaw },
-                        args.scan_beams,
-                        args.scan_range,
-                    );
-                    let (fw, rot) =
-                        vi_lib::ctrl::lost_creep(&scan, preferred, args.scan_range, creep_rot);
+                    let (fw, rot) = match scan.as_ref() {
+                        Some(s) => vi_lib::ctrl::lost_creep(s, preferred, args.scan_range, creep_rot),
+                        None => (0.0, 0.0),
+                    };
                     creep_rot = rot;
                     if reloc_ticks % 25 == 1 {
                         eprintln!(
@@ -955,9 +1023,15 @@ fn simulate(
                     // probation 中の方策飢餓は「誤姿勢で方策が引けない」という
                     // 外部証拠 — run を殺さず probation を落として lost へ戻す
                     // (誤解除先が非 free に落ちるケースは走行検証まで届かない)。
-                    if loc.as_ref().map(|l| l.in_probation()).unwrap_or(false) {
+                    // 復帰中 (re-lock 前) の全地図 belief も同じ扱い: probation
+                    // を完走した誤解除が安全ゲートで詰む (津田沼 K2 で実測 —
+                    // エイリアスの quality はバーの上に留まり得る) のは同じく
+                    // 誤姿勢の外部証拠なので、死なずに再マッチへ回す。
+                    let reject = loc.as_ref().map(|l| l.in_probation()).unwrap_or(false)
+                        || (recovering && matches!(loc.as_ref(), Some(Est::Whole(_))));
+                    if reject {
                         if let Some(l) = &mut loc {
-                            eprintln!("  [prob] t={t} 方策飢餓 → probation 失敗");
+                            eprintln!("  [prob] t={t} 方策飢餓 → 解除を棄却して lost へ");
                             l.fail_probation();
                         }
                         starve = 0;
@@ -986,14 +1060,8 @@ fn simulate(
             if let Some((v, w_deg)) = moved {
                 l.predict(v, w_deg, args.tick_s);
             }
-            if mode != Mode::Dead {
-                let scan = cast_scan(
-                    native,
-                    PoseView { x, y, yaw_rad: yaw },
-                    args.scan_beams,
-                    args.scan_range,
-                );
-                l.observe(&scan);
+            if let Some(s) = scan.as_ref() {
+                l.observe(s);
             }
             let us = t0.elapsed().as_secs_f64() * 1e6;
             r.loc_us_sum += us;
@@ -1165,6 +1233,7 @@ fn main() -> ExitCode {
         probation_obs: args.probation,
         probation_min_q: args.probation_min_q,
         lost_sigma_per_m: args.lost_sigma_per_m,
+        global_match: args.global_match,
         ..WholeBeliefConfig::default()
     };
     {
