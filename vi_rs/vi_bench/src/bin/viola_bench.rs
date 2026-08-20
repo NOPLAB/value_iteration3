@@ -69,9 +69,21 @@
 //! エイリアスへの誤解除** (err 170〜238 m、quality 0.5〜0.8) で終わる: 60 m
 //! センサでも「幅 W の廊下」の署名はキャンパス内の複数箇所と 30 m 走っても
 //! 一致し続け、崩壊の勝者はほぼコイントス (証拠を濃くする実験は誤収束を
-//! 速めただけ)。終端の壁は尤度場の場所弁別力 — 次手は解除の probation
-//! (解除直後を仮 re-lock とし、短い検証走行の予測整合で確定) か、より豊かな
-//! 場所署名。
+//! 速めただけ)。終端の壁は尤度場の場所弁別力。
+//!
+//! 解除の probation (`--probation 100 --probation-min-q 0.3` →
+//! `BeliefConfig::probation_obs`) も実装・計測済み (2026-08-20): 誤解除は
+//! 想定どおり捕捉できる — 瞬時 quality の減衰 (誤解除でも走行 ~50 m は
+//! 0.9 前後を保ってから落ちる) と、probation 中の方策飢餓 (誤姿勢が非 free
+//! に落ちる) の 2 経路で lost へ戻し、全域一様へ再拡散して探索をやり直す。
+//! これで終端状態は「誤走行のまま NO_ACTION で死ぬ」から「リトライ継続
+//! (TIMEOUT) か安全停止 (LOST)」に変わった (K1 で判別走行 106.7 m を継続)。
+//! しかし relock は依然 0/4 — 再拡散のたびに崩壊が勝たせるのは**毎回別の遠方
+//! エイリアス**で、真位置が一度も勝たない。誤エイリアスの瞬時 quality が
+//! 0.88〜1.00 に達することから、0.15 m / 6° セル中心の離散化が 60 m ビームの
+//! 端点を ±3 m 振り、たまたま整列したエイリアスセルが真位置セルに勝つ構造的
+//! バイアスを疑う。次手はリトライの積み増しではなく尤度評価そのもの
+//! (距離比例 σ かサブセル補正)。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -259,6 +271,14 @@ struct Args {
     lost_min_d: f64,
     #[arg(long, default_value_t = 0.0)]
     lost_min_a_deg: f64,
+    /// 解除の probation (`BeliefConfig::probation_obs` — belief/viterbi のみ):
+    /// 仮解除後、--lost-min-d の並進を伴う観測 n 回すべてで瞬時 quality ≥
+    /// --probation-min-q を確認してから確定。割れたら lost へ戻して再拡散。
+    /// 0 = 従来 (即確定)。
+    #[arg(long, default_value_t = 0)]
+    probation: u32,
+    #[arg(long, default_value_t = 0.4)]
+    probation_min_q: f64,
 
     /// CSV 出力先 (省略時は標準出力の表のみ)。
     #[arg(long)]
@@ -393,6 +413,18 @@ impl Est {
         match self {
             Est::Win(l) => l.reloc_targets(),
             Est::Whole(b) => b.reloc_targets(),
+        }
+    }
+    /// 解除の probation (全地図のみ — 窓つき系は未対応で常に確定解除)。
+    fn in_probation(&self) -> bool {
+        match self {
+            Est::Win(_) => false,
+            Est::Whole(b) => b.in_probation(),
+        }
+    }
+    fn fail_probation(&mut self) {
+        if let Est::Whole(b) = self {
+            b.fail_probation();
         }
     }
 }
@@ -677,6 +709,17 @@ fn simulate(
                     relock_streak = 0;
                 }
             }
+            // probation 較正/診断: 解除後 (仮・誤とも) の瞬時 quality と真値誤差。
+            if r.relock_tick.is_none() && t % 25 == 0 {
+                if let (Some(e), Some(l)) = (est, &loc) {
+                    eprintln!(
+                        "  [prob] t={t} q={:.2} err={:.1} prob={}",
+                        l.quality(),
+                        ((e.x - x).powi(2) + (e.y - y).powi(2)).sqrt(),
+                        l.in_probation(),
+                    );
+                }
+            }
         }
 
         // 推定姿勢で方策を引く。推定上のゴールなら実ノードと同じく停止して
@@ -846,9 +889,20 @@ fn simulate(
             if est.is_some() {
                 starve += 1;
                 if starve > 50 {
-                    r.starved = true;
-                    r.ticks += 1;
-                    break;
+                    // probation 中の方策飢餓は「誤姿勢で方策が引けない」という
+                    // 外部証拠 — run を殺さず probation を落として lost へ戻す
+                    // (誤解除先が非 free に落ちるケースは走行検証まで届かない)。
+                    if loc.as_ref().map(|l| l.in_probation()).unwrap_or(false) {
+                        if let Some(l) = &mut loc {
+                            eprintln!("  [prob] t={t} 方策飢餓 → probation 失敗");
+                            l.fail_probation();
+                        }
+                        starve = 0;
+                    } else {
+                        r.starved = true;
+                        r.ticks += 1;
+                        break;
+                    }
                 }
             }
             None
@@ -1042,6 +1096,8 @@ fn main() -> ExitCode {
         reloc_scale: args.reloc_scale,
         lost_update_min_d_m: args.lost_min_d,
         lost_update_min_a_deg: args.lost_min_a_deg,
+        probation_obs: args.probation,
+        probation_min_q: args.probation_min_q,
         ..WholeBeliefConfig::default()
     };
     {

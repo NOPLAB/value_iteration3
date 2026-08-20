@@ -110,6 +110,15 @@ pub struct BeliefConfig {
     /// 幾何の小地図では有効) を保つ。使うときは両方をセットで。
     pub lost_update_min_d_m: f64,
     pub lost_update_min_a_deg: f64,
+    /// 解除の probation (保護観察): 0 より大なら、ロスト解除を仮とし、
+    /// `lost_update_min_d_m` の並進を伴う観測 probation_obs 回すべてで瞬時
+    /// quality ≥ probation_min_q を確認してから確定する。1 回でも割れたら
+    /// [`Belief::fail_probation`] (全域一様への再拡散) で lost へ戻す。
+    /// 静止観測では誤エイリアスと真位置は判別できない (だから誤解除する —
+    /// 津田沼で実測 err 170〜238 m、quality 0.5〜0.8) が、誤姿勢のまま走ると
+    /// 予測が数 m で破綻する — その走行を検証に使う。0 (既定) = 従来 (即確定)。
+    pub probation_obs: u32,
+    pub probation_min_q: f64,
     /// min-plus (MAP / Viterbi) 更新則で回す。全期間 min-plus (レベル切替なし)。
     pub viterbi: bool,
 }
@@ -132,6 +141,8 @@ impl Default for BeliefConfig {
             reloc_scale: 1.0,
             lost_update_min_d_m: 0.0,
             lost_update_min_a_deg: 0.0,
+            probation_obs: 0,
+            probation_min_q: 0.4,
             viterbi: false,
         }
     }
@@ -376,6 +387,10 @@ pub struct Belief {
     /// ([`mode_count`] ≤ 1 — 離れたエイリアスに分かれたままの「集中」で
     /// 降ろすと誤姿勢を返す。津田沼 K4 で実測)。
     lost: bool,
+    /// 解除の probation の残り確認回数 (0 = probation 中でない) と、前回の
+    /// 確認からの並進の累積 [m] ([`BeliefConfig::probation_obs`])。
+    probation: u32,
+    prob_move: f64,
 }
 
 impl Belief {
@@ -419,6 +434,8 @@ impl Belief {
             q_ewma: 0.0,
             ess_c: 0.0,
             lost: false,
+            probation: 0,
+            prob_move: 0.0,
         }
     }
 
@@ -558,8 +575,10 @@ impl Belief {
         self.pend_ticks = 0;
         self.initialized = true;
         self.q_ewma = 1.0;
-        // 手動シードは「ここに居る」という外部の主張 — ラッチを降ろす。
+        // 手動シードは「ここに居る」という外部の主張 — ラッチを降ろす
+        // (probation も外部の主張が上書きする)。
         self.lost = false;
+        self.probation = 0;
         self.recompute_ess();
     }
 
@@ -594,6 +613,7 @@ impl Belief {
         // リセット直後に再リセットしない (旧 enter_uniform の q_ewma 復帰と同じ)。
         self.q_ewma = self.cfg.reset_quality;
         self.lost = true;
+        self.probation = 0;
         self.recompute_ess();
     }
 
@@ -625,6 +645,8 @@ impl Belief {
         {
             return;
         }
+        // probation の並進カウント用: この flush で消費する変位 (符号なし)。
+        let moved_m = self.pend_f.abs();
         self.flush();
         if self.active.is_empty() {
             // flush で全質量が壁・地図外へ抜けた — 全滅復旧。
@@ -674,6 +696,7 @@ impl Belief {
         self.recompute_ess();
         if mismatched || self.ess_c > self.cfg.lost_ess {
             self.lost = true;
+            self.probation = 0;
         } else if self.lost
             && self.ess_c < self.cfg.contract_ess
             && mode_count(&self.top_cells(UNIMODAL_TOP_K), MODE_MIN_SEP_M) <= 1
@@ -684,7 +707,40 @@ impl Belief {
             // ずれる)。単峰まで確認してから降ろす。多峰のままなら lost を
             // 維持して能動的再定位 (reloc_targets) に判別させる。
             self.lost = false;
+            if self.cfg.probation_obs > 0 {
+                // 仮解除 — 検証走行の予測整合を見てから確定する。解除を
+                // 決めた静止観測そのものは検証に数えない (else if で分離)。
+                self.probation = self.cfg.probation_obs;
+                self.prob_move = 0.0;
+            }
+        } else if self.probation > 0 {
+            // probation: lost_update_min_d_m の並進ごとに瞬時 quality を検査。
+            // EWMA でなく瞬時なのは、廊下エイリアスの破綻が「開口部を通過した
+            // 1 観測」で現れるため — 平均は正しい区間に薄められる。
+            self.prob_move += moved_m;
+            if self.prob_move >= self.cfg.lost_update_min_d_m {
+                self.prob_move = 0.0;
+                if self.quality < self.cfg.probation_min_q {
+                    self.fail_probation();
+                } else {
+                    self.probation -= 1;
+                }
+            }
         }
+    }
+
+    /// probation 中か (仮解除 — pose は返るが確定前)。
+    pub fn in_probation(&self) -> bool {
+        self.probation > 0
+    }
+
+    /// probation を失敗させて lost へ戻す。observe 内の quality 破綻のほか、
+    /// 呼び出し側が「誤姿勢で方策が引けない」等の外部証拠で落とすのにも使う。
+    /// 半量 mix ([`Belief::mix_uniform`]) でないのは、mix 後も ESS が contract
+    /// を割ったままで解除↔失敗が観測 1 回ごとに振動するため — 全域一様へ
+    /// 戻して出直す (誤った証拠は捨てるのが正しい)。
+    pub fn fail_probation(&mut self) {
+        self.enter_uniform_free();
     }
 
     /// レーザーが貫通したセルを free 扱いにして、地図の壁を反証する
@@ -2051,6 +2107,82 @@ mod tests {
         loc.observe(&scan);
         loc.observe(&scan);
         assert!(loc.pose().is_some(), "単峰 + 集中 + 観測一致で解除するはず");
+    }
+
+    /// 解除の probation: 仮解除中に予測整合が割れたら lost へ戻して再拡散し、
+    /// 整合が probation_obs 回続けば確定する (誤エイリアスへの誤解除は静止では
+    /// 判別できないが、走ると予測が破綻する — 津田沼で実測)。
+    #[test]
+    fn probation_reverts_on_mismatch_and_confirms_on_consistency() {
+        let size = 60;
+        let mut g = OccupancyGrid {
+            width: size,
+            height: size,
+            resolution: 0.05,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            data: vec![0i8; (size * size) as usize],
+        };
+        for i in 0..size {
+            for (x, y) in [(i, 0), (i, size - 1), (0, i), (size - 1, i)] {
+                g.data[(y * size + x) as usize] = 100;
+            }
+        }
+        let bc = BeliefConfig {
+            beam_step: 4,
+            init_sigma_xy_m: 0.1,
+            probation_obs: 2,
+            probation_min_q: 0.3,
+            // 0 = 毎観測カウント (テストは predict なしで回すため)。
+            lost_update_min_d_m: 0.0,
+            ..BeliefConfig::default()
+        };
+        let mut loc = Belief::new(&g, 36, &g, bc);
+        let truth = pose(0.8, 0.8, 0.0);
+        loc.seed(truth);
+        let scan = cast_scan(&g, truth, 36, 8.0);
+        for _ in 0..4 {
+            loc.observe(&scan);
+        }
+        // ラッチを立てる — belief は単峰・集中のままなので次の観測で解除条件が
+        // 立つが、probation_obs > 0 なので仮解除に入る。
+        loc.lost = true;
+        loc.observe(&scan);
+        assert!(loc.pose().is_some(), "仮解除でも pose は返る");
+        assert!(loc.in_probation(), "解除直後は probation 中のはず");
+
+        // 検証 1 回目: 整合 — まだ確定しない。
+        loc.observe(&scan);
+        assert!(loc.in_probation(), "probation_obs=2: 1 回の整合では確定しない");
+
+        // 2 回目に予測と割れる観測 (全ビーム 0.4 m — 壁のない空中) — lost へ
+        // 戻して全域一様へ再拡散すること。
+        let mut bad = scan.clone();
+        for r in &mut bad.ranges {
+            *r = 0.4;
+        }
+        loc.observe(&bad);
+        assert!(loc.pose().is_none(), "予測整合が割れたら lost へ戻ること");
+        assert!(!loc.in_probation());
+        assert!(
+            loc.ess() > loc.cfg.lost_ess,
+            "失敗時は全域一様へ再拡散すること (ess={:.0})",
+            loc.ess()
+        );
+
+        // 確定パス: 立ち上げ直して同じ仮解除から整合 2 回 — 確定して
+        // probation が消えること。
+        loc.seed(truth);
+        for _ in 0..4 {
+            loc.observe(&scan);
+        }
+        loc.lost = true;
+        loc.observe(&scan); // 仮解除
+        loc.observe(&scan); // 整合 1
+        loc.observe(&scan); // 整合 2 — 確定
+        assert!(loc.pose().is_some());
+        assert!(!loc.in_probation(), "整合が続けば確定するはず");
     }
 
     /// ロスト中の相関観測ゲート: 静止のままの再スキャンは積分されない
