@@ -45,6 +45,7 @@ fn all_solvers() -> Vec<(&'static str, U64Solver)> {
         ("stream_mimic", StreamMimic),
         ("prio_ls", PriorityLabelSetting),
         ("prio_lc", PriorityLabelCorrecting),
+        ("schur", SchurPortal { tile: 32, portal_thetas: 8 }),
     ]
 }
 

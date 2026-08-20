@@ -27,6 +27,7 @@ pub mod frontier3d;
 pub mod observe;
 pub mod original;
 pub mod pyramid;
+pub mod schur;
 pub mod stack;
 pub mod stream;
 pub mod priority;
@@ -358,6 +359,10 @@ pub enum U64Solver {
     StreamMimic,
     PriorityLabelSetting,
     PriorityLabelCorrecting,
+    /// タイル通過行列 (ミンプラス Schur 補元): ゴール非依存の前計算 → ポータル
+    /// Dijkstra + タイル復元 → frontier2d 掃き直しで固定点まで ([`schur`])。
+    /// 処女でない場 (掃き直し / local_penalty あり) は frontier2d へ委譲。
+    SchurPortal { tile: u32, portal_thetas: u32 },
 }
 
 impl U64Solver {
@@ -377,6 +382,7 @@ impl U64Solver {
             "stream_mimic" => U64Solver::StreamMimic,
             "prio_ls" => U64Solver::PriorityLabelSetting,
             "prio_lc" => U64Solver::PriorityLabelCorrecting,
+            "schur" => U64Solver::SchurPortal { tile: 32, portal_thetas: 8 },
             _ => return None,
         })
     }
@@ -526,6 +532,12 @@ pub fn solve_observed(
         U64Solver::PriorityLabelCorrecting => {
             priority::priority_solve_observed(vi, max_iter, false, obs)
         }
+        U64Solver::SchurPortal { tile, portal_thetas } => schur::schur_solve_observed(
+            vi,
+            max_iter,
+            obs,
+            schur::SchurConfig { tile: tile as i32, portal_thetas: portal_thetas as i32 },
+        ),
     }
 }
 
