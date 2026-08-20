@@ -78,12 +78,41 @@
 //! に落ちる) の 2 経路で lost へ戻し、全域一様へ再拡散して探索をやり直す。
 //! これで終端状態は「誤走行のまま NO_ACTION で死ぬ」から「リトライ継続
 //! (TIMEOUT) か安全停止 (LOST)」に変わった (K1 で判別走行 106.7 m を継続)。
-//! しかし relock は依然 0/4 — 再拡散のたびに崩壊が勝たせるのは**毎回別の遠方
-//! エイリアス**で、真位置が一度も勝たない。誤エイリアスの瞬時 quality が
-//! 0.88〜1.00 に達することから、0.15 m / 6° セル中心の離散化が 60 m ビームの
-//! 端点を ±3 m 振り、たまたま整列したエイリアスセルが真位置セルに勝つ構造的
-//! バイアスを疑う。次手はリトライの積み増しではなく尤度評価そのもの
-//! (距離比例 σ かサブセル補正)。
+//! 当初 relock 0/4 のままで、真値プローブ ([truth] トレース) による解剖で
+//! 原因の連鎖を 1 つずつ特定・修正した (すべて `--lost-sigma-per-m 0.05` で
+//! 有効になるロスト観測モデル + vi_lib 側の修正):
+//!
+//! 1. **距離比例 σ** (`lost_sigma_per_m`): セル中心・θ ビン中心の離散化が
+//!    60 m ビーム端点を ±3 m 振る → LUT で σ_eff = σ0 + r·k。
+//! 2. **スキャン内テンパリング**: 生のビーム積は相対枝刈りと組み合うと
+//!    「ビームあたり 25% 劣るだけ」の真値を 2 観測 (0.4 m) で永久に殺す
+//!    (winner's curse) → 幾何平均化で 1 観測のレンジを [z_min, 1] に圧縮。
+//! 3. **unknown = 障害物の廃止**: 地図端の未知領域に囲まれた free の島が
+//!    全ビーム尤度 1.0 の「ブラックホール」になり全誤解除がそこへ吸われて
+//!    いた → 三値地図 (`build_occupancy_tri`) + E 正規化 (未知・地図外の
+//!    端点は幾何平均の分母から除外、既知 4 ビーム未満は中立 0.5 で頭打ち)。
+//!    床 (z_min) 案は世界レイキャストが unknown 境界で終端するぶん真値が
+//!    出血して base 追跡まで壊した — 中立でも定数で数える限り際の真値が
+//!    地図内エイリアスに恒常的に負ける。除外だけが対称。
+//! 4. **回頭コミット** (`ctrl::lost_creep` の last_rot_deg): 左右の開口で
+//!    最小回頭の勝者が毎 tick 反転する袋小路ディザ (±5° — 相関ゲート 30° を
+//!    超えず belief まで凍結) → 前進できるまで同方向を維持。
+//! 5. **リセットループの ESS ゲート**: 一様混合直後の加重平均 quality は
+//!    「ゴミの平均」で恒常的に reset_quality 未満 → 毎観測リセットで濃縮が
+//!    始まらない → ロスト中かつ ESS > lost_ess の間は再リセットしない。
+//! 6. **ロスト中の再リセットは mix でなく全平坦化**: mix は誤ピーク
+//!    (ゴースト) に質量を残したまま床を 1e-8 で張るので、床上の真値は
+//!    相対枝刈りの 3 桁下から始まり確立できない → `enter_uniform_free`。
+//! 7. **解除条件を単峰性のみに**: 軟化した観測モデルでは勝者シェアが ~1% で
+//!    頭打ちし ESS は二度と contract_ess を割らない (真値が 127 s argmax の
+//!    まま解除されずタイムアウト) → mode_count ≤ 1 だけで解除し、誤単峰は
+//!    probation に検証させる分業。
+//!
+//! 結果 (2026-08-20、--probation 100 --probation-min-q 0.3 --lost-sigma-per-m
+//! 0.05 追加): **relock 4/4** (従来 0/36) — K4 交差点 96.9 s → ゴール到達、
+//! K2 広場 56.3 s (後続の再ロストからの復帰走行中に衝突 — 安全性は次の課題)、
+//! K3 576 s / K1 廊下 806.8 s (並進対称を破るのに複数サイクル要、ゴールは
+//! tick 予算切れ)。ロスト中 observe は平坦化後の全域走査で最大 ~20 s。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -279,6 +308,11 @@ struct Args {
     probation: u32,
     #[arg(long, default_value_t = 0.4)]
     probation_min_q: f64,
+    /// ロスト中の距離比例 σ (`BeliefConfig::lost_sigma_per_m` — belief/viterbi
+    /// のみ): σ_eff = σ0 + r·この値。セル中心・θ ビン中心の離散化が長ビーム
+    /// 端点を振るぶんの繰り込み。θ ビン半幅 3° ≒ 0.05 が目安。0 = 従来。
+    #[arg(long, default_value_t = 0.0)]
+    lost_sigma_per_m: f64,
 
     /// CSV 出力先 (省略時は標準出力の表のみ)。
     #[arg(long)]
@@ -415,6 +449,13 @@ impl Est {
             Est::Whole(b) => b.reloc_targets(),
         }
     }
+    /// 診断: 真値仮説の周辺重み / 最大重みとその位置 (全地図のみ)。
+    fn probe_weight(&self, p: PoseView) -> (f64, f64, Option<PoseView>) {
+        match self {
+            Est::Win(_) => (f64::NAN, f64::NAN, None),
+            Est::Whole(b) => b.probe_weight(p),
+        }
+    }
     /// 解除の probation (全地図のみ — 窓つき系は未対応で常に確定解除)。
     fn in_probation(&self) -> bool {
         match self {
@@ -513,6 +554,9 @@ fn simulate(
     vi: &mut ValueIterator,
     grid: &OccupancyGrid,
     native: &OccupancyGrid,
+    // native の三値版 (-1 unknown 保存) — belief の尤度場専用。世界 (レイ
+    // キャスト) は unknown = 障害物の native のまま。
+    native_tri: &OccupancyGrid,
     // 障害物までの距離場 (chamfer_dist、3 = 1 セル)。grid と同じ格子。
     chamfer: &[u32],
     mode: Mode,
@@ -533,9 +577,10 @@ fn simulate(
     let mut rng = Rng(noise_seed.max(1));
     let mut loc = (mode != Mode::Truth).then(|| match mode {
         Mode::Whole => {
-            // 幾何 (belief 格子) は VI と同じスケール後の grid、尤度場だけ native。
-            // 実ノードと同じ入れ子 — 窓つきの GridLocalizer は native 一本。
-            let mut b = Belief::new(grid, N_THETA, native, wbc);
+            // 幾何 (belief 格子) は VI と同じスケール後の grid、尤度場だけ native
+            // の三値版 (実ノードは ROS の -1 入り地図をそのまま受けるので、
+            // これが実構成)。窓つきの GridLocalizer は native 一本。
+            let mut b = Belief::new(grid, N_THETA, native_tri, wbc);
             b.seed(seed_pose);
             Est::Whole(Box::new(b))
         }
@@ -589,6 +634,8 @@ fn simulate(
     let mut reloc_gave_up = false;
     // --reloc-creep: ロスト 1 回ぶんの凍結判別点 (pose 復帰で捨てる)。
     let mut reloc_frozen: Option<Vec<(f64, f64)>> = None;
+    // lost_creep の回頭コミット (前 tick の回頭成分 — 前進 / pose 復帰で 0)。
+    let mut creep_rot = 0.0f64;
     // δ* の実行状態 (残距離 [m], ロボット系方位 [rad])。凍結時に上位モードから
     // 1 度だけ落とし、以後は指令オドメトリで更新する — 上位モードの同一性は
     // エイリアス間で毎 tick 入れ替わるので、モードから引き直すと方位が振動して
@@ -680,6 +727,19 @@ fn simulate(
                 }
                 // 能動的再定位が生きている間は「静止のまま判別不能」に数えない
                 // (走って判別しに行っている最中なので)。
+                // 診断: 真値仮説の生死 (相対枝刈りで 0 = 死、以後復活不能)。
+                if t % 25 == 0 {
+                    if let Some(l) = &loc {
+                        let (tw, mw, win) = l.probe_weight(PoseView { x, y, yaw_rad: yaw });
+                        let (wx, wy, wd) = win
+                            .map(|p| (p.x, p.y, (p.x - x).hypot(p.y - y)))
+                            .unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+                        eprintln!(
+                            "  [truth] t={t} w={tw:.2e} max={mw:.2e} ratio={:.1e} win=({wx:.0},{wy:.0}) d={wd:.0}",
+                            if mw > 0.0 { tw / mw } else { f64::NAN },
+                        );
+                    }
+                }
                 let reloc_live =
                     args.active_reloc && !reloc_gave_up && reloc_ticks < reloc_ticks_limit;
                 if !reloc_live {
@@ -742,6 +802,7 @@ fn simulate(
             reloc_gave_up = false;
             reloc_frozen = None;
             reloc_delta = None;
+            creep_rot = 0.0;
             let (ix, iy, it) = pose_to_cell(vi, e.x, e.y, e.yaw_rad);
             if in_field(vi, ix, iy, it) {
                 match greedy_decide(vi, ix, iy, it, args.action_tolerance_cells) {
@@ -798,7 +859,9 @@ fn simulate(
                         args.scan_beams,
                         args.scan_range,
                     );
-                    let (fw, rot) = vi_lib::ctrl::lost_creep(&scan, preferred, args.scan_range);
+                    let (fw, rot) =
+                        vi_lib::ctrl::lost_creep(&scan, preferred, args.scan_range, creep_rot);
+                    creep_rot = rot;
                     if reloc_ticks % 25 == 1 {
                         eprintln!(
                             "  [creep] t={t} frozen={} pref_deg={:?} cmd=({fw:.2},{rot:.0}) yaw={:.0}",
@@ -1032,6 +1095,9 @@ fn main() -> ExitCode {
         origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
         data: nocc,
     };
+    // belief の尤度場用 (unknown = -1 を保存 — 実ノードが受ける ROS 地図と同じ)。
+    let (tocc, _, _) = pgm::build_occupancy_tri(&map, 1);
+    let native_tri = OccupancyGrid { data: tocc, ..native.clone() };
 
     let actions = scaled_actions(args.action_scale);
     let max_fw = actions.iter().map(|a| a.delta_fw).fold(0.0f64, f64::max);
@@ -1098,11 +1164,12 @@ fn main() -> ExitCode {
         lost_update_min_a_deg: args.lost_min_a_deg,
         probation_obs: args.probation,
         probation_min_q: args.probation_min_q,
+        lost_sigma_per_m: args.lost_sigma_per_m,
         ..WholeBeliefConfig::default()
     };
     {
         let probe = GridLocalizer::new(&native, N_THETA, bc);
-        let whole = Belief::new(&grid, N_THETA, &native, wbc);
+        let whole = Belief::new(&grid, N_THETA, &native_tri, wbc);
         eprintln!(
             "belief: grid {:.1} MB (window) / whole-map {:.1} MB ({} free cells)",
             probe.belief_mb(),
@@ -1216,6 +1283,7 @@ fn main() -> ExitCode {
                     &mut vi,
                     &grid,
                     &native,
+                    &native_tri,
                     &chamfer,
                     mode,
                     start,

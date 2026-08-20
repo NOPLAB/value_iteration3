@@ -59,7 +59,19 @@ use crate::value_iterator::ValueIterator;
 /// 判別点を出せない (判別地形は数十 m 先) が、開けた方向へ這い続ければ廊下端・
 /// 交差点で観測が勝手にエイリアスを割る。返り値は本家 action 単位
 /// (`delta_fw` [m], `delta_rot` [deg])。(0, 0) は「スキャンが空 = 動けない」。
-pub fn lost_creep(scan: &LaserScan, preferred_rad: Option<f64>, max_range: f64) -> (f64, f64) {
+///
+/// `last_rot_deg` は前 tick の返り値の回頭成分 (前進したら 0 を渡す)。回頭を
+/// 始めたら前進できるまで同方向を維持する — 前方の左右に開口が並ぶ袋小路では
+/// 最小回頭の勝者がノイズで毎 tick 左右反転し、正味 ±5° のディザで永遠に
+/// 抜けられない上に、相関観測ゲート (30°) を一度も超えず belief まで凍る
+/// (津田沼 K4 で実測: 275 tick 凍結)。回頭のコミットは最悪 1 回転 (~18 s) で
+/// 必ずどこかの開口に整列する。
+pub fn lost_creep(
+    scan: &LaserScan,
+    preferred_rad: Option<f64>,
+    max_range: f64,
+    last_rot_deg: f64,
+) -> (f64, f64) {
     use std::f64::consts::PI;
     /// 方位の開き = その方位 ±CONE の最小レンジ。前進 / 徐行 / 回頭整合のしきい値。
     // ponytail: 定数 — ロボット寸法依存が出たら引数化。
@@ -117,12 +129,20 @@ pub fn lost_creep(scan: &LaserScan, preferred_rad: Option<f64>, max_range: f64) 
             best_clear.unwrap_or(best_any.0)
         }
     };
+    // 回頭のコミット: 回頭中 (last_rot_deg ≠ 0) は方向を変えない (doc 参照)。
+    let commit = |natural: f64| {
+        if last_rot_deg != 0.0 {
+            last_rot_deg.signum()
+        } else {
+            natural
+        }
+    };
     if target.abs() > ALIGN_RAD {
         // ほぼ真後ろ (|target| ≈ π) は wrap で符号が毎 tick 反転し、±ROT の
         // チャタリングで回り切れない (津田沼 K4 で実測: yaw が 90±3° に 160 s
         // 張り付く)。後方目標は左回り固定で 1 方向へ回り切る。
         let dir = if target.abs() > 2.0 { 1.0 } else { target.signum() };
-        return (0.0, ROT_DEG * dir);
+        return (0.0, ROT_DEG * commit(dir));
     }
     let front = open_at(0.0);
     if front > GO_CLEAR_M {
@@ -131,7 +151,7 @@ pub fn lost_creep(scan: &LaserScan, preferred_rad: Option<f64>, max_range: f64) 
         (CREEP_FW, 0.0)
     } else {
         // 向いた先も塞がっている (全周が狭い袋小路など) — 決定的に左回頭で脱出。
-        (0.0, ROT_DEG)
+        (0.0, ROT_DEG * commit(1.0))
     }
 }
 
@@ -692,7 +712,7 @@ mod tests {
             ranges: (0..360).map(|i| f((i as f64).to_radians())).collect(),
         };
         // 全周 10 m — 前方が最も開いた同率なので回頭せず前進。
-        let (fw, rot) = lost_creep(&scan(&|_| 10.0), None, 60.0);
+        let (fw, rot) = lost_creep(&scan(&|_| 10.0), None, 60.0, 0.0);
         assert!(fw > 0.0 && rot == 0.0, "全周が開いていれば前進: ({fw}, {rot})");
         // 前方 ±30° だけ 0.4 m — 開いた側 (それ以外) へ回頭。
         let blocked = scan(&|b| {
@@ -700,14 +720,14 @@ mod tests {
                 - std::f64::consts::PI;
             if d.abs() < 0.52 { 0.4 } else { 10.0 }
         });
-        let (fw, rot) = lost_creep(&blocked, None, 60.0);
+        let (fw, rot) = lost_creep(&blocked, None, 60.0, 0.0);
         assert!(fw == 0.0 && rot != 0.0, "前方が塞がれば回頭: ({fw}, {rot})");
         // preferred = 真後ろ (開いている) — そちらへ回頭。
-        let (fw, rot) = lost_creep(&scan(&|_| 10.0), Some(std::f64::consts::PI), 60.0);
+        let (fw, rot) = lost_creep(&scan(&|_| 10.0), Some(std::f64::consts::PI), 60.0, 0.0);
         assert!(fw == 0.0 && rot != 0.0, "preferred へ回頭: ({fw}, {rot})");
         // preferred が塞がっていれば無視して開いた方向 (前方) へ — 前進。
         let back_blocked = scan(&|b| if (b - std::f64::consts::PI).abs() < 0.52 { 0.4 } else { 10.0 });
-        let (fw, rot) = lost_creep(&back_blocked, Some(std::f64::consts::PI), 60.0);
+        let (fw, rot) = lost_creep(&back_blocked, Some(std::f64::consts::PI), 60.0, 0.0);
         assert!(fw > 0.0 && rot == 0.0, "塞がった preferred は無視: ({fw}, {rot})");
     }
 

@@ -119,6 +119,22 @@ pub struct BeliefConfig {
     /// 予測が数 m で破綻する — その走行を検証に使う。0 (既定) = 従来 (即確定)。
     pub probation_obs: u32,
     pub probation_min_q: f64,
+    /// ロスト中のみ、ビーム距離 r に比例して σ を膨らませる: σ_eff = σ0 +
+    /// lost_sigma_per_m · r。仮説はセル中心 (±res/2) と θ ビン中心 (±3° @60
+    /// ビン) でしか評価できず、その角度誤差は端点を接線方向に r·Δθ だけ振る —
+    /// 60 m ビームで ±3 m。固定 σ0 = 0.2 m はこれを尤度 0 に落とすため、真位置
+    /// のセルが長ビームで不当に罰され、たまたま整列した遠方エイリアスが崩壊に
+    /// 勝つ (津田沼で実測: 誤エイリアスの瞬時 quality 0.88〜1.00)。非ロストは
+    /// 加重平均でサブセル追跡できるので σ0 のまま — 検出感度も変えない。
+    /// θ ビン半幅 3° = 0.052 rad が自然な値 (~0.05)。0 (既定) = 従来。
+    ///
+    /// 有効時はもう 1 つ、**スキャン内テンパリング**も同じ LUT に焼き込まれる:
+    /// ビーム尤度の積を (1/M) 乗の積 = 幾何平均に置き換え、1 観測のダイナミック
+    /// レンジを [z_min, 1] に圧縮する。生の積はビームあたり 25% 劣るだけの
+    /// 仮説を 2 観測で相対枝刈りの下へ落とし、リセット直後の真位置仮説が
+    /// 偶然の最良適合セルに 0.4 m で永久に殺される (winner's curse — 津田沼
+    /// K4 で実測)。observe 内コメント参照。
+    pub lost_sigma_per_m: f64,
     /// min-plus (MAP / Viterbi) 更新則で回す。全期間 min-plus (レベル切替なし)。
     pub viterbi: bool,
 }
@@ -143,6 +159,7 @@ impl Default for BeliefConfig {
             lost_update_min_a_deg: 0.0,
             probation_obs: 0,
             probation_min_q: 0.4,
+            lost_sigma_per_m: 0.0,
             viterbi: false,
         }
     }
@@ -152,6 +169,20 @@ impl Default for BeliefConfig {
 const EWMA_BETA: f64 = 0.3;
 /// リセットで free 一様分布と混ぜる質量比 (EMCL の resetting 相当)。
 const MIX_UNIFORM: f32 = 0.5;
+/// 未知セルに落ちた端点の中立尤度。1.0 (旧 = unknown を障害物扱い) は未知に
+/// 囲まれた free の島が全ビーム満点になるブラックホール、0 (= 床) は世界側の
+/// レイキャストが unknown 境界で終端するぶん**真値**が出血して base 追跡まで
+/// 壊す (津田沼で両方とも実測)。追跡経路では実障害物の裾との max として、
+/// ロスト観測モデルでは証拠不足仮説の頭打ち定数として使う。ponytail: 定数、
+/// 地図ごとの調整が要るなら BeliefConfig へ昇格。
+const UNKNOWN_L: f64 = 0.5;
+/// ロスト観測モデルの最少証拠ビーム数 (E 正規化): 未知・地図外に落ちた端点は
+/// 幾何平均の**分母から除外**し、既知端点ビームだけで評価する — 定数で数える
+/// (中立クランプ) と、境界終端ビームを持つ真値が地図内エイリアスに恒常的に
+/// 不利 (×0.8/観測、津田沼 K4 で実測: ゴーストに負け続けて枝刈り死)。既知
+/// ビームがこれ未満の仮説は幾何平均を立てず UNKNOWN_L で頭打ち — 全ビームが
+/// 未知に落ちる深部フリンジの偽者が「無罰 = 満点」へ戻るのを防ぐ。
+const LOST_MIN_KNOWN: u32 = 4;
 /// [`Belief::b_hat`] の下端アンカー: 「十分集中」とみなす ESS。
 // ponytail: 定数、必要なら BeliefConfig へ昇格。
 const TIGHT_ESS: f64 = 30.0;
@@ -209,6 +240,14 @@ struct LikelihoodField {
     ox: f64,
     oy: f64,
     lf: Vec<u8>,
+    /// 最近障害物までのチャンファー距離 [セル]、255 で飽和 (native 0.05 m なら
+    /// 12.75 m)。ロスト中の距離比例 σ ([`BeliefConfig::lost_sigma_per_m`]) は
+    /// lf の u8 量子化 (d ≳ 3.5σ で 0 に潰れ復元不能) では評価できないため、
+    /// 距離そのものを並置してビーム別 LUT で引く。
+    dist: Vec<u8>,
+    /// unknown (data < 0) セルの bitset。端点が落ちたら尤度を
+    /// [`UNKNOWN_L`] でクランプ (実障害物の裾との max)。
+    unk: Vec<u64>,
     /// free (data == 0) セルの bitset。belief の物理拘束用 — 壁・未知の中の
     /// 姿勢仮説を許さない (尤度場はビームの当たり先しか見ないので、これが
     /// 無いと「壁の中に居る」仮説が観測で一切罰されない)。
@@ -219,14 +258,26 @@ impl LikelihoodField {
     fn from_grid(g: &OccupancyGrid, sigma_m: f64) -> Self {
         let (w, h) = (g.width, g.height);
         let n = (w as usize) * (h as usize);
-        // ValueIterator と同じ規約: data == 0 が free、非 0 は障害物。
+        // ROS 規約の三値: data > 0 = 障害物、0 = free、< 0 = unknown。
+        // unknown は障害物にも free にも数えない — 障害物に数える (旧実装の
+        // 「非 0 は障害物」) と、地図端の未知領域に囲まれた free の島がどんな
+        // スキャンにも全ビーム尤度 1.0 で一致する「尤度場のブラックホール」に
+        // なり、誘拐復帰の崩壊が毎回そこへ吸われる (津田沼で実測: 全誤解除の
+        // 勝者が未知 49% の北東フリンジ、真位置は毎観測 ×0.5 で敗死)。
+        // unknown に落ちた端点は最寄りの**実**障害物までの距離で評価され、
+        // 深部なら床 z_min = 「情報なし」に落ちる (AMCL の likelihood_field が
+        // 地図外端点を z_rand のみで評価するのと同じ側)。二値 {0,100} の
+        // 呼び出し元には挙動不変。
         let mut d = vec![f32::INFINITY; n];
         let mut free = vec![0u64; n.div_ceil(64)];
+        let mut unk = vec![0u64; n.div_ceil(64)];
         for i in 0..n {
-            if g.data[i] != 0 {
+            if g.data[i] > 0 {
                 d[i] = 0.0;
-            } else {
+            } else if g.data[i] == 0 {
                 free[i >> 6] |= 1u64 << (i & 63);
+            } else {
+                unk[i >> 6] |= 1u64 << (i & 63);
             }
         }
         let idx = |x: i32, y: i32| (y * w + x) as usize;
@@ -270,6 +321,7 @@ impl LikelihoodField {
             }
         }
         let inv_2s2 = 1.0 / (2.0 * sigma_m * sigma_m);
+        let dist = d.iter().map(|&dc| dc.min(255.0) as u8).collect();
         let lf = d
             .into_iter()
             .map(|dc| {
@@ -277,7 +329,51 @@ impl LikelihoodField {
                 (255.0 * (-dm * dm * inv_2s2).exp()).round() as u8
             })
             .collect();
-        Self { w, h, res: g.resolution, ox: g.origin_x, oy: g.origin_y, lf, free }
+        Self { w, h, res: g.resolution, ox: g.origin_x, oy: g.origin_y, lf, dist, unk, free }
+    }
+
+    /// 世界座標の最近障害物距離のインデックス (0..=255、セル単位)。地図外は
+    /// 255 (= 遠い) — [`LikelihoodField::at`] の「地図外は尤度 0」と実質同じ
+    /// 側に落ちる (LUT[255] は z_min に対して無視できる)。
+    #[inline]
+    fn dist_idx(&self, wx: f64, wy: f64) -> usize {
+        let x = ((wx - self.ox) / self.res).floor() as i32;
+        let y = ((wy - self.oy) / self.res).floor() as i32;
+        if x < 0 || y < 0 || x >= self.w || y >= self.h {
+            return 255;
+        }
+        self.dist[(y * self.w + x) as usize] as usize
+    }
+
+    /// 世界座標が unknown セルか (追跡経路の [`UNKNOWN_L`] クランプ用)。地図外
+    /// は false — 追跡では地図外端点を従来どおり床に落とす (base 追跡はそれで
+    /// 成立しており、クランプを広げる理由がない)。
+    #[inline]
+    fn unk_at(&self, wx: f64, wy: f64) -> bool {
+        let x = ((wx - self.ox) / self.res).floor() as i32;
+        let y = ((wy - self.oy) / self.res).floor() as i32;
+        if x < 0 || y < 0 || x >= self.w || y >= self.h {
+            return false;
+        }
+        let i = (y * self.w + x) as usize;
+        self.unk[i >> 6] & (1u64 << (i & 63)) != 0
+    }
+
+    /// 既知 (free または実障害物) セルに落ちた端点の距離インデックス。
+    /// unknown と地図外は None = 「情報なし」— ロスト観測モデル
+    /// ([`LOST_MIN_KNOWN`]) は幾何平均の分母から除外する。
+    #[inline]
+    fn known_dist(&self, wx: f64, wy: f64) -> Option<usize> {
+        let x = ((wx - self.ox) / self.res).floor() as i32;
+        let y = ((wy - self.oy) / self.res).floor() as i32;
+        if x < 0 || y < 0 || x >= self.w || y >= self.h {
+            return None;
+        }
+        let i = (y * self.w + x) as usize;
+        if self.unk[i >> 6] & (1u64 << (i & 63)) != 0 {
+            return None;
+        }
+        Some(self.dist[i] as usize)
     }
 
     /// セルが free か。地図外は false。
@@ -675,10 +771,40 @@ impl Belief {
         if beams.is_empty() {
             return;
         }
+        // ロスト中の観測モデル (lost_sigma_per_m > 0 で有効)。ビームごとに
+        // 距離 256 段 → 尤度の LUT を張る (exp はビーム数 × 256 回だけ —
+        // セルあたりの評価コストは固定 σ の lf 参照と同じに保つ)。2 つを焼き込む:
+        // (1) 距離比例 σ: σ_eff = σ0 + r·lost_sigma_per_m (config doc 参照)。
+        // (2) スキャン内テンパリング: z_min ミキシング済みビーム尤度の (1/M) 乗。
+        //     積が幾何平均になり、1 観測のダイナミックレンジが [z_min, 1] に
+        //     圧縮される。生の積は「ビームあたり 25% 劣るだけ」の仮説を 2 観測
+        //     で相対枝刈り (1e-4) の下へ落とし、リセット直後の真位置仮説が
+        //     偶然の最良適合セルに 0.4 m で永久に殺される (津田沼 K4 で実測 —
+        //     リセット 2 観測後に真値の重みが 0)。スキャン間の相関ゲート
+        //     (lost_update_min_d/a) と同じ「相関証拠を独立扱いで過大計上しない」
+        //     をスキャン内の 18 ビームにも適用した形。
+        let lut: Option<Vec<[f32; 256]>> =
+            (lost && self.cfg.lost_sigma_per_m > 0.0).then(|| {
+                let res = self.field.res;
+                let z_min = self.cfg.z_min;
+                let m_inv = 1.0 / beams.len() as f64;
+                beams
+                    .iter()
+                    .map(|&(_, r)| {
+                        let s = self.cfg.sensor_sigma_m + self.cfg.lost_sigma_per_m * r;
+                        let inv_2s2 = 1.0 / (2.0 * s * s);
+                        std::array::from_fn(|d| {
+                            let dm = d as f64 * res;
+                            let l = (-dm * dm * inv_2s2).exp();
+                            (z_min + (1.0 - z_min) * l).powf(m_inv) as f32
+                        })
+                    })
+                    .collect()
+            });
         let quality = if self.cfg.viterbi {
-            self.vit_observe(&beams)
+            self.vit_observe(&beams, lut.as_deref())
         } else {
-            self.sum_observe(&beams)
+            self.sum_observe(&beams, lut.as_deref())
         };
         self.quality = quality;
         self.q_ewma = (1.0 - EWMA_BETA) * self.q_ewma + EWMA_BETA * quality;
@@ -690,22 +816,42 @@ impl Belief {
         // ラッチ条件は mix_uniform の**前**に確定させる — リセットは q_ewma を
         // reset_quality へ書き戻すので、後から見ると不一致の証拠が消えている。
         let mismatched = self.q_ewma < self.cfg.reset_quality;
-        if mismatched {
-            self.mix_uniform();
+        // 既にロストで belief がまだ広い (ESS > lost_ess) 間は再ミックスしない —
+        // 一様混合直後の加重平均 quality は「ゴミの平均」で恒常的に低く、毎観測
+        // リセットすると濃縮が永遠に始まらない上、active が毎回全域に戻って
+        // 観測コストも爆発する (E 正規化で顕在化 — 津田沼 K4 で実測: 真値が
+        // 850 tick 一様床に凍結、observe 平均 645 ms)。濃縮が進んで ESS が
+        // lost_ess を割れば quality は意味を取り戻し、そのときの不一致は従来
+        // どおり再拡散する (EMCL の expansion resetting の本来の対象)。
+        if mismatched && !(self.lost && self.ess_c > self.cfg.lost_ess) {
+            if self.lost {
+                // ロスト中の再リセットは mix でなく**全平坦化**。mix は誤ピーク
+                // (ゴースト) に質量 (1-α) を残したまま一様床を 1/(n·α) で張る
+                // ので、床上の真の仮説は相対枝刈り (max × weight_skip_ratio) の
+                // 3 桁下から始まり、確立する前に必ず刈られる (津田沼 K4 で
+                // 実測: 検出時のゴースト 0.3 vs 床 1.1e-8 — 粒子フィルタの
+                // 注入粒子はリサンプリングで対等になるが、ヒストグラム +
+                // 相対枝刈りでは桁が合わない)。未ロストの最初の mix は残す —
+                // 誤警報 (追跡中の一時的な不一致) なら生き残ったピークが
+                // 次の観測で回復する。
+                self.enter_uniform_free();
+            } else {
+                self.mix_uniform();
+            }
         }
         self.recompute_ess();
         if mismatched || self.ess_c > self.cfg.lost_ess {
             self.lost = true;
             self.probation = 0;
-        } else if self.lost
-            && self.ess_c < self.cfg.contract_ess
-            && mode_count(&self.top_cells(UNIMODAL_TOP_K), MODE_MIN_SEP_M) <= 1
-        {
-            // 解除は「集中」だけでは足りない — リセット直後の過渡や尤度飽和の
-            // プラトーでは、遠く離れたエイリアスに分かれたまま ESS だけが
-            // しきい値を横切る (津田沼で実測: 解除された平均姿勢が 80〜130 m
-            // ずれる)。単峰まで確認してから降ろす。多峰のままなら lost を
-            // 維持して能動的再定位 (reloc_targets) に判別させる。
+        } else if self.lost && mode_count(&self.top_cells(UNIMODAL_TOP_K), MODE_MIN_SEP_M) <= 1 {
+            // 解除は**単峰性のみ**で判定する (多峰のままなら lost を維持して
+            // 能動的再定位に判別させる)。かつては ess < contract_ess も要求して
+            // いたが、E 正規化 + テンパリングの軟化した観測モデルでは勝者の
+            // 質量シェアが ~1% で頭打ちし、ESS は数千のまま二度と 50 を割らない
+            // (津田沼 K4 で実測: 真値が 127 s 間 argmax なのに解除されず
+            // タイムアウト)。固定 ESS しきい値は地図スケールにも追従しない。
+            // 誤単峰への早すぎる解除は probation (probation_obs) が受け持つ —
+            // 解除を安くして検証を走行に置くのが分業。
             self.lost = false;
             if self.cfg.probation_obs > 0 {
                 // 仮解除 — 検証走行の予測整合を見てから確定する。解除を
@@ -796,6 +942,46 @@ impl Belief {
             y: m.y + self.pend_f * m.yaw_rad.sin(),
             yaw_rad: m.yaw_rad + self.pend_rot_deg.to_radians(),
         })
+    }
+
+    /// 診断: 姿勢の周辺 (±1 セル・±1 θ ビン) の最大重みと、belief 全体の最大
+    /// 重みとその位置。ベンチが真値仮説の生死と「誰に負けたか」を追う用 —
+    /// 相対枝刈りで 0 に落ちた仮説は以後の観測では復活できない。
+    pub fn probe_weight(&self, p: PoseView) -> (f64, f64, Option<PoseView>) {
+        if !self.initialized {
+            return (0.0, 0.0, None);
+        }
+        let cx = ((p.x - self.ox) / self.res).floor() as i32;
+        let cy = ((p.y - self.oy) / self.res).floor() as i32;
+        let deg = p.yaw_rad.to_degrees().rem_euclid(360.0);
+        let ct = ((deg / self.t_res_deg) as i32).clamp(0, self.nt - 1);
+        let mut w = 0.0f32;
+        for dt in -1..=1 {
+            let it = (ct + dt + self.nt) % self.nt;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let (ix, iy) = (cx + dx, cy + dy);
+                    if ix < 0 || iy < 0 || ix >= self.nx || iy >= self.ny {
+                        continue;
+                    }
+                    w = w.max(self.b[bidx2(self.nx, self.ny, ix, iy, it)]);
+                }
+            }
+        }
+        let mut maxw = 0.0f32;
+        let mut arg = None;
+        for &i in &self.active {
+            if self.b[i as usize] > maxw {
+                maxw = self.b[i as usize];
+                arg = Some(i);
+            }
+        }
+        let win = arg.map(|i| {
+            let (ix, iy, it) = self.decode(i);
+            let (x, y) = self.cell_center(ix, iy);
+            PoseView { x, y, yaw_rad: self.theta_center(it) }
+        });
+        (w as f64, maxw as f64, win)
     }
 
     /// belief の上位 `k` 仮説 (セル中心の姿勢, 正規化重み)。重み降順 — QMDP
@@ -1115,9 +1301,11 @@ impl Belief {
     /// 枝刈りを乗算**後**に置くのは意図的 — 乗算前に相対しきい値で切ると、
     /// 一様混合リセットが張った床 (α/free 数 ≪ max·ratio) がビーム評価される
     /// 前に消え、リセットが機能しなくなるため。
-    fn sum_observe(&mut self, beams: &[(f64, f64)]) -> f64 {
+    fn sum_observe(&mut self, beams: &[(f64, f64)], lut: Option<&[[f32; 256]]>) -> f64 {
         let z_min = self.cfg.z_min;
         let m_inv = 1.0 / beams.len() as f64;
+        // 追跡経路の未知端点クランプ / ロスト経路の証拠不足の頭打ち定数。
+        let unk_l = z_min + (1.0 - z_min) * UNKNOWN_L;
         // ビーム角は加法定理で回す (セルごとに全ビームの sin/cos を呼ばない)。
         let bt: Vec<(f64, f64, f64)> =
             beams.iter().map(|&(ba, r)| (ba.cos(), ba.sin(), r)).collect();
@@ -1138,18 +1326,47 @@ impl Belief {
             let th = self.theta_center(it);
             let (ct, st) = (th.cos(), th.sin());
             let (cx, cy) = self.cell_center(ix, iy);
-            let mut prod = 1.0f64;
-            for &(cb, sb, r) in &bt {
+            let (mut prod, mut known) = (1.0f64, 0u32);
+            for (bi, &(cb, sb, r)) in bt.iter().enumerate() {
                 let (ca, sa) = (ct * cb - st * sb, st * cb + ct * sb);
-                let l = self.field.at(cx + r * ca, cy + r * sa);
-                prod *= z_min + (1.0 - z_min) * l;
+                let (px, py) = (cx + r * ca, cy + r * sa);
+                match lut {
+                    // ロスト観測モデル: LUT は z_min ミキシング + (1/M)
+                    // テンパリング焼き込み済み。未知・地図外の端点は分母から
+                    // 除外 (E 正規化 — LOST_MIN_KNOWN の doc 参照)。
+                    Some(t) => {
+                        if let Some(d) = self.field.known_dist(px, py) {
+                            prod *= t[bi][d] as f64;
+                            known += 1;
+                        }
+                    }
+                    None => {
+                        let mut lb = z_min + (1.0 - z_min) * self.field.at(px, py);
+                        // 未知セルの端点は中立 (UNKNOWN_L) との max。
+                        if lb < unk_l && self.field.unk_at(px, py) {
+                            lb = unk_l;
+                        }
+                        prod *= lb;
+                    }
+                }
             }
             // 観測一致度はビームの**幾何**平均 (= prod^(1/M))。算術平均だと
             // ミスマッチでも「たまたま障害物帯に乗った端点」の寄与で 0.3 台に
             // 浮き、ロスト検出のしきい値と分離できない。幾何平均は外れビームに
             // 引きずられて z_min 側へ落ちるので、整合 (~0.5+) と乖離する。
-            quality += w as f64 * prod.powf(m_inv);
-            self.b[i] = (w as f64 * prod) as f32;
+            let (gm, bw) = if lut.is_some() {
+                let s = if known >= LOST_MIN_KNOWN {
+                    // (Π l^(1/M))^(M/E) = (Π l)^(1/E) — 既知ビームの幾何平均。
+                    prod.powf(bt.len() as f64 / known as f64)
+                } else {
+                    unk_l
+                };
+                (s, s)
+            } else {
+                (prod.powf(m_inv), prod)
+            };
+            quality += w as f64 * gm;
+            self.b[i] = (w as f64 * bw) as f32;
             true
         });
         // 枝刈り: 乗算後の集中をアクティブ集合へ反映 (weight_skip_ratio が
@@ -1249,7 +1466,7 @@ impl Belief {
     /// 補正の min-plus 版: (flush 済みの) δ へ観測コスト -ln(尤度積) を加算し、
     /// b = exp(δmin − δ) を実体化する。戻り値は quality (従来と同じ
     /// 「前回 b 加重のビーム幾何平均尤度」— しきい値系をそのまま使う)。
-    fn vit_observe(&mut self, beams: &[(f64, f64)]) -> f64 {
+    fn vit_observe(&mut self, beams: &[(f64, f64)], lut: Option<&[[f32; 256]]>) -> f64 {
         let (nx, ny, nt) = (self.nx, self.ny, self.nt);
         let n = (nx as usize) * (ny as usize) * (nt as usize);
         let (ox, oy, res, t_res) = (self.ox, self.oy, self.res, self.t_res_deg);
@@ -1262,6 +1479,8 @@ impl Belief {
         let thr_ln =
             (-(self.cfg.weight_skip_ratio.max(1e-30)).ln()).max(self.reset_floor_ln()) as f32;
         let m_inv = 1.0 / beams.len() as f64;
+        // sum 側と同じ: 追跡クランプ / 証拠不足の頭打ち定数。
+        let unk_l = z_min + (1.0 - z_min) * UNKNOWN_L;
         let bt: Vec<(f64, f64, f64)> =
             beams.iter().map(|&(ba, r)| (ba.cos(), ba.sin(), r)).collect();
         let mut quality = 0.0f64;
@@ -1285,14 +1504,39 @@ impl Belief {
                         continue;
                     }
                     let cx = ox + (ix as f64 + 0.5) * res;
-                    let mut prod = 1.0f64;
-                    for &(cb, sb, r) in &bt {
+                    let (mut prod, mut known) = (1.0f64, 0u32);
+                    for (bi, &(cb, sb, r)) in bt.iter().enumerate() {
                         let (ca, sa) = (ct * cb - st * sb, st * cb + ct * sb);
-                        let l = self.field.at(cx + r * ca, cy + r * sa);
-                        prod *= z_min + (1.0 - z_min) * l;
+                        let (px, py) = (cx + r * ca, cy + r * sa);
+                        match lut {
+                            // sum 側と同じ E 正規化 (LOST_MIN_KNOWN の doc 参照)。
+                            Some(t) => {
+                                if let Some(dk) = self.field.known_dist(px, py) {
+                                    prod *= t[bi][dk] as f64;
+                                    known += 1;
+                                }
+                            }
+                            None => {
+                                let mut lb = z_min + (1.0 - z_min) * self.field.at(px, py);
+                                if lb < unk_l && self.field.unk_at(px, py) {
+                                    lb = unk_l;
+                                }
+                                prod *= lb;
+                            }
+                        }
                     }
-                    quality += self.b[i] as f64 * prod.powf(m_inv);
-                    delta[i] = d - prod.ln() as f32;
+                    let (gm, cost) = if lut.is_some() {
+                        let s = if known >= LOST_MIN_KNOWN {
+                            prod.powf(bt.len() as f64 / known as f64)
+                        } else {
+                            unk_l
+                        };
+                        (s, s)
+                    } else {
+                        (prod.powf(m_inv), prod)
+                    };
+                    quality += self.b[i] as f64 * gm;
+                    delta[i] = d - cost.ln() as f32;
                 }
             }
         }
@@ -2183,6 +2427,237 @@ mod tests {
         loc.observe(&scan); // 整合 2 — 確定
         assert!(loc.pose().is_some());
         assert!(!loc.in_probation(), "整合が続けば確定するはず");
+    }
+
+    /// ロスト中の距離比例 σ: θ ビン中心の角度誤差 (±3° @60 ビン) は長ビームの
+    /// 端点を r·Δθ だけ振る — 18 m 先の孤立柱を 3° ずれて評価すると端点は
+    /// ~1 m 外れ、固定 σ0 = 0.2 m では尤度 0 (床 z_min) に潰れるが、
+    /// lost_sigma_per_m で σ_eff = 0.2 + 0.05·18 = 1.1 m に膨れば回復する。
+    #[test]
+    fn lost_sigma_per_m_forgives_theta_bin_offset_at_range() {
+        // 100×100 @0.5 m の全 free 地図 + 孤立柱 1 セル。スキャンは手書き 1 本
+        // (レイキャスト無し = 幾何が式のまま)。
+        let size = 100;
+        let mut g = OccupancyGrid {
+            width: size,
+            height: size,
+            resolution: 0.5,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            data: vec![0i8; (size * size) as usize],
+        };
+        // 真の姿勢 (25, 25, 6°) の正面 18 m に柱。仮説は θ ビン中心 (3°) で
+        // しか評価できない — 端点は柱から ~1 m 外れる。
+        let (tx, ty) = (25.0 + 18.0 * 6f64.to_radians().cos(), 25.0 + 18.0 * 6f64.to_radians().sin());
+        let (px, py) = ((tx / 0.5) as i32, (ty / 0.5) as i32);
+        g.data[(py * size + px) as usize] = 100;
+        let scan = crate::msg::LaserScan {
+            angle_min: 0.0,
+            angle_increment: 0.1,
+            ranges: vec![18.0],
+            ..Default::default()
+        };
+        let hyp = pose(25.0, 25.0, 3f64.to_radians()); // nt=60 の it=0 ビン中心
+        let q_at = |per_m: f64| {
+            let bc = BeliefConfig {
+                beam_step: 1,
+                max_range_m: 60.0,
+                lost_sigma_per_m: per_m,
+                ..BeliefConfig::default()
+            };
+            let mut loc = Belief::new(&g, 60, &g, bc);
+            loc.seed(hyp);
+            loc.lost = true; // LUT はロスト中のみ
+            loc.observe(&scan);
+            loc.quality()
+        };
+        let (q0, q1) = (q_at(0.0), q_at(0.05));
+        assert!(q0 < 0.15, "固定 σ では床に潰れるはず (q0={q0:.3})");
+        // seed は隣接 θ ビン (±6°) にも質量を撒き、そこは σ_eff でも半端に
+        // 罰されるので中心ビン単体の ~0.68 までは戻らない — 分離だけを見る。
+        assert!(q1 > 0.3 && q1 > 4.0 * q0, "距離比例 σ で回復するはず (q0={q0:.3} q1={q1:.3})");
+    }
+
+    /// ロスト中のスキャン内テンパリング: 生のビーム積は「全ビーム床 (z_min)」
+    /// の仮説を 1 観測で 0.05^M ≈ 1e-8 に落とし相対枝刈りが即殺するが、
+    /// 幾何平均 (LUT 焼き込み) では 1 観測の下限が z_min = 0.05 なので
+    /// 枝刈り (max × 1e-4) を生き延びる — リセット直後の真位置仮説の寿命。
+    #[test]
+    fn lost_tempering_keeps_moderate_hypotheses_alive() {
+        let size = 100;
+        let mut g = OccupancyGrid {
+            width: size,
+            height: size,
+            resolution: 0.5,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            data: vec![0i8; (size * size) as usize],
+        };
+        // 仮説 A (25, 25, 3°) の間引き後ビーム (step 4 → 角 0, 0.4, .., 2.0 rad)
+        // の端点にちょうど柱を置く — A はほぼ完全一致。
+        let ya = 3f64.to_radians();
+        for k in 0..6 {
+            let a = ya + 0.4 * k as f64;
+            let (px, py) = (25.0 + 18.0 * a.cos(), 25.0 + 18.0 * a.sin());
+            let (ix, iy) = ((px / 0.5) as i32, (py / 0.5) as i32);
+            if ix >= 0 && iy >= 0 && ix < size && iy < size {
+                g.data[(iy * size + ix) as usize] = 100;
+            }
+        }
+        let scan = crate::msg::LaserScan {
+            angle_min: 0.0,
+            angle_increment: 0.1,
+            ranges: vec![18.0; 24], // ×4 間引きで 6 本残る
+            ..Default::default()
+        };
+        let hyp_a = pose(25.0, 25.0, ya);
+        let hyp_b = pose(25.0, 21.0, ya); // 4 m 横 — 全ビーム床
+        let alive_b = |per_m: f64| {
+            let bc = BeliefConfig {
+                beam_step: 1,
+                max_range_m: 60.0,
+                lost_sigma_per_m: per_m,
+                ..BeliefConfig::default()
+            };
+            let mut loc = Belief::new(&g, 60, &g, bc);
+            loc.seed(hyp_a);
+            // B を同量のピークとして注入 (リセット直後の対等な競合を模す)。
+            let peak = loc.active.iter().map(|&i| loc.b[i as usize]).fold(0.0f32, f32::max);
+            let it = (ya.to_degrees() / 6.0) as i32;
+            let (ix, iy) = ((hyp_b.x / 0.5) as i32, (hyp_b.y / 0.5) as i32);
+            let bi = ((it * loc.ny + iy) * loc.nx + ix) as u32;
+            loc.b[bi as usize] = peak;
+            loc.active.push(bi);
+            loc.lost = true;
+            loc.observe(&scan);
+            loc.probe_weight(hyp_b).0 > 0.0
+        };
+        assert!(!alive_b(0.0), "生のビーム積では B は 1 観測で枝刈りされるはず");
+        assert!(alive_b(0.05), "テンパリングで B は枝刈りを生き延びるはず");
+    }
+
+    /// unknown (-1) は尤度場の障害物に数えない: 未知領域の深部に落ちた端点は
+    /// 中立 [`UNKNOWN_L`] (満点でも床でもない)。障害物扱い (旧) は未知に面した
+    /// 仮説がどんなスキャンにも満点一致するブラックホール、床 (z_min) は世界の
+    /// レイキャストが unknown 境界で終端するぶん真値が出血して base 追跡まで
+    /// 壊す — どちらも津田沼で実測した。
+    #[test]
+    fn unknown_is_neutral_in_likelihood_field() {
+        let size = 60;
+        let mut g = OccupancyGrid {
+            width: size,
+            height: size,
+            resolution: 0.5,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            data: vec![0i8; (size * size) as usize],
+        };
+        // 右半分 (x > 15 m) は unknown、free 側に実壁 1 セル (端点 A の位置)。
+        for iy in 0..size {
+            for ix in 30..size {
+                g.data[(iy * size + ix) as usize] = -1;
+            }
+        }
+        // 仮説セル中心 (5.25, 15.25)・θ ビン中心 3° から r=5 の端点が落ちるセル。
+        g.data[(31 * size + 20) as usize] = 100;
+        let hyp = pose(5.0, 15.0, 3f64.to_radians());
+        let q_for = |r: f64| {
+            let scan = crate::msg::LaserScan {
+                angle_min: 0.0,
+                angle_increment: 0.1,
+                ranges: vec![r],
+                ..Default::default()
+            };
+            let bc =
+                BeliefConfig { beam_step: 1, max_range_m: 60.0, ..BeliefConfig::default() };
+            let mut loc = Belief::new(&g, 60, &g, bc);
+            loc.seed(hyp);
+            loc.observe(&scan);
+            loc.quality()
+        };
+        let q_unk = q_for(22.0); // 端点 = 未知領域の深部 (実壁から ~17 m)
+        // 旧実装 (unknown = 障害物) では ≈ 1.0 (seed 近傍の全仮説の端点が未知に
+        // 落ち、全て d=0 = 満点)。床実装では ≈ z_min。中立はその間に立つ。
+        assert!(
+            (0.3..0.8).contains(&q_unk),
+            "未知深部の端点は中立域のはず (q={q_unk:.3})"
+        );
+    }
+
+    /// E 正規化 (LOST_MIN_KNOWN): 未知に落ちたビームは幾何平均の分母に
+    /// 入らない — フロンティア際の仮説 (既知 4 + 未知 2、既知は全一致) は
+    /// 全ビーム既知の内部仮説と同格 (パリティ)、全ビーム未知の深部フリンジは
+    /// 中立で頭打ち (満点に戻らない)。
+    #[test]
+    fn lost_e_normalization_no_frontier_handicap() {
+        let size = 100;
+        let mut g = OccupancyGrid {
+            width: size,
+            height: size,
+            resolution: 0.5,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            data: vec![0i8; (size * size) as usize],
+        };
+        // 右半分 (x > 25 m) は unknown、深部に free の島 (3×3 @ (35,15))。
+        for iy in 0..size {
+            for ix in 50..size {
+                g.data[(iy * size + ix) as usize] = -1;
+            }
+        }
+        for iy in 29..=31 {
+            for ix in 69..=71 {
+                g.data[(iy * size + ix) as usize] = 0;
+            }
+        }
+        // 各シードの間引き後ビーム (角 3°+0.4k rad, r=10) の**既知側**端点に柱。
+        let ya = 3f64.to_radians();
+        let mut pillar = |sx: f64, sy: f64, ks: &[usize]| {
+            for &k in ks {
+                let a = ya + 0.4 * k as f64;
+                let (ex, ey) = (sx + 0.25 + 10.0 * a.cos(), sy + 0.25 + 10.0 * a.sin());
+                let (ix, iy) = ((ex / 0.5) as i32, (ey / 0.5) as i32);
+                g.data[(iy * size + ix) as usize] = 100;
+            }
+        };
+        pillar(10.0, 15.0, &[0, 1, 2, 3, 4, 5]); // C: 内部、全 6 ビーム既知一致
+        pillar(17.0, 15.0, &[2, 3, 4, 5]); // A: 際、既知 4 一致 + 未知 2
+        let scan = crate::msg::LaserScan {
+            angle_min: 0.0,
+            angle_increment: 0.1,
+            ranges: vec![10.0; 24], // ×4 間引きで 6 本
+            ..Default::default()
+        };
+        let q_at = |sx: f64, sy: f64| {
+            let bc = BeliefConfig {
+                beam_step: 1,
+                max_range_m: 60.0,
+                lost_sigma_per_m: 0.05,
+                ..BeliefConfig::default()
+            };
+            let mut loc = Belief::new(&g, 60, &g, bc);
+            loc.seed(pose(sx, sy, ya));
+            loc.lost = true;
+            loc.observe(&scan);
+            loc.quality()
+        };
+        let q_c = q_at(10.0, 15.0);
+        let q_a = q_at(17.0, 15.0);
+        let q_d = q_at(35.0, 15.0); // 深部フリンジ: 全ビーム未知
+        // 絶対値は seed の広がり (±セル・±θ ビンの隣接仮説が σ_eff でも半端に
+        // 罰される) で希釈されるので、主張はパリティ (際 ≥ 内部 × 0.85) のみ。
+        assert!(
+            q_a > 0.85 * q_c && q_a > 0.3,
+            "際の仮説は内部と同格のはず (a={q_a:.3} c={q_c:.3})"
+        );
+        assert!(
+            (0.35..0.7).contains(&q_d),
+            "深部フリンジは中立で頭打ちのはず (d={q_d:.3})"
+        );
     }
 
     /// ロスト中の相関観測ゲート: 静止のままの再スキャンは積分されない

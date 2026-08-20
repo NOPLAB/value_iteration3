@@ -252,6 +252,53 @@ pub fn build_occupancy(map: &PgmMap, scale: usize, unknown_as_obstacle: bool) ->
     (occ, ow as i32, oh as i32)
 }
 
+/// [`build_occupancy`] の三値版: ROS 規約の -1 (unknown) / 0 (free) /
+/// 100 (occupied) を保存する。ダウンサンプルの優先度は occupied > unknown >
+/// free。推定器の観測モデル用 — `vi_lib::belief` は unknown を障害物にも
+/// free にも数えない (unknown を障害物に潰すと地図端が尤度場のブラック
+/// ホールになる)。世界 (レイキャスト) 側は従来どおり [`build_occupancy`] を使う。
+pub fn build_occupancy_tri(map: &PgmMap, scale: usize) -> (Vec<i8>, i32, i32) {
+    let w = map.width;
+    let h = map.height;
+    let ow = w.div_ceil(scale);
+    let oh = h.div_ceil(scale);
+    let mut occ = vec![0i8; ow * oh];
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let mut cell = 0i8;
+            'blk: for dy in 0..scale {
+                let iy = oy * scale + dy;
+                if iy >= h {
+                    break;
+                }
+                let src_row = h - 1 - iy;
+                for dx in 0..scale {
+                    let ix = ox * scale + dx;
+                    if ix >= w {
+                        break;
+                    }
+                    let pixel = map.pixels[src_row * w + ix];
+                    match classify(
+                        pixel,
+                        map.meta.negate,
+                        map.meta.occupied_thresh,
+                        map.meta.free_thresh,
+                    ) {
+                        Occupancy::Obstacle => {
+                            cell = 100;
+                            break 'blk;
+                        }
+                        Occupancy::Unknown => cell = -1,
+                        Occupancy::Free => {}
+                    }
+                }
+            }
+            occ[oy * ow + ox] = cell;
+        }
+    }
+    (occ, ow as i32, oh as i32)
+}
+
 /// Classify one pixel using the `map_server` rule.
 ///
 /// `occ = (255 - p) / 255` for `negate == false` (dark = occupied), or
