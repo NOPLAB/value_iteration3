@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use vi_lib::bridge::PoseView;
 
 use vi_planner::core::{
-    lock, mode_count, quality_shift, spread_m, try_lock, value_grid_on, Decision, PlanError,
+    lock, mode_count, quality_shift, spread_m, try_lock, value_grid_on, weighted_modes, Decision,
+    PlanError,
 };
 
 use super::handles::FollowCtx;
@@ -36,8 +37,15 @@ pub struct FollowTuning {
     pub scan_quality_gate: f64,
     /// ロスト中に判別点へ走る能動的再定位 (`prepare_reloc_goal` + QMDP)。
     pub active_reloc: bool,
-    /// 能動的再定位を諦めて通常の停止待ちに戻すまでの tick 数。
+    /// 能動的再定位を諦めて通常の停止待ちに戻すまでの tick 数 (creep も共有)。
     pub reloc_ticks_limit: u32,
+    /// ロスト中のスキャン反射 creep (`ctrl::lost_creep`) — `belief_recovery` で
+    /// 有効。相関観測ゲートは静止スキャンを読み捨てるので、動き続けないと
+    /// belief が二度と更新されない凍結デッドロックになる (viola_bench の
+    /// 対照実験で実測)。core も判別場も要らないので compact 構成でも動く。
+    pub lost_creep: bool,
+    /// creep がスキャンを読む最大レンジ [m] (belief_max_range)。
+    pub scan_max_range: f64,
 }
 
 /// QMDP に渡す belief 仮説の上限。ヒストグラムの上位セルだけで質量の大半を
@@ -69,6 +77,12 @@ enum Reloc {
 /// (廊下 1 本ぶん) より小さい値。
 // ponytail: 定数。地図の粒度で調整が要るならパラメータへ昇格。
 const QMDP_MIN_SEP_M: f64 = 0.5;
+
+/// QMDP へ渡す仮説の峰への集約 ([`weighted_modes`]): 峰の分離と峰数の上限。
+/// viola_bench の津田沼で確定した値 (生 top-64 は veto の積み上げで NoAction
+/// 94% — 集約で 0)。
+const QMDP_MODE_SEP_M: f64 = 1.0;
+const QMDP_MODES: usize = 4;
 
 pub enum Outcome {
     Reached,
@@ -200,6 +214,8 @@ pub fn run_follow(
     let mut last_viz: Option<Instant> = None;
     let mut reloc = Reloc::Idle;
     let mut reloc_ticks = 0u32;
+    // creep の回頭コミット (前 tick の回頭成分 — lost_creep の doc 参照)。
+    let mut creep_rot = 0.0f64;
     loop {
         let tick_start = Instant::now();
         if cancel.load(Ordering::Relaxed) {
@@ -243,26 +259,36 @@ pub fn run_follow(
             // resetting / 全地図 belief の一様混合リセット) を待つ。active_reloc なら
             // 仮説を判別する地点の多目標場を解き、QMDP で走って復帰を早める
             // (core::prepare_reloc_goal の doc)。
-            let mut acted = false;
-            if tuning.active_reloc
-                && reloc_ticks < tuning.reloc_ticks_limit
-                && !matches!(reloc, Reloc::GaveUp)
-            {
+            // どの経路も最新スキャンしか見ないので先に 1 回だけ引く (スキャンは
+            // コールバックで localizer に反映済みなので、ここで消費してよい)。
+            let last_scan = std::mem::take(&mut *scan_queue.lock().unwrap()).pop();
+            // ロスト中の走行予算は再定位 QMDP と creep で共有する。予算切れ後は
+            // 停止待ちに戻り、ゴールは no-pose 失敗 → standalone の投げ直しが
+            // 予算を張り直す。
+            let lost_budget = reloc_ticks < tuning.reloc_ticks_limit;
+            if lost_budget && (tuning.active_reloc || tuning.lost_creep) {
                 reloc_ticks += 1;
+            }
+            let mut acted = false;
+            if tuning.active_reloc && lost_budget && !matches!(reloc, Reloc::GaveUp) {
                 acted = 'reloc: {
-                    // localizer → core の順 (入れ子ロックを作らない)。
+                    // localizer → core の順 (入れ子ロックを作らない)。QMDP へは
+                    // 生の top-64 セルでなく峰へ集約した仮説を渡す — 広い地図の
+                    // 多峰 belief では Q の薄まりと veto の積み上げで NoAction に
+                    // 張り付く (weighted_modes の doc、津田沼で実測 94% → 0)。
                     let (hyps, targets) = {
                         let l = lock(localizer);
-                        (l.top_cells(QMDP_TOP_K), l.reloc_targets())
+                        (
+                            weighted_modes(&l.top_cells(QMDP_TOP_K), QMDP_MODE_SEP_M, QMDP_MODES),
+                            l.reloc_targets(),
+                        )
                     };
                     if hyps.len() < 2 {
                         break 'reloc false;
                     }
                     // 近接ガード: 姿勢が無く local_penalty を置けないので、生の
-                    // 最近接レンジで守る (スキャンはコールバックで localizer に
-                    // 反映済みなので捨ててよい)。
-                    let scans = std::mem::take(&mut *scan_queue.lock().unwrap());
-                    if scans.last().is_some_and(|s| {
+                    // 最近接レンジで守る。
+                    if last_scan.as_ref().is_some_and(|s| {
                         s.ranges
                             .iter()
                             .filter(|r| r.is_finite() && **r > 0.0)
@@ -315,6 +341,28 @@ pub fn run_follow(
                     }
                 };
             }
+            if !acted && tuning.lost_creep && lost_budget {
+                // スキャン反射の creep (`ctrl::lost_creep`) — 判別場が立たない間
+                // (単峰・targets なし・compact の GaveUp) も動き続ける。安全判定は
+                // 仮説地図でなくスキャンそのもの。相関観測ゲートは静止スキャンを
+                // 読み捨てるので、ここで止まると belief が二度と更新されない
+                // 凍結デッドロックになる (viola_bench の対照実験)。
+                if let Some(s) = &last_scan {
+                    let (fw, rot_deg) =
+                        vi_lib::ctrl::lost_creep(s, None, tuning.scan_max_range, creep_rot);
+                    creep_rot = rot_deg;
+                    if fw != 0.0 || rot_deg != 0.0 {
+                        let mut tw = geometry_msgs::msg::Twist::default();
+                        tw.linear.x = fw;
+                        tw.angular.z = rot_deg.to_radians();
+                        let _ = cmd_pub.publish(tw);
+                        let mut l = lock(localizer);
+                        l.predict(fw, rot_deg, tuning.period.as_secs_f64());
+                        *lock(latest_pose) = l.pose();
+                        acted = true;
+                    }
+                }
+            }
             if acted {
                 failure_ticks = 0;
             } else {
@@ -329,6 +377,7 @@ pub fn run_follow(
             }
             continue;
         };
+        creep_rot = 0.0; // 回頭コミットはロストの連続区間内だけ
         // 追従が belief から要るもの 2 つ — QMDP 用の上位仮説と、スキャン注入の
         // 品質ゲート (直近補正の観測一致度 → 減衰段数) — を **1 回のロックで**
         // まとめて取る。core のロックの前に取るので (localizer → core) 入れ子は
@@ -412,7 +461,8 @@ pub fn run_follow(
             // なり follow_controller が一度も動かない (tb3 デモで実測、
             // `mode_count` の doc 参照)。
             let decision = if mode_count(&hyps, QMDP_MIN_SEP_M) >= 2 {
-                core.decide_qmdp(&hyps)
+                // 生のセル集合でなく峰へ集約して渡す (weighted_modes の doc)。
+                core.decide_qmdp(&weighted_modes(&hyps, QMDP_MODE_SEP_M, QMDP_MODES))
             } else {
                 core.decide(pose)
             };

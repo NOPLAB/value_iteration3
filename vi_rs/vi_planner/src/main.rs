@@ -300,6 +300,8 @@ fn main() -> Result<()> {
             active_reloc: params.active_reloc,
             reloc_ticks_limit: (node::boot::RELOC_TIMEOUT_SEC * params.control_frequency).ceil()
                 as u32,
+            lost_creep: params.belief_recovery,
+            scan_max_range: params.belief_max_range.max(0.1),
         },
         retry: RetryTuning {
             limit: params.goal_retry_limit,

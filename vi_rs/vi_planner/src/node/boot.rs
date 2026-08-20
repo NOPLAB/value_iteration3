@@ -58,8 +58,12 @@ const MPPI_SIGMA_AUTO: f64 = 0.0;
 /// 投げ直しの前に、止まったままスキャンを取り込んで場を精密化する時間 [s]
 /// (standalone の `run_settle` — BT の `Wait` と違って場が実際に動く)。
 pub const GOAL_RETRY_SETTLE_SEC: f64 = 3.0;
-/// 能動的再定位を諦めて通常の停止待ちに戻すまでの時間 [s]。
-pub const RELOC_TIMEOUT_SEC: f64 = 30.0;
+/// ロスト中の判別走行 (能動的再定位 + belief_recovery の creep) を諦めて
+/// 停止待ちに戻すまでの時間 [s]。津田沼の誘拐復帰は relock 17〜42 s
+/// (viola_bench de0b85f) なので、旧 30 s ではベンチ実証済みの復帰の途中で
+/// 止まる。予算切れ後はゴールが no-pose 失敗になり、standalone の投げ直しが
+/// 予算を張り直す。
+pub const RELOC_TIMEOUT_SEC: f64 = 120.0;
 
 /// このマシンで**いま**確保できるメモリ [B] (`/proc/meminfo` の `MemAvailable`)。
 /// 読めなければ `None` = 判定そのものを見送る (推測で起動を止めない)。
@@ -177,7 +181,7 @@ pub fn build_core(
             }
         }
         kind @ ("belief" | "viterbi") => {
-            let bc = WholeMapBeliefConfig {
+            let mut bc = WholeMapBeliefConfig {
                 sensor_sigma_m: params.belief_sensor_sigma.max(0.01),
                 beam_step: params.belief_beam_step.max(1) as usize,
                 max_range_m: params.belief_max_range.max(0.1),
@@ -187,6 +191,24 @@ pub fn build_core(
                 viterbi: kind == "viterbi",
                 ..WholeMapBeliefConfig::default()
             };
+            if params.belief_recovery {
+                // viola_bench の津田沼誘拐復帰で確定した束 (de0b85f、relock 4/4)。
+                // ゲートは AMCL update_min_d/a の慣例値、σ 勾配はレンジの 5%、
+                // probation は 0.2 m ゲート × 100 観測 ≈ 20 m の検証走行。
+                // ponytail: 束の定数 — 個別に詰めたくなったら viola_bench で
+                // 計測してから昇格。
+                bc.global_match = true;
+                bc.lost_sigma_per_m = 0.05;
+                bc.lost_update_min_d_m = 0.2;
+                bc.lost_update_min_a_deg = 30.0;
+                bc.probation_obs = 100;
+                bc.probation_min_q = 0.4;
+                eprintln!(
+                    "vi_planner: belief_recovery on — global scan match + lost observation \
+                     model + correlation gate + probation; the follow loop creeps while \
+                     lost (motion is required: the gate discards stationary scans)"
+                );
+            }
             let b = Belief::new(&vi_grid, params.theta_cell_num as i32, &binary_grid, bc);
             eprintln!(
                 "vi_planner: localizer = {} (whole-map belief on the planner grid: \

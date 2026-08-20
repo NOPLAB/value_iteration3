@@ -101,6 +101,15 @@ pub struct Params {
     /// ロスト中に安全停止で待つ代わりに、仮説を判別する地点への多目標 VI を解いて
     /// QMDP で走る (能動的再定位)。判別点を出せる adaptive localizer + 密ソルバ用。
     pub active_reloc: bool,
+    /// 全地図 belief/viterbi に、津田沼誘拐復帰ベンチ (viola_bench, de0b85f) で
+    /// 確定した復帰スタックを**束で**入れる: 全域相関スキャンマッチ
+    /// (global_match) + 距離比例 σ のロスト観測モデル + ロスト中の相関観測
+    /// ゲート + 解除の probation。あわせて follow ループのスキャン反射 creep
+    /// (`ctrl::lost_creep`) が有効になる — ゲートは静止スキャンを読み捨てるので、
+    /// ロスト中に動き続けないと belief が二度と更新されない凍結デッドロックに
+    /// なる (bench の対照実験で実測)。個別の knob にはしない: 値の出どころは
+    /// viola_bench で、詰め直すのも bench。
+    pub belief_recovery: bool,
     /// DWA/MPPI の前方シミュレーション時間 [s]。
     pub dwa_horizon_s: f64,
     /// DWA の致死 penalty しきい値 (PROB_BASE 単位、0 = 無効)。
@@ -289,6 +298,8 @@ pub fn read_params(node: &Node) -> Result<Params> {
         // 多目標 VI のゴールにして QMDP で走る。復帰したら本来のゴールを
         // 解き直して走行に戻る (core::prepare_reloc_goal の doc 参照)。
         active_reloc: p!("active_reloc", bool, false),
+        // 誘拐・追跡破綻からの復帰スタック (束、doc は Params::belief_recovery)。
+        belief_recovery: p!("belief_recovery", bool, false),
         // DWA/MPPI の前方シミュレーション時間。候補数と温度は固定 (node::boot)。
         // 既定 (1.0 s, 7×11) の実測は decide ~30 µs — 10 Hz の 40 ms 予算には遠い。
         dwa_horizon_s: p!("dwa_horizon_s", f64, 1.0),
@@ -460,6 +471,17 @@ pub fn validate(p: &Params) -> Result<U64Solver> {
                 p.solver
             ));
         }
+    }
+    // 復帰スタックは全地図 belief の機構 (global_match / ロスト観測モデル /
+    // probation は WholeMapBeliefConfig にしかない)。他の localizer で黙って
+    // 無効になるより、起動で読める形で落とす。
+    if p.belief_recovery && !matches!(p.localizer.as_str(), "belief" | "viterbi") {
+        return Err(anyhow!(
+            "belief_recovery is the whole-map belief recovery stack, and localizer={} does \
+             not use it. Set localizer: belief (or viterbi), or leave belief_recovery at \
+             false.",
+            p.localizer
+        ));
     }
     Ok(solver)
 }

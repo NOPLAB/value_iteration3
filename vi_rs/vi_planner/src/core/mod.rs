@@ -45,7 +45,9 @@ pub use follow::{DwaController, FollowController, FollowKind, GreedyController, 
 //   - 窓つき: vi_lib::localize の `Localizer` トレイト (external / grid / adaptive)。
 //   - 全地図: vi_lib::belief の `Belief` (belief / viterbi)。窓もレベル機構も無い。
 // `BeliefConfig` が両側にあるので、全地図側は別名で入れる。
-pub use vi_lib::belief::{mode_count, spread_m, Belief, BeliefConfig as WholeMapBeliefConfig};
+pub use vi_lib::belief::{
+    mode_count, spread_m, weighted_modes, Belief, BeliefConfig as WholeMapBeliefConfig,
+};
 pub use vi_lib::localize::{
     AdaptiveLocalizer, BeliefConfig, ExternalLocalizer, GridLocalizer, Localizer,
 };
