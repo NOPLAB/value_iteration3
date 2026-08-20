@@ -59,13 +59,17 @@
 //! を追加して解消。K1 廊下は scale 4 でも targets 空 — 判別点 (交差点) は
 //! 数十 m 先で δ≤12 m の局所探索では原理的に届かない。
 //!
-//! (2)(3) の解消後も K4 は未達で、残る本丸は**判別機動の実行**: 静止~回転だけ
-//! だと belief は誤エイリアスへ単峰 (quality 0.99) で収束し (28.3 m ずれ —
-//! belief 内部からは検出不能)、収束レースに負ける。QMDP は多目標場の最寄り
-//! 割当がモード間で食い違い回頭が拮抗 (223 act で 0.3 m)、open-loop δ*
-//! (`--reloc-openloop`) は真値が top-4 モードに無いと壁際へ寄り近接ガード
-//! (0.35 m) とデッドロック (0.8 m で停止)。エイリアス下で実行可能な判別機動の
-//! 設計が次のイテレーション。
+//! 判別機動の実行も 2 つの実行器の失敗 (QMDP: 多目標場の最寄り割当が食い違い
+//! 回頭拮抗で 0.3 m / naive open-loop δ*: 真値が top-4 モード外だと近接ガードと
+//! デッドロック) を経て `ctrl::lost_creep` (`--reloc-creep`) + 相関観測ゲート
+//! (`--lost-min-d 0.2 --lost-min-a-deg 30`、AMCL update_min_d/a 相当) で解決 —
+//! ロスト中の安全な判別走行 6〜25 m を達成。それでも K1〜K4 全て最後は**遠方
+//! エイリアスへの誤解除** (err 170〜238 m、quality 0.5〜0.8) で終わる: 60 m
+//! センサでも「幅 W の廊下」の署名はキャンパス内の複数箇所と 30 m 走っても
+//! 一致し続け、崩壊の勝者はほぼコイントス (証拠を濃くする実験は誤収束を
+//! 速めただけ)。終端の壁は尤度場の場所弁別力 — 次手は解除の probation
+//! (解除直後を仮 re-lock とし、短い検証走行の予測整合で確定) か、より豊かな
+//! 場所署名。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -241,13 +245,18 @@ struct Args {
     /// 潰れるので上げる (津田沼は 4.0 目安)。
     #[arg(long, default_value_t = 1.0)]
     reloc_scale: f64,
-    /// 【実験】判別変位 δ* を多目標 VI + QMDP でなく open-loop (上位モードから
-    /// 最寄り判別点へ回頭 → 前進) で実行する。δ* は全仮説共通のロボット系変位
-    /// なので、どの仮説が真でも同じ操舵でよい — 多目標場の最寄り割当がモード間で
-    /// 食い違い回頭が拮抗する (回転だけで誤エイリアスに収束し負ける) 問題の
-    /// 切り分け用。判別場の solve (~17 s×2) も不要になる。
+    /// 判別機動を [`vi_lib::ctrl::lost_creep`] (スキャン反射の安全並進、δ* は
+    /// 方位バイアス) で実行する。多目標 VI + QMDP (既定) は最寄り割当の食い違い
+    /// で回頭が拮抗し、収束レースに負ける — creep は判別場の solve も不要。
     #[arg(long)]
-    reloc_openloop: bool,
+    reloc_creep: bool,
+    /// ロスト中の相関観測ゲート (`BeliefConfig::lost_update_min_d_m` /
+    /// `lost_update_min_a_deg` — AMCL の update_min_d/a 相当)。0 = 従来挙動。
+    /// 判別機動と併用するなら 0.2 / 30 が目安。
+    #[arg(long, default_value_t = 0.0)]
+    lost_min_d: f64,
+    #[arg(long, default_value_t = 0.0)]
+    lost_min_a_deg: f64,
 
     /// CSV 出力先 (省略時は標準出力の表のみ)。
     #[arg(long)]
@@ -544,8 +553,13 @@ fn simulate(
     let mut field_is_reloc = false;
     let mut reloc_ticks = 0u32;
     let mut reloc_gave_up = false;
-    // --reloc-openloop: ロスト 1 回ぶんの凍結判別点 (pose 復帰で捨てる)。
+    // --reloc-creep: ロスト 1 回ぶんの凍結判別点 (pose 復帰で捨てる)。
     let mut reloc_frozen: Option<Vec<(f64, f64)>> = None;
+    // δ* の実行状態 (残距離 [m], ロボット系方位 [rad])。凍結時に上位モードから
+    // 1 度だけ落とし、以後は指令オドメトリで更新する — 上位モードの同一性は
+    // エイリアス間で毎 tick 入れ替わるので、モードから引き直すと方位が振動して
+    // 回頭に食われる (実測: 180 s で並進 2.5 m)。
+    let mut reloc_delta: Option<(f64, f64)> = None;
     // QMDP 決定の内訳 (診断用: 判別場が立ったのに走らないときの切り分け)。
     let (mut qn_goal, mut qn_act, mut qn_noact) = (0u32, 0u32, 0u32);
     let reloc_ticks_limit = (args.reloc_timeout_s / args.tick_s).ceil() as u32;
@@ -682,6 +696,7 @@ fn simulate(
             reloc_ticks = 0;
             reloc_gave_up = false;
             reloc_frozen = None;
+            reloc_delta = None;
             let (ix, iy, it) = pose_to_cell(vi, e.x, e.y, e.yaw_rad);
             if in_field(vi, ix, iy, it) {
                 match greedy_decide(vi, ix, iy, it, args.action_tolerance_cells) {
@@ -704,44 +719,60 @@ fn simulate(
                 // (b) 修正 — 生セルはキャンパス級の多峰で veto ロックする)。
                 let hyps = vi_lib::belief::weighted_modes(&l.top_cells(QMDP_TOP_K), 1.0, 4);
                 // 近接ガードは chamfer クリアランスで代用 (本家は生スキャン最近接)。
-                if args.reloc_openloop && hyps.len() >= 2 && clr_now >= RELOC_STOP_RANGE {
-                    // open-loop 実行: δ* は全仮説共通のロボット系変位なので、
-                    // 上位モードの座標系で最寄り判別点へ回頭 → 前進すればよい
-                    // (どの仮説が真でも同じ操舵)。predict が回すのはモードの
-                    // yaw も同じなので、毎 tick 上位モードから引き直す。
+                if args.reloc_creep {
+                    // creep 実行器: 安全判定はスキャン (真値の環境) のみ —
+                    // 仮説地図の近接ガード (clr_now) は使わない。δ* があれば
+                    // 上位モード系の最寄り判別点への方位をバイアスに渡す。
                     if reloc_frozen.is_none() {
                         let targets = l.reloc_targets();
-                        if reloc_ticks % 50 == 1 {
-                            eprintln!(
-                                "  [reloc] t={t} hyps={} targets={} (openloop)",
-                                hyps.len(),
-                                targets.len(),
-                            );
-                        }
                         if !targets.is_empty() {
+                            // δ* を (残距離, ロボット系方位) へ 1 度だけ落とす。
+                            if let Some(&(mp, _)) = hyps.first() {
+                                if let Some((tx, ty)) = targets
+                                    .iter()
+                                    .copied()
+                                    .min_by(|a, b| {
+                                        (a.0 - mp.x)
+                                            .hypot(a.1 - mp.y)
+                                            .total_cmp(&(b.0 - mp.x).hypot(b.1 - mp.y))
+                                    })
+                                {
+                                    reloc_delta = Some((
+                                        (tx - mp.x).hypot(ty - mp.y),
+                                        wrap_rad((ty - mp.y).atan2(tx - mp.x) - mp.yaw_rad),
+                                    ));
+                                }
+                            }
                             reloc_frozen = Some(targets);
                         }
                     }
-                    if let (Some(ts), Some(&(mp, _))) = (&reloc_frozen, hyps.first()) {
-                        let (tx, ty) = ts
-                            .iter()
-                            .copied()
-                            .min_by(|a, b| {
-                                (a.0 - mp.x)
-                                    .hypot(a.1 - mp.y)
-                                    .total_cmp(&(b.0 - mp.x).hypot(b.1 - mp.y))
-                            })
-                            .unwrap();
-                        let d = (tx - mp.x).hypot(ty - mp.y);
-                        let ang = wrap_rad((ty - mp.y).atan2(tx - mp.x) - mp.yaw_rad);
-                        cmd = if d < 0.5 {
-                            None // 判別点に到着 — 止まって観測を待つ
-                        } else if ang.abs() > 0.3 {
-                            Some((0.0, 20.0 * ang.signum()))
-                        } else {
-                            Some((0.3, 0.0))
-                        };
-                        from_reloc = cmd.is_some();
+                    let preferred = reloc_delta.map(|(_, b)| b);
+                    let scan = cast_scan(
+                        native,
+                        PoseView { x, y, yaw_rad: yaw },
+                        args.scan_beams,
+                        args.scan_range,
+                    );
+                    let (fw, rot) = vi_lib::ctrl::lost_creep(&scan, preferred, args.scan_range);
+                    if reloc_ticks % 25 == 1 {
+                        eprintln!(
+                            "  [creep] t={t} frozen={} pref_deg={:?} cmd=({fw:.2},{rot:.0}) yaw={:.0}",
+                            reloc_frozen.is_some(),
+                            preferred.map(|b| b.to_degrees() as i32),
+                            yaw.to_degrees().rem_euclid(360.0),
+                        );
+                    }
+                    // 診断: qn_act = 前進 tick / qn_goal = 回頭 tick / qn_noact = 停止。
+                    if fw != 0.0 {
+                        qn_act += 1;
+                    } else if rot != 0.0 {
+                        qn_goal += 1;
+                    } else {
+                        qn_noact += 1;
+                    }
+                    if fw != 0.0 || rot != 0.0 {
+                        cmd = Some((fw, rot));
+                        from_reloc = true;
                     }
                 } else if hyps.len() >= 2 && clr_now >= RELOC_STOP_RANGE {
                     if !field_is_reloc {
@@ -821,6 +852,16 @@ fn simulate(
             None
         };
 
+        // δ* 実行状態の指令オドメトリ更新 (ロボット系の目標点を平行移動+回転)。
+        if let (Some((d, b)), Some((v, w_deg))) = (&mut reloc_delta, moved) {
+            let (bx, by) = (*d * b.cos() - v * args.tick_s, *d * b.sin());
+            *b = wrap_rad(by.atan2(bx) - (w_deg.to_radians()) * args.tick_s);
+            *d = bx.hypot(by);
+            if *d < 0.5 {
+                reloc_delta = None; // 判別点に到着 — 以後は開けた方向へ這う
+            }
+        }
+
         if let Some(l) = &mut loc {
             let t0 = Instant::now();
             if let Some((v, w_deg)) = moved {
@@ -852,8 +893,10 @@ fn simulate(
         vi.set_goal(goal.0, goal.1, args.goal_theta_deg as i32);
         solve(vi, solver, args.max_iters);
     }
-    if r.reloc_solves > 0 {
-        eprintln!("  [reloc] qmdp decisions: act={qn_act} goal={qn_goal} noaction={qn_noact}");
+    if r.reloc_solves > 0 || qn_act + qn_goal + qn_noact > 0 {
+        eprintln!(
+            "  [reloc] executor ticks: fw/act={qn_act} rot/goal={qn_goal} stop/noact={qn_noact}"
+        );
     }
     r
 }
@@ -995,6 +1038,8 @@ fn main() -> ExitCode {
         lost_ess: args.lost_ess,
         contract_ess: args.contract_ess,
         reloc_scale: args.reloc_scale,
+        lost_update_min_d_m: args.lost_min_d,
+        lost_update_min_a_deg: args.lost_min_a_deg,
         ..WholeBeliefConfig::default()
     };
     {
