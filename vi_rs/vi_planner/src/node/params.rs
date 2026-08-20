@@ -292,9 +292,11 @@ pub fn read_params(node: &Node) -> Result<Params> {
         // DWA/MPPI の前方シミュレーション時間。候補数と温度は固定 (node::boot)。
         // 既定 (1.0 s, 7×11) の実測は decide ~30 µs — 10 Hz の 40 ms 予算には遠い。
         dwa_horizon_s: p!("dwa_horizon_s", f64, 1.0),
-        // 軌道途中に margin 帯 (penalty ≥ 2·PROB_BASE) を踏む候補を棄却する。
-        // 0 で無効 (実機で壁を掠める旧挙動に戻る)。
-        dwa_lethal_penalty: p!("dwa_lethal_penalty", f64, 2.0),
+        // 軌道途中に margin 帯を踏む候補を棄却する (2.0 で penalty ≥ 2·PROB_BASE
+        // が致死)。既定 0 = 無効: 障害物の情報源を VI の場一つに保つ (帯をハード
+        // 制約で二重に読むと戸口で候補が全滅し greedy と交代する)。実機で壁を
+        // 掠めるなら 2.0 を試す。
+        dwa_lethal_penalty: p!("dwa_lethal_penalty", f64, 0.0),
         // MPPI のサンプル本数。実測 decide ~0.2 ms。
         mppi_samples: p!("mppi_samples", i64, 256),
 

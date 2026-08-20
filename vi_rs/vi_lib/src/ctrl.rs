@@ -27,9 +27,13 @@
 //! する (壁角テストで実測)。安全 (占有セル非侵入) は衝突棄却が担う。margin 帯の
 //! 一時的な通過露出は本家 greedy (方策追従) も同様に持つ性質。
 //!
-//! ただし DWA は積算しない代わりに**侵入**を禁じる ([`DwaConfig::lethal_penalty`]):
-//! 決定的 argmax は境界最適弧を毎回正確に選ぶので車体余白がゼロになり、実機で
-//! 壁を掠めた。軌道途中のセルが致死しきい値以上の候補は棄却する。棄却で前進候補が
+//! DWA には積算しない代わりに**侵入**を禁じるオプションがある
+//! ([`DwaConfig::lethal_penalty`]、既定は無効): 決定的 argmax は境界最適弧を毎回
+//! 正確に選ぶので車体余白がゼロになり、実機で壁を掠めた。有効にすると軌道途中の
+//! セルが致死しきい値以上の候補を棄却する。ただし VI がソフトコストとして通す
+//! margin 帯をハード制約で二重に読むことになり、帯を横切るのが最安な戸口では
+//! 前進候補が全滅して greedy と tick ごとに交代する — 既定で切ってあるのは
+//! そのため (障害物の情報源を場一つに保つ)。棄却で前進候補が
 //! 全滅した角のポケットでは後退シャッフルだけが生き残り Some を返し続ける
 //! (greedy 救済が発火しない) ライブロックになり得るので、対で無進展ガードを置く:
 //! 最良候補が現在 V̂ を下げられないなら None を返して greedy に譲る (壁角テストで
@@ -38,7 +42,7 @@
 
 use crate::action::Action;
 use crate::msg::LaserScan;
-use crate::params::{MAX_COST, PROB_BASE};
+use crate::params::MAX_COST;
 use crate::planner::PolicyView;
 use crate::value_iterator::ValueIterator;
 
@@ -239,10 +243,12 @@ pub struct DwaConfig {
     /// 衝突判定の弧長サンプリング間隔 [m]。0 = auto (セル解像度の半分)。
     pub collide_step_m: f64,
     /// 軌道途中のセルを致死とみなす penalty しきい値 (18bit 固定小数点、
-    /// `penalty + local_penalty` がこの値以上で候補棄却)。0 = 無効。free の base が
-    /// `PROB_BASE`、margin 帯は `(margin_penalty+1)·PROB_BASE` の二値なので、既定の
-    /// `2·PROB_BASE` で帯全域 (とレーザ注入セル = `2048·PROB_BASE` から半減減衰)
-    /// が致死になる。ゴール圏到達はこの判定より先に見るので、帯内ゴールへは入れる。
+    /// `penalty + local_penalty` がこの値以上で候補棄却)。**既定 0 = 無効** —
+    /// 障害物の情報源を VI の場 (V̂) 一つに保ち、コントローラ側で margin 帯を
+    /// ハード制約として二重に読まない。free の base が `PROB_BASE`、margin 帯は
+    /// `(margin_penalty+1)·PROB_BASE` の二値なので、`2·PROB_BASE` にすると帯全域
+    /// (とレーザ注入セル = `2048·PROB_BASE` から半減減衰) が致死になる。ゴール圏
+    /// 到達はこの判定より先に見るので、帯内ゴールへは入れる。
     pub lethal_penalty: u64,
 }
 
@@ -262,7 +268,7 @@ impl DwaConfig {
             horizon_s: 1.0,
             tick_s,
             collide_step_m: 0.0,
-            lethal_penalty: 2 * PROB_BASE,
+            lethal_penalty: 0,
         }
     }
 }
@@ -696,6 +702,7 @@ mod tests {
     use super::*;
     use crate::action::Action;
     use crate::msg::{OccupancyGrid, Quaternion};
+    use crate::params::PROB_BASE;
     use crate::planner::pose_to_cell;
     use crate::solvers::{solve, U64Solver};
 
@@ -910,17 +917,18 @@ mod tests {
     fn dwa_lethal_penalty_defers_band_cells_to_greedy() {
         let size = 64;
         let vi = solved_vi(size, size, walled_map(size), (2.8, 0.6, 0));
-        let cfg = DwaConfig::from_actions(&vi.actions, 0.1);
+        let off = DwaConfig::from_actions(&vi.actions, 0.1);
+        assert_eq!(off.lethal_penalty, 0, "既定は無効");
+        let mut cfg = off.clone();
+        cfg.lethal_penalty = 2 * PROB_BASE;
         // 壁 (x セル 32..40) の margin 帯 (safety_radius 0.1 m = 2 セル) 内の
         // free セル。penalty は二値なので帯内は一様に (30+1)·PROB_BASE。
         let (x, y) = (30.5 * RES, 20.5 * RES);
         assert!(CostView::free_at(&vi, 30, 20));
         assert!(CostView::penalty_at(&vi, 30, 20) >= cfg.lethal_penalty);
-        // 既定 (致死しきい値あり): どの候補も帯内を通る → 全滅 → greedy 救済へ。
+        // 致死しきい値あり: どの候補も帯内を通る → 全滅 → greedy 救済へ。
         assert!(dwa_decide(&vi, &vi, &cfg, x, y, 0.0).is_none());
-        // 無効化すれば従来通り候補が出る (掠め挙動の再現側)。
-        let mut off = cfg.clone();
-        off.lethal_penalty = 0;
+        // 既定 (無効): V̂ だけで候補が出る。
         assert!(dwa_decide(&vi, &vi, &off, x, y, 0.0).is_some());
     }
 

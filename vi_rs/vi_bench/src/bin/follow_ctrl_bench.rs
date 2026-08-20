@@ -123,8 +123,8 @@ struct Args {
     #[arg(long, default_value_t = 11)]
     n_w: usize,
 
-    /// DWA の致死 penalty しきい値 (PROB_BASE 単位、0 = 無効)。
-    #[arg(long, default_value_t = 2.0)]
+    /// DWA の致死 penalty しきい値 (PROB_BASE 単位、既定 0 = 無効)。
+    #[arg(long, default_value_t = 0.0)]
     dwa_lethal: f64,
 
     /// MPPI のサンプル本数 / softmax 温度 / ノイズ時間相関 / 制御逸脱ペナルティ /
