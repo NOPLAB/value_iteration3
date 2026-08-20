@@ -1,17 +1,22 @@
 //! `schur_demo` — SchurPortal のインタラクティブデモ。
 //!
-//! 地図とアーティファクトを常駐させ、ブラウザ GUI (canvas) から
-//! 右クリック = ゴール / 左クリック = スタートを受ける:
+//! 地図とアーティファクトを常駐させ、ブラウザ GUI (canvas、パン/ズーム対応)
+//! から 右クリック = ゴール / 左クリック = スタートを受ける。勾配は 3 段階で
+//! プログレッシブに正確になる:
 //!
-//! 1. ゴール確定 → ポータル Dijkstra (~100-400 ms) → **タイル粒度の粗い勾配を
-//!    即時表示** (各タイル = その ポータルの min D)。
-//! 2. 裏で全場 V̂ をタイル並列復元 → 細かい勾配 (min over θ) に置き換え。
-//! 3. スタート確定 → V̂ 上の greedy rollout → 経路をオーバーレイ。
+//! 1. ゴール確定 → ポータル Dijkstra (~0.3-0.5 s) → **タイル粒度の粗い勾配を
+//!    即時表示** (各タイル = 所属ポータルの min D)。
+//! 2. 全場 V̂ をタイル並列復元 → セル粒度の上界勾配 (min over θ)。
+//! 3. V̂ 温間の exactify (並列 frontier2d_par_unsafe) → **厳密場** に置き換え。
+//! 4. スタート確定 → 現在の場の greedy rollout → 経路をオーバーレイ。
 //!
-//! HTTP は std のみ (依存追加なし)。GET だけの最小実装で、状態は
-//! Mutex<Demo> に握らせて逐次処理する。
+//! HTTP は std のみ (依存追加なし)。状態は Mutex<Demo> で逐次処理。
 //!
+//!   # tb3_house (小、全段が秒未満〜2 s)
 //!   cargo run --release -p vi_bench --bin schur_demo
+//!   # 津田沼キャンパス (157M 状態: 粗 ~0.4 s / V̂ ~40 s / 厳密 ~+21 s)
+//!   cargo run --release -p vi_bench --bin schur_demo -- \
+//!       --map ../assets/map_tsudanuma.yaml --scale 3
 //!   → http://127.0.0.1:8008 を開く
 //!
 //! アーティファクトは `--out` (既定 schur_demo_out/) にキャッシュされ、
@@ -30,7 +35,7 @@ use vi_bench::pgm;
 use vi_lib::params::{MAX_COST, PROB_BASE};
 use vi_lib::planner::rollout_path_on;
 use vi_lib::solvers::schur::{build, portal_costs, upper_bound_field, SchurArtifact, SchurConfig};
-use vi_lib::solvers::REACH_THRESH as REACH;
+use vi_lib::solvers::{solve, U64Solver, REACH_THRESH as REACH};
 use vi_lib::{OccupancyGrid, Quaternion, State, ValueIterator};
 
 #[derive(Parser)]
@@ -114,29 +119,38 @@ struct Demo {
     vi: ValueIterator,
     art: SchurArtifact,
     grid: OccupancyGrid,
-    goal_radius_m: f64,
-    /// 現在のゴール (セル)。None = 未設定。
     goal: Option<(i32, i32)>,
-    /// 現在の D (ゴール確定時に計算)。
     d: Option<Vec<u64>>,
-    /// 全場 V̂ が組み上がっているか。
+    /// 全場 V̂ が組み上がっているか / さらに厳密化済みか。
     materialized: bool,
+    exact: bool,
 }
 
 impl Demo {
-    fn cell_of(&self, wx: f64, wy: f64) -> (i32, i32) {
-        (
-            (((wx - self.grid.origin_x) / self.grid.resolution).floor() as i32)
-                .clamp(0, self.grid.width - 1),
-            (((wy - self.grid.origin_y) / self.grid.resolution).floor() as i32)
-                .clamp(0, self.grid.height - 1),
-        )
-    }
     fn world_of(&self, ix: i32, iy: i32) -> (f64, f64) {
         (
             self.grid.origin_x + (ix as f64 + 0.5) * self.grid.resolution,
             self.grid.origin_y + (iy as f64 + 0.5) * self.grid.resolution,
         )
+    }
+
+    /// 現在の場の min-over-θ [秒] を f32 LE で。先頭 4 byte は計測 ms。
+    fn field_bytes(&self, ms: f64) -> Vec<u8> {
+        let (nx, ny, nt) = (self.grid.width, self.grid.height, N_THETA);
+        let mut bytes = Vec::with_capacity((nx * ny * 4) as usize + 4);
+        bytes.extend_from_slice(&(ms as f32).to_le_bytes());
+        for iy in 0..ny {
+            for ix in 0..nx {
+                let base = (ix * nt + iy * nt * nx) as usize;
+                let mut m = MAX_COST;
+                for it in 0..nt as usize {
+                    m = m.min(self.vi.states[base + it].total_cost);
+                }
+                let v = if m >= REACH { f32::INFINITY } else { m as f32 / PROB_BASE as f32 };
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        bytes
     }
 }
 
@@ -189,13 +203,12 @@ fn main() {
         art.size_bytes() as f64 / 1e6
     );
 
-    let demo = Mutex::new(Demo { vi, art, grid, goal_radius_m, goal: None, d: None, materialized: false });
+    let demo = Mutex::new(Demo { vi, art, grid, goal: None, d: None, materialized: false, exact: false });
 
     let listener = TcpListener::bind(("127.0.0.1", args.port)).expect("bind");
-    eprintln!("open http://127.0.0.1:{}/  (右クリック=ゴール, 左クリック=スタート)", args.port);
+    eprintln!("open http://127.0.0.1:{}/  (右クリック=ゴール, 左クリック=スタート, ドラッグ=パン, ホイール=ズーム)", args.port);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        // 逐次処理: 状態は 1 つ、リクエストはどのみち Mutex で直列になる。
         if let Err(e) = handle(stream, &demo) {
             eprintln!("request error: {e}");
         }
@@ -226,7 +239,6 @@ fn handle(mut stream: TcpStream, demo: &Mutex<Demo>) -> std::io::Result<()> {
         "/meta" => {
             let d = demo.lock().unwrap();
             let portals: Vec<String> = {
-                // xy で重複排除 (θ 違いは 1 点に潰す)。
                 let mut seen = std::collections::HashSet::new();
                 d.art
                     .portals
@@ -257,7 +269,7 @@ fn handle(mut stream: TcpStream, demo: &Mutex<Demo>) -> std::io::Result<()> {
             let (ix, iy) = (q("x").unwrap_or(0.0) as i32, q("y").unwrap_or(0.0) as i32);
             let mut d = demo.lock().unwrap();
             let Some((gx, gy)) =
-                snap_to_free(&d.grid.data, d.grid.width, d.grid.height, ix, iy, 64)
+                snap_to_free(&d.grid.data, d.grid.width, d.grid.height, ix, iy, 200)
             else {
                 return respond(&mut stream, "application/json", b"{\"err\":\"no free cell near goal\"}");
             };
@@ -266,7 +278,6 @@ fn handle(mut stream: TcpStream, demo: &Mutex<Demo>) -> std::io::Result<()> {
             d.vi.set_goal(wx, wy, 90);
             let dd = portal_costs(&d.vi, &d.art);
             let ms = t0.elapsed().as_secs_f64() * 1e3;
-            // 粗い勾配: タイルごとに所属ポータルの min D [秒]。-1 = 情報なし。
             let mut coarse = vec![-1.0f64; d.art.tiles.len()];
             for (t, e) in d.art.tiles.iter().enumerate() {
                 let m = e.portals.iter().map(|&p| dd[p as usize]).min().unwrap_or(MAX_COST);
@@ -277,6 +288,7 @@ fn handle(mut stream: TcpStream, demo: &Mutex<Demo>) -> std::io::Result<()> {
             d.d = Some(dd);
             d.goal = Some((gx, gy));
             d.materialized = false;
+            d.exact = false;
             let json = format!(
                 "{{\"ms\":{ms:.1},\"gx\":{gx},\"gy\":{gy},\"coarse\":[{}]}}",
                 coarse
@@ -287,7 +299,7 @@ fn handle(mut stream: TcpStream, demo: &Mutex<Demo>) -> std::io::Result<()> {
             );
             respond(&mut stream, "application/json", json.as_bytes())
         }
-        // 全場 V̂ を組み上げて min-over-θ の f32 場 [秒] を返す (未到達 = Inf)。
+        // 全場 V̂ (上界) を組み上げて min-over-θ を返す。
         "/field" => {
             let mut d = demo.lock().unwrap();
             if d.goal.is_none() {
@@ -300,23 +312,28 @@ fn handle(mut stream: TcpStream, demo: &Mutex<Demo>) -> std::io::Result<()> {
                 d.materialized = true;
             }
             let ms = t0.elapsed().as_secs_f64() * 1e3;
-            let (nx, ny, nt) = (d.grid.width, d.grid.height, N_THETA);
-            let mut bytes = Vec::with_capacity((nx * ny * 4) as usize + 32);
-            bytes.extend_from_slice(&(ms as f32).to_le_bytes());
-            for iy in 0..ny {
-                for ix in 0..nx {
-                    let base = (ix * nt + iy * nt * nx) as usize;
-                    let mut m = MAX_COST;
-                    for it in 0..nt as usize {
-                        m = m.min(d.vi.states[base + it].total_cost);
-                    }
-                    let v = if m >= REACH { f32::INFINITY } else { m as f32 / PROB_BASE as f32 };
-                    bytes.extend_from_slice(&v.to_le_bytes());
-                }
-            }
+            let bytes = d.field_bytes(ms);
             respond(&mut stream, "application/octet-stream", &bytes)
         }
-        // スタート確定: V̂ 上の greedy rollout → 世界座標の折れ線。
+        // V̂ 温間の exactify → 厳密場 (収束した Bellman 固定点) を返す。
+        "/exact" => {
+            let mut d = demo.lock().unwrap();
+            if !d.materialized {
+                return respond(&mut stream, "application/json", b"{\"err\":\"field not ready\"}");
+            }
+            let t0 = Instant::now();
+            if !d.exact {
+                let st = solve(&mut d.vi, U64Solver::Frontier2DParUnsafe, 1_000_000);
+                if !st.converged {
+                    return respond(&mut stream, "application/json", b"{\"err\":\"exactify did not converge\"}");
+                }
+                d.exact = true;
+            }
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            let bytes = d.field_bytes(ms);
+            respond(&mut stream, "application/octet-stream", &bytes)
+        }
+        // スタート確定: 現在の場の greedy rollout → セル座標の折れ線。
         "/path" => {
             let d = demo.lock().unwrap();
             if !d.materialized {
@@ -325,13 +342,13 @@ fn handle(mut stream: TcpStream, demo: &Mutex<Demo>) -> std::io::Result<()> {
             let (ix, iy) = (q("x").unwrap_or(0.0) as i32, q("y").unwrap_or(0.0) as i32);
             let th = q("th").unwrap_or(0.0);
             let Some((sx, sy)) =
-                snap_to_free(&d.grid.data, d.grid.width, d.grid.height, ix, iy, 64)
+                snap_to_free(&d.grid.data, d.grid.width, d.grid.height, ix, iy, 200)
             else {
                 return respond(&mut stream, "application/json", b"{\"err\":\"no free cell near start\"}");
             };
             let (wx, wy) = d.world_of(sx, sy);
             let t0 = Instant::now();
-            let r = rollout_path_on(&d.vi, wx, wy, th.to_radians(), 100_000, 2);
+            let r = rollout_path_on(&d.vi, wx, wy, th.to_radians(), 200_000, 2);
             let ms = t0.elapsed().as_secs_f64() * 1e3;
             let pts: Vec<String> = r
                 .poses
@@ -345,9 +362,10 @@ fn handle(mut stream: TcpStream, demo: &Mutex<Demo>) -> std::io::Result<()> {
                 })
                 .collect();
             let json = format!(
-                "{{\"ms\":{ms:.1},\"status\":\"{:?}\",\"reached\":{},\"pts\":[{}]}}",
+                "{{\"ms\":{ms:.1},\"status\":\"{:?}\",\"reached\":{},\"exact\":{},\"pts\":[{}]}}",
                 r.status,
                 r.reached_goal(),
+                d.exact,
                 pts.join(",")
             );
             respond(&mut stream, "application/json", json.as_bytes())
@@ -376,54 +394,58 @@ fn respond_status(stream: &mut TcpStream, code: u16, body: &[u8]) -> std::io::Re
     stream.flush()
 }
 
-// ── ブラウザ GUI (自己完結、依存なし) ──────────────────────────────────────
+// ── ブラウザ GUI (自己完結、依存なし、パン/ズーム対応) ─────────────────────
 
 const HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8">
 <title>SchurPortal demo</title>
 <style>
-body{margin:0;background:#17181b;color:#ecebe6;font-family:"IBM Plex Sans JP","Hiragino Sans",sans-serif;font-size:14px}
-#bar{display:flex;gap:1.2em;align-items:center;padding:10px 14px;border-bottom:1px solid #33363c;flex-wrap:wrap}
+html,body{margin:0;height:100%;background:#17181b;color:#ecebe6;font-family:"IBM Plex Sans JP","Hiragino Sans",sans-serif;font-size:14px;overflow:hidden}
+#bar{display:flex;gap:1em;align-items:center;padding:8px 14px;border-bottom:1px solid #33363c;flex-wrap:wrap}
 #bar b{color:#35c08d}
-.badge{font-family:ui-monospace,monospace;background:#24262b;border-radius:6px;padding:2px 8px}
-#wrap{padding:12px;overflow:auto}
-canvas{image-rendering:pixelated;border:1px solid #33363c;border-radius:6px;display:block;cursor:crosshair}
+.badge{font-family:ui-monospace,monospace;background:#24262b;border-radius:6px;padding:2px 8px;white-space:nowrap}
+.badge.on{background:#1d2f28;color:#35c08d}
+canvas{display:block;cursor:crosshair}
 select{background:#24262b;color:#ecebe6;border:1px solid #33363c;border-radius:6px;padding:2px 6px}
 .hint{color:#a8acb4}
+#stage{font-weight:700}
 </style></head><body>
 <div id="bar">
   <span><b>SchurPortal</b> デモ</span>
-  <span class="hint">右クリック = ゴール / 左クリック = スタート</span>
+  <span class="hint">右クリック=ゴール / 左クリック=スタート / ドラッグ=パン / ホイール=ズーム</span>
   <label>開始方位 <select id="th"><option>0</option><option>45</option><option selected>90</option><option>135</option><option>180</option><option>225</option><option>270</option><option>315</option></select>°</label>
   <span class="badge" id="t_dij">Dijkstra: –</span>
-  <span class="badge" id="t_field">全場 V̂: –</span>
+  <span class="badge" id="t_field">V̂ 上界: –</span>
+  <span class="badge" id="t_exact">厳密化: –</span>
   <span class="badge" id="t_path">rollout: –</span>
+  <span class="badge on" id="stage">場: なし</span>
   <span id="msg" class="hint"></span>
 </div>
-<div id="wrap"><canvas id="cv"></canvas></div>
+<canvas id="cv"></canvas>
 <script>
 const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
 let meta, mapbits, field = null, coarse = null, goal = null, start = null, path = null;
-let SCALE = 4;
+let stage = 'なし';
+// ビュー変換: screen = cell * s + t (セル座標は y 上向き → 描画時に h-1-iy)
+let view = {s: 1, tx: 0, ty: 0};
 
-// viridis 5 点近似
 function viridis(t){
   const s=[[68,1,84],[59,82,139],[33,145,140],[94,201,98],[253,231,37]];
   t=Math.max(0,Math.min(1,t))*4; const i=Math.min(3,Math.floor(t)), f=t-i;
   return s[i].map((a,k)=>Math.round(a+(s[i+1][k]-a)*f));
 }
 
-function draw(){
-  const {w,h}=meta;
-  cv.width=w*SCALE; cv.height=h*SCALE;
-  const img=ctx.createImageData(w,h);
-  // 正規化: 有限値の p99
+// ── ラスタ (1px/セル) — データ変更時だけ再構築 ──
+const off = document.createElement('canvas');
+function renderRaster(){
+  const {w,h}=meta; off.width=w; off.height=h;
+  const img=off.getContext('2d').createImageData(w,h);
   let p99=1;
   if(field){const fin=[]; for(let i=0;i<w*h;i++){const v=field[i]; if(isFinite(v)&&v>0)fin.push(v);}
     fin.sort((a,b)=>a-b); p99=fin[Math.floor(fin.length*0.99)]||1;}
   let c99=1;
   if(coarse){const fin=coarse.filter(v=>v>=0).sort((a,b)=>a-b); c99=fin[Math.floor(fin.length*0.99)]||1;}
   for(let iy=0;iy<h;iy++)for(let ix=0;ix<w;ix++){
-    const gi=iy*w+ix, pi=((h-1-iy)*w+ix)*4; // 格子は y 上向き → 画像は下向き
+    const gi=iy*w+ix, pi=((h-1-iy)*w+ix)*4;
     let r=20,g=20,b=24;
     if(mapbits[gi]===1){r=g=b=8;}
     else if(field){const v=field[gi];
@@ -433,45 +455,63 @@ function draw(){
       const t=Math.floor(ix/meta.tile)+Math.floor(iy/meta.tile)*meta.tnx;
       const v=coarse[t];
       if(v>=0){const c=viridis(1-v/c99); r=c[0]*0.75;g=c[1]*0.75;b=c[2]*0.75;}
+      else {r=60;g=60;b=66;}
     } else {r=232;g=231;b=226;}
     img.data[pi]=r;img.data[pi+1]=g;img.data[pi+2]=b;img.data[pi+3]=255;
   }
-  // 等倍で描いてから拡大
-  const off=document.createElement('canvas'); off.width=w; off.height=h;
   off.getContext('2d').putImageData(img,0,0);
+  draw();
+}
+
+function scr(ix,iy){ return [ix*view.s+view.tx, (meta.h-1-iy)*view.s+view.ty]; }
+
+function draw(){
+  cv.width=window.innerWidth; cv.height=window.innerHeight-document.getElementById('bar').offsetHeight;
+  ctx.fillStyle='#101114'; ctx.fillRect(0,0,cv.width,cv.height);
   ctx.imageSmoothingEnabled=false;
-  ctx.drawImage(off,0,0,w*SCALE,h*SCALE);
-  const P=(x,y)=>[x*SCALE, (h-1-y)*SCALE];
-  if(path){ctx.strokeStyle='#ff5252';ctx.lineWidth=2.5;ctx.beginPath();
-    path.forEach((p,i)=>{const [x,y]=P(p[0],p[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();}
-  if(goal){const [x,y]=P(goal[0]+0.5,goal[1]-0.5);ctx.fillStyle='#35c08d';
-    ctx.beginPath();ctx.arc(x,y,6,0,7);ctx.fill();ctx.fillStyle='#0b0b0b';ctx.font='9px monospace';ctx.fillText('G',x-3,y+3);}
-  if(start){const [x,y]=P(start[0]+0.5,start[1]-0.5);ctx.fillStyle='#ff5252';
-    ctx.beginPath();ctx.arc(x,y,6,0,7);ctx.fill();ctx.fillStyle='#fff';ctx.font='9px monospace';ctx.fillText('S',x-3,y+3);}
+  ctx.drawImage(off, view.tx, view.ty, meta.w*view.s, meta.h*view.s);
+  document.getElementById('stage').textContent='場: '+stage;
+  if(path){ctx.strokeStyle='#ff5252';ctx.lineWidth=Math.max(1.5,view.s*0.6);ctx.beginPath();
+    path.forEach((p,i)=>{const [x,y]=scr(p[0],p[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();}
+  const mark=(c,txt,fill,ink)=>{const [x,y]=scr(c[0]+0.5,c[1]-0.5);
+    ctx.fillStyle=fill;ctx.beginPath();ctx.arc(x,y,7,0,7);ctx.fill();
+    ctx.fillStyle=ink;ctx.font='bold 10px monospace';ctx.fillText(txt,x-3,y+3.5);};
+  if(goal) mark(goal,'G','#35c08d','#0b0b0b');
+  if(start) mark(start,'S','#ff5252','#fff');
 }
 
 function cellOf(ev){
   const r=cv.getBoundingClientRect();
-  const ix=Math.floor((ev.clientX-r.left)/SCALE);
-  const iy=meta.h-1-Math.floor((ev.clientY-r.top)/SCALE);
+  const ix=Math.floor((ev.clientX-r.left-view.tx)/view.s);
+  const iy=meta.h-1-Math.floor((ev.clientY-r.top-view.ty)/view.s);
   return [ix,iy];
 }
 
 async function setGoal(ix,iy){
-  document.getElementById('msg').textContent='Dijkstra...';
+  const M=document.getElementById('msg');
+  M.textContent='Dijkstra...';
   const j=await (await fetch(`/goal?x=${ix}&y=${iy}`)).json();
-  if(j.err){document.getElementById('msg').textContent=j.err;return;}
-  goal=[j.gx,j.gy]; coarse=j.coarse; field=null; path=null; start=null;
+  if(j.err){M.textContent=j.err;return;}
+  goal=[j.gx,j.gy]; coarse=j.coarse; field=null; path=null; start=null; stage='粗 (タイル粒度)';
   document.getElementById('t_dij').textContent=`Dijkstra: ${j.ms} ms`;
-  document.getElementById('t_field').textContent='全場 V̂: ...';
-  document.getElementById('msg').textContent='粗い勾配 (タイル粒度) — 全場を復元中...';
-  draw();
-  const buf=await (await fetch('/field')).arrayBuffer();
-  const f32=new Float32Array(buf);
-  document.getElementById('t_field').textContent=`全場 V̂: ${f32[0].toFixed(0)} ms`;
-  field=f32.subarray(1);
-  document.getElementById('msg').textContent='左クリックでスタートを置くと経路が出ます';
-  draw();
+  document.getElementById('t_field').textContent='V̂ 上界: ...';
+  document.getElementById('t_exact').textContent='厳密化: –';
+  M.textContent='粗い勾配を表示中 — 全場 V̂ を復元しています...';
+  renderRaster();
+  let buf=await (await fetch('/field')).arrayBuffer();
+  let f32=new Float32Array(buf);
+  document.getElementById('t_field').textContent=`V̂ 上界: ${(f32[0]/1000).toFixed(1)} s`;
+  field=f32.subarray(1); stage='V̂ (上界)';
+  M.textContent='V̂ を表示中 — 厳密化しています... (スタートはもう置けます)';
+  renderRaster();
+  buf=await (await fetch('/exact')).arrayBuffer();
+  if(buf.byteLength<100){M.textContent='exactify error';return;}
+  f32=new Float32Array(buf);
+  document.getElementById('t_exact').textContent=`厳密化: ${(f32[0]/1000).toFixed(1)} s`;
+  field=f32.subarray(1); stage='厳密 (収束固定点)';
+  M.textContent='厳密場を表示中 — 左クリックでスタートを置くと経路が出ます';
+  renderRaster();
+  if(path && start){ setStart(start[0], start[1]); }
 }
 
 async function setStart(ix,iy){
@@ -481,19 +521,40 @@ async function setStart(ix,iy){
   if(j.err){document.getElementById('msg').textContent=j.err;return;}
   start=[ix,iy]; path=j.pts;
   document.getElementById('t_path').textContent=`rollout: ${j.ms} ms`;
-  document.getElementById('msg').textContent=j.reached?'ゴール到達':'経路: '+j.status+' (V̂ 上の greedy は稀に循環します — exactify 前の既知の性質)';
+  document.getElementById('msg').textContent=(j.reached?'ゴール到達':'経路: '+j.status)+(j.exact?' (厳密場)':' (V̂ 上)');
   draw();
 }
 
+// ── パン / ズーム / クリック判別 ──
+let drag=null;
+cv.addEventListener('mousedown',ev=>{if(ev.button===0)drag={x:ev.clientX,y:ev.clientY,tx:view.tx,ty:view.ty,moved:0};});
+window.addEventListener('mousemove',ev=>{if(!drag)return;
+  const dx=ev.clientX-drag.x, dy=ev.clientY-drag.y;
+  drag.moved=Math.max(drag.moved,Math.abs(dx)+Math.abs(dy));
+  view.tx=drag.tx+dx; view.ty=drag.ty+dy; draw();});
+window.addEventListener('mouseup',ev=>{
+  if(drag && drag.moved<5 && ev.button===0){const [x,y]=cellOf(ev); setStart(x,y);}
+  drag=null;});
 cv.addEventListener('contextmenu',ev=>{ev.preventDefault();const [x,y]=cellOf(ev);setGoal(x,y);});
-cv.addEventListener('click',ev=>{const [x,y]=cellOf(ev);setStart(x,y);});
+cv.addEventListener('wheel',ev=>{ev.preventDefault();
+  const r=cv.getBoundingClientRect();
+  const mx=ev.clientX-r.left, my=ev.clientY-r.top;
+  const k=ev.deltaY<0?1.2:1/1.2;
+  const ns=Math.max(0.1,Math.min(40,view.s*k));
+  view.tx=mx-(mx-view.tx)*(ns/view.s);
+  view.ty=my-(my-view.ty)*(ns/view.s);
+  view.s=ns; draw();},{passive:false});
+window.addEventListener('resize',draw);
 
 (async()=>{
   meta=await (await fetch('/meta')).json();
   mapbits=new Uint8Array(await (await fetch('/map')).arrayBuffer());
-  SCALE=Math.max(1,Math.min(6,Math.floor(1200/meta.w)));
+  const availH=window.innerHeight-document.getElementById('bar').offsetHeight;
+  view.s=Math.min(window.innerWidth/meta.w, availH/meta.h)*0.97;
+  view.tx=(window.innerWidth-meta.w*view.s)/2;
+  view.ty=(availH-meta.h*view.s)/2;
   document.getElementById('msg').textContent='右クリックでゴールを置いてください';
-  draw();
+  renderRaster();
 })();
 </script></body></html>
 "#;
