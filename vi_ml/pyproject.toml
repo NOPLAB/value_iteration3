@@ -1,0 +1,16 @@
+[project]
+name = "vi_ml"
+version = "0.1.0"
+description = "CNN surrogate for the u64 value-iteration planner (dataset from bench_map, U-Net, pyramid rollout)"
+requires-python = ">=3.12"
+dependencies = ["numpy>=2", "torch>=2.4", "pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["vi_ml"]
