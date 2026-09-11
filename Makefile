@@ -177,4 +177,10 @@ ml-eval:
 	$(ML_PY) -m vi_ml.eval out/train64.npz out/unet.pt
 	$(ML_PY) -m vi_ml.pyramid out/maps128.npz out/unet.pt
 
-.PHONY: ml-test ml-data ml-train ml-eval
+ml-train-ddpm:
+	$(ML_PY) -m vi_ml.diffusion train out/train64.npz --out out/ddpm.pt
+
+ml-eval-ddpm:
+	$(ML_PY) -m vi_ml.diffusion eval out/train64.npz out/ddpm.pt --steps 20
+
+.PHONY: ml-test ml-data ml-train ml-eval ml-train-ddpm ml-eval-ddpm

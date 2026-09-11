@@ -53,3 +53,11 @@ def test_exact_solver_roundtrip():
     assert np.isfinite(v[f]).mean() > 0.9 and np.isnan(v[~f]).all()
     ok, _ = rollout.greedy(v, maps.pick_free(rng, f & np.isfinite(v)), v == 0)
     assert ok
+
+
+def test_ddpm_sample_shape_and_range():
+    from vi_ml.diffusion import DDPM
+    m = DDPM().eval()
+    cond = torch.from_numpy(encode(np.ones((64, 64), bool), (3, 3)))[None]
+    x = m.sample(cond, steps=2)
+    assert x.shape == (1, 64, 64) and torch.isfinite(x).all()
