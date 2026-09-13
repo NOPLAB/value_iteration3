@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .model import UNet, decode_value, encode
+from .model import UNet, cpu_state_dict, decode_value, device, encode
 from .train import masked_l1, whole_samples
 
 T = 1000
@@ -47,11 +47,12 @@ class DDPM(torch.nn.Module):
         """Deterministic DDIM (η=0) from pure noise → x0 in [-1,1]."""
         g = torch.Generator().manual_seed(seed)
         B, _, H, W = cond.shape
-        x = torch.randn(B, H, W, generator=g)
+        dev = cond.device
+        x = torch.randn(B, H, W, generator=g).to(dev)
         ts = torch.linspace(T, 0, steps + 1).round().long()
         for t, t_prev in zip(ts[:-1], ts[1:]):
             ab, ab_prev = self.ab[t], self.ab[t_prev]
-            x0 = self(cond, x, t.expand(B)).clamp(-1, 1)
+            x0 = self(cond, x, t.expand(B).to(dev)).clamp(-1, 1)
             eps = (x - ab.sqrt() * x0) / (1 - ab).sqrt()
             x = ab_prev.sqrt() * x0 + (1 - ab_prev).sqrt() * eps
         return x
@@ -72,7 +73,9 @@ def train(xs, ys, ws, epochs: int, out: Path, val_frac: float = 0.1, seed: int =
     nv = int(len(xs) * val_frac)
     va, tr = idx[:nv], idx[nv:]
     X, Y, Wt = (torch.from_numpy(a) for a in (xs, ys * 2 - 1, ws))  # field in [-1,1]
-    model = DDPM()
+    dev = device()
+    print(f"device {dev}", file=sys.stderr)
+    model = DDPM().to(dev)
     opt = torch.optim.AdamW(model.net.parameters(), 1e-3, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, 2e-3, total_steps=epochs * ((len(tr) + batch - 1) // batch))
 
@@ -81,9 +84,9 @@ def train(xs, ys, ws, epochs: int, out: Path, val_frac: float = 0.1, seed: int =
         if train_mode and np.random.rand() < 0.5:
             cond, x0, w = cond.flip(-1), x0.flip(-1), w.flip(-1)
         t = torch.randint(1, T + 1, (len(b),))
-        ab = model.ab[t][:, None, None]
+        ab = model.ab.cpu()[t][:, None, None]
         x_t = ab.sqrt() * x0 + (1 - ab).sqrt() * torch.randn_like(x0)
-        return masked_l1(model(cond, x_t, t), x0, w)
+        return masked_l1(model(cond.to(dev), x_t.to(dev), t.to(dev)), x0.to(dev), w.to(dev))
 
     best = np.inf
     for ep in range(epochs):
@@ -105,7 +108,7 @@ def train(xs, ys, ws, epochs: int, out: Path, val_frac: float = 0.1, seed: int =
         print(f"epoch {ep + 1}/{epochs} train {tl / len(tr):.4f} val {vl:.4f} ({time.time() - t0:.0f}s)", file=sys.stderr)
         if vl < best:
             best = vl
-            torch.save(model.state_dict(), out)
+            torch.save(cpu_state_dict(model), out)
 
 
 def load_model(path: Path) -> DDPM:

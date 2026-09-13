@@ -38,6 +38,24 @@ def encode(free: np.ndarray, goal: tuple[int, int] | None, boundary_s: np.ndarra
     return x
 
 
+def device() -> torch.device:
+    """Training device: the DirectML adapter (Radeon iGPU) when torch-directml is
+    installed and VI_ML_DEVICE is not "cpu". Inference stays on the CPU (faster at
+    batch=1, and that is what the planner would run)."""
+    import os
+    if os.environ.get("VI_ML_DEVICE", "").lower() == "cpu":
+        return torch.device("cpu")
+    try:
+        import torch_directml
+        return torch_directml.device()
+    except ImportError:
+        return torch.device("cpu")
+
+
+def cpu_state_dict(model: nn.Module) -> dict:
+    return {k: v.detach().cpu() for k, v in model.state_dict().items()}
+
+
 def _block(cin, cout):
     return nn.Sequential(nn.Conv2d(cin, cout, 3, padding=1), nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
                          nn.Conv2d(cout, cout, 3, padding=1), nn.BatchNorm2d(cout), nn.ReLU(inplace=True))

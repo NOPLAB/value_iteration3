@@ -38,9 +38,17 @@ def read_dump(path: Path) -> np.ndarray:
     return np.frombuffer(raw[8:], np.float32).reshape(h, w).copy()
 
 
+def write_dump(v: np.ndarray, path: Path) -> None:
+    """Inverse of `read_dump` (also the `--init-value` input format)."""
+    h, w = v.shape
+    path.write_bytes(np.array([w, h], np.int32).tobytes() + np.ascontiguousarray(v, np.float32).tobytes())
+
+
 def solve(free: np.ndarray, goal: tuple[int, int], solver: str = "frontier2d_sparse",
-          res: float = RES_M) -> tuple[np.ndarray, float]:
-    """(value[H,W] in seconds, solve_ms). `goal` is (iy, ix) in grid cells."""
+          res: float = RES_M, init: np.ndarray | None = None, stats: dict | None = None,
+          max_iters: int | None = None) -> tuple[np.ndarray, float]:
+    """(value[H,W] in seconds, solve_ms). `goal` is (iy, ix) in grid cells.
+    `init`: warm-start field (seconds, NaN = unknown). `stats`, if given, receives iters/updates."""
     if not BENCH_MAP.exists():
         raise FileNotFoundError(f"{BENCH_MAP}: build with `cargo build --release -p vi_bench --bin bench_map`")
     gy, gx = goal
@@ -53,8 +61,15 @@ def solve(free: np.ndarray, goal: tuple[int, int], solver: str = "frontier2d_spa
                "--goal-radius-m", str(GOAL_RADIUS_M),
                "--safety-radius-m", str(SAFETY_RADIUS_M), "--safety-penalty", str(SAFETY_PENALTY),
                "--dump-value", str(dump)]
+        if init is not None:
+            write_dump(init, d / "init.bin")
+            cmd += ["--init-value", str(d / "init.bin")]
+        if max_iters is not None:
+            cmd += ["--max-iters", str(max_iters)]
         p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if p.returncode != 0:
             raise RuntimeError(p.stderr[-2000:])
-        m = re.search(r"total_ms=([\d.]+)", p.stderr)
-        return read_dump(dump), float(m.group(1))
+        m = re.search(r"iters=(\d+) updates=(\d+) total_ms=([\d.]+) converged=(\w)", p.stderr)
+        if stats is not None:
+            stats.update(iters=int(m.group(1)), updates=int(m.group(2)), converged=m.group(4) == "Y")
+        return read_dump(dump), float(m.group(3))

@@ -21,6 +21,7 @@ make ml-test
 | `vi_ml/train.py` | 64² 全体 ＋ 128² から切った 64² 窓（境界 2 セルに真値）を混ぜて学習 |
 | `vi_ml/eval.py` | 保留 400 枚で U-Net vs 厳密解 |
 | `vi_ml/diffusion.py` | 条件付き拡散モデル（同じ U-Net 本体に x_t と t/T を 2ch 追加、x0 予測、DDIM η=0 で生成）。`make ml-train-ddpm` / `ml-eval-ddpm` |
+| `vi_ml/warmstart.py` | `bench_map --init-value` で CNN の場を初期値にした厳密 VI と cold の比較 |
 | `vi_ml/pyramid.py` | 128² を 2× プールした粗場を CNN で出し、ロボット周辺の 64² 窓の境界に流し込んで細場を CNN で出し、8 歩進んで窓を動かす |
 
 ## 結果（2026-09-03、U-Net 4.4M、25 エポック、val L1 0.013、CPU 1 スレッド）
@@ -66,5 +67,30 @@ make ml-test
 ```
 
 読み方: 到達率は回帰と同じ 50% 前後で頭打ちで、ステップを増やしても上がらない。値の相対誤差は桁で悪く（クランプした log 値を戻すので外れ値が大きい）、推論は最短でも 5 倍遅い。局所最小はサンプリングの多様性では消えず、この問題では拡散モデルを使う理由はない。
+
+## 内蔵 Radeon での学習（2026-09-13、torch-directml）
+
+`uv sync` で `torch-directml` が入り（torch は 2.4.1+cpu に固定される）、`model.device()` が Radeon 780M を自動で選ぶ。`VI_ML_DEVICE=cpu` で無効化。推論は batch=1 では CPU の方が速いので CPU のまま。
+
+| | CPU (Ryzen 7 8840U, 8C) | Radeon 780M (DirectML) |
+|---|---|---|
+| U-Net 学習 1 バッチ (32) | 574 ms | 304 ms |
+| U-Net 1 エポック | 88 s | 50 s |
+| DDPM 1 エポック | 49〜77 s | 35 s |
+| U-Net 推論 batch=1 | 24 ms | 28 ms |
+
+GPU で学習し直したモデルの保留 400 枚の結果（種の違いによる揺れの範囲）: U-Net 到達率 0.454 / 値誤差 0.199、DDIM 5 ステップ 到達率 0.562 / 値誤差 6.7（元表は `out/eval_gpu.md`, `out/eval_ddpm5_gpu.md`）。
+
+## warm start（2026-09-13、保留 50 枚、frontier2d_sparse、反復上限 2000）
+
+`bench_map --init-value` を追加し、θ 最小の 2D 場を全 θ の初期値にして解いた。`seed_frontier_2d` が有限値のセルを全部フロンティアに入れるので、ソルバ側の改造は不要。
+
+| init | iters (median) | updates M (median) | solve ms (median) | max |Δ| vs cold (s) | not converged in 2000 |
+|---|---|---|---|---|---|
+| cold (MAX_COST) | 99 | 3.82 | 98.5 | 0.0000 | 0/50 |
+| warm: true θ-min field | 99 | 5.64 | 140.4 | 20.1861 | 0/50 |
+| warm: U-Net field | 130 | 7.11 | 148.9 | 20.1861 | 8/50 |
+
+読み方: 真の θ 最小場から始めても cold より遅く、U-Net の場からは 8/50 が収束しない。収束したものも真値から最大 20 s ずれる。原因は 2D 場を 60 θ に複製すると 59/60 の状態が楽観的すぎる値になり、値を上げる方向の伝播がゴールから全域にやり直しになること。楽観的な初期値では打ち切り付きの Bellman 更新が真の固定点に戻らない場合もある。warm start を効かせるには 3D（x, y, θ）で楽観的でない場が要り、2D の CNN では役に立たない。
 
 次の候補: CNN の粗場を warm start にして `vi_lib` の `resweep` で厳密解まで持っていく版。

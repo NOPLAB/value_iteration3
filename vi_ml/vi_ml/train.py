@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .model import UNet, encode, encode_value
+from .model import UNet, cpu_state_dict, device, encode, encode_value
 
 RING = 2  # border cells whose true value is fed in as the window boundary
 WIN = 64
@@ -58,7 +58,9 @@ def train(xs, ys, ws, epochs: int, out: Path, val_frac: float = 0.1, seed: int =
     nv = int(n * val_frac)
     va, tr = idx[:nv], idx[nv:]
     X, Y, Wt = (torch.from_numpy(a) for a in (xs, ys, ws))
-    model = UNet()
+    dev = device()
+    print(f"device {dev}", file=sys.stderr)
+    model = UNet().to(dev)
     opt = torch.optim.AdamW(model.parameters(), 1e-3, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, 2e-3, total_steps=epochs * ((len(tr) + batch - 1) // batch))
     best = np.inf
@@ -72,7 +74,7 @@ def train(xs, ys, ws, epochs: int, out: Path, val_frac: float = 0.1, seed: int =
             x, y, w = X[b], Y[b], Wt[b]
             if np.random.rand() < 0.5:  # flip augmentation (goal/boundary flip with it)
                 x, y, w = x.flip(-1), y.flip(-1), w.flip(-1)
-            loss = masked_l1(model(x), y, w)
+            loss = masked_l1(model(x.to(dev)), y.to(dev), w.to(dev))
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -80,12 +82,12 @@ def train(xs, ys, ws, epochs: int, out: Path, val_frac: float = 0.1, seed: int =
             tl += loss.item() * len(b)
         model.eval()
         with torch.no_grad():
-            vl = float(np.mean([masked_l1(model(X[va[i:i + 64]]), Y[va[i:i + 64]], Wt[va[i:i + 64]]).item()
+            vl = float(np.mean([masked_l1(model(X[va[i:i + 64]].to(dev)), Y[va[i:i + 64]].to(dev), Wt[va[i:i + 64]].to(dev)).item()
                                 for i in range(0, nv, 64)])) if nv else np.nan
         print(f"epoch {ep + 1}/{epochs} train {tl / len(tr):.4f} val {vl:.4f} ({time.time() - t0:.0f}s)", file=sys.stderr)
         if vl < best:
             best = vl
-            torch.save(model.state_dict(), out)
+            torch.save(cpu_state_dict(model), out)
     return model, va
 
 
