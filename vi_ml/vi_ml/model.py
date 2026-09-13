@@ -62,7 +62,7 @@ def _block(cin, cout):
 
 
 class UNet(nn.Module):
-    def __init__(self, cin: int = 4, base: int = 24, depth: int = 4):
+    def __init__(self, cin: int = 4, base: int = 24, depth: int = 4, cout: int = 1):
         super().__init__()
         chs = [base * 2 ** i for i in range(depth)]
         self.enc = nn.ModuleList()
@@ -78,7 +78,8 @@ class UNet(nn.Module):
             self.up.append(nn.ConvTranspose2d(c, co, 2, stride=2))
             self.dec.append(_block(co * 2, co))
             c = co
-        self.head = nn.Conv2d(c, 1, 1)
+        self.head = nn.Conv2d(c, cout, 1)
+        self.cout = cout
 
     def forward(self, x):
         skips = []
@@ -89,7 +90,8 @@ class UNet(nn.Module):
         x = self.mid(x)
         for u, d, s in zip(self.up, self.dec, reversed(skips)):
             x = d(torch.cat([u(x), s], 1))
-        return self.head(x)[:, 0]
+        y = self.head(x)
+        return y[:, 0] if self.cout == 1 else y
 
 
 def predict(model: nn.Module, x: np.ndarray) -> np.ndarray:

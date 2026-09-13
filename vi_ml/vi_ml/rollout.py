@@ -14,7 +14,7 @@ RADIUS = 3  # 0.3 m forward step at 0.1 m/cell
 def _clear(value: np.ndarray, y, x, ny, nx) -> bool:
     n = 2 * max(abs(ny - y), abs(nx - x))
     for t in np.linspace(0, 1, n + 1)[1:]:
-        py, px = int(round(y + (ny - y) * t)), int(round(x + (nx - x) * t))
+        py, px = y + int(round((ny - y) * t)), x + int(round((nx - x) * t))  # round the offset: parity-independent
         if not np.isfinite(value[py, px]):
             return False
     return True

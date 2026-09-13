@@ -183,4 +183,10 @@ ml-train-ddpm:
 ml-eval-ddpm:
 	$(ML_PY) -m vi_ml.diffusion eval out/train64.npz out/ddpm.pt --steps 20
 
-.PHONY: ml-test ml-data ml-train ml-eval ml-train-ddpm ml-eval-ddpm
+ml-train-policy:
+	$(ML_PY) -m vi_ml.policy train out/train64.npz --out out/policy.pt
+
+ml-eval-policy:
+	$(ML_PY) -m vi_ml.policy eval out/train64.npz out/policy.pt
+
+.PHONY: ml-test ml-data ml-train ml-eval ml-train-ddpm ml-eval-ddpm ml-train-policy ml-eval-policy

@@ -61,3 +61,16 @@ def test_ddpm_sample_shape_and_range():
     cond = torch.from_numpy(encode(np.ones((64, 64), bool), (3, 3)))[None]
     x = m.sample(cond, steps=2)
     assert x.shape == (1, 64, 64) and torch.isfinite(x).all()
+
+
+def test_policy_labels_reproduce_greedy():
+    from vi_ml.policy import K, follow, labels
+    yy, xx = np.mgrid[0:16, 0:16]
+    v = np.hypot(yy - 8.0, xx - 8.0)
+    lab = labels(v)
+    assert lab[8, 8] == -1 and (lab >= 0).sum() == 255
+    lg = np.full((K * K, 16, 16), -1e9, np.float32)
+    ys, xs = np.nonzero(lab >= 0)
+    lg[lab[ys, xs], ys, xs] = 0
+    ok, p = follow(lg, np.ones((16, 16), bool), (0, 0), v == 0)
+    assert ok and p == rollout.greedy(v, (0, 0), v == 0)[1]
