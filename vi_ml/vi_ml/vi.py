@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -68,7 +69,16 @@ def solve(free: np.ndarray, goal: tuple[int, int], solver: str = "frontier2d_spa
             cmd += ["--max-iters", str(max_iters)]
         if action_scale != 1.0:  # coarse levels: keep "3 cells per step" as the cell grows
             cmd += ["--action-scale", str(action_scale)]
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        # The binary lives on a shared cephfs; under cluster load an exec can come
+        # back EACCES/ENOENT for a moment even though the file is fine. Retry.
+        for attempt in range(4):
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                break
+            except OSError:
+                if attempt == 3:
+                    raise
+                time.sleep(2 * (attempt + 1))
         if p.returncode != 0:
             raise RuntimeError(p.stderr[-2000:])
         m = re.search(r"iters=(\d+) updates=(\d+) total_ms=([\d.]+) converged=(\w)", p.stderr)

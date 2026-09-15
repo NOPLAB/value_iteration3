@@ -29,7 +29,8 @@ import torch.nn.functional as F
 
 from . import maps, rollout, vi
 from .model import UNet, cpu_state_dict, decode_value, device, encode, encode_value
-from .policy import K, follow, labels
+from .policy import K, OFFSETS, follow, labels
+from .rollout import RADIUS
 
 TOP = 64          # top level fits the training window: goal always in view
 WIN = 64
@@ -91,16 +92,57 @@ def pyramid(free, goal, value=None, top: int = TOP):
     return levels
 
 
+# ---------------------------------------------------------------- guide encoding
+REL_K = 31  # local reference window (cells)
+
+
+def relative_guide(g: np.ndarray) -> np.ndarray:
+    """(g − local min) / (local max − local min) over a REL_K window; NaN stays NaN.
+
+    The absolute value of a guide is the wrong thing to feed a small refiner: a
+    campus map runs to 2000 s while the training maps stop near 400 s, and the model
+    then sees a channel outside anything it was trained on. What it needs is the
+    *descent direction*, which is scale-free — normalising against the local range
+    makes the channel independent of both the map's size and the cell's time scale,
+    and computing it from the full field makes it identical whether a window is
+    cropped for training or the map is swept convolutionally at test time."""
+    fill = float(np.nanmax(g)) if np.isfinite(g).any() else 0.0
+    dev = device()
+    x = torch.from_numpy(np.nan_to_num(g, nan=fill).astype(np.float32))[None, None].to(dev)
+    # separable: a max filter over a square is a row pass then a column pass
+    # (62 comparisons per cell instead of 961 — the square form dominated a
+    # campus-sized map's runtime).
+    def box_max(t):
+        t = F.max_pool2d(t, (REL_K, 1), stride=1, padding=(REL_K // 2, 0))
+        return F.max_pool2d(t, (1, REL_K), stride=1, padding=(0, REL_K // 2))
+    mx = box_max(x)
+    mn = -box_max(-x)
+    rel = ((x - mn) / (mx - mn).clamp(min=1e-6)).clamp(0.0, 1.0)[0, 0].cpu().numpy()
+    rel[~np.isfinite(g)] = np.nan
+    return rel
+
+
+def encode_guided(free: np.ndarray, goal, rel: np.ndarray | None) -> np.ndarray:
+    """(4,H,W): free, goal, relative guide, guide-known mask."""
+    x = np.zeros((4, *free.shape), np.float32)
+    x[0] = free
+    if goal is not None:
+        x[1, goal[0], goal[1]] = 1.0
+    if rel is not None:
+        known = np.isfinite(rel)
+        x[2] = np.where(known, rel, 0.0)
+        x[3] = known
+    return x
+
+
 # ---------------------------------------------------------------- samples
-def _window(free, goal, value, lab, guide, y0, x0, rng):
+def _window(free, goal, value, lab, rel, y0, x0, rng):
     f = free[y0:y0 + WIN, x0:x0 + WIN]
     v = value[y0:y0 + WIN, x0:x0 + WIN]
     g = (goal[0] - y0, goal[1] - x0)
     g = g if 0 <= g[0] < WIN and 0 <= g[1] < WIN else None
-    b = None
-    if guide is not None:
-        b = guide[y0:y0 + WIN, x0:x0 + WIN]
-    return (encode(f, g, b), encode_value(v).astype(np.float32),
+    b = rel[y0:y0 + WIN, x0:x0 + WIN] if rel is not None else None
+    return (encode_guided(f, g, b), encode_value(v).astype(np.float32),
             (f & np.isfinite(v)).astype(np.float32), lab[y0:y0 + WIN, x0:x0 + WIN].astype(np.int16))
 
 
@@ -138,11 +180,12 @@ def samples_for_map(args):
         if min(H, W) >> levels < 16:
             continue
         guide, _ = coarse_guide(free, goal, levels)
+        rel = relative_guide(guide)
         for _ in range(per_map):
             y0, x0 = int(rng.integers(0, H - WIN + 1)), int(rng.integers(0, W - WIN + 1))
             if free[y0:y0 + WIN, x0:x0 + WIN].mean() < 0.1:
                 continue
-            out.append(_window(free, goal, value, lab, guide, y0, x0, rng))
+            out.append(_window(free, goal, value, lab, rel, y0, x0, rng))
     return out
 
 
@@ -236,7 +279,12 @@ def load_model(path: Path) -> UNet:
 # ---------------------------------------------------------------- inference
 @torch.no_grad()
 def forward_tiled(model, x: np.ndarray, tile: int = 512, halo: int = 32) -> np.ndarray:
-    """Fully-convolutional forward of (4,H,W) in tiles with a halo; output (COUT,H,W)."""
+    """Fully-convolutional forward of (4,H,W) in tiles with a halo; output (COUT,H,W).
+
+    Runs on the training device when there is one: a campus-sized map is 5.9M cells
+    and the same pass costs seconds on a CPU against tens of milliseconds on a GPU."""
+    dev = device()
+    model = model.to(dev)
     _, H, W = x.shape
     Hp, Wp = -(-H // 16) * 16, -(-W // 16) * 16
     xp = np.zeros((4, Hp + 2 * halo, Wp + 2 * halo), np.float32)
@@ -245,9 +293,11 @@ def forward_tiled(model, x: np.ndarray, tile: int = 512, halo: int = 32) -> np.n
     for y0 in range(0, Hp, tile):
         for x0 in range(0, Wp, tile):
             y1, x1 = min(y0 + tile, Hp), min(x0 + tile, Wp)
-            t = torch.from_numpy(xp[:, y0:y1 + 2 * halo, x0:x1 + 2 * halo])[None]
-            o = model(t)[0].numpy()
-            out[:, y0:y1, x0:x1] = o[:, halo:halo + (y1 - y0), halo:halo + (x1 - x0)]
+            t = torch.from_numpy(xp[:, y0:y1 + 2 * halo, x0:x1 + 2 * halo])[None].to(dev)
+            o = model(t)[0, :, halo:halo + (y1 - y0), halo:halo + (x1 - x0)]
+            out[:, y0:y1, x0:x1] = o.cpu().numpy()
+    if dev.type == "cuda":
+        torch.cuda.synchronize()
     return out[:, :H, :W]
 
 
@@ -266,11 +316,54 @@ def solve_map(model, free: np.ndarray, goal, top: int = TOP, refine: bool = True
     guide, _ = coarse_guide(free, goal, levels)
     t1 = time.perf_counter()
     if not refine:
-        return None, guide, [(t1 - t0) * 1e3, 0.0]
-    out = forward_tiled(model, encode(free, goal, guide))
-    val = decode_value(out[0])
-    val[~free] = np.nan
-    return out[1:], val, [(t1 - t0) * 1e3, (time.perf_counter() - t1) * 1e3]
+        return None, guide, [(t1 - t0) * 1e3, 0.0, 0.0]
+    x = encode_guided(free, goal, relative_guide(guide))
+    t2 = time.perf_counter()
+    out = forward_tiled(model, x)
+    t3 = time.perf_counter()
+    return out[1:], guide, [(t1 - t0) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3]
+
+
+def follow_hybrid(lg, guide: np.ndarray, free: np.ndarray, start, goal_mask, max_steps=None):
+    """Descend the guide; where the guide has no descending jump (its local minima,
+    which is exactly where plain descent dies) take the policy's highest-logit clear
+    jump instead, refusing already-visited cells so an escape cannot cycle.
+
+    The guide is an exact solve of a coarser map, so descending it is sound wherever
+    it descends — the model is only asked for the part the coarse map cannot express."""
+    H, W = free.shape
+    max_steps = max_steps or 2 * (H + W)
+    y, x = start
+    path = [(y, x)]
+    seen = {(y, x)}
+    escapes = 0
+    for _ in range(max_steps):
+        if goal_mask[y, x]:
+            return True, path, escapes
+        nxt = None
+        best = guide[y, x]
+        for ny in range(max(0, y - RADIUS), min(H, y + RADIUS + 1)):
+            for nx in range(max(0, x - RADIUS), min(W, x + RADIUS + 1)):
+                if guide[ny, nx] < best and rollout._clear(guide, y, x, ny, nx):
+                    nxt, best = (ny, nx), guide[ny, nx]
+        if nxt is None and lg is not None:  # guide local minimum: let the model escape
+            for k in np.argsort(-lg[:, y, x]):
+                dy, dx = OFFSETS[k]
+                ny, nx = y + dy, x + dx
+                if (dy, dx) == (0, 0) or not (0 <= ny < H and 0 <= nx < W):
+                    continue
+                if not free[ny, nx] or (ny, nx) in seen:
+                    continue
+                if rollout._clear(np.where(free, 0.0, np.nan), y, x, ny, nx):
+                    nxt = (ny, nx)
+                    escapes += 1
+                    break
+        if nxt is None:
+            return False, path, escapes
+        y, x = nxt
+        seen.add((y, x))
+        path.append((y, x))
+    return bool(goal_mask[y, x]), path, escapes
 
 
 def evaluate_maps(model, items, starts: int, label: str, top: int = TOP, refine: bool = True):
@@ -284,21 +377,22 @@ def evaluate_maps(model, items, starts: int, label: str, top: int = TOP, refine:
         ms = (time.perf_counter() - t0) * 1e3
         m = free & np.isfinite(true)
         gm = true == 0
-        ok, okv, ratios = 0, 0, []
+        ok, okv, ratios, esc = 0, 0, [], 0
         for _ in range(starts):
             s = maps.pick_free(rng, m)
             r_t, p_t = rollout.greedy(true, s, gm)
-            r_p, p_p = follow(lg, free, s, gm) if lg is not None else rollout.greedy(val, s, gm)
+            r_p, p_p, e = follow_hybrid(lg, val, free, s, gm)
+            esc += e
             r_v, _ = rollout.greedy(val, s, gm)
             ok += r_p
             okv += r_v
-            if r_p and r_t and rollout.length(p_t) > 0:
+            if r_p and rollout.length(p_t) > 0:
                 ratios.append(rollout.length(p_p) / rollout.length(p_t))
         rel = float(np.nanmean(np.abs(val[m] - true[m]) / (true[m] + 1)))
         rows.append((kind, free.shape, ok / starts, okv / starts, float(np.mean(ratios)) if ratios else np.nan, rel, ms, vi_ms))
-        print(f"  {kind} {free.shape} success policy {ok / starts:.2f} value-greedy {okv / starts:.2f} ratio {rows[-1][4]:.2f} "
+        print(f"  {kind} {free.shape} success hybrid {ok / starts:.2f} guide-only {okv / starts:.2f} escapes {esc} ratio {rows[-1][4]:.2f} "
               f"rel.err {rel:.2f} {label} {ms:.0f} ms (levels {[round(t) for t in per_level]}) vi {vi_ms:.0f} ms", file=sys.stderr)
-    print(f"| kind | maps | success(policy) | success(value greedy) | len ratio | rel.err | {label} ms | vi ms |")
+    print(f"| kind | maps | success(hybrid) | success(guide only) | len ratio | rel.err | {label} ms | vi ms |")
     print("|---|---|---|---|---|---|---|---|")
     for k in sorted({r[0] for r in rows}) + ["all"]:
         rs = [r for r in rows if k == "all" or r[0] == k]
