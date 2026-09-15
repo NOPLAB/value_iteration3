@@ -301,27 +301,68 @@ def forward_tiled(model, x: np.ndarray, tile: int = 512, halo: int = 32) -> np.n
     return out[:, :H, :W]
 
 
-def solve_map(model, free: np.ndarray, goal, top: int = TOP, refine: bool = True):
-    """→ (policy logits (K²,H,W), value seconds (H,W), [coarse ms, refine ms]).
+MODES = ("exact+model", "exact", "model", "flat")
 
-    Exact VI on the map pooled down to `top`, then one fully-convolutional pass of
-    the small model over the whole fine map with that guide. Two levels, one pass:
-    nothing compounds, and the cost is one forward over the fine grid."""
-    levels = 0
-    f = free
-    while max(f.shape) > top:
-        f = pool_free_conservative(f)
-        levels += 1
+
+def solve_map(model, free: np.ndarray, goal, top: int = TOP, mode: str = "exact+model"):
+    """→ (policy logits (K²,H,W) or None, value field (H,W) in seconds, [ms per stage]).
+
+    `mode` says where the global structure comes from:
+      exact+model  coarse level solved exactly, one model pass on the fine level (default)
+      exact        coarse level only — no model at all
+      model        no exact solve anywhere: the top level is predicted with an empty
+                   guide, and each finer level is guided by the level above it
+      flat         one model pass over the full map with no guide at all
+    """
+    assert mode in MODES, mode
     t0 = time.perf_counter()
-    guide, _ = coarse_guide(free, goal, levels)
-    t1 = time.perf_counter()
-    if not refine:
-        return None, guide, [(t1 - t0) * 1e3, 0.0, 0.0]
-    x = encode_guided(free, goal, relative_guide(guide))
-    t2 = time.perf_counter()
-    out = forward_tiled(model, x)
-    t3 = time.perf_counter()
-    return out[1:], guide, [(t1 - t0) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3]
+
+    if mode == "flat":
+        out = forward_tiled(model, encode_guided(free, goal, None))
+        val = decode_value(out[0])
+        val[~free] = np.nan
+        return out[1:], val, [0.0, 0.0, (time.perf_counter() - t0) * 1e3]
+
+    if mode in ("exact", "exact+model"):
+        levels = 0
+        f = free
+        while max(f.shape) > top:
+            f = pool_free_conservative(f)
+            levels += 1
+        guide, _ = coarse_guide(free, goal, levels)
+        t1 = time.perf_counter()
+        if mode == "exact":
+            return None, guide, [(t1 - t0) * 1e3, 0.0, 0.0]
+        x = encode_guided(free, goal, relative_guide(guide))
+        t2 = time.perf_counter()
+        out = forward_tiled(model, x)
+        return out[1:], guide, [(t1 - t0) * 1e3, (t2 - t1) * 1e3, (time.perf_counter() - t2) * 1e3]
+
+    # mode == "model": every level comes out of the network.
+    lv = pyramid(free, goal, top=top)
+    guide, enc_ms, net_ms = None, 0.0, 0.0
+    for l in range(len(lv) - 1, -1, -1):
+        f, g, _ = lv[l]
+        ta = time.perf_counter()
+        if guide is None:
+            H, W = f.shape
+            fp = np.zeros((max(WIN, H), max(WIN, W)), bool)
+            fp[:H, :W] = f
+            x = encode_guided(fp, g, None)
+        else:
+            up = upsample(guide, f.shape)
+            up[~f] = np.nan
+            x = encode_guided(f, g, relative_guide(up))
+        tb = time.perf_counter()
+        out = forward_tiled(model, x)
+        if guide is None:
+            out = out[:, :f.shape[0], :f.shape[1]]
+        tc = time.perf_counter()
+        enc_ms += (tb - ta) * 1e3
+        net_ms += (tc - tb) * 1e3
+        guide = decode_value(out[0]) * 2 ** l  # coarse cells cover 2^l times the distance
+        guide[~f] = np.nan
+    return out[1:], guide, [0.0, enc_ms, net_ms]
 
 
 def follow_hybrid(lg, guide: np.ndarray, free: np.ndarray, start, goal_mask, max_steps=None):
@@ -366,14 +407,13 @@ def follow_hybrid(lg, guide: np.ndarray, free: np.ndarray, start, goal_mask, max
     return bool(goal_mask[y, x]), path, escapes
 
 
-def evaluate_maps(model, items, starts: int, label: str, top: int = TOP, refine: bool = True):
+def evaluate_maps(model, items, starts: int, label: str, top: int = TOP, mode: str = "exact+model"):
     """items: iterable of (kind, free, goal, true_value, vi_ms)."""
     rows = []
     rng = np.random.default_rng(0)
     for kind, free, goal, true, vi_ms in items:
         t0 = time.perf_counter()
-        lg, val, per_level = solve_map(model, free, goal, top=top, refine=refine)
-        guide = val if lg is None else None
+        lg, val, per_level = solve_map(model, free, goal, top=top, mode=mode)
         ms = (time.perf_counter() - t0) * 1e3
         m = free & np.isfinite(true)
         gm = true == 0
@@ -447,7 +487,7 @@ def main(argv=None):
     ev.add_argument("weights", type=Path, nargs="?")
     ev.add_argument("--n", type=int, default=40)
     ev.add_argument("--starts", type=int, default=8)
-    ev.add_argument("--no-refine", dest="refine", action="store_false", help="coarse exact VI only, no model")
+    ev.add_argument("--mode", default="exact+model", choices=MODES)
     ev.add_argument("--top", type=int, default=TOP, help="pool until the long side fits this; exact VI there")
     re_ = sub.add_parser("real")
     re_.add_argument("yaml", type=Path)
@@ -456,7 +496,7 @@ def main(argv=None):
     re_.add_argument("--scale", type=int, default=2)
     re_.add_argument("--vi-ms", type=float, default=np.nan)
     re_.add_argument("--starts", type=int, default=20)
-    re_.add_argument("--no-refine", dest="refine", action="store_false", help="coarse exact VI only, no model")
+    re_.add_argument("--mode", default="exact+model", choices=MODES)
     re_.add_argument("--top", type=int, default=768, help="Tsudanuma at 0.1 m: 768 → exact VI at 0.4 m (736×500)")
     a = ap.parse_args(argv)
     if a.cmd == "prepare":
@@ -468,14 +508,14 @@ def main(argv=None):
         train(np.load(a.samples), a.epochs, a.out)
     elif a.cmd == "eval":
         d = np.load(a.data)
-        model = load_model(a.weights) if a.refine else None
+        model = load_model(a.weights) if a.mode != "exact" else None
 
         def items():
             for i in range(len(d["free"]) - a.n, len(d["free"])):
                 free, goal = d["free"][i], tuple(int(v) for v in d["goal"][i])
                 _, vi_ms = vi.solve(free, goal)
                 yield str(d["kind"][i]), free, goal, d["value"][i], vi_ms
-        evaluate_maps(model, items(), a.starts, "pyramid", a.top, a.refine)
+        evaluate_maps(model, items(), a.starts, a.mode, a.top, a.mode)
     else:
         free = load_real(a.yaml, a.scale)
         true = vi.read_dump(a.truth)
@@ -484,8 +524,8 @@ def main(argv=None):
         goal = (int(gy), int(gx))
         if not free[goal]:
             goal = tuple(int(v) for v in np.argwhere(true == 0)[0])
-        evaluate_maps(load_model(a.weights) if a.refine else None,
-                      [(a.yaml.stem, free, goal, true, a.vi_ms)], a.starts, "pyramid", a.top, a.refine)
+        evaluate_maps(load_model(a.weights) if a.mode != "exact" else None,
+                      [(a.yaml.stem, free, goal, true, a.vi_ms)], a.starts, a.mode, a.top, a.mode)
 
 
 if __name__ == "__main__":
