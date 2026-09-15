@@ -32,6 +32,8 @@ def load_house(scale: int = 2) -> np.ndarray:
 
 def make_map(rng: np.random.Generator, size: int, house: np.ndarray):
     kind = str(rng.choice(list(MIX), p=list(MIX.values())))
+    if kind == "crop" and min(house.shape) < size:
+        kind = "rooms"  # the real map is smaller than the requested crop
     free = maps.crop(rng, house, size) if kind == "crop" else maps.KINDS[kind](rng, size)
     free = maps.thicken(free)
     goal = maps.pick_free(rng, free)

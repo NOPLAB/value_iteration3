@@ -39,17 +39,22 @@ def encode(free: np.ndarray, goal: tuple[int, int] | None, boundary_s: np.ndarra
 
 
 def device() -> torch.device:
-    """Training device: the DirectML adapter (Radeon iGPU) when torch-directml is
-    installed and VI_ML_DEVICE is not "cpu". Inference stays on the CPU (faster at
-    batch=1, and that is what the planner would run)."""
+    """Training device: CUDA if present, else the DirectML adapter (Radeon iGPU) when
+    torch-directml is installed. `VI_ML_DEVICE` overrides ("cpu"/"cuda"/"dml").
+    Inference stays on the CPU (faster at batch=1, and that is what the planner runs)."""
     import os
-    if os.environ.get("VI_ML_DEVICE", "").lower() == "cpu":
+    want = os.environ.get("VI_ML_DEVICE", "").lower()
+    if want == "cpu":
         return torch.device("cpu")
-    try:
-        import torch_directml
-        return torch_directml.device()
-    except ImportError:
-        return torch.device("cpu")
+    if want in ("", "cuda") and torch.cuda.is_available():
+        return torch.device("cuda")
+    if want in ("", "dml"):
+        try:
+            import torch_directml
+            return torch_directml.device()
+        except ImportError:
+            pass
+    return torch.device("cpu")
 
 
 def cpu_state_dict(model: nn.Module) -> dict:

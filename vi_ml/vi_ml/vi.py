@@ -46,7 +46,7 @@ def write_dump(v: np.ndarray, path: Path) -> None:
 
 def solve(free: np.ndarray, goal: tuple[int, int], solver: str = "frontier2d_sparse",
           res: float = RES_M, init: np.ndarray | None = None, stats: dict | None = None,
-          max_iters: int | None = None) -> tuple[np.ndarray, float]:
+          max_iters: int | None = None, action_scale: float = 1.0) -> tuple[np.ndarray, float]:
     """(value[H,W] in seconds, solve_ms). `goal` is (iy, ix) in grid cells.
     `init`: warm-start field (seconds, NaN = unknown). `stats`, if given, receives iters/updates."""
     if not BENCH_MAP.exists():
@@ -58,7 +58,7 @@ def solve(free: np.ndarray, goal: tuple[int, int], solver: str = "frontier2d_spa
         dump = d / "value.bin"
         cmd = [str(BENCH_MAP), "--map", str(yaml), "--solver", solver,
                "--goal-x", str((gx + 0.5) * res), "--goal-y", str((gy + 0.5) * res),
-               "--goal-radius-m", str(GOAL_RADIUS_M),
+               "--goal-radius-m", str(max(GOAL_RADIUS_M, 2 * res) if res > RES_M else GOAL_RADIUS_M),
                "--safety-radius-m", str(SAFETY_RADIUS_M), "--safety-penalty", str(SAFETY_PENALTY),
                "--dump-value", str(dump)]
         if init is not None:
@@ -66,6 +66,8 @@ def solve(free: np.ndarray, goal: tuple[int, int], solver: str = "frontier2d_spa
             cmd += ["--init-value", str(d / "init.bin")]
         if max_iters is not None:
             cmd += ["--max-iters", str(max_iters)]
+        if action_scale != 1.0:  # coarse levels: keep "3 cells per step" as the cell grows
+            cmd += ["--action-scale", str(action_scale)]
         p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if p.returncode != 0:
             raise RuntimeError(p.stderr[-2000:])

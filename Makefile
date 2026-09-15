@@ -189,4 +189,20 @@ ml-train-policy:
 ml-eval-policy:
 	$(ML_PY) -m vi_ml.policy eval out/train64.npz out/policy.pt
 
-.PHONY: ml-test ml-data ml-train ml-eval ml-train-ddpm ml-eval-ddpm ml-train-policy ml-eval-policy
+ml-data-256:
+	$(ML_PY) -m vi_ml.dataset out/maps256.npz --n 400 --size 256 --seed 200000
+
+ml-prepare-ms:
+	$(ML_PY) -m vi_ml.multiscale prepare out/ms.npz out/train64.npz out/maps128.npz out/maps256.npz
+
+ml-train-ms:
+	$(ML_PY) -m vi_ml.multiscale train out/ms.npz --out out/ms.pt
+
+ml-eval-ms:
+	$(ML_PY) -m vi_ml.multiscale eval out/maps256.npz out/ms.pt --n 40
+
+# 真値は bench_map --scale 2 --solver frontier2d_sparse_compact --goal-x 152.55 --goal-y 97.55 --dump-value out/tsudanuma_s2.bin
+ml-eval-tsudanuma:
+	$(ML_PY) -m vi_ml.multiscale real ../assets/map_tsudanuma.yaml out/tsudanuma_s2.bin out/ms.pt --scale 2
+
+.PHONY: ml-test ml-data ml-train ml-eval ml-train-ddpm ml-eval-ddpm ml-train-policy ml-eval-policy         ml-data-256 ml-prepare-ms ml-train-ms ml-eval-ms ml-eval-tsudanuma
