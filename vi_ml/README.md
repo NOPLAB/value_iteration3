@@ -192,16 +192,22 @@ ML の場を活かすなら初期値としてではなく、`exact+model`（粗�
 
 ## `frontier2d_sparse` が本家と食い違う（2026-09-20、要調査・vi_ml とは別件）
 
-warm start の検証中に見つけた。保留 60 枚中 4 枚で、`frontier2d_sparse` の解が本家準拠の
-`reference`・`frontier2d` と一致しない。index 3985（blobs, 64x64）では:
+warm start の検証中に見つけた。本家 `reference` と `frontier2d_sparse` を保留 20 枚で突き合わせると、
+2 枚で sparse が自由セルを未到達（`MAX_COST`）のまま残す。逆向き（sparse だけ到達）は 0 枚。
 
-| solver | 有限値のセル（自由セル 1776） | 値 |
-|---|---|---|
-| reference（本家） | 1776 | 基準 |
-| frontier2d | 1776 | reference と一致 |
-| frontier2d_sparse | 1561 | 到達済みセルでも最大 20.186 s 低い |
+| index | kind | reference が解けて sparse が残すセル | 両方有限のセルでの最大差 |
+|---|---|---|---|
+| 3985 | blobs | 215 / 1776 | 20.186 s（sparse が低い） |
+| 3986 | rooms | 1813 | 0.000 s |
 
-sparse は 215 セルを未到達のまま止まる。再現用の地図とコマンドは `vi_ml/repro/` に置いた。
+index 3985 は `frontier2d` でも確認していて、`reference` と完全一致（有限セル 1776、差 0）。
+sparse を `frontier2d` の場で warm start すると `reference` と一致するので、
+足りないのは更新式ではなく**伝播**の方。再現用の地図とコマンドは `vi_ml/repro/`。
 `solvers::conformance` が通る地図では出ないので、θ マスク疎評価が依存集合の上位集合になる
 という前提が崩れる形状があると思われる。vi_ml のデータセットは sparse で作ったため、
-教師ラベルにも同じ誤りが混ざっている（到達率などの指標は cold/warm 両方に同じ基準を使っており、比較自体は有効）。
+教師ラベルにも同じ取りこぼしが混ざっている（到達率などの比較は cold/warm 双方に同じ基準を使っており、比較自体は有効）。
+
+**別の未解明点**: `frontier2d`（直列・正準）は保留 60 枚中 9 枚で 1,500 反復以内に収束せず、
+上限なしだと 64² 1 枚に 10 分以上かかる地図がある（sparse は同じ地図を 100 反復・0.1 秒台で解く）。
+`reference` は 20 枚すべて数秒で収束した。0.2 m に粗くした Tsudanuma でも `frontier2d` は 2 時間で終わらなかった。
+sparse の件とは別の現象として残しておく。
