@@ -152,6 +152,14 @@ struct Args {
     #[arg(long)]
     compact_out_dir: Option<PathBuf>,
 
+    /// Optional warm start: a value field in the `--dump-value` format (θ-min seconds,
+    /// NaN = unreachable) written into every θ of each free non-goal cell before the
+    /// solve. `seed_frontier_2d` then seeds every finite cell, so a resweep-capable
+    /// solver relaxes the given field to the fixed point instead of descending from
+    /// MAX_COST — the CNN-warm-start experiment in `vi_ml/`.
+    #[arg(long)]
+    init_value: Option<PathBuf>,
+
     /// Optional path to dump the converged value field (min over theta, seconds)
     /// as a binary `[i32 ow][i32 oh][f32 ow*oh]` (row-major `v[ix + ow*iy]`,
     /// NaN for unreachable). For map-overlay visualisation.
@@ -494,6 +502,32 @@ fn main() -> ExitCode {
             _ => {
                 // Reuse the prebuilt ValueIterator for the first solver; rebuild for the rest.
                 let mut vi = prebuilt.take().unwrap_or_else(|| build());
+                if let Some(path) = &args.init_value {
+                    let raw = std::fs::read(path).expect("read --init-value");
+                    let iw = i32::from_le_bytes(raw[0..4].try_into().unwrap());
+                    let ih = i32::from_le_bytes(raw[4..8].try_into().unwrap());
+                    assert_eq!((iw, ih), (ow, oh), "--init-value dims must match the grid");
+                    let mut seeded = 0usize;
+                    for iy in 0..oh {
+                        for ix in 0..ow {
+                            let o = 8 + 4 * (ix + ow * iy) as usize;
+                            let v = f32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
+                            if !v.is_finite() || v < 0.0 {
+                                continue;
+                            }
+                            let c = (v as f64 * PROB_BASE as f64) as u64;
+                            for it in 0..THETA_CELL_NUM {
+                                let idx = vi.to_index(ix, iy, it) as usize;
+                                let s = &mut vi.states[idx];
+                                if s.free && !s.final_state {
+                                    s.total_cost = c;
+                                    seeded += 1;
+                                }
+                            }
+                        }
+                    }
+                    eprintln!("warm start: {seeded} states seeded from {}", path.display());
+                }
                 let st = solve(&mut vi, solver, budget);
                 solved_vi = Some(vi);
                 st
