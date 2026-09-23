@@ -27,9 +27,12 @@ pub mod frontier3d;
 pub mod observe;
 pub mod original;
 pub mod pyramid;
+pub mod ordered;
 pub mod schur;
 #[cfg(feature = "cuda")]
 pub mod schur_gpu;
+#[cfg(feature = "cuda")]
+pub mod frontier_gpu;
 pub mod stack;
 pub mod stream;
 pub mod priority;
@@ -538,7 +541,7 @@ pub fn solve_observed(
             vi,
             max_iter,
             obs,
-            schur::SchurConfig { tile: tile as i32, portal_thetas: portal_thetas as i32 },
+            schur::SchurConfig { tile: tile as i32, portal_thetas: portal_thetas as i32, spacing: 16 },
         ),
     }
 }

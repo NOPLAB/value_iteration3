@@ -78,11 +78,23 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
         }
     }
 
-    // ── ジョブ = ポータルを持つタイル。watch はタイル内ローカル状態 index
-    //    (順序 = tile_portals[t] = TileEdges.portals の順)。
+    // ── VRAM 予算: 値バッファ (n_prob × dom × 8 B) が支配項。チャンクは問題数
+    //    ではなくバイト数で絞り、1 タイルの問題数が予算を超える場合は**タイル内で
+    //    問題を分割**する (t256 で 1 タイル ~数百問題 × dom 33 MB = 13 GB 超 →
+    //    WDDM が host へページングし ~30 倍遅くなる事故の根治)。watch は常に
+    //    タイルの全パッチなので、分割しても W の列 (問題 j) は完全に埋まる。
+    let dom_bytes = dom * 8;
+    let probs_cap = PROBS_PER_CHUNK.min(((2usize << 30) / dom_bytes.max(1)).max(1));
+
+    // ── ジョブ = ポータルを持つタイルの問題スライス [j0, j0+jn)。ポータルごとの
+    //    パッチ (タイル内ローカル状態 index の列、順序 = tile_portals[t] =
+    //    TileEdges.portals の順)。問題 = パッチを釘付けする 1 ポータル、
+    //    watch = タイルの全パッチ状態 (CPU `tile_edges` と同じ)。
     struct Job {
         t: usize,
-        watch: Vec<i32>,
+        patches: Vec<Vec<i32>>,
+        j0: usize,
+        jn: usize,
     }
     let mut jobs: Vec<Job> = Vec::new();
     for t in 0..art.tiles.len() {
@@ -92,14 +104,25 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
         }
         let (tx, ty) = (t as i32 % art.tnx, t as i32 / art.tnx);
         let (x0, y0) = art.domain_origin(tx, ty);
-        let watch = plist
+        let patches: Vec<Vec<i32>> = plist
             .iter()
-            .map(|&pid| {
-                let p = art.portals[pid as usize];
-                to_index_raw(p.ix - x0, p.iy - y0, p.it, side, nt)
-            })
+            .map(|&pid| art.patch_local_idx(src, x0, y0, side, art.portals[pid as usize]))
             .collect();
-        jobs.push(Job { t, watch });
+        let n = patches.len();
+        let mut j0 = 0usize;
+        while j0 < n {
+            let jn = probs_cap.min(n - j0);
+            jobs.push(Job { t, patches: patches.clone(), j0, jn });
+            j0 += jn;
+        }
+    }
+    // W を事前初期化 (分割ジョブが列単位で書き込む)。
+    for t in 0..art.tiles.len() {
+        let plist = &tile_portals[t];
+        if !plist.is_empty() {
+            let n = plist.len();
+            art.tiles[t] = TileEdges { portals: plist.clone(), w: vec![MAX_COST; n * n] };
+        }
     }
 
     let ctx = CudaContext::new(0)?;
@@ -109,6 +132,7 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
     let stream = ctx.default_stream();
     let module = ctx.load_module(compile_ptx(KERNEL_SRC)?)?;
     let k_init = module.load_function("vi_init")?;
+    let k_pin = module.load_function("vi_pin")?;
     let k_pass = module.load_function("vi_pass")?;
     let k_gather = module.load_function("vi_gather")?;
 
@@ -117,14 +141,14 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
     let cells = (side * side) as usize;
     let (nx, ny) = (src.cell_num_x, src.cell_num_y);
 
-    // ── チャンク実行: ジョブ境界で PROBS_PER_CHUNK 問題まで詰める。
+    // ── チャンク実行: ジョブ (≤ probs_cap 問題ずつに分割済み) を probs_cap まで詰める。
     let mut ji = 0usize;
     while ji < jobs.len() {
         let mut je = ji;
         let mut n_prob = 0usize;
         while je < jobs.len() {
-            let n = jobs[je].watch.len();
-            if n_prob > 0 && n_prob + n > PROBS_PER_CHUNK {
+            let n = jobs[je].jn;
+            if n_prob > 0 && n_prob + n > probs_cap {
                 break;
             }
             n_prob += n;
@@ -132,7 +156,7 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
         }
         let chunk = &jobs[ji..je];
         let n_slots = chunk.len();
-        let max_watch = chunk.iter().map(|j| j.watch.len()).max().unwrap();
+        let max_watch = chunk.iter().map(|j| j.patches.iter().map(|p| p.len()).sum::<usize>()).max().unwrap();
 
         // slot 静的データ: free/penalty は θ 不変 (`State::from_occupancy` は
         // θ を見ない) ので xy 平面だけ持つ。地図外は free=0 / pen=PROB_BASE
@@ -140,7 +164,8 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
         let mut frees = vec![0u8; n_slots * cells];
         let mut pens = vec![PROB_BASE; n_slots * cells];
         let mut prob_slot: Vec<i32> = Vec::with_capacity(n_prob);
-        let mut prob_pin: Vec<i32> = Vec::with_capacity(n_prob);
+        let mut pin_off: Vec<i32> = vec![0];
+        let mut pin_states: Vec<i32> = Vec::new();
         let mut watch_off: Vec<i32> = vec![0];
         let mut watch_states: Vec<i32> = Vec::new();
         for (slot, job) in chunk.iter().enumerate() {
@@ -158,18 +183,22 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
                     }
                 }
             }
-            watch_states.extend_from_slice(&job.watch);
+            for patch in &job.patches {
+                watch_states.extend_from_slice(patch);
+            }
             watch_off.push(watch_states.len() as i32);
-            for &pin in &job.watch {
+            for patch in &job.patches[job.j0..job.j0 + job.jn] {
                 prob_slot.push(slot as i32);
-                prob_pin.push(pin);
+                pin_states.extend_from_slice(patch);
+                pin_off.push(pin_states.len() as i32);
             }
         }
 
         let d_frees = stream.clone_htod(&frees)?;
         let d_pens = stream.clone_htod(&pens)?;
         let d_pslot = stream.clone_htod(&prob_slot)?;
-        let d_ppin = stream.clone_htod(&prob_pin)?;
+        let d_poff = stream.clone_htod(&pin_off)?;
+        let d_pst = stream.clone_htod(&pin_states)?;
         let d_woff = stream.clone_htod(&watch_off)?;
         let d_wst = stream.clone_htod(&watch_states)?;
         let mut d_values = stream.alloc_zeros::<u64>(n_prob * dom)?;
@@ -188,8 +217,19 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
                 shared_mem_bytes: 0,
             };
             let mut lb = stream.launch_builder(&k_init);
-            lb.arg(&total).arg(&dom_i).arg(&d_ppin).arg(&mut d_values);
+            lb.arg(&total).arg(&dom_i).arg(&mut d_values);
             unsafe { lb.launch(cfg) }?;
+            // 釘付け: 問題ごとのパッチ状態を 0 に。
+            let npin = pin_states.len() as i64;
+            let cfg2 = LaunchConfig {
+                grid_dim: (((npin as u64).div_ceil(BLOCK as u64)) as u32, 1, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let nprob_i = n_prob as i32;
+            let mut lb = stream.launch_builder(&k_pin);
+            lb.arg(&npin).arg(&nprob_i).arg(&dom_i).arg(&d_poff).arg(&d_pst).arg(&mut d_values);
+            unsafe { lb.launch(cfg2) }?;
         }
 
         // パスループ (ホスト側)。停止則は CPU `solve_gs` の watch 方式の移植:
@@ -204,13 +244,20 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
         let gtotal = (n_prob * max_watch) as i64;
         let mw_i = max_watch as i32;
         let gbx = ((gtotal as u64).div_ceil(BLOCK as u64)) as u32;
-        // prev の初期値 = init 直後の clamp 値: 問題 j の pin (= watch[j]) が 0、他は MAX。
+        // prev の初期値 = init 直後の clamp 値: 問題 j の pin パッチ (watch 内の
+        // 当該区間) が 0、他は MAX。
         let mut prev = vec![MAX_COST; n_prob * max_watch];
         {
             let mut pi = 0usize;
             for job in chunk {
-                for j in 0..job.watch.len() {
-                    prev[pi * max_watch + j] = 0;
+                let mut k_off = vec![0usize];
+                for patch in &job.patches {
+                    k_off.push(k_off.last().unwrap() + patch.len());
+                }
+                for jj in 0..job.jn {
+                    for k in k_off[job.j0 + jj]..k_off[job.j0 + jj + 1] {
+                        prev[pi * max_watch + k] = 0;
+                    }
                     pi += 1;
                 }
             }
@@ -239,7 +286,6 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
                 .arg(&d_frees)
                 .arg(&d_pens)
                 .arg(&d_pslot)
-                .arg(&d_ppin)
                 .arg(&d_done)
                 .arg(&mut d_values)
                 .arg(&mut d_maxreal);
@@ -279,8 +325,8 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
             let mut changed = false;
             let mut pi = 0usize;
             for job in chunk {
-                let n = job.watch.len();
-                for _ in 0..n {
+                let n: usize = job.patches.iter().map(|p| p.len()).sum();
+                for _ in 0..job.jn {
                     let p = pi;
                     pi += 1;
                     if done[p] == 1 {
@@ -322,17 +368,44 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
                 t_chunk.elapsed().as_secs_f64() * 1e3
             );
         }
+        // W[i][j] = パッチ i の最悪状態から パッチ j への初到達コスト (CPU `patch_max`)。
+        let agg = crate::solvers::schur::patch_agg();
         let mut pbase = 0usize;
         for job in chunk {
-            let n = job.watch.len();
-            let mut w = vec![MAX_COST; n * n];
-            for j in 0..n {
+            let n = job.patches.len();
+            let w = &mut art.tiles[job.t].w;
+            let mut k_off: Vec<usize> = vec![0];
+            for patch in &job.patches {
+                k_off.push(k_off.last().unwrap() + patch.len());
+            }
+            for jj in 0..job.jn {
+                let j = job.j0 + jj;
                 for i in 0..n {
-                    w[i * n + j] = wout[(pbase + j) * max_watch + i];
+                    if i == j {
+                        w[i * n + j] = 0;
+                        continue;
+                    }
+                    let row = &wout[(pbase + jj) * max_watch..];
+                    let mut mx = 0u64;
+                    let (mut sum, mut cnt) = (0u128, 0u64);
+                    let mut any = false;
+                    for k in k_off[i]..k_off[i + 1] {
+                        any = true;
+                        mx = mx.max(row[k]); // gather 済み = clamp 済み
+                        if row[k] < MAX_COST {
+                            sum += row[k] as u128;
+                            cnt += 1;
+                        }
+                    }
+                    w[i * n + j] = match (any, agg) {
+                        (false, _) => MAX_COST,
+                        (true, crate::solvers::schur::PatchAgg::Mean) => if cnt > 0 { (sum / cnt as u128) as u64 } else { MAX_COST },
+                        (true, crate::solvers::schur::PatchAgg::Center) => row[k_off[i]], // パッチ列挙の先頭は中心ではないが近似
+                        (true, _) => mx,
+                    };
                 }
             }
-            art.tiles[job.t] = TileEdges { portals: tile_portals[job.t].clone(), w };
-            pbase += n;
+            pbase += job.jn;
         }
         ji = je;
     }

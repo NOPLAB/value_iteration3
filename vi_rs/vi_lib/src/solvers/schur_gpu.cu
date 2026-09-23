@@ -16,15 +16,29 @@ __device__ __forceinline__ u64 clamp_unreached(u64 v) {
     return v >= REACH_THRESH ? MAX_COST : v;
 }
 
-/* 値バッファ初期化: 全状態 TILE_INIT、pin (釘付けポータル) のみ 0。 */
-extern "C" __global__ void vi_init(long long total, int dom,
-                                   const int* __restrict__ prob_pin,
-                                   u64* values) {
+/* 値バッファ初期化: 全状態 TILE_INIT。釘付けは vi_pin が 0 を書く。 */
+extern "C" __global__ void vi_init(long long total, int dom, u64* values) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
-    int p = (int)(i / dom);
-    int off = (int)(i % dom);
-    values[i] = (off == prob_pin[p]) ? 0ULL : TILE_INIT;
+    values[i] = TILE_INIT;
+}
+
+/* 釘付け: 問題 p のパッチ状態 pin_states[pin_off[p]..pin_off[p+1]] を 0 に。
+   タイル内で値 0 を取るのは釘だけ (1 歩 ≥ 1 s) なので、vi_pass は V==0 を
+   釘として飛ばす。 */
+extern "C" __global__ void vi_pin(long long npin, int n_prob, int dom,
+                                  const int* __restrict__ pin_off,
+                                  const int* __restrict__ pin_states,
+                                  u64* values) {
+    long long k = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= npin) return;
+    /* k が属する問題 p を pin_off から二分探索 */
+    int lo = 0, hi = n_prob;
+    while (hi - lo > 1) {
+        int mid = (lo + hi) / 2;
+        if (pin_off[mid] <= k) lo = mid; else hi = mid;
+    }
+    values[(long long)lo * dom + pin_states[k]] = 0ULL;
 }
 
 /* 1 パス: 問題 p = blockIdx.y の全セルを並列 in-place 更新 (chaotic
@@ -45,7 +59,6 @@ extern "C" __global__ void vi_pass(int side, int nt, int dom, int n_actions,
                                    const u8* __restrict__ frees,
                                    const u64* __restrict__ pens,
                                    const int* __restrict__ prob_slot,
-                                   const int* __restrict__ prob_pin,
                                    const u8* __restrict__ done,
                                    u64* values,
                                    u64* max_real) {
@@ -63,7 +76,7 @@ extern "C" __global__ void vi_pass(int side, int nt, int dom, int n_actions,
     int r = i / nt;
     int ix = r % side;
     int iy = r / side;
-    if (!fr[iy * side + ix] || i == prob_pin[p]) return;
+    if (!fr[iy * side + ix] || V[i] == 0ULL) return; /* 非 free / 釘 (パッチ) */
 
     u64 before = clamp_unreached(V[i]);
     u64 best = MAX_COST;

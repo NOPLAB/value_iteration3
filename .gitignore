@@ -22,3 +22,6 @@ __pycache__/
 
 # 実験出力 (bench_map --compact-out-dir などの再生成可能物)
 /out/
+
+# schur_bench / schur_demo の実験出力
+/vi_rs/*_out/

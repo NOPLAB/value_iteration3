@@ -34,7 +34,9 @@ use vi_bench::params::{canonical_actions, N_THETA};
 use vi_bench::pgm;
 use vi_lib::params::{MAX_COST, PROB_BASE};
 use vi_lib::planner::rollout_path_on;
-use vi_lib::solvers::schur::{build, portal_costs, upper_bound_field, SchurArtifact, SchurConfig};
+use vi_lib::solvers::schur::{
+    build, fix_portal_actions, materialize_many, portal_costs, SchurArtifact, SchurConfig,
+};
 use vi_lib::solvers::{solve, U64Solver, REACH_THRESH as REACH};
 use vi_lib::{OccupancyGrid, Quaternion, State, ValueIterator};
 
@@ -46,8 +48,11 @@ struct Args {
     map: Option<PathBuf>,
     #[arg(long, default_value_t = 2)]
     scale: usize,
-    #[arg(long, default_value_t = 32)]
-    tile: i32,
+    /// 提供するタイル一辺の候補 (カンマ区切り)。キャッシュ済み成果物があるものだけ
+    /// ドロップダウンに載る (無いものはスキップ。大きい地図の成果物は schur_bench
+    /// --gpu で作ってから)。1 つも無ければ先頭のタイルを CPU ビルドする。
+    #[arg(long, default_value = "32,48,64,96,128,192,256")]
+    tiles: String,
     #[arg(long, default_value_t = 8)]
     thetas: i32,
     #[arg(long, default_value_t = 0.2)]
@@ -117,16 +122,95 @@ fn snap_to_free(occ: &[i8], w: i32, h: i32, gx: i32, gy: i32, max_r: i32) -> Opt
 
 struct Demo {
     vi: ValueIterator,
-    art: SchurArtifact,
+    /// タイル一辺 → 成果物。`cur` が選択中。
+    arts: std::collections::BTreeMap<i32, SchurArtifact>,
+    cur: i32,
     grid: OccupancyGrid,
     goal: Option<(i32, i32)>,
     d: Option<Vec<u64>>,
+    /// ゴール確定時に立てた実 final (materialize_one が釘に使う)。
+    finals: Vec<(i32, i32, i32)>,
+    /// 未復元タイル (末尾 = 次 = ゴールに近い順)。
+    pending: Vec<i32>,
+    total: usize,
+    /// ゴール/タイル切替の世代。古い /field_step を弾く。
+    gen: u64,
     /// 全場 V̂ が組み上がっているか / さらに厳密化済みか。
     materialized: bool,
     exact: bool,
 }
 
 impl Demo {
+    fn art(&self) -> &SchurArtifact {
+        &self.arts[&self.cur]
+    }
+
+    /// ゴール確定/タイル切替の共通経路: set_goal → Dijkstra → タイル粒度の粗勾配 JSON。
+    fn run_goal(&mut self, gx: i32, gy: i32) -> String {
+        let (wx, wy) = self.world_of(gx, gy);
+        let t0 = Instant::now();
+        self.vi.set_goal(wx, wy, 90);
+        let dd = portal_costs(&self.vi, &self.arts[&self.cur]);
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        let art = self.art();
+        let mut coarse = vec![-1.0f64; art.tiles.len()];
+        for (t, e) in art.tiles.iter().enumerate() {
+            let m = e.portals.iter().map(|&p| dd[p as usize]).min().unwrap_or(MAX_COST);
+            if m < REACH {
+                coarse[t] = m as f64 / PROB_BASE as f64;
+            }
+        }
+        let json = format!(
+            "{{\"ms\":{ms:.1},\"gx\":{gx},\"gy\":{gy},\"tile\":{},\"tnx\":{},\"tny\":{},\"coarse\":[{}]}}",
+            art.tile,
+            art.tnx,
+            art.tny,
+            coarse
+                .iter()
+                .map(|v| if *v < 0.0 { "-1".to_string() } else { format!("{v:.1}") })
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        // 復元キュー: ポータル D の最小が小さい (= ゴールに近い) タイルから。
+        // ポータルが全滅でも実 final を含むタイルは先頭 (ゴールタイル自身)。
+        let finals: Vec<(i32, i32, i32)> = self
+            .vi
+            .states
+            .iter()
+            .filter(|s| s.final_state)
+            .map(|s| (s.ix, s.iy, s.it))
+            .collect();
+        let art = &self.arts[&self.cur];
+        let side = art.tile + 2 * art.halo;
+        let mut keyed: Vec<(u64, i32)> = Vec::new();
+        for t in 0..art.tiles.len() as i32 {
+            let e = &art.tiles[t as usize];
+            let mut k = e.portals.iter().map(|&p| dd[p as usize]).min().unwrap_or(MAX_COST);
+            if k >= MAX_COST {
+                let (tx, ty) = (t % art.tnx, t / art.tnx);
+                let (x0, y0) = (tx * art.tile - art.halo, ty * art.tile - art.halo);
+                if finals
+                    .iter()
+                    .any(|&(fx, fy, _)| fx >= x0 && fx < x0 + side && fy >= y0 && fy < y0 + side)
+                {
+                    k = 0;
+                }
+            }
+            if k < MAX_COST {
+                keyed.push((k, t));
+            }
+        }
+        keyed.sort();
+        self.pending = keyed.into_iter().map(|(_, t)| t).rev().collect(); // pop() = 近い順
+        self.total = self.pending.len();
+        self.finals = finals;
+        self.gen += 1;
+        self.d = Some(dd);
+        self.goal = Some((gx, gy));
+        self.materialized = false;
+        self.exact = false;
+        format!("{{\"gen\":{},\"total\":{},{}", self.gen, self.total, &json[1..])
+    }
     fn world_of(&self, ix: i32, iy: i32) -> (f64, f64) {
         (
             self.grid.origin_x + (ix as f64 + 0.5) * self.grid.resolution,
@@ -179,31 +263,50 @@ fn main() {
     vi.set_map_geometry_no_states(&grid, N_THETA, goal_radius_m, 15);
     vi.states = build_states(&grid, N_THETA, args.safety_radius_m, args.safety_penalty);
 
-    let art_path = args.out.join(format!(
-        "schur_demo_{}_s{}_t{}_h{}.bin",
-        map_path.file_stem().and_then(|s| s.to_str()).unwrap_or("map"),
-        args.scale,
-        args.tile,
-        args.thetas
-    ));
-    let art = if art_path.exists() {
-        eprintln!("loading artifact: {}", art_path.display());
-        SchurArtifact::load(&art_path).expect("load artifact")
-    } else {
-        eprintln!("building artifact (1 回だけ、次回からキャッシュ) ...");
+    let stem = map_path.file_stem().and_then(|s| s.to_str()).unwrap_or("map").to_string();
+    let tile_list: Vec<i32> = args.tiles.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+    let mut arts: std::collections::BTreeMap<i32, SchurArtifact> = std::collections::BTreeMap::new();
+    for &t in &tile_list {
+        let path = args.out.join(format!("schur_demo_{stem}_s{}_t{t}_h{}.bin", args.scale, args.thetas));
+        if path.exists() {
+            let a = SchurArtifact::load(&path).expect("load artifact");
+            if (a.nx, a.ny) != (ow, oh) {
+                eprintln!("skip tile {t}: 成果物の格子 {}x{} が地図 {ow}x{oh} と不一致", a.nx, a.ny);
+                continue;
+            }
+            eprintln!("tile {t}: loaded {} ({} portals, {:.1} MB)", path.display(), a.portals.len(), a.size_bytes() as f64 / 1e6);
+            arts.insert(t, a);
+        } else {
+            eprintln!("tile {t}: 成果物なし ({}) — スキップ", path.display());
+        }
+    }
+    if arts.is_empty() {
+        let t = *tile_list.first().expect("--tiles が空");
+        eprintln!("成果物が 1 つも無いので tile {t} を CPU ビルド (1 回だけ、次回からキャッシュ) ...");
         let t0 = Instant::now();
-        let a = build(&vi, &SchurConfig { tile: args.tile, portal_thetas: args.thetas });
+        let a = build(&vi, &SchurConfig { tile: t, portal_thetas: args.thetas, spacing: 16 });
         eprintln!("artifact built in {:.1} s ({} portals)", t0.elapsed().as_secs_f64(), a.portals.len());
-        a.save(&art_path).expect("save artifact");
-        a
-    };
-    eprintln!(
-        "ready: {} portals, artifact {:.2} MB",
-        art.portals.len(),
-        art.size_bytes() as f64 / 1e6
-    );
+        a.save(&args.out.join(format!("schur_demo_{stem}_s{}_t{t}_h{}.bin", args.scale, args.thetas)))
+            .expect("save artifact");
+        arts.insert(t, a);
+    }
+    let cur = *arts.keys().next().unwrap();
+    eprintln!("ready: tiles {:?}, 選択中 {cur}", arts.keys().collect::<Vec<_>>());
 
-    let demo = Mutex::new(Demo { vi, art, grid, goal: None, d: None, materialized: false, exact: false });
+    let demo = Mutex::new(Demo {
+        vi,
+        arts,
+        cur,
+        grid,
+        goal: None,
+        d: None,
+        finals: Vec::new(),
+        pending: Vec::new(),
+        total: 0,
+        gen: 0,
+        materialized: false,
+        exact: false,
+    });
 
     let listener = TcpListener::bind(("127.0.0.1", args.port)).expect("bind");
     eprintln!("open http://127.0.0.1:{}/  (右クリック=ゴール, 左クリック=スタート, ドラッグ=パン, ホイール=ズーム)", args.port);
@@ -240,7 +343,7 @@ fn handle(mut stream: TcpStream, demo: &Mutex<Demo>) -> std::io::Result<()> {
             let d = demo.lock().unwrap();
             let portals: Vec<String> = {
                 let mut seen = std::collections::HashSet::new();
-                d.art
+                d.art()
                     .portals
                     .iter()
                     .filter(|p| seen.insert((p.ix, p.iy)))
@@ -248,13 +351,14 @@ fn handle(mut stream: TcpStream, demo: &Mutex<Demo>) -> std::io::Result<()> {
                     .collect()
             };
             let json = format!(
-                "{{\"w\":{},\"h\":{},\"res\":{},\"tile\":{},\"tnx\":{},\"tny\":{},\"portals\":[{}]}}",
+                "{{\"w\":{},\"h\":{},\"res\":{},\"tile\":{},\"tnx\":{},\"tny\":{},\"tiles\":[{}],\"portals\":[{}]}}",
                 d.grid.width,
                 d.grid.height,
                 d.grid.resolution,
-                d.art.tile,
-                d.art.tnx,
-                d.art.tny,
+                d.art().tile,
+                d.art().tnx,
+                d.art().tny,
+                d.arts.keys().map(|t| t.to_string()).collect::<Vec<_>>().join(","),
                 portals.join(",")
             );
             respond(&mut stream, "application/json", json.as_bytes())
@@ -273,47 +377,69 @@ fn handle(mut stream: TcpStream, demo: &Mutex<Demo>) -> std::io::Result<()> {
             else {
                 return respond(&mut stream, "application/json", b"{\"err\":\"no free cell near goal\"}");
             };
-            let (wx, wy) = d.world_of(gx, gy);
-            let t0 = Instant::now();
-            d.vi.set_goal(wx, wy, 90);
-            let dd = portal_costs(&d.vi, &d.art);
-            let ms = t0.elapsed().as_secs_f64() * 1e3;
-            let mut coarse = vec![-1.0f64; d.art.tiles.len()];
-            for (t, e) in d.art.tiles.iter().enumerate() {
-                let m = e.portals.iter().map(|&p| dd[p as usize]).min().unwrap_or(MAX_COST);
-                if m < REACH {
-                    coarse[t] = m as f64 / PROB_BASE as f64;
-                }
-            }
-            d.d = Some(dd);
-            d.goal = Some((gx, gy));
-            d.materialized = false;
-            d.exact = false;
-            let json = format!(
-                "{{\"ms\":{ms:.1},\"gx\":{gx},\"gy\":{gy},\"coarse\":[{}]}}",
-                coarse
-                    .iter()
-                    .map(|v| if *v < 0.0 { "-1".to_string() } else { format!("{v:.1}") })
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
+            let json = d.run_goal(gx, gy);
             respond(&mut stream, "application/json", json.as_bytes())
         }
-        // 全場 V̂ (上界) を組み上げて min-over-θ を返す。
-        "/field" => {
+        // タイル切替: ゴールが立っていれば新しい成果物で粗勾配から取り直す。
+        "/tile" => {
+            let t = q("t").unwrap_or(0.0) as i32;
             let mut d = demo.lock().unwrap();
+            if !d.arts.contains_key(&t) {
+                return respond(&mut stream, "application/json", b"{\"err\":\"unknown tile\"}");
+            }
+            d.cur = t;
+            d.materialized = false;
+            d.exact = false;
+            let json = if let Some((gx, gy)) = d.goal {
+                d.run_goal(gx, gy)
+            } else {
+                let art = d.art();
+                format!("{{\"tile\":{},\"tnx\":{},\"tny\":{}}}", art.tile, art.tnx, art.tny)
+            };
+            respond(&mut stream, "application/json", json.as_bytes())
+        }
+        // 現在場のスナップショット (min-over-θ)。復元は /field_step が進める。
+        "/field" => {
+            let d = demo.lock().unwrap();
             if d.goal.is_none() {
                 return respond(&mut stream, "application/json", b"{\"err\":\"set goal first\"}");
             }
             let t0 = Instant::now();
-            if !d.materialized {
-                let Demo { vi, art, .. } = &mut *d;
-                upper_bound_field(vi, art);
-                d.materialized = true;
-            }
-            let ms = t0.elapsed().as_secs_f64() * 1e3;
-            let bytes = d.field_bytes(ms);
+            let bytes = d.field_bytes(t0.elapsed().as_secs_f64() * 1e3);
             respond(&mut stream, "application/octet-stream", &bytes)
+        }
+        // 漸進復元: ~0.4 s ぶんゴールに近いタイルから materialize して進捗を返す。
+        "/field_step" => {
+            let gen = q("gen").unwrap_or(-1.0) as u64;
+            let mut dm = demo.lock().unwrap();
+            if dm.goal.is_none() || gen != dm.gen {
+                return respond(&mut stream, "application/json", b"{\"err\":\"stale\"}");
+            }
+            let t0 = Instant::now();
+            let cur = dm.cur;
+            // ゴールに近い側から 1 バッチをスレッド並列で復元 (~0.1-0.5 s)。
+            const BATCH: usize = 48;
+            let take = BATCH.min(dm.pending.len());
+            let cut = dm.pending.len() - take;
+            let batch: Vec<i32> = dm.pending.split_off(cut);
+            let n = batch.len();
+            {
+                let Demo { vi, arts, d: dd, finals, .. } = &mut *dm;
+                materialize_many(vi, &arts[&cur], dd.as_ref().unwrap(), finals, &batch);
+            }
+            if dm.pending.is_empty() && !dm.materialized {
+                dm.materialized = true;
+                let Demo { vi, arts, .. } = &mut *dm;
+                fix_portal_actions(vi, &arts[&cur]);
+            }
+            let done = dm.total - dm.pending.len();
+            let json = format!(
+                "{{\"done\":{done},\"total\":{},\"finished\":{},\"ms\":{:.1},\"n\":{n}}}",
+                dm.total,
+                dm.materialized,
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+            respond(&mut stream, "application/json", json.as_bytes())
         }
         // V̂ 温間の exactify → 厳密場 (収束した Bellman 固定点) を返す。
         "/exact" => {
@@ -336,7 +462,7 @@ fn handle(mut stream: TcpStream, demo: &Mutex<Demo>) -> std::io::Result<()> {
         // スタート確定: 現在の場の greedy rollout → セル座標の折れ線。
         "/path" => {
             let d = demo.lock().unwrap();
-            if !d.materialized {
+            if d.goal.is_none() || d.total == d.pending.len() {
                 return respond(&mut stream, "application/json", b"{\"err\":\"field not ready\"}");
             }
             let (ix, iy) = (q("x").unwrap_or(0.0) as i32, q("y").unwrap_or(0.0) as i32);
@@ -405,13 +531,16 @@ html,body{margin:0;height:100%;background:#17181b;color:#ecebe6;font-family:"IBM
 .badge{font-family:ui-monospace,monospace;background:#24262b;border-radius:6px;padding:2px 8px;white-space:nowrap}
 .badge.on{background:#1d2f28;color:#35c08d}
 canvas{display:block;cursor:crosshair}
-select{background:#24262b;color:#ecebe6;border:1px solid #33363c;border-radius:6px;padding:2px 6px}
+select,button{background:#24262b;color:#ecebe6;border:1px solid #33363c;border-radius:6px;padding:2px 6px;font-size:13px}
+button{cursor:pointer}button:hover{background:#2c2f35}button:disabled{color:#5c6068;cursor:default}
 .hint{color:#a8acb4}
 #stage{font-weight:700}
 </style></head><body>
 <div id="bar">
   <span><b>SchurPortal</b> デモ</span>
   <span class="hint">右クリック=ゴール / 左クリック=スタート / ドラッグ=パン / ホイール=ズーム</span>
+  <label>tile <select id="tile"></select></label>
+  <button id="ex" disabled>厳密化</button>
   <label>開始方位 <select id="th"><option>0</option><option>45</option><option selected>90</option><option>135</option><option>180</option><option>225</option><option>270</option><option>315</option></select>°</label>
   <span class="badge" id="t_dij">Dijkstra: –</span>
   <span class="badge" id="t_field">V̂ 上界: –</span>
@@ -487,31 +616,77 @@ function cellOf(ev){
   return [ix,iy];
 }
 
-async function setGoal(ix,iy){
-  const M=document.getElementById('msg');
-  M.textContent='Dijkstra...';
-  const j=await (await fetch(`/goal?x=${ix}&y=${iy}`)).json();
-  if(j.err){M.textContent=j.err;return;}
-  goal=[j.gx,j.gy]; coarse=j.coarse; field=null; path=null; start=null; stage='粗 (タイル粒度)';
+const M=()=>document.getElementById('msg');
+function applyCoarse(j){
+  goal=[j.gx,j.gy]; coarse=j.coarse; field=null; path=null; stage='粗 (タイル粒度)';
   document.getElementById('t_dij').textContent=`Dijkstra: ${j.ms} ms`;
   document.getElementById('t_field').textContent='V̂ 上界: ...';
   document.getElementById('t_exact').textContent='厳密化: –';
-  M.textContent='粗い勾配を表示中 — 全場 V̂ を復元しています...';
+  document.getElementById('ex').disabled=true;
   renderRaster();
-  let buf=await (await fetch('/field')).arrayBuffer();
-  let f32=new Float32Array(buf);
-  document.getElementById('t_field').textContent=`V̂ 上界: ${(f32[0]/1000).toFixed(1)} s`;
-  field=f32.subarray(1); stage='V̂ (上界)';
-  M.textContent='V̂ を表示中 — 厳密化しています... (スタートはもう置けます)';
-  renderRaster();
-  buf=await (await fetch('/exact')).arrayBuffer();
-  if(buf.byteLength<100){M.textContent='exactify error';return;}
-  f32=new Float32Array(buf);
+}
+async function snapField(){
+  const buf=await (await fetch('/field')).arrayBuffer();
+  if(buf.byteLength<100)return;
+  field=new Float32Array(buf).subarray(1);
+}
+let pumpToken=0;
+async function pumpField(g){
+  const my=++pumpToken;
+  let k=0, tsum=0;
+  M().textContent='粗い勾配を表示中 — ゴールに近いタイルから V̂ を復元中...';
+  while(true){
+    if(my!==pumpToken)return;
+    const j=await (await fetch(`/field_step?gen=${g}`)).json();
+    if(j.err||my!==pumpToken)return;
+    tsum+=j.ms;
+    document.getElementById('t_field').textContent=
+      `V̂ 上界: ${Math.round(100*j.done/j.total)}% (${(tsum/1000).toFixed(1)} s)`;
+    if(++k%3===0||j.finished){
+      await snapField();
+      if(my!==pumpToken)return;
+      stage=j.finished?'V̂ (上界)':`V̂ 復元中 ${j.done}/${j.total}`;
+      renderRaster();
+    }
+    if(j.finished){
+      document.getElementById('ex').disabled=false;
+      M().textContent='V̂ (上界) 完了 — 「厳密化」ボタンで固定点へ。左クリックでスタート設置 (復元中でも可)';
+      if(start){ setStart(start[0], start[1]); }
+      return;
+    }
+  }
+}
+async function setGoal(ix,iy){
+  M().textContent='Dijkstra...';
+  const j=await (await fetch(`/goal?x=${ix}&y=${iy}`)).json();
+  if(j.err){M().textContent=j.err;return;}
+  start=null;
+  applyCoarse(j);
+  pumpField(j.gen);
+}
+async function doExact(){
+  if(!field){M().textContent='先にゴールを置いてください';return;}
+  const b=document.getElementById('ex'); b.disabled=true;
+  M().textContent='厳密化中... (V̂ 温間の frontier exactify)';
+  const buf=await (await fetch('/exact')).arrayBuffer();
+  if(buf.byteLength<100){M().textContent='exactify error';b.disabled=false;return;}
+  const f32=new Float32Array(buf);
   document.getElementById('t_exact').textContent=`厳密化: ${(f32[0]/1000).toFixed(1)} s`;
   field=f32.subarray(1); stage='厳密 (収束固定点)';
-  M.textContent='厳密場を表示中 — 左クリックでスタートを置くと経路が出ます';
+  M().textContent='厳密場を表示中';
   renderRaster();
-  if(path && start){ setStart(start[0], start[1]); }
+  if(start){ setStart(start[0], start[1]); }
+}
+async function setTile(t){
+  M().textContent=`tile ${t} に切替中...`;
+  const j=await (await fetch(`/tile?t=${t}`)).json();
+  if(j.err){M().textContent=j.err;return;}
+  meta.tile=j.tile; meta.tnx=j.tnx; meta.tny=j.tny;
+  document.getElementById('t_exact').textContent='厳密化: –';
+  document.getElementById('ex').disabled=true;
+  if(j.coarse){ applyCoarse(j); pumpField(j.gen); }
+  else { coarse=null; field=null; path=null; stage='なし';
+         M().textContent=`tile ${t} — 右クリックでゴールを置いてください`; renderRaster(); }
 }
 
 async function setStart(ix,iy){
@@ -546,8 +721,12 @@ cv.addEventListener('wheel',ev=>{ev.preventDefault();
   view.s=ns; draw();},{passive:false});
 window.addEventListener('resize',draw);
 
+document.getElementById('ex').addEventListener('click',doExact);
 (async()=>{
   meta=await (await fetch('/meta')).json();
+  const ts=document.getElementById('tile');
+  meta.tiles.forEach(t=>{const o=document.createElement('option');o.textContent=t;o.selected=(t===meta.tile);ts.appendChild(o);});
+  ts.addEventListener('change',()=>setTile(parseInt(ts.value)));
   mapbits=new Uint8Array(await (await fetch('/map')).arrayBuffer());
   const availH=window.innerHeight-document.getElementById('bar').offsetHeight;
   view.s=Math.min(window.innerWidth/meta.w, availH/meta.h)*0.97;

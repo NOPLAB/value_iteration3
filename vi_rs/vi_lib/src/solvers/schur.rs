@@ -14,6 +14,19 @@
 //! 全ポータルの `D(p)`、(3) 各タイルはポータルを `total_cost = D(p)` で final
 //! 釘付けしたミニ VI で復元、の 3 段。
 //!
+//! # ポータルは「パッチ」である (2026-08-21 の実測)
+//!
+//! 単一状態 (x,y,θ) を釘付けして w を測ると、そこへ**正確に当てる**コストが確率遷移の
+//! 取り直し (着地が 2〜3 セルに割れ、外れたら戻ってやり直す) で数倍に膨れる:
+//! 1 歩手前で 4.3 s (正味 1.0 s)、横 1 セルずれから 12.2 s。1 ポータル通過ごとに
+//! 3〜8 s 上乗せされ、house で gap 142% / tsudanuma s3 で 55% — θ 数・間隔とは
+//! 無関係だった。そこでポータルは**着地フットプリント大のパッチ**
+//! ([`PATCH_R`] セル × [`PATCH_T`] θ ビンの近傍) として扱う:
+//! `w(P→Q)` = P の**最悪**状態から Q の**どれか**に初到達する最小コスト、`D(Q)` は
+//! Q の全状態の値の上界。帰納: p∈P について V(p) ≤ cost(p→Q) + max_{q∈Q} V(q)
+//! ≤ w(P→Q) + D(Q)。復元はパッチ全状態を D(Q) で釘付けするので、各釘 ≥ 真値 =
+//! 上界のまま。パッチ内の真値のばらつき (~1 セル分の移動) だけが残る緩みになる。
+//!
 //! # 上界性 (証明スケッチ)
 //!
 //! 遷移確率は正確に `2^18 = PROB_BASE` に和が合うので、打ち切り Bellman 作用素は
@@ -45,11 +58,28 @@ use crate::params::{MAX_COST, PROB_BASE};
 use crate::solvers::observe::{BoundaryPacer, InPlaceProbe, SolveFlow, SolveObserver, SolveOutcome};
 use crate::solvers::{displacement, frontier2d::frontier2d_solve_observed, Bitboard2D, REACH_THRESH};
 use crate::state::State;
-use crate::value_iterator::{to_index_raw, value_iteration_raw, ValueIterator};
+use crate::value_iterator::{min_action_cost, to_index_raw, value_iteration_raw, ValueIterator};
 
-/// 界面 1 本の free 連結区間内でのポータル間隔 [セル]。
-// ponytail: 固定間隔 — 地図ごとの調整が要るなら SchurConfig へ昇格。
-const PORTAL_SPACING: i32 = 16;
+/// ポータルパッチの xy 半径 [セル]。1 歩の着地の広がり (サブセル補間で ±1 セル)。
+const PATCH_R: i32 = 1;
+/// ポータルパッチの θ 半径 [ビン]。回転量 (20°) は θ ビン (6°) の整数倍でないので、
+/// 特定のビンに正確に収まるには取り直しが要る (同セルで 1 ビンずれから 10.6 s、
+/// 斜め 45° 6 セルから 1θ パッチで 8.5 s → 3θ で 2.6 s)。±1 ビンで着地の広がりを覆う。
+const PATCH_T: i32 = 1;
+/// パッチ値の集約 (診断スイッチ、既定 Max が唯一の上界)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PatchAgg {
+    Max,
+    Center,
+    Mean,
+}
+pub(crate) fn patch_agg() -> PatchAgg {
+    match std::env::var("VI_SCHUR_PATCH_AGG").as_deref() {
+        Ok("center") => PatchAgg::Center,
+        Ok("mean") => PatchAgg::Mean,
+        _ => PatchAgg::Max,
+    }
+}
 /// タイル GS パス数の上限。wrap なし ([`TILE_INIT`]) の GS は単調降下なので
 /// 通常 5〜20 パスで安定する — それを大きく超える遅い尾は早期打ち切り
 /// (残る値は下降途中 = 上界なので健全)。
@@ -88,11 +118,14 @@ pub struct SchurConfig {
     pub tile: i32,
     /// ポータル 1 xy あたりの heading 数 (θ ビンから等間隔に採る)。
     pub portal_thetas: i32,
+    /// 界面 1 本の free 連結区間内でのポータル間隔 [セル]。通過行列はタイルあたり
+    /// ポータル数の 2 乗なので、成果物サイズは (tile/spacing × portal_thetas)² に比例する。
+    pub spacing: i32,
 }
 
 impl Default for SchurConfig {
     fn default() -> Self {
-        Self { tile: 32, portal_thetas: 8 }
+        Self { tile: 32, portal_thetas: 8, spacing: 16 }
     }
 }
 
@@ -139,6 +172,41 @@ impl SchurArtifact {
     #[inline]
     pub(crate) fn side(&self) -> i32 {
         self.tile + 2 * self.halo
+    }
+
+    /// ポータル `p` のパッチ状態 (グローバル座標) を列挙する。地図外は除く
+    /// (free 判定は呼び手が行う)。
+    pub(crate) fn patch_states(&self, p: Portal) -> impl Iterator<Item = (i32, i32, i32)> + '_ {
+        let nt = self.nt;
+        (-PATCH_R..=PATCH_R).flat_map(move |dy| {
+            (-PATCH_R..=PATCH_R).flat_map(move |dx| {
+                (-PATCH_T..=PATCH_T).filter_map(move |dt| {
+                    let (gx, gy) = (p.ix + dx, p.iy + dy);
+                    if gx < 0 || gx >= self.nx || gy < 0 || gy >= self.ny {
+                        return None;
+                    }
+                    Some((gx, gy, (p.it + dt).rem_euclid(nt)))
+                })
+            })
+        })
+    }
+
+    /// ポータル `p` のパッチ状態を、左下 `(x0,y0)`・一辺 `side` の領域のローカル
+    /// 状態 index で列挙する (free かつ領域内のみ)。CPU/GPU ビルダー共有。
+    pub(crate) fn patch_local_idx(&self, src: &ValueIterator, x0: i32, y0: i32, side: i32, p: Portal) -> Vec<i32> {
+        let nt = self.nt;
+        let mut out = Vec::new();
+        for (gx, gy, it) in self.patch_states(p) {
+            let (lx, ly) = (gx - x0, gy - y0);
+            if lx < 0 || lx >= side || ly < 0 || ly >= side {
+                continue;
+            }
+            if !src.states[to_index_raw(gx, gy, it, self.nx, nt) as usize].free {
+                continue;
+            }
+            out.push(to_index_raw(lx, ly, it, side, nt));
+        }
+        out
     }
 
     /// メモリ上の概算サイズ [byte] (保存形式とほぼ一致)。
@@ -317,6 +385,102 @@ impl TileVi {
         s.optimal_action = None;
     }
 
+    /// ポータルパッチ (中心 (lx,ly,it)、[`PATCH_R`]/[`PATCH_T`]) の free な状態を
+    /// 領域内で `cost` に釘付けする。既に final の状態 (実ゴール 0 / 別の釘) は
+    /// min を採る — どちらも上界なので min も上界。複数成果物の併用釘
+    /// ([`materialize_one_multi`]) と隣接パッチの重なりがここを通る。
+    fn pin_patch(&mut self, lx: i32, ly: i32, it: i32, cost: u64) {
+        let (side, nt) = (self.side, self.vi.cell_num_t);
+        for dy in -PATCH_R..=PATCH_R {
+            for dx in -PATCH_R..=PATCH_R {
+                let (x, y) = (lx + dx, ly + dy);
+                if x < 0 || x >= side || y < 0 || y >= side {
+                    continue;
+                }
+                for dt in -PATCH_T..=PATCH_T {
+                    let t = (it + dt).rem_euclid(nt);
+                    let i = to_index_raw(x, y, t, side, nt) as usize;
+                    let s = &mut self.vi.states[i];
+                    if !s.free {
+                        continue;
+                    }
+                    if s.final_state {
+                        s.total_cost = s.total_cost.min(cost);
+                        continue;
+                    }
+                    s.final_state = true;
+                    s.total_cost = cost;
+                    s.optimal_action = None;
+                }
+            }
+        }
+    }
+
+    /// パッチ (中心 (lx,ly,it)) の free な状態 (ローカル座標、領域内)。
+    fn patch_local(&self, lx: i32, ly: i32, it: i32) -> Vec<(i32, i32, i32)> {
+        let (side, nt) = (self.side, self.vi.cell_num_t);
+        let mut out = Vec::with_capacity(((2 * PATCH_R + 1) * (2 * PATCH_R + 1) * (2 * PATCH_T + 1)) as usize);
+        for dy in -PATCH_R..=PATCH_R {
+            for dx in -PATCH_R..=PATCH_R {
+                let (x, y) = (lx + dx, ly + dy);
+                if x < 0 || x >= side || y < 0 || y >= side {
+                    continue;
+                }
+                for dt in -PATCH_T..=PATCH_T {
+                    let t = (it + dt).rem_euclid(nt);
+                    if self.vi.states[to_index_raw(x, y, t, side, nt) as usize].free {
+                        out.push((x, y, t));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// パッチ内の free 状態の値の集約 (既定 max = パッチ全体の上界)。free 状態が
+    /// 無ければ MAX。診断用に `VI_SCHUR_PATCH_AGG=center|mean` で上界でない集約に
+    /// 切り替えられる (max の悲観が gap に占める割合を測る)。
+    fn patch_max(&self, lx: i32, ly: i32, it: i32) -> u64 {
+        let (side, nt) = (self.side, self.vi.cell_num_t);
+        let agg = patch_agg();
+        if agg == PatchAgg::Center {
+            let s = &self.vi.states[to_index_raw(lx, ly, it, side, nt) as usize];
+            return if s.free { clamp_unreached(s.total_cost) } else { MAX_COST };
+        }
+        let mut mx = 0u64;
+        let (mut sum, mut cnt) = (0u128, 0u64);
+        let mut any = false;
+        for dy in -PATCH_R..=PATCH_R {
+            for dx in -PATCH_R..=PATCH_R {
+                let (x, y) = (lx + dx, ly + dy);
+                if x < 0 || x >= side || y < 0 || y >= side {
+                    continue;
+                }
+                for dt in -PATCH_T..=PATCH_T {
+                    let t = (it + dt).rem_euclid(nt);
+                    let s = &self.vi.states[to_index_raw(x, y, t, side, nt) as usize];
+                    if !s.free {
+                        continue;
+                    }
+                    any = true;
+                    let v = clamp_unreached(s.total_cost);
+                    mx = mx.max(v);
+                    if v < MAX_COST {
+                        sum += v as u128;
+                        cnt += 1;
+                    }
+                }
+            }
+        }
+        if !any {
+            return MAX_COST;
+        }
+        match agg {
+            PatchAgg::Mean => if cnt > 0 { (sum / cnt as u128) as u64 } else { MAX_COST },
+            _ => mx,
+        }
+    }
+
     /// 方向交互の Gauss-Seidel 全面パスで解く (compact.rs の `sweep_rect` と
     /// 同じ骨格)。フロンティア方式はタイル内では波が 1 ラウンドに reach セル
     /// しか進まないが、in-place GS は 1 パスで走査方向へタイルを横断するので
@@ -390,6 +554,47 @@ impl TileVi {
         updates
     }
 
+    /// 減少のみの GS 磨き: 釘を外したパッチ状態とその周辺を、Bellman 値が現在値
+    /// より小さいときだけ書く。上界場 (釘 D は証明済み上界) に対して min(現在, Bellman)
+    /// なので上界性を保ったまま平坦域だけが崩れる。無条件更新 (`value_iteration_raw`)
+    /// だと釘を外した状態が周囲の緩い値まで**上がり**、タイル全体が膨れる (house で
+    /// V̂ gap 124% → 173% を実測)。
+    fn polish_decrease_only(&mut self) -> u64 {
+        let (side, nt) = (self.side, self.vi.cell_num_t);
+        let mut updates = 0u64;
+        for pass in 0..TILE_MAX_ITER {
+            let fwd = pass & 1 == 0;
+            let mut moved = 0u64;
+            for yy in 0..side {
+                let ly = if fwd { yy } else { side - 1 - yy };
+                for xx in 0..side {
+                    let lx = if fwd { xx } else { side - 1 - xx };
+                    for it in 0..nt {
+                        let idx = to_index_raw(lx, ly, it, side, nt) as usize;
+                        let Some((c, a)) =
+                            min_action_cost(&self.vi.states, &self.vi.actions, idx, side, side, nt)
+                        else {
+                            continue;
+                        };
+                        let st = &mut self.vi.states[idx];
+                        if c < st.total_cost {
+                            if clamp_unreached(st.total_cost).abs_diff(clamp_unreached(c)) > 2 {
+                                moved += 1;
+                            }
+                            st.total_cost = c;
+                            st.optimal_action = a;
+                        }
+                    }
+                }
+            }
+            updates += moved;
+            if moved == 0 {
+                break;
+            }
+        }
+        updates
+    }
+
     #[inline]
     fn value(&self, lx: i32, ly: i32, it: i32) -> u64 {
         self.vi.states[to_index_raw(lx, ly, it, self.side, self.vi.cell_num_t) as usize].total_cost
@@ -410,11 +615,19 @@ pub(crate) fn place_portals(
     assert!(!src.states.is_empty(), "SchurArtifact::build needs dense states");
     let (nx, ny, nt) = (src.cell_num_x, src.cell_num_y, src.cell_num_t);
     let (mx, my, _mt) = displacement(src);
-    let halo = mx.max(my).max(1);
+    // halo = 遷移 reach + PATCH_R + 1。パッチ状態は領域の端から reach 分の余裕が要る
+    // (界面 x=k·tile の右パッチ端 x+PATCH_R から reach 先 = x+PATCH_R+reach が領域内、
+    // 領域右端は x+halo-1):
+    // 端の列では θ ビン内サンプリングが領域外 (非 free) へ質量を漏らして全移動行動が
+    // 無効になり、その状態が「閉じ込め」で未到達 = w が MAX になる (corridor テストの
+    // ドア脇で実測)。パッチの一部が領域外でも patch_max がその状態を見ずに D を作り、
+    // 復元側でそこを D に釘付けして上界が破れる。
+    let halo = mx.max(my).max(1) + PATCH_R + 1;
     let tile = cfg.tile.max(1);
     let tnx = ((nx + tile - 1) / tile).max(1);
     let tny = ((ny + tile - 1) / tile).max(1);
     let k_th = cfg.portal_thetas.clamp(1, nt);
+    let spacing = cfg.spacing.max(1);
 
     let free_at = |gx: i32, gy: i32| -> bool {
         src.states[to_index_raw(gx, gy, 0, nx, nt) as usize].free
@@ -451,7 +664,7 @@ pub(crate) fn place_portals(
     // free 連結区間 [a..=b] に等間隔で置く位置列。
     let run_positions = |a: i32, b: i32| -> Vec<i32> {
         let len = b - a + 1;
-        let n = ((len + PORTAL_SPACING - 1) / PORTAL_SPACING).max(1);
+        let n = ((len + spacing - 1) / spacing).max(1);
         (0..n).map(|i| a + (2 * i + 1) * len / (2 * n)).collect()
     };
 
@@ -581,13 +794,17 @@ fn tile_edges(
             (p.ix - x0, p.iy - y0, p.it)
         })
         .collect();
+    // 安定判定の watch は patch_max が読む全状態: 中心だけだと、ドアの陰の
+    // パッチ隅がまだ未到達のまま「安定」して w = MAX になる (corridor テストで実測)。
+    let watch: Vec<(i32, i32, i32)> =
+        local.iter().flat_map(|&(x, y, t)| tv.patch_local(x, y, t)).collect();
     let mut w = vec![MAX_COST; n * n];
     for (j, &(qx, qy, qt)) in local.iter().enumerate() {
         tv.reset_values();
-        tv.pin(qx, qy, qt, 0);
-        tv.solve_gs(Some(&local));
+        tv.pin_patch(qx, qy, qt, 0);
+        tv.solve_gs(Some(&watch));
         for (i, &(px, py, pt)) in local.iter().enumerate() {
-            w[i * n + j] = clamp_unreached(tv.value(px, py, pt));
+            w[i * n + j] = if i == j { 0 } else { tv.patch_max(px, py, pt) };
         }
     }
     TileEdges { portals: plist, w }
@@ -616,11 +833,43 @@ fn tiles_covering(art: &SchurArtifact, gx: i32, gy: i32) -> (i32, i32, i32, i32)
 /// ゴールタイルのミニ VI + ポータルグラフ Dijkstra で全ポータルの
 /// `D(p) = d(p → goal)` (上界) を求める。`vi` は `set_goal` 済み・未 solve。
 pub fn portal_costs(vi: &ValueIterator, art: &SchurArtifact) -> Vec<u64> {
+    portal_costs_masked(vi, art, None).d
+}
+
+/// ポータル Dijkstra の結果。`d` は各ポータルパッチの上界値、`parent`/`via_tile`
+/// が最短路木 (2 段クエリの回廊選択 [`corridor_tiles`] が辿る)。
+pub struct PortalDijkstra {
+    /// D(p) = ポータル p のパッチ全状態の上界。未到達は MAX。
+    pub d: Vec<u64>,
+    /// 最短路木の親ポータル。種 (ゴールタイル直シード) と未到達は `u32::MAX`。
+    pub parent: Vec<u32>,
+    /// p を最後に更新した辺のタイル (種はシードしたゴールタイル)。未到達は -1。
+    pub via_tile: Vec<i32>,
+    /// クエリ時間の内訳 [ms]: ゴールタイルのミニ VI シード。ゴールごとに一度で、
+    /// ポータル密度にほぼ依らない。
+    pub seed_ms: f64,
+    /// グラフ Dijkstra 本体 [ms]。辺数 ∝ (タイル内ポータル数)² × タイル数で、
+    /// マスク (回廊) が効くのはここ。
+    pub graph_ms: f64,
+}
+
+/// [`portal_costs`] のタイルマスク付き一般形。`Some(mask)` なら立っているタイルの
+/// 辺 (とゴールシード) しか使わない。経路集合を制限するだけなので返る D は常に
+/// 真値の上界のまま — 2 段クエリの「回廊だけ密」はこの性質に乗る。
+pub fn portal_costs_masked(
+    vi: &ValueIterator,
+    art: &SchurArtifact,
+    mask: Option<&[bool]>,
+) -> PortalDijkstra {
     let finals = collect_finals(vi);
-    let mut d = vec![MAX_COST; art.portals.len()];
+    let np = art.portals.len();
+    let mut d = vec![MAX_COST; np];
+    let mut parent = vec![u32::MAX; np];
+    let mut via_tile = vec![-1i32; np];
     if finals.is_empty() {
-        return d;
+        return PortalDijkstra { d, parent, via_tile, seed_ms: 0.0, graph_ms: 0.0 };
     }
+    let t_seed = std::time::Instant::now();
 
     // ゴールを領域に含むタイル集合。
     let mut goal_tiles = vec![false; art.tiles.len()];
@@ -637,6 +886,9 @@ pub fn portal_costs(vi: &ValueIterator, art: &SchurArtifact) -> Vec<u64> {
     let mut tv = TileVi::new(vi, art.side());
     for t in 0..art.tiles.len() {
         if !goal_tiles[t] || art.tiles[t].portals.is_empty() {
+            continue;
+        }
+        if mask.map_or(false, |m| !m[t]) {
             continue;
         }
         let (tx, ty) = (t as i32 % art.tnx, t as i32 / art.tnx);
@@ -657,20 +909,24 @@ pub fn portal_costs(vi: &ValueIterator, art: &SchurArtifact) -> Vec<u64> {
         let watch: Vec<(i32, i32, i32)> = art.tiles[t]
             .portals
             .iter()
-            .map(|&pid| {
+            .flat_map(|&pid| {
                 let p = art.portals[pid as usize];
-                (p.ix - x0, p.iy - y0, p.it)
+                tv.patch_local(p.ix - x0, p.iy - y0, p.it)
             })
             .collect();
         tv.solve_gs(Some(&watch));
         for &pid in &art.tiles[t].portals {
             let p = art.portals[pid as usize];
-            let v = clamp_unreached(tv.value(p.ix - x0, p.iy - y0, p.it));
+            let v = tv.patch_max(p.ix - x0, p.iy - y0, p.it);
             if v < d[pid as usize] {
                 d[pid as usize] = v;
+                via_tile[pid as usize] = t as i32;
             }
         }
     }
+
+    let seed_ms = t_seed.elapsed().as_secs_f64() * 1e3;
+    let t_graph = std::time::Instant::now();
 
     // ポータル → (tile, slot) 索引。
     let mut membership: Vec<Vec<(u32, u32)>> = vec![Vec::new(); art.portals.len()];
@@ -692,6 +948,9 @@ pub fn portal_costs(vi: &ValueIterator, art: &SchurArtifact) -> Vec<u64> {
             continue;
         }
         for &(t, sp) in &membership[p as usize] {
+            if mask.map_or(false, |m| !m[t as usize]) {
+                continue;
+            }
             let e = &art.tiles[t as usize];
             let n = e.portals.len();
             for sq in 0..n {
@@ -706,38 +965,86 @@ pub fn portal_costs(vi: &ValueIterator, art: &SchurArtifact) -> Vec<u64> {
                 let q = e.portals[sq];
                 if cand < d[q as usize] {
                     d[q as usize] = cand;
+                    parent[q as usize] = p;
+                    via_tile[q as usize] = t as i32;
                     heap.push(std::cmp::Reverse((cand, q)));
                 }
             }
         }
     }
-    d
+    PortalDijkstra { d, parent, via_tile, seed_ms, graph_ms: t_graph.elapsed().as_secs_f64() * 1e3 }
+}
+
+/// 2 段クエリの回廊選択: `from_tiles` (ロボットのタイル) の各ポータルから
+/// 粗 Dijkstra の最短路木をゴールへ辿り、通過タイルを立てたマスクを返す。
+/// `dilate` はタイル環の膨張 (最適経路が粗経路から 1 タイル逸れる程度の余裕)。
+pub fn corridor_tiles(
+    art: &SchurArtifact,
+    dij: &PortalDijkstra,
+    from_tiles: &[i32],
+    dilate: i32,
+) -> Vec<bool> {
+    let n_tiles = (art.tnx * art.tny) as usize;
+    let mut mask = vec![false; n_tiles];
+    for &t in from_tiles {
+        if t >= 0 && (t as usize) < n_tiles {
+            mask[t as usize] = true;
+            for &pid in &art.tiles[t as usize].portals {
+                let mut q = pid as usize;
+                if dij.d[q] >= MAX_COST {
+                    continue;
+                }
+                // 親は木 (緩和は値を厳密に下げる) だが、頑健性のため歩数上限。
+                for _ in 0..=art.portals.len() {
+                    let vt = dij.via_tile[q];
+                    if vt >= 0 {
+                        mask[vt as usize] = true;
+                    }
+                    if dij.parent[q] == u32::MAX {
+                        break;
+                    }
+                    q = dij.parent[q] as usize;
+                }
+            }
+        }
+    }
+    if dilate > 0 {
+        let src = mask.clone();
+        for ty in 0..art.tny {
+            for tx in 0..art.tnx {
+                if !src[(ty * art.tnx + tx) as usize] {
+                    continue;
+                }
+                for dy in -dilate..=dilate {
+                    for dx in -dilate..=dilate {
+                        let (ux, uy) = (tx + dx, ty + dy);
+                        if ux >= 0 && ux < art.tnx && uy >= 0 && uy < art.tny {
+                            mask[(uy * art.tnx + ux) as usize] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    mask
 }
 
 /// タイル 1 枚を tv 上で解く (hydrate + ポータル/実 final の釘付け + 収束)。
 /// 何も釘付けできなければ false (解かない)。
 fn solve_tile(
     src: &ValueIterator,
-    art: &SchurArtifact,
-    d: &[u64],
+    arts: &[(&SchurArtifact, &[u64])],
     finals: &[(i32, i32, i32)],
     tv: &mut TileVi,
     t: i32,
 ) -> (bool, u64) {
+    let art = arts[0].0;
     let (tx, ty) = (t % art.tnx, t / art.tnx);
     let (x0, y0) = art.domain_origin(tx, ty);
     let side = art.side();
     tv.hydrate(src, x0, y0);
     let mut pinned = false;
-    for &pid in &art.tiles[t as usize].portals {
-        let dv = d[pid as usize];
-        if dv >= MAX_COST {
-            continue;
-        }
-        let p = art.portals[pid as usize];
-        tv.pin(p.ix - x0, p.iy - y0, p.it, dv);
-        pinned = true;
-    }
+    // 実 final を先に釘付け (0) — パッチ釘がそれを上書きしないように。
     for &(gx, gy, it) in finals {
         let (lx, ly) = (gx - x0, gy - y0);
         if lx >= 0 && lx < side && ly >= 0 && ly < side {
@@ -745,10 +1052,49 @@ fn solve_tile(
             pinned = true;
         }
     }
+    let n_real_final = tv.vi.states.iter().filter(|s| s.final_state).count();
+    for &(a, d) in arts {
+        debug_assert!(
+            (a.tile, a.halo, a.nx, a.ny, a.nt) == (art.tile, art.halo, art.nx, art.ny, art.nt),
+            "成果物の幾何が一致しない (tile/halo/格子)"
+        );
+        for &pid in &a.tiles[t as usize].portals {
+            let dv = d[pid as usize];
+            if dv >= MAX_COST {
+                continue;
+            }
+            let p = a.portals[pid as usize];
+            tv.pin_patch(p.ix - x0, p.iy - y0, p.it, dv);
+            pinned = true;
+        }
+    }
     if !pinned {
         return (false, 0);
     }
-    (true, tv.solve_gs(None))
+    let mut updates = tv.solve_gs(None);
+    // パッチ釘を外して磨く: 釘付けのままだと D の平坦域が残り、貪欲 rollout が
+    // 循環する / 1 回の Bellman バックアップでは自分自身に質量が戻る状態 (ドア列の
+    // 前進の一部が同じセルに着地) が解けない。上界場に単調作用素を当てるだけなので
+    // 上界性は保たれ、パッチ内の値が実質 (隣接セル・θ の差) に落ちる。
+    if n_real_final < tv.vi.states.iter().filter(|s| s.final_state).count() {
+        let real: Vec<bool> = {
+            let mut tmp = tv.vi.states.iter().map(|_| false).collect::<Vec<_>>();
+            for &(gx, gy, it) in finals {
+                let (lx, ly) = (gx - x0, gy - y0);
+                if lx >= 0 && lx < side && ly >= 0 && ly < side {
+                    tmp[to_index_raw(lx, ly, it, side, tv.vi.cell_num_t) as usize] = true;
+                }
+            }
+            tmp
+        };
+        for (i, s) in tv.vi.states.iter_mut().enumerate() {
+            if s.final_state && !real[i] {
+                s.final_state = false;
+            }
+        }
+        updates += tv.polish_decrease_only();
+    }
+    (true, updates)
 }
 
 /// 解けた tv から (global 添字, 値, 方策) の差分列を取り出す。このタイルの釘
@@ -806,11 +1152,24 @@ pub fn materialize_one(
     tv: &mut TileScratch,
     t: i32,
 ) -> u64 {
-    let (pinned, updates) = solve_tile(vi, art, d, finals, &mut tv.0, t);
+    materialize_one_multi(vi, &[(art, d)], finals, tv, t)
+}
+
+/// [`materialize_one`] の複数成果物版: 全成果物のポータル釘を併用 (重なりは min)
+/// してタイル 1 枚を復元する。幾何 (tile/halo/格子) は一致していること。
+/// 2 段クエリ (粗 = 全域 Dijkstra、密 = 回廊限定 Dijkstra) の合成に使う。
+pub fn materialize_one_multi(
+    vi: &mut ValueIterator,
+    arts: &[(&SchurArtifact, &[u64])],
+    finals: &[(i32, i32, i32)],
+    tv: &mut TileScratch,
+    t: i32,
+) -> u64 {
+    let (pinned, updates) = solve_tile(vi, arts, finals, &mut tv.0, t);
     if !pinned {
         return 0;
     }
-    let diffs = tile_diffs(&tv.0, art, t);
+    let diffs = tile_diffs(&tv.0, arts[0].0, t);
     merge_diffs(vi, diffs.as_slice());
     updates
 }
@@ -822,6 +1181,51 @@ impl TileScratch {
     pub fn new(vi: &ValueIterator, art: &SchurArtifact) -> Self {
         Self(TileVi::new(vi, art.side()))
     }
+}
+
+/// タイル集合を並列復元して `vi.states` へ min マージする ([`upper_bound_field`]
+/// の部分集合版 — 漸進復元クライアント向け)。戻り値は更新数。全タイルを渡し
+/// 終えたら [`fix_portal_actions`] を一度呼ぶこと (ポータルセルの方策埋め)。
+pub fn materialize_many(
+    vi: &mut ValueIterator,
+    art: &SchurArtifact,
+    d: &[u64],
+    finals: &[(i32, i32, i32)],
+    tiles: &[i32],
+) -> u64 {
+    if tiles.is_empty() {
+        return 0;
+    }
+    let nthr = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+    let chunk = tiles.len().div_ceil(nthr).max(1);
+    let (src, d_ref, finals_ref) = (&*vi, d, finals);
+    let parts: Vec<(u64, Vec<(u32, u64, i8)>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = tiles
+            .chunks(chunk)
+            .map(|band| {
+                scope.spawn(move || {
+                    let mut tv = TileVi::new(src, art.side());
+                    let mut updates = 0u64;
+                    let mut diffs: Vec<(u32, u64, i8)> = Vec::new();
+                    for &t in band {
+                        let (pinned, u) = solve_tile(src, &[(art, d_ref)], finals_ref, &mut tv, t);
+                        if pinned {
+                            updates += u;
+                            diffs.extend(tile_diffs(&tv, art, t));
+                        }
+                    }
+                    (updates, diffs)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut updates = 0u64;
+    for (u, diffs) in &parts {
+        updates += u;
+        merge_diffs(vi, diffs);
+    }
+    updates
 }
 
 /// ポータルセルへ実行動を与える後処理。ポータルは各タイルで final 釘付けされる
@@ -836,12 +1240,13 @@ impl TileScratch {
 /// exactify (下降のみ) が固定点に届かず mismatch 43k。ここでは MAX_COST 級の
 /// 後継を持つ行動を「無効」として除外する (和は (REACH+pen)·2^18 ≈ 7e16 で
 /// 折り返さない)。実行動が一つも無ければ MAX のまま = exactify が埋める。
-fn fix_portal_actions(vi: &mut ValueIterator, art: &SchurArtifact) -> u64 {
+pub fn fix_portal_actions(vi: &mut ValueIterator, art: &SchurArtifact) -> u64 {
     let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
     let mut updates = 0;
-    for p in &art.portals {
-        let idx = to_index_raw(p.ix, p.iy, p.it, art.nx, nt) as usize;
-        if vi.states[idx].final_state || vi.states[idx].optimal_action.is_some() {
+    let patch: Vec<(i32, i32, i32)> = art.portals.iter().flat_map(|&p| art.patch_states(p)).collect();
+    for (gx, gy, git) in patch {
+        let idx = to_index_raw(gx, gy, git, art.nx, nt) as usize;
+        if !vi.states[idx].free || vi.states[idx].final_state || vi.states[idx].optimal_action.is_some() {
             continue; // 実ゴール / 被覆タイルの実値が既にある
         }
         let (six, siy, sit) = (vi.states[idx].ix, vi.states[idx].iy, vi.states[idx].it);
@@ -886,37 +1291,8 @@ fn fix_portal_actions(vi: &mut ValueIterator, art: &SchurArtifact) -> u64 {
 pub fn upper_bound_field(vi: &mut ValueIterator, art: &SchurArtifact) -> u64 {
     let finals = collect_finals(vi);
     let d = portal_costs(vi, art);
-    let n_tiles = art.tnx * art.tny;
-    let nthr = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
-    let tids: Vec<i32> = (0..n_tiles).collect();
-    let chunk = tids.len().div_ceil(nthr).max(1);
-    let (src, d_ref, finals_ref) = (&*vi, &d, &finals);
-    let parts: Vec<(u64, Vec<(u32, u64, i8)>)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = tids
-            .chunks(chunk)
-            .map(|band| {
-                scope.spawn(move || {
-                    let mut tv = TileVi::new(src, art.side());
-                    let mut updates = 0u64;
-                    let mut diffs: Vec<(u32, u64, i8)> = Vec::new();
-                    for &t in band {
-                        let (pinned, u) = solve_tile(src, art, d_ref, finals_ref, &mut tv, t);
-                        if pinned {
-                            updates += u;
-                            diffs.extend(tile_diffs(&tv, art, t));
-                        }
-                    }
-                    (updates, diffs)
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let mut updates = 0u64;
-    for (u, diffs) in &parts {
-        updates += u;
-        merge_diffs(vi, diffs);
-    }
+    let tids: Vec<i32> = (0..art.tnx * art.tny).collect();
+    let updates = materialize_many(vi, art, &d, &finals, &tids);
     updates + fix_portal_actions(vi, art)
 }
 
@@ -1068,7 +1444,7 @@ pub(crate) mod testfix {
     }
 
     pub(crate) fn cfg() -> SchurConfig {
-        SchurConfig { tile: 6, portal_thetas: 4 }
+        SchurConfig { tile: 6, portal_thetas: 4, spacing: 16 }
     }
 }
 
@@ -1167,6 +1543,68 @@ mod tests {
 
 
     #[test]
+    fn two_level_corridor_query_is_sound() {
+        let mut exact = corridor_vi();
+        run_reference_to_fixed_point(&mut exact);
+        let vi = corridor_vi();
+        let coarse = build(&vi, &cfg());
+        let fine = build(&vi, &SchurConfig { tile: 6, portal_thetas: 8, spacing: 3 });
+        assert_eq!((coarse.tile, coarse.halo), (fine.tile, fine.halo), "幾何一致が前提");
+        let dij_c = portal_costs_masked(&vi, &coarse, None);
+        let dij_f_full = portal_costs_masked(&vi, &fine, None);
+        // ロボット = 右室 (ドアの向こう) の最遠到達セル。
+        let far = exact
+            .states
+            .iter()
+            .filter(|s| s.free && !s.final_state && s.total_cost < REACH && s.ix > 12)
+            .max_by_key(|s| s.total_cost)
+            .expect("右室に到達可能セルがあるはず");
+        let rt = (far.iy / coarse.tile) * coarse.tnx + far.ix / coarse.tile;
+        let mask = corridor_tiles(&coarse, &dij_c, &[rt], 1);
+        let n_cor = mask.iter().filter(|&&b| b).count();
+        assert!(n_cor > 0 && n_cor <= mask.len(), "回廊が空");
+        let dij_f = portal_costs_masked(&vi, &fine, Some(&mask));
+        // 回廊限定 D は全域 D の上界 (経路制限しかしていない)。
+        for i in 0..fine.portals.len() {
+            assert!(
+                dij_f.d[i] >= dij_f_full.d[i],
+                "回廊 D が全域 D を下回った @ portal {i}"
+            );
+        }
+        let finals: Vec<(i32, i32, i32)> = vi
+            .states
+            .iter()
+            .filter(|s| s.final_state)
+            .map(|s| (s.ix, s.iy, s.it))
+            .collect();
+        let mut tv = TileScratch::new(&vi, &coarse);
+        let mut vi_c = corridor_vi();
+        materialize_one(&mut vi_c, &coarse, &dij_c.d, &finals, &mut tv, rt);
+        let mut vi_2 = corridor_vi();
+        materialize_one_multi(
+            &mut vi_2,
+            &[(&coarse, &dij_c.d[..]), (&fine, &dij_f.d[..])],
+            &finals,
+            &mut tv,
+            rt,
+        );
+        let fi = to_index_raw(far.ix, far.iy, far.it, exact.cell_num_x, exact.cell_num_t) as usize;
+        assert!(vi_2.states[fi].total_cost < MAX_COST, "2 段復元がロボット状態に値を出さない");
+        for i in 0..exact.states.len() {
+            assert!(
+                vi_2.states[i].total_cost >= exact.states[i].total_cost,
+                "2 段の上界破れ @ {i}: {} < {}",
+                vi_2.states[i].total_cost,
+                exact.states[i].total_cost
+            );
+            assert!(
+                vi_2.states[i].total_cost <= vi_c.states[i].total_cost,
+                "2 段が粗単独より悪い @ {i}"
+            );
+        }
+    }
+
+    #[test]
     fn artifact_roundtrip() {
         let vi = corridor_vi();
         let art = build(&vi, &cfg());
@@ -1177,3 +1615,4 @@ mod tests {
         assert_eq!(art, loaded);
     }
 }
+
