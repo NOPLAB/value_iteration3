@@ -410,9 +410,14 @@ pub fn follow_waypoints_server(
                     let mut missed: Vec<i32> = Vec::new();
                     let mut outcome = TourOutcome::Done;
                     for (i, goal) in goals.iter().enumerate() {
-                        let mut fb = nav2_msgs::action::FollowWaypoints_Feedback::default();
-                        fb.current_waypoint = i as u32;
-                        let _ = feedback.publish(fb);
+                        let publish_current = || {
+                            let mut fb = nav2_msgs::action::FollowWaypoints_Feedback::default();
+                            fb.current_waypoint = i as u32;
+                            if feedback.publish(fb).is_err() {
+                                eprintln!("ERROR: vi_planner: waypoint feedback channel closed");
+                            }
+                        };
+                        publish_current();
                         eprintln!(
                             "vi_planner: waypoint {}/{} -> ({:.2}, {:.2})",
                             i + 1,
@@ -420,7 +425,11 @@ pub fn follow_waypoints_server(
                             goal.x,
                             goal.y
                         );
-                        match run_goal(&ctx, *goal, &cancel_t, retry, &retries, &|_| {}) {
+                        // A newly discovered client can miss the initial volatile sample.
+                        // Keep reporting the active waypoint on real control progress.
+                        match run_goal(&ctx, *goal, &cancel_t, retry, &retries, &|_| {
+                            publish_current();
+                        }) {
                             Outcome::Reached => {}
                             Outcome::Preempted => {
                                 outcome = TourOutcome::Aborted("vi_planner: tour preempted");
