@@ -13,7 +13,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Result;
 
@@ -25,7 +25,7 @@ use vi_planner::core::{lock, PlanError, PlanStats, Prefetcher};
 use rclrs::*;
 
 use super::follow_loop::{
-    run_follow, run_goal, run_settle, FollowProgress, FollowTuning, Outcome, RetryTuning,
+    run_follow, run_goal, FollowProgress, FollowTuning, Outcome, RetryTuning,
 };
 use super::handles::Handles;
 use super::msg::{pose_view_from, poses_to_path, ros_grid_from, stop_cmd};
@@ -46,8 +46,6 @@ pub struct Wiring {
     pub prefetch: Option<Prefetcher>,
     /// follow_waypoints: 1 点失敗したら残りを諦めるか。
     pub stop_on_failure: bool,
-    /// 点と点の間の待ち (`run_settle` — 単に寝るのではなく場を更新する)。
-    pub pause: Duration,
     /// ロールアウト固着時のヒント表示用 (safety_radius_penalty [秒/セル], safety_radius [m])。
     pub hint: (i64, f64),
 }
@@ -370,7 +368,6 @@ pub fn follow_waypoints_server(
     let follow_cancel = Arc::clone(&w.follow_cancel);
     let prefetch = w.prefetch.clone();
     let stop_on_failure = w.stop_on_failure;
-    let pause = w.pause;
     let tuning = w.tuning;
     let retry = w.retry;
 
@@ -440,12 +437,6 @@ pub fn follow_waypoints_server(
                                     break;
                                 }
                             }
-                        }
-                        // 次の点へ向かうまでの間 (`waypoint_pause_sec`)。単に
-                        // 待つのではなく場を更新し続ける (run_settle)。
-                        if !pause.is_zero() && !run_settle(&ctx, &cancel_t, pause) {
-                            outcome = TourOutcome::Aborted("vi_planner: tour preempted");
-                            break;
                         }
                     }
                     stop_cmd(ctx.cmd_pub);

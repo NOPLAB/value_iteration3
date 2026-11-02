@@ -41,8 +41,6 @@ pub struct Params {
     /// RAM sink の上限 [MB]。0 = 空きメモリの半分で自動判定。
     pub compact_ram_limit_mb: i64,
     pub vi_threads: i64,
-    pub goal_tolerance_xy: f64,
-    pub goal_tolerance_deg: f64,
     pub pose_topic: String,
     pub global_frame: String,
     /// map→odom TF を配信するか (AMCL の契約の置き換え)。外部 localizer が
@@ -79,6 +77,8 @@ pub struct Params {
     // ── 狭域 (follow_path) ──
     /// ローカルウィンドウの前後半径 [m] (本家 ValueIteratorLocal は 1.0 固定)。
     pub local_xy_range: f64,
+    /// ヒットセル周囲のペナルティ帯の半幅 [m]。0 はヒットセルのみ。
+    pub scan_penalty_radius: f64,
     /// ローカルウィンドウの横半径 [m]。0 = `local_xy_range` と同じ (等方)。
     pub local_xy_range_lat: f64,
     /// ウィンドウ形状 ("square" / "circle" / "ellipse" / "capsule")。
@@ -120,7 +120,6 @@ pub struct Params {
     pub standalone: bool,
     pub goal_retry_limit: i64,
     pub waypoint_stop_on_failure: bool,
-    pub waypoint_pause_sec: f64,
     // ── 狭域 → 広域のフィードバック (全域掃き) ──
     pub global_sweep: bool,
     /// 全域掃きに渡す CPU の割合 [%]。
@@ -206,8 +205,6 @@ pub fn read_params(node: &Node) -> Result<Params> {
         // どうかは同居プロセスと保存先の速さ次第、つまり運用側にしか分からない。
         compact_ram_limit_mb: p!("compact_ram_limit_mb", i64, 0),
         vi_threads: p!("vi_threads", i64, 0),
-        goal_tolerance_xy: p!("goal_tolerance_xy", f64, 0.25),
-        goal_tolerance_deg: p!("goal_tolerance_deg", f64, 10.0),
         pose_topic: p!("pose_topic", Arc<str>, "mcl_pose".into()).to_string(),
         global_frame: p!("global_frame", Arc<str>, "map".into()).to_string(),
         publish_tf: p!("publish_tf", bool, false),
@@ -266,6 +263,7 @@ pub fn read_params(node: &Node) -> Result<Params> {
         // 追従が見る・スキャンで補正するウィンドウの半径。広げると 1 tick の
         // refine 対象と compact パッチ (辺 ∝ 2×半径) が大きくなる。
         local_xy_range: p!("local_xy_range", f64, 1.0),
+        scan_penalty_radius: p!("scan_penalty_radius", f64, 0.1),
         // 窓の形。既定 square は本家そのもの (地図軸の矩形)。lat を別に与えれば
         // 「前後 2m × 左右 1m」のような異方の窓になる。ellipse / capsule は
         // 走行方向に応じて前後の半軸が伸縮する (面積は一定 — 前に伸びたぶん
@@ -324,9 +322,6 @@ pub fn read_params(node: &Node) -> Result<Params> {
         // follow_waypoints: 1 点失敗したら残りを諦めるか。false なら次の点へ進み、
         // 飛ばした番号を result.missed_waypoints で返す (nav2_waypoint_follower と同義)。
         waypoint_stop_on_failure: p!("stop_on_failure", bool, false),
-        // 1 点に着いてから次の点へ向かうまでの待ち (nav2_waypoint_follower の
-        // waypoint_pause_duration [ms] に相当。こちらは秒)。
-        waypoint_pause_sec: p!("waypoint_pause_sec", f64, 0.2),
 
         // 狭域が書いた local_penalty を全域へ伝播させる背景掃き (core::sweep_global)。
         // これを止めると、狭域が「通れない」と判断しても広域の経路は塞がった通路を
@@ -413,6 +408,9 @@ pub fn validate(p: &Params) -> Result<U64Solver> {
     }
     if p.local_xy_range <= 0.0 {
         return Err(anyhow!("local_xy_range must be > 0, got {}", p.local_xy_range));
+    }
+    if !p.scan_penalty_radius.is_finite() || p.scan_penalty_radius < 0.0 {
+        return Err(anyhow!("scan_penalty_radius must be finite and >= 0"));
     }
     if p.local_xy_range_lat < 0.0 {
         return Err(anyhow!(

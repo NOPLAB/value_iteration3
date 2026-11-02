@@ -374,11 +374,10 @@ pub fn build_core(
         );
     }
     let cfg = PlanConfig {
+        scan_penalty_radius: params.scan_penalty_radius,
         solver,
         max_solve_iter: MAX_SOLVE_ITER,
         solve_chunk: SOLVE_CHUNK,
-        goal_tolerance_xy: params.goal_tolerance_xy,
-        goal_tolerance_deg: params.goal_tolerance_deg,
         max_rollout_steps: params.max_rollout_steps.max(1) as usize,
         start_tolerance_cells,
         path_spacing: params.path_spacing,

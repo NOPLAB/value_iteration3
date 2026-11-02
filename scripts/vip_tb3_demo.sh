@@ -80,9 +80,7 @@ VI_ARGS=(
     -p compact_ram_limit_mb:=0           # 規定: 0 = 空きメモリの半分まで RAM sink、超えたら
                                          #   /tmp/vi_planner_sink へ。>0 で MB を明示
     -p vi_threads:=0                     # 規定: 0 = VI_THREADS を触らない (>0 で設定)
-    # ── ゴール判定 / 姿勢・TF ──
-    -p goal_tolerance_xy:=0.25           # 規定: 0.25 [m] (navigate_to_pose の達成判定)
-    -p goal_tolerance_deg:=10.0          # 規定: 10.0 [deg]
+    # ── 姿勢・TF ──
     -p pose_topic:=mcl_pose              # 規定: mcl_pose — emcl2 の推定出力をそのまま使う
     -p global_frame:=map                 # 規定: map
     -p publish_tf:=false                 # 規定: false — map→odom TF は emcl2 が配信 (併用禁止)
@@ -97,6 +95,7 @@ VI_ARGS=(
     -p path_spacing:=0.05               # 規定: 0.05 [m] (densify の点間隔)
     # ── 狭域 (follow_path) ──
     -p local_xy_range:=1.0               # 規定: 1.0 [m] (ローカルウィンドウ半径、本家固定値)
+    -p scan_penalty_radius:=0.1          # 規定: 0.1 [m] (ヒットセル周囲の正方形の半幅、セル単位で切り上げ)
     -p follow:=true                      # 規定: true — false で global-only (nav2_controller と組む)
     -p scan_topic:=scan                  # 規定: scan
     -p control_frequency:=10.0           # 規定: 10.0 [Hz]
@@ -110,7 +109,6 @@ VI_ARGS=(
     -p standalone:=true                  # 規定: false — bt_navigator 等の代わりに自前で提供
     -p goal_retry_limit:=3               # 規定: 3 (追従失敗時の投げ直し上限、負で無制限)
     -p stop_on_failadaptive=false            # 規定: false (巡回で 1 点失敗しても次へ)
-    -p waypoint_pause_sec:=0.2           # 規定: 0.2 [s] (点に着いてから次へ向かうまでの settle)
     # ── 狭域 → 広域フィードバック (全域掃き) ──
     -p global_sweep:=true                # 規定: true (local_penalty を全域へ伝播)
     -p global_sweep_duty:=25             # 規定: 25 [%] (掃きに渡す CPU の割合、100 で掃きっぱなし)

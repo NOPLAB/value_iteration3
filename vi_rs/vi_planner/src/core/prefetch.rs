@@ -43,10 +43,6 @@ impl Clone for Prefetcher {
 }
 
 struct Shared {
-    /// ゴールの一致判定 ([`goal_matches`])。走行中の核と同じ値を使うこと —
-    /// 違うと「先読みは持っているのに採用されない」が静かに起きる。
-    tol_xy: f64,
-    tol_deg: f64,
     /// 進行中の先読みを待つときの観測間隔 ([`PlanConfig::prefetch_poll_ms`])。
     /// 呼び出し側の cancel (プリエンプト) を見る刻みでもある。
     wait_tick: Duration,
@@ -86,8 +82,6 @@ impl Prefetcher {
     /// compact なら `compact_sink_gen` を走行中の核と**共有**したもの。
     pub fn spawn(build: BuildParams, cfg: PlanConfig) -> Self {
         let shared = Arc::new(Shared {
-            tol_xy: cfg.goal_tolerance_xy,
-            tol_deg: cfg.goal_tolerance_deg,
             wait_tick: Duration::from_millis(cfg.prefetch_poll_ms.max(1)),
             state: Mutex::new(State::default()),
             cv: Condvar::new(),
@@ -172,8 +166,6 @@ impl Prefetcher {
                 if goal_matches(
                     (c.goal_x, c.goal_y, c.goal_t_deg),
                     (goal.x, goal.y, goal_t_deg),
-                    self.0.tol_xy,
-                    self.0.tol_deg,
                 ) {
                     return st.ready.take();
                 }
@@ -212,19 +204,14 @@ impl Prefetcher {
     }
 
     fn same_goal(&self, a: PoseView, b: (f64, f64, i32)) -> bool {
-        goal_matches(
-            (a.x, a.y, yaw_to_goal_theta_deg(a.yaw_rad)),
-            b,
-            self.0.tol_xy,
-            self.0.tol_deg,
-        )
+        goal_matches((a.x, a.y, yaw_to_goal_theta_deg(a.yaw_rad)), b)
     }
 
     /// `next` を注文する。既に用意できている / 解いている点なら何もしない。
     fn request(&self, st: &mut State, next: PoseView) {
         let key = (next.x, next.y, yaw_to_goal_theta_deg(next.yaw_rad));
         let have = st.ready.as_ref().is_some_and(|c| {
-            goal_matches((c.goal_x, c.goal_y, c.goal_t_deg), key, self.0.tol_xy, self.0.tol_deg)
+            goal_matches((c.goal_x, c.goal_y, c.goal_t_deg), key)
         });
         if have || [st.solving, st.want].iter().flatten().any(|g| self.same_goal(*g, key)) {
             return;

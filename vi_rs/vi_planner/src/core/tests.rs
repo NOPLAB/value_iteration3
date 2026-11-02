@@ -46,11 +46,10 @@ fn build(size: i32) -> BuildParams {
 
 fn cfg() -> PlanConfig {
     PlanConfig {
+        scan_penalty_radius: 0.1,
         solver: U64Solver::Frontier2DSparse,
         max_solve_iter: 100_000,
         solve_chunk: 16,
-        goal_tolerance_xy: 0.25,
-        goal_tolerance_deg: 10.0,
         max_rollout_steps: 10_000,
         start_tolerance_cells: 10,
         path_spacing: RES,
@@ -538,8 +537,9 @@ fn is_cached_goal_tracks_the_replacement() {
     assert!(!core.is_cached_goal(followed), "nothing solved yet");
     core.prepare_goal(followed, &cancel).expect("solve");
     assert!(core.is_cached_goal(followed));
-    // 許容差内のゆらぎは同一ゴール扱い。
-    assert!(core.is_cached_goal(pose(2.05, 2.0, 0.0)));
+    // 近くても位置や向きが異なれば別ゴール。
+    assert!(!core.is_cached_goal(pose(2.05, 2.0, 0.0)));
+    assert!(!core.is_cached_goal(pose(2.0, 2.0, 5.0_f64.to_radians())));
 
     // 広域側が別ゴールを解くとキャッシュが差し替わる。
     core.plan(pose(0.6, 0.6, 0.0), pose(0.8, 2.4, 0.0), &cancel).expect("new goal");

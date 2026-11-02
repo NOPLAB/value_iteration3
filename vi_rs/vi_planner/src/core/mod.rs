@@ -149,15 +149,13 @@ pub type SinkGen = Option<Arc<AtomicU64>>;
 /// (`plan_*` = 広域ロールアウト / `decide` = 狭域追従)。
 #[derive(Clone)]
 pub struct PlanConfig {
+    /// スキャンのヒットセル周囲に塗るペナルティ帯の半幅 [m]。
+    pub scan_penalty_radius: f64,
     pub solver: U64Solver,
     /// solve 総イテレーション上限 (発散ガード)。
     pub max_solve_iter: u32,
     /// cancel 観測間隔 (イテレーション数)。密経路のみ (compact は 1 回で走り切る)。
     pub solve_chunk: u32,
-    /// キャッシュ再利用とみなすゴール位置差 (m)。
-    pub goal_tolerance_xy: f64,
-    /// キャッシュ再利用とみなすゴール方位差 (度)。
-    pub goal_tolerance_deg: f64,
 
     // ── 広域 (compute_path_to_pose) ──
     pub max_rollout_steps: usize,
@@ -452,18 +450,11 @@ pub struct PlannerCore {
     follow: Box<dyn FollowController>,
 }
 
-/// 円環上の角度差 (度、0..=180)。
-fn circ_deg_diff(a: i32, b: i32) -> i32 {
-    let d = (a - b).rem_euclid(360);
-    d.min(360 - d)
-}
-
 /// 2 つのゴール `(x, y, θ[deg])` を「同じ」とみなせるか。キャッシュの再利用判定と
 /// 先読み ([`Prefetcher`]) の照合が同じ規則を使うためにここに 1 つだけ置く
 /// (別々にすると、先読みが用意した場を採用できないゴールが静かに生まれる)。
-fn goal_matches(a: (f64, f64, i32), b: (f64, f64, i32), tol_xy: f64, tol_deg: f64) -> bool {
-    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt() <= tol_xy
-        && circ_deg_diff(a.2, b.2) as f64 <= tol_deg
+fn goal_matches(a: (f64, f64, i32), b: (f64, f64, i32)) -> bool {
+    a == b
 }
 
 /// `from` からゴール圏まで、いまの場の方策だけで辿り着けるか。早期走り出し
@@ -605,7 +596,7 @@ impl PlannerCore {
         Self { solve_only: true, penalty: None, ..Self::new(build, cfg) }
     }
 
-    /// キャッシュ中のゴールが `goal` と同一 (許容差内) か。追従スレッドが
+    /// キャッシュ中のゴールが `goal` と同一か。追従スレッドが
     /// 「自分のゴールの価値関数がまだ載っているか」を毎 tick 確認するのに使う
     /// (広域側の計画要求が別ゴールで solve し直すとキャッシュが差し替わるため)。
     pub fn is_cached_goal(&self, goal: PoseView) -> bool {
@@ -617,8 +608,6 @@ impl PlannerCore {
         goal_matches(
             (c.goal_x, c.goal_y, c.goal_t_deg),
             (goal.x, goal.y, goal_t_deg),
-            self.cfg.goal_tolerance_xy,
-            self.cfg.goal_tolerance_deg,
         )
     }
 
@@ -1147,8 +1136,10 @@ impl PlannerCore {
     /// [`quality_shift`] で quality から量子化する。0 は `observe_scan` と同一。
     pub fn observe_scan_gated(&mut self, scan: &LaserScan, pose: PoseView, shift: u32) {
         let map_clear = self.cfg.map_clear_from_scan;
+        let radius = self.cfg.scan_penalty_radius;
         if let Some(vi) = self.local_mut() {
             vi.clear_map_from_scan = map_clear;
+            vi.scan_penalty_radius = radius;
             vi.set_local_cost_attenuated(scan, pose.x, pose.y, pose.yaw_rad, shift);
         }
         self.harvest_penalties();

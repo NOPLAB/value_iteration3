@@ -309,7 +309,6 @@ fn main() -> Result<()> {
         },
         prefetch,
         stop_on_failure: params.waypoint_stop_on_failure,
-        pause: Duration::from_secs_f64(params.waypoint_pause_sec.max(0.0)),
         // ロールアウト固着時のヒント表示用 (safety_radius_penalty [秒/セル],
         // safety_radius [m])。
         hint: (params.safety_radius_penalty, params.safety_radius),

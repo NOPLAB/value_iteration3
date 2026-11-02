@@ -159,6 +159,8 @@ const DEADBAND_CELLS: f64 = 0.3;
 
 pub struct ValueIteratorLocal {
     pub base: ValueIterator,
+    /// ヒットセル周囲に塗る正方形の半幅 [m]。セル数へ切り上げ、0 はヒットセルのみ。
+    pub scan_penalty_radius: f64,
     pub local_ix_min: i32,
     pub local_ix_max: i32,
     pub local_iy_min: i32,
@@ -200,6 +202,7 @@ impl ValueIteratorLocal {
     pub fn new(actions: Vec<Action>, thread_num: i32) -> Self {
         Self {
             base: ValueIterator::new(actions, thread_num),
+            scan_penalty_radius: 0.1,
             local_ix_min: 0,
             local_ix_max: 0,
             local_iy_min: 0,
@@ -385,6 +388,7 @@ impl ValueIteratorLocal {
         let start_angle = msg.angle_min;
         let nt = self.base.cell_num_t;
         let (ox, oy, res) = (self.base.map_origin_x, self.base.map_origin_y, self.base.xy_resolution);
+        let radius = (self.scan_penalty_radius / res).ceil() as i32;
 
         for i in 0..msg.ranges.len() {
             let a = t + msg.angle_increment * i as f64 + start_angle;
@@ -410,8 +414,8 @@ impl ValueIteratorLocal {
                 d += 0.1;
             }
 
-            for iix in (ix - 2)..=(ix + 2) {
-                for iiy in (iy - 2)..=(iy + 2) {
+            for iix in (ix - radius)..=(ix + radius) {
+                for iiy in (iy - radius)..=(iy + radius) {
                     if !self.in_local_area(iix, iiy) {
                         continue;
                     }
@@ -641,19 +645,45 @@ mod tests {
 
     #[test]
     fn set_local_cost_sets_penalty_band() {
-        let mut vi = ValueIteratorLocal::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
-        let map = free_grid(60, 60);
-        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.2, 10);
-        // 1 ビーム、正面 (angle_min=0, increment=0), range=0.5m → ヒット点 (10,0) 付近。
-        let scan = LaserScan {
-            angle_min: 0.0,
-            angle_increment: 0.0,
-            ranges: vec![0.5],
-        };
-        vi.set_local_cost(&scan, 0.0, 0.0, 0.0);
-        // ヒット点±2 セルのどこかに 2048<<bit が立っていること。
-        let hit = vi.base.to_index(10, 0, 0) as usize;
-        assert_eq!(vi.base.states[hit].local_penalty, 2048u64 << PROB_BASE_BIT);
+        for (res, radius_m, cells) in [
+            (0.05, 0.1, 2),
+            (0.1, 0.1, 1),
+            (0.25, 0.1, 1),
+            (0.1, 0.26, 3),
+            (0.1, 0.0, 0),
+        ] {
+            let mut vi = ValueIteratorLocal::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
+            let mut map = free_grid(60, 60);
+            map.resolution = res;
+            vi.set_map_with_occupancy_grid(&map, 4, 0.2, 30.0, 0.2, 10);
+            vi.scan_penalty_radius = radius_m;
+            let (x, y) = (20.5 * res, 20.5 * res);
+            vi.set_local_window(x, y, 0.0);
+            let scan = LaserScan {
+                angle_min: 0.0,
+                angle_increment: 0.0,
+                ranges: vec![2.0 * res],
+            };
+
+            vi.set_local_cost(&scan, x, y, 0.0);
+
+            for ix in 0_i32..60 {
+                for iy in 0_i32..60 {
+                    let expected = if (ix - 22).abs() <= cells && (iy - 20).abs() <= cells {
+                        2048u64 << PROB_BASE_BIT
+                    } else {
+                        0
+                    };
+                    for it in 0..4 {
+                        let i = vi.base.to_index(ix, iy, it) as usize;
+                        assert_eq!(
+                            vi.base.states[i].local_penalty, expected,
+                            "res={res}, radius={radius_m}, cell=({ix},{iy},{it})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
