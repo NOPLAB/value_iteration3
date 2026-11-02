@@ -57,5 +57,15 @@ RUN git clone --depth 1 --branch humble \
 RUN . /opt/ros/humble/setup.sh && . /ros2_rust_ws/install/local_setup.sh && \
     colcon build --merge-install --packages-select nav2_msgs
 
+# ROS message bindings no longer ship the legacy rust_packages index.
+# colcon-ros-cargo needs that index to generate local crates.io patches.
+RUN for prefix in /opt/ros/humble /ros2_rust_ws/install; do \
+      mkdir -p "$prefix/share/ament_index/resource_index/rust_packages"; \
+      for manifest in "$prefix"/share/*/rust/Cargo.toml; do \
+        package_dir="${manifest%/rust/Cargo.toml}"; \
+        touch "$prefix/share/ament_index/resource_index/rust_packages/${package_dir##*/}"; \
+      done; \
+    done
+
 WORKDIR /workspace
 CMD ["/bin/bash"]

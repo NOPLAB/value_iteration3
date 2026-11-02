@@ -16,13 +16,12 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Generate the ROS crate patches and link the node before running core tests.
+# A clean checkout cannot resolve the ROS dependencies from crates.io alone.
+bash "$REPO_ROOT/scripts/ros2_build.sh"
+
 # vi_planner core (rclrs-free) unit tests. They run under `--lib` so cargo does
 # NOT build the rclrs `vi_planner` binary, which links only via colcon (a plain
 # `cargo test --test ...` would fail to find the nav2_msgs C typesupport libs).
 cd "$REPO_ROOT/vi_rs/vi_planner"
 cargo test --lib
-
-# Full colcon build (this is what links the rclrs `vi_planner` binary; plain
-# cargo cannot link the message C typesupport libs outside colcon).
-cd "$REPO_ROOT"
-bash scripts/ros2_build.sh
