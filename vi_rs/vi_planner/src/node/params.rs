@@ -325,13 +325,10 @@ pub fn read_params(node: &Node) -> Result<Params> {
 
         // 狭域が書いた local_penalty を全域へ伝播させる背景掃き (core::sweep_global)。
         // これを止めると、狭域が「通れない」と判断しても広域の経路は塞がった通路を
-        // 指し続ける (旧挙動)。密ソルバは全域 Gauss–Seidel、compact は sink の
-        // タイル修復で同じことをする (どちらも `core::sweep_global` の入口)。
+        // 指し続ける。密は能動集合、compact はタイル修復を worker へ渡す。
         global_sweep: p!("global_sweep", bool, true),
-        // 掃きに渡す CPU の割合。掃きスレッドは「この割合だけロックを握って掃き、
-        // 残りは手放して待つ」を繰り返す。追従ループは同じ Mutex を try_lock で取り、
-        // 3 tick 続けて取れないとロボットを止めるので、上げるほど伝播は速く、
-        // 追従が譲られる隙間は狭くなる (100 = 掃きっぱなし)。
+        // 広域 worker に渡す CPU の割合。計算は核のロック外で実行する。
+        // 上げるほど伝播は速くなるが、CPU とメモリ帯域の使用量が増える。
         global_sweep_duty: p!("global_sweep_duty", i64, 25),
 
         // 次のウェイポイントの価値関数を、いまの点へ走っている間に解いておく

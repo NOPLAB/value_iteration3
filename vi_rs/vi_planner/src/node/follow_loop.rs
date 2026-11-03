@@ -205,6 +205,7 @@ pub fn run_follow(
     } // ここでロックを解放 — 以降は tick ごとに取り直す。
 
     // ── 2. 制御ループ ──
+    let _region = super::sweep::LocalRegion::claim(core);
     // tick の中では取得した guard が `core` を隠すので、guard を手放したあとに
     // 本体へ触るための別名を先に取っておく。
     let shared = core;
@@ -558,6 +559,7 @@ pub fn run_follow(
 /// 戻り値は「最後まで待てたか」。false は cancel された。
 pub fn run_settle(ctx: &FollowCtx, cancel: &AtomicBool, dur: Duration) -> bool {
     let FollowCtx { core, latest_pose, localizer, scan_queue, cmd_pub, tuning, .. } = *ctx;
+    let _region = super::sweep::LocalRegion::claim(core);
     let deadline = Instant::now() + dur;
     while Instant::now() < deadline {
         let tick_start = Instant::now();

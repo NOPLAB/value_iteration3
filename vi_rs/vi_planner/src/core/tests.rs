@@ -630,6 +630,7 @@ fn visualization_grids_match_geometry() {
     let g = core.value_grid(60).expect("full grid");
     assert_eq!((g.width, g.height), (64, 64));
     assert_eq!(g.data.len(), 64 * 64);
+    assert_grid_rows(&core, &g);
 
     // 地図端 (原点) にウィンドウ → min 側がクランプされ 21x21
     // (local_ixy_range = 1.0m / 0.05m = 20)。
@@ -656,6 +657,7 @@ fn compact_visualization_grids_match_geometry() {
     let g = core.value_grid(60).expect("full grid");
     assert_eq!((g.width, g.height), (64, 64));
     assert_eq!(g.data.len(), 64 * 64);
+    assert_grid_rows(&core, &g);
 
     let robot = pose(1.0, 1.0, 0.0);
     core.set_window(robot);
@@ -665,6 +667,23 @@ fn compact_visualization_grids_match_geometry() {
     // だけ 21x21 にクランプされる (visualization_grids_match_geometry 参照)。
     assert_eq!((w.width, w.height), (41, 41));
     assert!(w.data.iter().all(|&v| (-1..=100).contains(&i32::from(v))));
+}
+
+fn assert_grid_rows(core: &PlannerCore, full: &OccupancyGrid) {
+    for rows in [0..1, 7..11, 63..70] {
+        let (_, part, height) = core.value_grid_rows(rows.clone(), 60).expect("rows");
+        let end = rows.end.min(height);
+        assert_eq!(height, full.height as usize);
+        assert_eq!(part.width, full.width);
+        assert_eq!(part.height as usize, end - rows.start);
+        assert_eq!(
+            part.data,
+            full.data[rows.start * full.width as usize..end * full.width as usize],
+        );
+        let expected_y = full.origin_y + rows.start as f64 * full.resolution;
+        assert!((part.origin_y - expected_y).abs() < 1e-9);
+    }
+    assert!(core.value_grid_rows(64..65, 60).is_none());
 }
 
 /// スキャンで注入された local_penalty が、ローカル反復を経て「ヒット帯へ
@@ -1122,6 +1141,7 @@ fn decide_borrows_action_from_neighbors() {
         prefetch: None,
         solve_only: false,
         follow: strict_follow,
+        global: global::Manager::default(),
     };
     assert_eq!(strict_core.decide(on_obstacle), Decision::NoAction);
     // tolerance 4 (0.2m) なら近傍の行動を借りられる。
@@ -1138,6 +1158,7 @@ fn decide_borrows_action_from_neighbors() {
         prefetch: None,
         solve_only: false,
         follow: relaxed_follow,
+        global: global::Manager::default(),
     };
     assert!(matches!(relaxed_core.decide(on_obstacle), Decision::Action { .. }));
 }
@@ -1210,7 +1231,8 @@ fn corridor(size: i32, y_lo: i32, y_hi: i32) -> BuildParams {
 /// `done` まで繰り返す)。戻り値は消費した呼び出し回数。
 fn propagate(core: &mut PlannerCore) -> usize {
     let mut calls = 0;
-    while !core.sweep_global(usize::MAX).1 {
+    while core.is_dirty() {
+        core.sweep_global(usize::MAX);
         calls += 1;
         assert!(calls < 100_000, "全域伝播が終わらない");
     }
@@ -1295,6 +1317,10 @@ fn sweeping_stops_once_the_field_settles() {
     let calls = propagate(&mut core);
     assert!(!core.is_dirty(), "新しい不動点に達したら印は落ちること");
     assert!(calls > 0, "少なくとも 1 チャンクは掃くこと");
+    core.observe_scan(&scan, robot);
+    assert!(!core.is_dirty(), "同じ入力の再注入で伝播を再開しないこと");
+    core.observe_scan_gated(&scan, robot, 1);
+    assert!(core.is_dirty(), "値を反復する前でも入力コストの変更は伝播させること");
 }
 
 /// 通路を塞いだ場を、窓ごと動かしてから伝播させる。テストごとに同じ状況を作る。
@@ -1805,6 +1831,175 @@ fn the_core_and_the_prefetcher_cross_threads() {
     send::<PlannerCore>();
     // 先読みの取っ手は核の中に入ったまま別スレッドへ渡るので、両方が要る。
     send_sync::<Prefetcher>();
+}
+
+// manager の checkout / compute / commit を、順序を固定して交差させる。
+fn managed_field(compact: bool) -> PlannerCore {
+    let mut b = build(32);
+    b.grid.resolution = 0.1;
+    b.theta_cell_num = 8;
+    b.actions = vec![
+        Action::new("forward", 0.2, 0.0, 0),
+        Action::new("back", -0.1, 0.0, 1),
+        Action::new("left", 0.0, 45.0, 2),
+        Action::new("right", 0.0, -45.0, 3),
+    ];
+    b.local_xy_range = 0.3;
+    b.local_shape.range_m = 0.3;
+    b.repair_interior_cells = 4;
+    let config = if compact { cfg_compact() } else { cfg() };
+    let mut core = PlannerCore::new(b, config);
+    core.prepare_goal(pose(2.8, 1.6, 0.0), &AtomicBool::new(false)).expect("solve");
+    core.set_window(pose(1.6, 1.6, 0.0));
+    core.observe_scan(
+        &LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.2] },
+        pose(1.6, 1.6, 0.0),
+    );
+    core.refine_passes(4);
+    assert!(core.is_dirty(), "the scan must create propagation work");
+    core
+}
+
+fn managed_values(core: &PlannerCore) -> Vec<u64> {
+    match &core.cached.as_ref().expect("field").field {
+        Field::Dense(_) => dense_values(core),
+        Field::Compact(_) => compact_values(core),
+    }
+}
+
+fn owned_values(core: &PlannerCore) -> Vec<u64> {
+    let vi = core.local().expect("local window");
+    vi.base.states.iter()
+        .filter(|s| vi.in_local_area(s.ix, s.iy))
+        .map(|s| s.total_cost)
+        .collect()
+}
+
+#[test]
+fn global_jobs_leave_the_core_available_for_local_control() {
+    use std::sync::mpsc;
+    for compact in [false, true] {
+        let core = Arc::new(Mutex::new(managed_field(compact)));
+        let mut job = lock(&core).prepare_global_job(128).expect("global work");
+        let (started, ready) = mpsc::sync_channel(1);
+        let (resume, gate) = mpsc::sync_channel(1);
+        let (finished, result) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            started.send(()).expect("announce job");
+            gate.recv().expect("release worker");
+            job.run();
+            finished.send(job).expect("return job");
+        });
+        ready.recv_timeout(Duration::from_secs(10)).expect("worker started");
+        let decision = try_lock(&core).map(|mut c| {
+            c.set_window(pose(1.6, 1.6, 0.0));
+            c.refine_passes(4);
+            c.decide(pose(1.6, 1.6, 0.0))
+        });
+        // 判定前に解放し、失敗時にも worker が待ち続けないようにする。
+        resume.send(()).expect("resume");
+        let job = result.recv_timeout(Duration::from_secs(10)).expect("worker finished");
+        worker.join().expect("worker");
+        assert!(decision.is_some(), "global computation must not own the core lock");
+        lock(&core).commit_global_job(job);
+    }
+}
+
+#[test]
+fn obsolete_global_jobs_cannot_modify_a_replacement_goal() {
+    for compact in [false, true] {
+        let mut core = managed_field(compact);
+        let mut job = core.prepare_global_job(128).expect("global work");
+        let cancel = AtomicBool::new(false);
+        core.prepare_goal(pose(0.4, 1.6, 0.0), &cancel).expect("replacement");
+        // 座標が元に戻っても、以前の場に対する結果を使ってはいけない。
+        core.prepare_goal(pose(2.8, 1.6, 0.0), &cancel).expect("new field at old goal");
+        let expected = managed_values(&core);
+        job.run();
+        core.commit_global_job(job);
+        assert_eq!(managed_values(&core), expected, "old goal epoch was committed");
+        assert!(!core.is_dirty(), "obsolete work must not dirty the new field");
+    }
+}
+
+#[test]
+fn a_new_local_owner_is_protected_from_an_outstanding_global_job() {
+    for compact in [false, true] {
+        let mut core = managed_field(compact);
+        let mut changed_job = false;
+        for _ in 0..64 {
+            let mut job = core.prepare_global_job(usize::MAX).expect("global work");
+            let old_owner = core.claim_local();
+            let owner = core.claim_local();
+            core.release_local(old_owner);
+            // 窓を広げて、取り出し済みの仕事を狭域へ移す。値は変更しないので、
+            // 入力競合チェックではなく担当の保護が効いていることを確かめる。
+            core.local_mut().expect("window").set_local_xy_range(10.0);
+            core.set_window(pose(1.6, 1.6, 0.0));
+            let expected = owned_values(&core);
+            job.run();
+            let (delta, _) = core.commit_global_job(job);
+            assert_eq!(owned_values(&core), expected, "global result overwrote the new owner");
+            core.release_local(owner);
+            if delta > 0 {
+                changed_job = true;
+                break;
+            }
+        }
+        assert!(changed_job, "exercise a job that would change its assigned cells");
+        finish_in_background(&mut core, 100_000);
+        assert!(!core.is_dirty(), "released local work must return to global scheduling");
+    }
+}
+
+#[test]
+fn invalidations_received_during_global_work_are_not_lost() {
+    for compact in [false, true] {
+        let mut core = managed_field(compact);
+        let mut expected = managed_field(compact);
+        let mut job = core.prepare_global_job(128).expect("global work");
+        for c in [&mut core, &mut expected] {
+            c.set_window(pose(1.2, 1.6, 0.0));
+            c.observe_scan(
+                &LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.2] },
+                pose(1.2, 1.6, 0.0),
+            );
+            c.refine_passes(4);
+        }
+        job.run();
+        core.commit_global_job(job);
+        finish_in_background(&mut core, 100_000);
+        finish_in_background(&mut expected, 100_000);
+        assert_eq!(
+            managed_values(&core), managed_values(&expected),
+            "an invalidation arriving after checkout was dropped",
+        );
+    }
+}
+
+#[test]
+fn local_and_global_owners_settle_to_the_shared_field() {
+    for compact in [false, true] {
+        let mut core = managed_field(compact);
+        let mut expected = managed_field(compact);
+        finish_in_background(&mut expected, 100_000);
+        let owner = core.claim_local();
+        for _ in 0..100_000 {
+            core.set_window(pose(1.6, 1.6, 0.0));
+            core.refine_passes(4);
+            if let Some(mut job) = core.prepare_global_job(128) {
+                assert!(core.is_dirty(), "a dispatched job is still outstanding work");
+                job.run();
+                core.commit_global_job(job);
+            }
+            if !core.is_dirty() {
+                break;
+            }
+        }
+        assert!(!core.is_dirty(), "local-owned work prevented convergence");
+        assert_eq!(managed_values(&core), managed_values(&expected));
+        core.release_local(owner);
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

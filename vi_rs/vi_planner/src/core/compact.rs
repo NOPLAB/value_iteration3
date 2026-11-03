@@ -142,12 +142,7 @@ impl Patch {
         hydrate_states(&mut self.vi.base, f, build, overlay, p0);
     }
 
-    /// パッチが占めているグローバルセル範囲 `(x0, x1, y0, y1)`。未ハイドレートなら None。
-    fn footprint(&self) -> Option<(i32, i32, i32, i32)> {
-        let (p0x, p0y) = self.at?;
-        let side = 2 * self.half;
-        Some((p0x, p0x + side, p0y, p0y + side))
-    }
+
 }
 
 /// compact 経路で観測した `local_penalty` の全域表 (密経路では作らない)。
@@ -223,7 +218,7 @@ pub(super) struct Repair {
     pub(super) tnx: i32,
     pub(super) tny: i32,
     /// タイルが待ち行列に入っているか (二重投入よけ)。
-    queued: Vec<bool>,
+    pub(super) queued: Vec<bool>,
     pub(super) queue: VecDeque<u32>,
     /// いまの伝播で消費したタイル訪問数 (キューが空になるとリセット)。
     pub(super) visits: usize,
@@ -231,14 +226,11 @@ pub(super) struct Repair {
     /// 実際どれだけ働いたかを呼び出し側がログに出すためだけの値 — compact 側の
     /// 「1 掃き」は地図の大きさでは決まらないので、経過時間だけでは読めない。
     pub(super) last_visits: usize,
-    /// 訪問数の上限。超えたら諦めてキューを捨てる (暴走ガード。ここに掛かるのは
-    /// 想定外なので、掛かったら握り潰さずログに出す)。
-    visit_cap: usize,
 }
 
 impl Repair {
     /// タイル番号 → interior のグローバルセル範囲 `(x0, x1, y0, y1)` (両端含む)。
-    fn interior_of(&self, t: u32, gnx: i32, gny: i32) -> (i32, i32, i32, i32) {
+    pub(super) fn interior_of(&self, t: u32, gnx: i32, gny: i32) -> (i32, i32, i32, i32) {
         let (tx, ty) = ((t as i32) % self.tnx, (t as i32) / self.tnx);
         let x0 = tx * self.interior;
         let y0 = ty * self.interior;
@@ -248,7 +240,7 @@ impl Repair {
     /// グローバル矩形 `(x0, x1, y0, y1)` から `halo` セル以内にある interior を
     /// 持つタイルをすべて投入する。値が動いたセルの**上流**は必ずこの範囲にいる
     /// (上流はチェビシェフ距離 `reach` = `halo` 以内) ので、これで取りこぼさない。
-    fn enqueue_around(&mut self, (x0, x1, y0, y1): (i32, i32, i32, i32)) {
+    pub(super) fn enqueue_around(&mut self, (x0, x1, y0, y1): (i32, i32, i32, i32)) {
         let h = self.halo;
         let tx0 = ((x0 - h).max(0) / self.interior).min(self.tnx - 1);
         let tx1 = ((x1 + h).max(0) / self.interior).min(self.tnx - 1);
@@ -282,7 +274,7 @@ impl Repair {
     }
 
     /// 伝播 1 回ぶんの終わり。訪問数はログ用に写してから畳む。
-    fn settle(&mut self) {
+    pub(super) fn settle(&mut self) {
         self.last_visits = self.visits;
         self.visits = 0;
     }
@@ -427,11 +419,6 @@ pub(super) fn new_repair(build: &BuildParams, reach: i32) -> Result<Repair, Plan
         queue: VecDeque::new(),
         visits: 0,
         last_visits: 0,
-        // 1 タイルあたり平均 64 訪問 (= 128 パス) まで。1 訪問が 2 パスなので、
-        // これは「密経路が全域 Δ=0 まで 128 掃き必要」に相当する。64x64 の通路
-        // 地図で密が 72 掃き・compact が 1 タイルあたり 36 訪問だったので、
-        // 3 倍以上の余裕がある。ここは収束の見積もりではなく暴走ガード。
-        visit_cap: tiles.saturating_mul(64).saturating_add(256),
     })
 }
 
@@ -441,7 +428,7 @@ pub(super) fn new_repair(build: &BuildParams, reach: i32) -> Result<Repair, Plan
 /// `overlay` からは観測済みの `local_penalty` を**矩形全体に**戻す。中だけでは
 /// 足りない: `action_cost` は遷移先の `local_penalty` を読むので、凍結境界側が 0 の
 /// ままだと縁の行動コストが sink の値と食い違う。
-fn hydrate_states(
+pub(super) fn hydrate_states(
     base: &mut ValueIterator,
     f: &CompactField,
     build: &BuildParams,
@@ -562,35 +549,6 @@ fn commit_states(
         }
     }
     bbox
-}
-
-/// 局所座標の矩形 `[x0..=x1] x [y0..=y1]` を Gauss–Seidel で 1 パス掃き、Δ 合計を返す。
-/// 掃き向きは 4 通りから選ぶ (タイルは毎回起こし直すので索引表は持たない —
-/// 掃き順は毎回この 2 つの bool で決める)。
-fn sweep_rect(
-    vi: &mut ValueIterator,
-    (x0, x1, y0, y1): (i32, i32, i32, i32),
-    nt: i32,
-    fwd_x: bool,
-    fwd_y: bool,
-) -> u64 {
-    let ys: Vec<i32> = if fwd_y { (y0..=y1).collect() } else { (y0..=y1).rev().collect() };
-    let xs: Vec<i32> = if fwd_x { (x0..=x1).collect() } else { (x0..=x1).rev().collect() };
-    let mut delta = 0u64;
-    for &iy in &ys {
-        for &ix in &xs {
-            for it in 0..nt {
-                let i = vi.to_index(ix, iy, it) as usize;
-                delta = delta.saturating_add(vi.value_iteration_at(i));
-            }
-        }
-    }
-    delta
-}
-
-/// 閉区間の矩形 `(x0, x1, y0, y1)` どうしが重なるか。
-fn rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
-    a.0 <= b.1 && b.0 <= a.1 && a.2 <= b.3 && b.2 <= a.3
 }
 
 /// compact 出力 sink を作る。`dir` 指定時はディスク mmap、無指定は RAM。
@@ -742,7 +700,7 @@ impl PlannerCore {
     /// 「窓が動いた」以外に伝播の起点は無い。
     pub(super) fn commit_window(&mut self) {
         let patch = self.patch.as_ref();
-        let repair = self.repair.as_mut();
+        let mut repair = self.repair.as_mut();
         let Some(c) = self.cached.as_mut() else { return };
         let Field::Compact(f) = &mut c.field else { return };
         let Some(p) = patch else { return };
@@ -753,108 +711,19 @@ impl PlannerCore {
             p.vi.local_iy_min,
             p.vi.local_iy_max,
         );
-        let Some(bbox) = commit_states(f, &p.vi.base, p0, win) else { return };
-        if let Some(r) = repair {
-            r.enqueue_around(bbox);
-            self.dirty = true;
-        }
-    }
-
-    /// compact 経路の全域伝播: 待ち行列の先頭のタイルを 1 枚だけ修復する。
-    /// 戻り値は `(このタイルの Δ 合計, 待ち行列が空になったか)`。
-    ///
-    /// halo を凍結して interior だけを掃くブロック Gauss–Seidel。1 訪問では
-    /// 落ち着き切らないことがあるが、変化があれば自分のタイルも
-    /// [`Repair::enqueue_around`] で入り直すので、キューが空 = どのタイルも
-    /// 自分の halo に対して Δ=0 = 全域 Gauss–Seidel と同じ不動点になる。
-    ///
-    /// ## パッチの無効化
-    ///
-    /// 追従パッチは sink の写しを凍結して持っている。修復がその footprint を
-    /// 書き換えたら `at = None` にして次の tick で起こし直させる。しないと、
-    /// パッチが古い凍結値から計算した値を `commit_window` が書き戻し → タイルが
-    /// また直し → …… と互いを上書きし続けて**キューが空にならない** (値は
-    /// どちらも正しいので、症状は「掃きが終わらない」だけ)。`commit_window` は
-    /// 毎 tick 走っているので、起こし直しで失われるものは無い。
-    ///
-    /// 判定は footprint 全体との重なりで、狭域の窓の中まで含む (保守側)。**代償は
-    /// セル解像度で効く**: パッチの一辺は `2*(2*win + reach + 2) + 1` セルなので、
-    /// 0.25 m/cell なら 27 角 = 4.4 万状態でも、0.10 m/cell では 53 角 = 16.9 万状態
-    /// (13.4 MB) になり、起こし直しが 10 Hz の `set_window` の中で走る。波面が
-    /// ロボットの近くを通るあいだこれが続くので、細かい地図では tick の実測を
-    /// 見ること (窓の外だけに絞るのは、窓の中を patch と修復のどちらが持つかを
-    /// 決め直すことになるので、測ってからにする)。
-    pub(super) fn repair_one_tile(&mut self) -> (u64, bool) {
-        let build = &self.build;
-        let overlay = self.penalty.as_ref();
-        let Some(r) = self.repair.as_mut() else {
-            self.dirty = false; // global_sweep: false なので作っていない
-            return (0, true);
-        };
-        let Some(c) = self.cached.as_mut() else {
-            r.clear();
-            self.dirty = false;
-            return (0, true);
-        };
-        let Field::Compact(f) = &mut c.field else {
-            self.dirty = false;
-            return (0, true);
-        };
-        let Some(t) = r.queue.pop_front() else {
-            r.settle();
-            self.dirty = false;
-            // どのタイルも自分の halo に対して Δ=0 = 全域の不動点。早期走り出しで
-            // 未確定のまま走らせていた場は、ここで解き終わったことになる。
-            c.mark_complete();
-            return (0, true);
-        };
-        r.queued[t as usize] = false;
-        r.visits += 1;
-        if r.visits > r.visit_cap {
-            // ここに掛かるのは想定外 (ブロック GS は必ず止まる)。握り潰すと
-            // 「掃きが終わらない」としか見えないので、捨てたことを必ず出す。
-            eprintln!(
-                "vi_planner: tile repair gave up after {} visits with {} tiles still queued; \
-                 the global field may be stale until the next goal",
-                r.visits,
-                r.queue.len() + 1
-            );
-            r.clear();
-            self.dirty = false;
-            return (0, true);
-        }
-
-        let (gnx, gny, nt) = f.cell_num;
-        let (gx0, gx1, gy0, gy1) = r.interior_of(t, gnx, gny);
-        let p0 = (gx0 - r.halo, gy0 - r.halo);
-        hydrate_states(&mut r.vi, f, build, overlay, p0);
-
-        // interior のタイル局所座標。halo は読むだけ (凍結境界)。
-        let rect = (r.halo, r.halo + (gx1 - gx0), r.halo, r.halo + (gy1 - gy0));
-        // 掃き向きは訪問ごとに回して伝播方向を偏らせない。
-        let mut delta = sweep_rect(&mut r.vi, rect, nt, r.visits & 1 == 0, r.visits & 2 == 0);
-        if delta > 0 {
-            // 動いたタイルだけ 2 パス目を掃いてから返す。動かないタイル
-            // (= 伝播の波面の外) は 1 パスで抜ける — 仕事量が地図の大きさでは
-            // なく影響範囲に比例するのはここ。
-            let back = sweep_rect(&mut r.vi, rect, nt, r.visits & 1 != 0, r.visits & 2 != 0);
-            delta = delta.saturating_add(back);
-            if let Some(bbox) = commit_states(f, &r.vi, p0, rect) {
-                r.enqueue_around(bbox);
-                if let Some(p) = self.patch.as_mut() {
-                    if p.footprint().map(|fp| rects_overlap(fp, bbox)).unwrap_or(false) {
-                        p.at = None;
+        for y in win.2..=win.3 {
+            for x in win.0..=win.1 {
+                if !p.vi.in_local_area(x, y) {
+                    continue;
+                }
+                if let Some(bbox) = commit_states(f, &p.vi.base, p0, (x, x, y, y)) {
+                    if let Some(r) = repair.as_deref_mut() {
+                        r.enqueue_around(bbox);
+                        self.dirty = true;
                     }
                 }
             }
         }
-
-        let done = r.queue.is_empty();
-        if done {
-            r.settle();
-            self.dirty = false;
-            c.mark_complete(); // 上の pop_front 側と同じ「全域の不動点」判定
-        }
-        (delta, done)
     }
+
 }
