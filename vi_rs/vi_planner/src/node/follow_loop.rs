@@ -2,7 +2,8 @@
 //!
 //! `core::follow` の判断器 (greedy / DWA / MPPI) が「1 tick でどの行動を出すか」
 //! を決めるのに対し、ここはそれを回す**制御ループ**そのもの: 窓の移動 → スキャン
-//! 注入 → 予算内の再反復 → 行動の配信、を `control_frequency` で繰り返す。
+//! スキャン注入 → 非同期に精密化された場から判断 → 行動配信を繰り返す。
+//! `control_frequency` は入力・指令の周期で、価値反復は独立 worker が担う。
 //!
 //! [`run_follow`] が 1 回きりの追従 (`follow_path` = BT 構成)、[`run_goal`] が
 //! それを「失敗したら場を落ち着かせて投げ直す」で包んだもの (standalone)、
@@ -25,7 +26,6 @@ use super::msg::{poses_to_path, ros_grid_from, stop_cmd};
 #[derive(Clone, Copy)]
 pub struct FollowTuning {
     pub period: Duration,
-    pub refine_budget: Duration,
     /// pose 欠落 / 方策なしをこの連続 tick 数で追従失敗とみなす。
     pub failure_ticks_limit: u32,
     /// belief が多峰のとき QMDP (`decide_qmdp`) で行動を選ぶ (単峰は従来どおり)。
@@ -444,7 +444,6 @@ pub fn run_follow(
             // 自己位置が曖昧なほど壁際のマージンを広げる (文献 4·2·2)。注入の後に
             // 置く — 帯は地図の壁から起こすので、スキャンの塗り直しと打ち消し合わない。
             core.inflate_by_sigma(sigma);
-            core.refine_for(tuning.refine_budget);
 
             // 可視化グリッドの作成はロック内 (states を読む) / 配信は外。
             let mut window_grid = None;
@@ -545,15 +544,15 @@ pub fn run_follow(
 /// 止まったまま場を更新し続ける「待ち」。投げ直しの前に挟む。
 ///
 /// **Nav2 の BT の `Wait` はこれができない。** あちらが待っている間は
-/// `follow_path` が走っていないので `observe_scan` も `refine_for` も呼ばれず、
+/// `follow_path` が走っていないと `observe_scan` が呼ばれず、
 /// つまり `set_local_cost` の penalty 半減 — 一度«通れない»と塗った場所が
 /// «やっぱり通れる»に戻る唯一の経路 — が 1 段も進まない。待ち時間を延ばしても
 /// 場が同じままなら、投げ直しは同じ失敗を同じ場所で繰り返すだけになる
 /// (2026-08-04 の実機で `no_action_timeout_sec` を 15 秒へ延ばして確認: 粘らず、
 /// 1 点飛ばすまでが 2 分に伸びただけだった)。
 ///
-/// ここでは 0 速度を出しながら制御ループと同じ更新 (窓の移動 → スキャン注入 →
-/// 精密化) を回す。ロックの持ち方も制御ループと同じ `try_lock` で、掃きスレッド
+/// ここでは 0 速度を出しながら窓を移動してスキャンを注入し、独立 worker が
+/// 精密化する。ロックの持ち方も制御ループと同じ `try_lock` で、掃きスレッド
 /// からも先読みからも取り上げない。
 ///
 /// 戻り値は「最後まで待てたか」。false は cancel された。
@@ -578,7 +577,6 @@ pub fn run_settle(ctx: &FollowCtx, cancel: &AtomicBool, dur: Duration) -> bool {
                 for scan in &scans {
                     c.observe_scan_gated(scan, pose, scan_shift);
                 }
-                c.refine_for(tuning.refine_budget);
             }
         }
 

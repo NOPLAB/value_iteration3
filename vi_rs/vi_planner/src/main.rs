@@ -37,8 +37,8 @@
 //!   - solve 中はロックを保持する (cancel は `solve_chunk` ごとに観測するので
 //!     プリエンプトは効く)。BT は ComputePathToPose → FollowPath の順に呼ぶので、
 //!     実際に solve するのは広域側の 1 回だけになる。
-//!   - 追従の制御ループは **tick ごとに取得・解放**する。10Hz・予算 40ms なので、
-//!     1Hz のロールアウトは tick の隙間に入る。
+//!   - 追従の制御ループは **tick ごとに取得・解放**する。価値反復は独立した
+//!     local/global worker がスナップショット上で並行し、反映時だけロックする。
 //!   - 先読みワーカー (`waypoint_prefetch`) は**この Mutex を一度も取らない**。
 //!     自分の予備の核を別に持っていて、解けた場だけを受け渡す
 //!     (`core::Prefetcher`)。握らせると、無くしたはずの停止がそのまま戻る。
@@ -272,8 +272,8 @@ fn main() -> Result<()> {
     };
 
     // 6c. 狭域 → 広域のフィードバック (背景の全域掃きスレッド)。
-    //     `global_sweep: false` なら立たない。詳細は node::sweep の doc。
-    node::sweep::spawn(Arc::clone(&handles), &params);
+    //     狭域・広域は制御周期から独立し、それぞれ指定 CPU 配分で反復する。
+    node::sweep::spawn(Arc::clone(&handles), &params)?;
 
     // 6d. アクションサーバの配線材料。
     //
@@ -289,7 +289,6 @@ fn main() -> Result<()> {
         clock: node.get_clock(),
         tuning: FollowTuning {
             period: Duration::from_secs_f64(1.0 / params.control_frequency),
-            refine_budget: Duration::from_millis(params.refine_budget_ms.max(0) as u64),
             failure_ticks_limit: (params.no_action_timeout_sec.max(0.0)
                 * params.control_frequency)
                 .ceil()

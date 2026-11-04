@@ -1,18 +1,20 @@
-//! 狭域の担当割り当てと、広域ジョブの配送・結果反映を行う manager。
+//! 制御周期から独立した狭域・広域 worker。計算は共有ロック外で並行する。
 
-use std::sync::{mpsc, Arc, Mutex};
+use std::io;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vi_planner::core::{lock, GlobalJob, PlannerCore};
+use anyhow::{Context, Result};
+use vi_planner::core::{lock, PlannerCore};
+use vi_planner::cpu::{CpuPacer, CpuShare};
 
 use super::handles::Handles;
 use super::msg::ros_grid_from;
 use super::params::Params;
 
-/// ジョブを処理してから CPU を譲るまでの目安。ロック保持時間ではない。
-const BUDGET: Duration = Duration::from_millis(20);
 const STATES_PER_JOB: usize = 5_000;
 const REPORT_EVERY: Duration = Duration::from_secs(2);
+const IDLE: Duration = Duration::from_millis(20);
 
 /// 追従終了時に狭域の仕事を広域へ返す。古い追従の終了で新しい担当を外さない。
 pub struct LocalRegion<'a> {
@@ -47,101 +49,90 @@ fn value_grid(core: &Mutex<PlannerCore>, threshold: u64) -> Option<vi_lib::msg::
     Some(grid)
 }
 
-/// manager は取り出し・反映だけをロック内で行い、Bellman 更新は worker に渡す。
-/// 配送と返却は各 1 件。広域の計算を待つのは manager だけで、追従は待たない。
-pub fn spawn(handles: Arc<Handles>, params: &Params) {
-    if !params.global_sweep && !params.early_start {
-        return;
+/// 各 worker が自分のジョブだけを管理する。相手の計算終了は待たない。
+pub fn spawn(handles: Arc<Handles>, params: &Params) -> Result<()> {
+    if params.follow {
+        let h = Arc::clone(&handles);
+        let share = params.local_cpu_share;
+        std::thread::Builder::new()
+            .name("vi-local".into())
+            .spawn(move || {
+                if let Err(error) = local_worker(h, share) {
+                    eprintln!("ERROR: vi_planner: local worker stopped: {error}");
+                }
+            })
+            .context("starting local worker")?;
     }
-    let duty = params.global_sweep_duty.clamp(1, 100) as f64 / 100.0;
-    std::thread::spawn(move || {
-        std::thread::scope(|scope| {
-            let (jobs, incoming) = mpsc::sync_channel::<GlobalJob>(1);
-            let (finished, results) = mpsc::sync_channel::<GlobalJob>(1);
-            scope.spawn(move || {
-                while let Ok(mut job) = incoming.recv() {
-                    job.run();
-                    if finished.send(job).is_err() {
-                        return;
-                    }
+    if params.global_sweep || params.early_start {
+        let share = params.global_cpu_share;
+        std::thread::Builder::new()
+            .name("vi-global".into())
+            .spawn(move || {
+                if let Err(error) = global_worker(handles, share) {
+                    eprintln!("ERROR: vi_planner: global worker stopped: {error}");
                 }
-            });
+            })
+            .context("starting global worker")?;
+    }
+    eprintln!(
+        "vi_planner: worker CPU shares local={} global={} (one core = 1.0)",
+        params.local_cpu_share.get(),
+        params.global_cpu_share.get(),
+    );
+    Ok(())
+}
 
-            let mut sweep_start = None;
-            let mut last_report = Instant::now();
-            loop {
-                let batch_start = Instant::now();
-                let mut worked = false;
-                let mut done = false;
-                loop {
-                    let job = lock(&handles.core).prepare_global_job(STATES_PER_JOB);
-                    let Some(job) = job else { break };
-                    sweep_start.get_or_insert_with(Instant::now);
-                    worked = true;
-                    if jobs.send(job).is_err() {
-                        eprintln!("ERROR: vi_planner: global worker disconnected");
-                        return;
-                    }
-                    let Ok(job) = results.recv() else {
-                        eprintln!(
-                            "ERROR: vi_planner: global worker stopped before returning a job"
-                        );
-                        return;
-                    };
-                    done = lock(&handles.core).commit_global_job(job).1;
-                    if done || batch_start.elapsed() >= BUDGET {
-                        break;
-                    }
-                }
+fn local_worker(handles: Arc<Handles>, share: CpuShare) -> io::Result<()> {
+    let mut pacer = CpuPacer::new(share)?;
+    loop {
+        let job = lock(&handles.core).prepare_local_job();
+        if let Some(mut job) = job {
+            job.run();
+            let _delta = lock(&handles.core).commit_local_job(job);
+            pacer.pace()?;
+        } else {
+            std::thread::sleep(IDLE);
+            pacer.reset()?;
+        }
+    }
+}
 
-                // 局所側が最後の仕事を終えた場合も収束を報告する。
-                done |= !lock(&handles.core).is_dirty();
-                let mut draw = false;
-                if sweep_start.is_some() && (done || last_report.elapsed() >= REPORT_EVERY) {
-                    last_report = Instant::now();
-                    {
-                        let c = lock(&handles.core);
-                        if let Some(started) = sweep_start {
-                            if done {
-                                let (work, unit) = c.sweep_work();
-                                eprintln!(
-                                    "vi_planner: global propagation settled in {:.1}s ({work} {unit})",
-                                    started.elapsed().as_secs_f64(),
-                                );
-                            } else if let Some((processed, queued)) = c.sweep_progress() {
-                                let (_, unit) = c.sweep_work();
-                                eprintln!(
-                                    "vi_planner: global propagation running for {:.1}s \
-                                     ({processed} {unit} done, {queued} queued)",
-                                    started.elapsed().as_secs_f64(),
-                                );
-                            }
-                        }
-                        if let Some(v) = handles.viz.as_ref() {
-                            if done || !v.interval.is_zero() {
-                                draw = true;
-                            }
-                        }
-                    }
-                    if done {
-                        sweep_start = None;
-                    }
-                }
-                if draw {
-                    if let Some(v) = handles.viz.as_ref() {
-                        if let Some(g) = value_grid(&handles.core, v.threshold_steps) {
-                            let _ = v.vf_pub.publish(ros_grid_from(&g, &v.frame_id, v.stamp()));
-                        }
-                    }
-                }
-
-                let idle = if worked {
-                    batch_start.elapsed().mul_f64((1.0 - duty) / duty)
-                } else {
-                    Duration::from_millis(200)
-                };
-                std::thread::sleep(idle);
+fn global_worker(handles: Arc<Handles>, share: CpuShare) -> io::Result<()> {
+    let mut pacer = CpuPacer::new(share)?;
+    let mut last_report = Instant::now();
+    let mut last_draw = Instant::now();
+    loop {
+        let job = {
+            let mut core = lock(&handles.core);
+            core.restart_global_check();
+            core.prepare_global_job(STATES_PER_JOB)
+        };
+        if let Some(mut job) = job {
+            job.run();
+            let (_, done) = lock(&handles.core).commit_global_job(job);
+            if last_report.elapsed() >= REPORT_EVERY {
+                last_report = Instant::now();
+                let core = lock(&handles.core);
+                let (work, unit) = core.sweep_work();
+                eprintln!("vi_planner: global check ({work} {unit}, settled={done})");
             }
-        });
-    });
+            if let Some(v) = handles.viz.as_ref() {
+                let draw = if v.interval.is_zero() {
+                    done
+                } else {
+                    last_draw.elapsed() >= v.interval
+                };
+                if draw {
+                    last_draw = Instant::now();
+                    if let Some(g) = value_grid(&handles.core, v.threshold_steps) {
+                        let _ = v.vf_pub.publish(ros_grid_from(&g, &v.frame_id, v.stamp()));
+                    }
+                }
+            }
+            pacer.pace()?;
+        } else {
+            std::thread::sleep(IDLE);
+            pacer.reset()?;
+        }
+    }
 }

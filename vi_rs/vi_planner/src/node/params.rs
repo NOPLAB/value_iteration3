@@ -18,6 +18,7 @@ use vi_lib::solvers::U64Solver;
 use vi_lib::LocalShape;
 
 use vi_planner::core::FollowKind;
+use vi_planner::cpu::CpuShare;
 
 use rclrs::*;
 
@@ -90,7 +91,8 @@ pub struct Params {
     pub follow: bool,
     pub scan_topic: String,
     pub control_frequency: f64,
-    pub refine_budget_ms: i64,
+    /// 狭域 worker の CPU 秒 / 実時間秒 (1 コア基準)。
+    pub local_cpu_share: CpuShare,
     pub no_action_timeout_sec: f64,
     /// follow 1 tick の判断器 ("greedy" = 本家 decision / "dwa"・"mppi" = 連続行動)。
     pub follow_controller: String,
@@ -122,8 +124,8 @@ pub struct Params {
     pub waypoint_stop_on_failure: bool,
     // ── 狭域 → 広域のフィードバック (全域掃き) ──
     pub global_sweep: bool,
-    /// 全域掃きに渡す CPU の割合 [%]。
-    pub global_sweep_duty: i64,
+    /// 広域 worker の CPU 秒 / 実時間秒 (1 コア基準)。
+    pub global_cpu_share: CpuShare,
     // ── ウェイポイントの先読み ──
     pub waypoint_prefetch: bool,
     pub waypoint_topic: String,
@@ -278,7 +280,8 @@ pub fn read_params(node: &Node) -> Result<Params> {
         follow: p!("follow", bool, true),
         scan_topic: p!("scan_topic", Arc<str>, "scan".into()).to_string(),
         control_frequency: p!("control_frequency", f64, 10.0),
-        refine_budget_ms: p!("refine_budget_ms", i64, 40),
+        local_cpu_share: CpuShare::new(p!("local_cpu_share", f64, 0.6))
+            .ok_or_else(|| anyhow!("local_cpu_share must be finite and in (0, 1]"))?,
         no_action_timeout_sec: p!("no_action_timeout_sec", f64, 3.0),
         // follow 1 tick の判断器。"greedy" (既定) は本家 ViNode::decision 準拠の離散
         // 6 行動。"dwa" / "mppi" は同じ価値関数を連続に読む (V̂ 補間 + 軌道サンプリング、
@@ -329,7 +332,8 @@ pub fn read_params(node: &Node) -> Result<Params> {
         global_sweep: p!("global_sweep", bool, true),
         // 広域 worker に渡す CPU の割合。計算は核のロック外で実行する。
         // 上げるほど伝播は速くなるが、CPU とメモリ帯域の使用量が増える。
-        global_sweep_duty: p!("global_sweep_duty", i64, 25),
+        global_cpu_share: CpuShare::new(p!("global_cpu_share", f64, 0.2))
+            .ok_or_else(|| anyhow!("global_cpu_share must be finite and in (0, 1]"))?,
 
         // 次のウェイポイントの価値関数を、いまの点へ走っている間に解いておく
         // (core::Prefetcher)。巡回では点が変わるたびに solve が丸ごと 1 回走り、その間

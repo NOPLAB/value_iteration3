@@ -2002,6 +2002,238 @@ fn local_and_global_owners_settle_to_the_shared_field() {
     }
 }
 
+#[test]
+fn local_jobs_leave_the_core_available_for_global_work_and_scan_updates() {
+    use std::sync::mpsc;
+    for compact in [false, true] {
+        let mut c = managed_field(compact);
+        c.claim_local();
+        let core = Arc::new(Mutex::new(c));
+        let mut local = lock(&core).prepare_local_job().expect("local work");
+        let (resume, gate) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            gate.recv_timeout(Duration::from_secs(10)).expect("release local worker");
+            local.run();
+            local
+        });
+        let global = try_lock(&core).map(|mut c| {
+            c.set_window(pose(1.6, 1.6, 0.0));
+            c.prepare_global_job(128)
+        });
+        resume.send(()).expect("resume");
+        let local = worker.join().expect("local worker");
+        let mut global = global.expect("local job must not hold the core lock").expect("global work");
+        global.run();
+        let mut c = lock(&core);
+        c.commit_global_job(global);
+        assert!(c.commit_local_job(local).is_some());
+    }
+}
+
+#[test]
+fn local_jobs_reject_goal_window_scan_and_owner_changes() {
+    for compact in [false, true] {
+        for change in 0..4 {
+            let mut core = managed_field(compact);
+            let owner = core.claim_local();
+            let mut job = core.prepare_local_job().expect("local work");
+            assert!(core.prepare_local_job().is_none(), "only one checkout per owner");
+            let mut successor = None;
+            match change {
+                0 => {
+                    let cancel = AtomicBool::new(false);
+                    core.prepare_goal(pose(0.4, 1.6, 0.0), &cancel).expect("new goal");
+                    core.prepare_goal(pose(2.8, 1.6, 0.0), &cancel).expect("goal ABA");
+                }
+                1 => {
+                    core.set_window(pose(0.4, 0.4, 0.0));
+                    core.set_window(pose(1.6, 1.6, 0.0));
+                }
+                2 => core.observe_scan(
+                    &LaserScan { angle_min: 1.57, angle_increment: 0.0, ranges: vec![0.2] },
+                    pose(1.6, 1.6, 0.0),
+                ),
+                _ => {
+                    core.claim_local();
+                    core.release_local(owner);
+                    successor = Some(core.prepare_local_job().expect("successor owns the window"));
+                }
+            }
+            let values = managed_values(&core);
+            let inputs = core.local_inputs();
+            job.run();
+            assert_eq!(core.commit_local_job(job), None, "change {change}, compact {compact}");
+            assert_eq!(managed_values(&core), values);
+            assert_eq!(core.local_inputs(), inputs);
+            if let Some(mut next) = successor {
+                assert!(core.prepare_local_job().is_none(), "stale commit cannot clear successor");
+                next.run();
+                assert!(core.commit_local_job(next).is_some());
+            }
+        }
+    }
+}
+
+#[test]
+fn identical_window_and_scan_inputs_do_not_starve_local_jobs() {
+    for compact in [false, true] {
+        let mut core = managed_field(compact);
+        core.claim_local();
+        let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.2] };
+        for _ in 0..4 {
+            let mut job = core.prepare_local_job().expect("local work");
+            let before = core.local_inputs();
+            core.set_window(pose(1.6, 1.6, 0.0));
+            core.observe_scan(&scan, pose(1.6, 1.6, 0.0));
+            assert_eq!(core.local_inputs(), before, "identical scan fixture");
+            job.run();
+            assert!(core.commit_local_job(job).is_some(), "unchanged inputs must commit");
+        }
+    }
+}
+
+#[test]
+fn local_jobs_preserve_shaped_masks_and_match_synchronous_refinement() {
+    for compact in [false, true] {
+        for shape in [LocalShape::Square, LocalShape::Circle, LocalShape::Ellipse, LocalShape::Capsule] {
+            let mut core = managed_field(compact);
+            let mut expected = managed_field(compact);
+            for c in [&mut core, &mut expected] {
+                c.local_mut().expect("local").set_local_shape(LocalShapeConfig {
+                    shape, range_m: 0.3, lat_m: 0.2, ..Default::default()
+                });
+                c.set_window(pose(1.6, 1.6, 0.7));
+            }
+            core.claim_local();
+            let mut job = core.prepare_local_job().expect("local work");
+            job.run();
+            assert!(core.commit_local_job(job).is_some());
+            expected.refine_passes(1);
+            assert_eq!(managed_values(&core), managed_values(&expected), "{shape:?}");
+        }
+    }
+}
+
+#[test]
+fn released_local_jobs_return_unfinished_cells_to_global_work() {
+    for compact in [false, true] {
+        let mut core = managed_field(compact);
+        let mut expected = managed_field(compact);
+        finish_in_background(&mut expected, 100_000);
+        let owner = core.claim_local();
+        let mut job = core.prepare_local_job().expect("local work");
+        core.release_local(owner);
+        assert!(core.prepare_local_job().is_none());
+        job.run();
+        assert_eq!(core.commit_local_job(job), None);
+        finish_in_background(&mut core, 100_000);
+        assert_eq!(managed_values(&core), managed_values(&expected));
+    }
+}
+
+#[test]
+fn changed_boundary_accepts_local_progress_without_certifying_old_inputs() {
+    for compact in [false, true] {
+        let mut core = managed_field(compact);
+        finish_in_background(&mut core, 100_000);
+        core.claim_local();
+        let mut pass = core.prepare_local_job().expect("local work");
+        pass.run();
+        assert_eq!(core.commit_local_job(pass), Some(0));
+        assert!(core.restart_global_check());
+        // Damage an unowned column. The global worker will repair it while a
+        // zero-delta local pass is outstanding; any global change revokes its
+        // boundary certificate, even when that change is outside the halo.
+        match &mut core.cached.as_mut().expect("field").field {
+            Field::Dense(vi) => {
+                for t in 0..vi.base.cell_num_t {
+                    let i = vi.base.to_index(2, 2, t) as usize;
+                    vi.base.states[i].total_cost = MAX_COST;
+                    vi.base.states[i].optimal_action = None;
+                }
+            }
+            Field::Compact(f) => {
+                let nt = f.cell_num.2 as usize;
+                f.sink.write_column(f.orig(2, 2, 0), &vec![MAX_COST; nt], &vec![-1; nt]);
+            }
+        }
+        let mut local = core.prepare_local_job().expect("local work");
+        local.run();
+        let before = managed_values(&core);
+        let mut exercised = false;
+        for _ in 0..1000 {
+            let Some(mut global) = core.prepare_global_job(128) else { break };
+            global.run();
+            core.commit_global_job(global);
+            if managed_values(&core) != before {
+                exercised = true;
+                break;
+            }
+        }
+        assert!(exercised, "exercise a changed global boundary");
+        assert_eq!(core.commit_local_job(local), Some(0), "accept the completed local pass");
+        assert!(!core.global.certified, "old boundary cannot certify the current field");
+        assert!(core.is_dirty());
+    }
+}
+
+#[test]
+fn global_rechecks_do_not_wait_for_local_convergence() {
+    for compact in [false, true] {
+        let mut core = managed_field(compact);
+        finish_in_background(&mut core, 100_000);
+        core.claim_local();
+        let mut local = core.prepare_local_job().expect("local work");
+        assert!(core.is_dirty(), "local certification is pending");
+        assert!(core.restart_global_check(), "global must recheck independently");
+        let mut global = core.prepare_global_job(128).expect("global work");
+        global.run();
+        core.commit_global_job(global);
+        local.run();
+        assert!(core.commit_local_job(local).is_some());
+    }
+}
+
+#[test]
+fn independent_jobs_converge_and_repeat_full_field_checks() {
+    for compact in [false, true] {
+        let mut core = managed_field(compact);
+        let mut expected = managed_field(compact);
+        finish_in_background(&mut expected, 100_000);
+        let owner = core.claim_local();
+        for _ in 0..100_000 {
+            let mut local = core.prepare_local_job().expect("local work");
+            let global = core.prepare_global_job(128);
+            local.run();
+            if let Some(mut global) = global {
+                global.run();
+                core.commit_global_job(global);
+            }
+            assert!(core.commit_local_job(local).is_some());
+            if !core.is_dirty() {
+                break;
+            }
+        }
+        assert!(!core.is_dirty(), "independent workers must converge");
+        assert_eq!(managed_values(&core), managed_values(&expected));
+        let mut local = core.prepare_local_job().expect("converged window is still checked");
+        local.run();
+        assert_eq!(core.commit_local_job(local), Some(0));
+        core.release_local(owner);
+        for _ in 0..2 {
+            assert!(core.restart_global_check());
+            assert!(!core.restart_global_check(), "do not reset an active round");
+            finish_in_background(&mut core, 100_000);
+            assert_eq!(managed_values(&core), managed_values(&expected));
+        }
+    }
+    let mut core = PlannerCore::new(build(32), cfg());
+    core.claim_local();
+    assert!(core.prepare_local_job().is_none());
+    assert!(core.prepare_global_job(128).is_none());
+    assert!(!core.restart_global_check());
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // 走り出しの短縮 (core::PlanConfig::early_start)
 //

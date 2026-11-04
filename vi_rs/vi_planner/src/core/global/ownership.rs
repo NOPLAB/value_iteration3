@@ -2,11 +2,27 @@
 use super::*;
 
 impl PlannerCore {
+    /// Recheck exhausted global work without waiting for local convergence.
+    /// This neither replaces the goal nor marks a solved field partial.
+    pub fn restart_global_check(&mut self) -> bool {
+        if self.cached.is_none() || self.global.in_flight.is_some() || self.global_queued() {
+            return false;
+        }
+        if let Some(r) = self.repair.as_mut() {
+            r.enqueue_all();
+        } else {
+            self.seed_sweep_all();
+        }
+        self.dirty = true;
+        true
+    }
+
     /// Latest follow claim wins. A superseded thread cannot release its successor.
     pub fn claim_local(&mut self) -> u64 {
         self.global.serial += 1;
         let owner = self.global.serial;
         self.global.owner = Some(owner);
+        self.global.local_in_flight = None;
         self.global.certified = false;
         self.update_local_ownership();
         owner
@@ -15,6 +31,7 @@ impl PlannerCore {
     pub fn release_local(&mut self, owner: u64) {
         if self.global.owner == Some(owner) {
             self.global.owner = None;
+            self.global.local_in_flight = None;
             self.update_local_ownership();
         }
     }
@@ -22,6 +39,7 @@ impl PlannerCore {
     pub(in crate::core) fn invalidate_global_jobs(&mut self) {
         self.global.epoch += 1;
         self.global.in_flight = None;
+        self.global.local_in_flight = None;
         self.global.owned.clear();
         self.global.deferred.clear();
         self.global.certified = false;
@@ -58,6 +76,13 @@ impl PlannerCore {
             }
         }
         if owned != self.global.owned {
+            if !self.global.certified {
+                let released: Vec<_> = self.global.owned.difference(&owned).copied().collect();
+                for (x, y) in released {
+                    self.enqueue_global((x, x, y, y));
+                }
+            }
+            self.global.local_revision += 1;
             self.global.certified = false;
         }
         self.global.owned = owned;
@@ -77,6 +102,11 @@ impl PlannerCore {
     pub(in crate::core) fn certify_local(&mut self) {
         self.global.certified = true;
         self.global.deferred.clear();
+    }
+
+    pub(in crate::core) fn invalidate_local_window(&mut self) {
+        self.global.local_revision += 1;
+        self.global.certified = false;
     }
 
     pub(super) fn refresh_local_boundary(&mut self) {
@@ -136,6 +166,7 @@ impl PlannerCore {
             return;
         }
         self.global.certified = false;
+        self.global.local_revision += 1;
         let Some(vi) = self.local() else { return };
         let p0 = if self.cfg.use_compact() {
             self.patch.as_ref().and_then(|p| p.at).unwrap_or((0, 0))
@@ -151,8 +182,8 @@ impl PlannerCore {
         self.enqueue_global(rect);
     }
 
-    pub(super) fn settle_global(&mut self) -> bool {
-        let queued = if let Some(r) = self.repair.as_ref() {
+    pub(super) fn global_queued(&self) -> bool {
+        if let Some(r) = self.repair.as_ref() {
             !r.queue.is_empty()
         } else {
             self.sweep.pos < self.sweep.cands.len()
@@ -161,8 +192,15 @@ impl PlannerCore {
                     .pending
                     .as_ref()
                     .is_some_and(|p| p.popcount() > 0)
-        };
-        let done = !queued && self.global.in_flight.is_none() && self.global.deferred.is_empty();
+        }
+    }
+
+    pub(super) fn settle_global(&mut self) -> bool {
+        let done = !self.global_queued()
+            && self.global.in_flight.is_none()
+            && self.global.local_in_flight.is_none()
+            && (self.global.owned.is_empty() || self.global.certified)
+            && self.global.deferred.is_empty();
         self.dirty = !done;
         if done {
             if let Some(r) = self.repair.as_mut() {

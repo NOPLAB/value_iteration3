@@ -46,7 +46,7 @@ mod value_grid;
 mod tests;
 
 pub use follow::{DwaController, FollowController, FollowKind, GreedyController, MppiController};
-pub use global::GlobalJob;
+pub use global::{GlobalJob, LocalJob};
 // 自己位置推定は 2 系統が併存する (アルゴリズムは vi_lib、配線はノードの分担):
 //   - 窓つき: vi_lib::localize の `Localizer` トレイト (external / grid / adaptive)。
 //   - 全地図: vi_lib::belief の `Belief` (belief / viterbi)。窓もレベル機構も無い。
@@ -1113,6 +1113,7 @@ impl PlannerCore {
     /// 起こし直す。前の位置での成果は `commit_window` が毎 tick sink へ返して
     /// あるので、置き直しで失われるものは無い。
     pub fn set_window(&mut self, pose: PoseView) {
+        let old_origin = self.patch.as_ref().and_then(|p| p.at);
         // build / cached / patch / penalty は別フィールドなので分割して借りられる。
         let build = &self.build;
         let patch = &mut self.patch;
@@ -1130,6 +1131,9 @@ impl PlannerCore {
                 }
                 p.vi.set_local_window(pose.x, pose.y, pose.yaw_rad);
             }
+        }
+        if self.patch.as_ref().and_then(|p| p.at) != old_origin {
+            self.invalidate_local_window();
         }
         self.update_local_ownership();
     }
@@ -1243,7 +1247,11 @@ impl PlannerCore {
 
     /// 狭域が共有場を動かしてから、まだ全域へ伝播させ切っていないか。
     pub fn is_dirty(&self) -> bool {
-        self.dirty || self.global.in_flight.is_some() || !self.global.deferred.is_empty()
+        self.dirty
+            || self.global.in_flight.is_some()
+            || self.global.local_in_flight.is_some()
+            || self.global.local_pending()
+            || !self.global.deferred.is_empty()
     }
 
     /// 直近の伝播 1 回で処理した量と、その単位。ログ用。
@@ -1266,7 +1274,9 @@ impl PlannerCore {
     /// 1000 tick 中 13 回だけ)。つまり「1 回終わった」ログはほぼ出ない —
     /// 掃きが動いているかはこちらで見ること。
     pub fn sweep_progress(&self) -> Option<(usize, usize)> {
-        let outstanding = usize::from(self.global.in_flight.is_some()) + self.global.deferred.len();
+        let outstanding = usize::from(self.global.in_flight.is_some())
+            + usize::from(self.global.local_in_flight.is_some())
+            + self.global.deferred.len();
         if let Some(r) = self.repair.as_ref() {
             let queued = r.queue.len() + outstanding;
             return (queued > 0).then_some((r.visits, queued));

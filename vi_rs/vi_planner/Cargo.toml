@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 anyhow  = "1"
+cpu-time = "1"
 # main.rs が action コールバック (rclrs の futures エグゼキュータ) と
 # 計画/追従スレッドを橋渡しする oneshot チャネルに使う。
 futures = "0.3"

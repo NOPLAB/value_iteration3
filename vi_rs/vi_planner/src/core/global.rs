@@ -6,9 +6,11 @@ use vi_lib::state::State;
 use super::*;
 
 mod job;
+mod local;
 mod ownership;
 use job::geometry;
 pub use job::GlobalJob;
+pub use local::LocalJob;
 
 #[derive(Default)]
 pub(super) struct Manager {
@@ -19,6 +21,15 @@ pub(super) struct Manager {
     pub(super) deferred: BTreeSet<(i32, i32)>,
     pub(super) certified: bool,
     pub(super) in_flight: Option<u64>,
+    pub(super) local_in_flight: Option<u64>,
+    local_revision: u64,
+    boundary_revision: u64,
+}
+
+impl Manager {
+    pub(super) fn local_pending(&self) -> bool {
+        !self.owned.is_empty() && !self.certified
+    }
 }
 
 fn unchanged(a: &State, b: &State) -> bool {
@@ -237,6 +248,7 @@ impl PlannerCore {
         }
         if !changed.is_empty() {
             // A new boundary value invalidates the local fixed-point certificate.
+            self.global.boundary_revision += 1;
             self.global.certified = false;
             self.refresh_local_boundary();
         }
