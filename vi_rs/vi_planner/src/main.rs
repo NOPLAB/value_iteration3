@@ -289,10 +289,6 @@ fn main() -> Result<()> {
         clock: node.get_clock(),
         tuning: FollowTuning {
             period: Duration::from_secs_f64(1.0 / params.control_frequency),
-            failure_ticks_limit: (params.no_action_timeout_sec.max(0.0)
-                * params.control_frequency)
-                .ceil()
-                .max(1.0) as u32,
             qmdp: params.qmdp,
             sigma_margin: params.sigma_margin_gain > 0.0,
             scan_quality_gate: params.scan_quality_gate,

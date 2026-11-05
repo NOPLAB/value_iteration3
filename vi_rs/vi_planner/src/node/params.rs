@@ -94,7 +94,6 @@ pub struct Params {
     pub control_frequency: f64,
     /// 狭域 worker の CPU 秒 / 実時間秒 (1 コア基準)。
     pub local_cpu_share: vi_planner::cpu::LocalCpuShare,
-    pub no_action_timeout_sec: f64,
     /// follow 1 tick の判断器 ("greedy" = 本家 decision / "dwa"・"mppi" = 連続行動)。
     pub follow_controller: String,
     /// belief が多峰のとき QMDP (Q(b,a) = Σ w·Q(s,a) の argmin) で行動を選ぶ。
@@ -284,7 +283,6 @@ pub fn read_params(node: &Node) -> Result<Params> {
         control_frequency: p!("control_frequency", f64, 10.0),
         local_cpu_share: vi_planner::cpu::LocalCpuShare::new(p!("local_cpu_share", f64, 0.6))
             .ok_or_else(|| anyhow!("local_cpu_share must be finite and > 0"))?,
-        no_action_timeout_sec: p!("no_action_timeout_sec", f64, 3.0),
         // follow 1 tick の判断器。"greedy" (既定) は本家 ViNode::decision 準拠の離散
         // 6 行動。"dwa" / "mppi" は同じ価値関数を連続に読む (V̂ 補間 + 軌道サンプリング、
         // core::follow の doc 参照)。指令の速度範囲は行動集合と同じで、候補全滅時は

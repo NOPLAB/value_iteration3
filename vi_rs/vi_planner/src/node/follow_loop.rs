@@ -26,8 +26,6 @@ use super::msg::{poses_to_path, ros_grid_from, stop_cmd};
 #[derive(Clone, Copy)]
 pub struct FollowTuning {
     pub period: Duration,
-    /// pose 欠落 / 方策なしをこの連続 tick 数で追従失敗とみなす。
-    pub failure_ticks_limit: u32,
     /// belief が多峰のとき QMDP (`decide_qmdp`) で行動を選ぶ (単峰は従来どおり)。
     pub qmdp: bool,
     /// σ に応じた壁際マージンの膨張が有効か (`PlanConfig::sigma_margin_gain > 0`)。
@@ -206,10 +204,6 @@ pub fn run_follow(
 
     // ── 2. 制御ループ ──
     let _region = super::sweep::LocalRegion::claim(core);
-    // tick の中では取得した guard が `core` を隠すので、guard を手放したあとに
-    // 本体へ触るための別名を先に取っておく。
-    let shared = core;
-    let mut failure_ticks = 0u32;
     // ロックを連続で取れなかった tick 数 (下の try_lock を参照)。
     let mut busy_ticks = 0u32;
     let mut last_viz: Option<Instant> = None;
@@ -252,7 +246,6 @@ pub fn run_follow(
                 }
                 reloc = Reloc::Idle;
                 reloc_ticks = 0;
-                failure_ticks = 0;
             }
         }
         let Some(pose) = pose else {
@@ -264,8 +257,7 @@ pub fn run_follow(
             // コールバックで localizer に反映済みなので、ここで消費してよい)。
             let last_scan = std::mem::take(&mut *scan_queue.lock().unwrap()).pop();
             // ロスト中の走行予算は再定位 QMDP と creep で共有する。予算切れ後は
-            // 停止待ちに戻り、ゴールは no-pose 失敗 → standalone の投げ直しが
-            // 予算を張り直す。
+            // 停止待ちに戻り、姿勢の復帰かキャンセルを待ち続ける。
             let lost_budget = reloc_ticks < tuning.reloc_ticks_limit;
             if lost_budget && (tuning.active_reloc || tuning.lost_creep) {
                 reloc_ticks += 1;
@@ -364,14 +356,8 @@ pub fn run_follow(
                     }
                 }
             }
-            if acted {
-                failure_ticks = 0;
-            } else {
+            if !acted {
                 stop_cmd(cmd_pub);
-                failure_ticks += 1;
-                if failure_ticks >= tuning.failure_ticks_limit {
-                    return Outcome::Failed("no robot pose for too long".into());
-                }
             }
             if let Some(rest) = tuning.period.checked_sub(tick_start.elapsed()) {
                 std::thread::sleep(rest);
@@ -509,32 +495,15 @@ pub fn run_follow(
                     *lock(latest_pose) = l.pose();
                 }
                 speed = fw as f32;
-                failure_ticks = 0;
             }
             Decision::NoAction => {
+                // 方策が出るまで停止して待つ。スキャン注入と背景の精密化は続く。
                 stop_cmd(cmd_pub);
-                failure_ticks += 1;
             }
         }
 
         report(&FollowProgress { pose, distance_remaining: dist, speed });
 
-        if failure_ticks >= tuning.failure_ticks_limit {
-            stop_cmd(cmd_pub);
-            // まだ解き終わっていない場 (early_start) だったなら捨てる。方策が引けないのは
-            // 「経路の外の未確定領域に入った」形で起き得るが、キャッシュを
-            // 残したままだと BT が投げ直すたびに同じ場で同じ失敗を繰り返す
-            // (prepare_goal はキャッシュヒットで solve に入らない)。捨てておけば
-            // 次の要求が最後まで解き直す。収束済みの場なら何もしない。
-            if lock(shared).discard_partial() {
-                eprintln!(
-                    "vi_planner: dropped the not-yet-finished value function (early_start) after \
-                     {failure_ticks} ticks without an action; the next request solves it \
-                     to convergence"
-                );
-            }
-            return Outcome::Failed("no applicable action for too long".into());
-        }
         if let Some(rest) = tuning.period.checked_sub(tick_start.elapsed()) {
             std::thread::sleep(rest);
         }
@@ -547,9 +516,7 @@ pub fn run_follow(
 /// `follow_path` が走っていないと `observe_scan` が呼ばれず、
 /// つまり `set_local_cost` の penalty 半減 — 一度«通れない»と塗った場所が
 /// «やっぱり通れる»に戻る唯一の経路 — が 1 段も進まない。待ち時間を延ばしても
-/// 場が同じままなら、投げ直しは同じ失敗を同じ場所で繰り返すだけになる
-/// (2026-08-04 の実機で `no_action_timeout_sec` を 15 秒へ延ばして確認: 粘らず、
-/// 1 点飛ばすまでが 2 分に伸びただけだった)。
+/// 場が同じままなら、投げ直しは同じ失敗を同じ場所で繰り返すだけになる。
 ///
 /// ここでは 0 速度を出しながら窓を移動してスキャンを注入し、独立 worker が
 /// 精密化する。ロックの持ち方も制御ループと同じ `try_lock` で、掃きスレッド

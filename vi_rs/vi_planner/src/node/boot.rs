@@ -61,8 +61,7 @@ pub const GOAL_RETRY_SETTLE_SEC: f64 = 3.0;
 /// ロスト中の判別走行 (能動的再定位 + belief_recovery の creep) を諦めて
 /// 停止待ちに戻すまでの時間 [s]。津田沼の誘拐復帰は relock 17〜42 s
 /// (viola_bench de0b85f) なので、旧 30 s ではベンチ実証済みの復帰の途中で
-/// 止まる。予算切れ後はゴールが no-pose 失敗になり、standalone の投げ直しが
-/// 予算を張り直す。
+/// 止まる。予算切れ後は安全停止で姿勢の復帰かキャンセルを待ち続ける。
 pub const RELOC_TIMEOUT_SEC: f64 = 120.0;
 
 /// このマシンで**いま**確保できるメモリ [B] (`/proc/meminfo` の `MemAvailable`)。

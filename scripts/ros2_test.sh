@@ -25,3 +25,6 @@ bash "$REPO_ROOT/scripts/ros2_build.sh"
 # `cargo test --test ...` would fail to find the nav2_msgs C typesupport libs).
 cd "$REPO_ROOT/vi_rs/vi_planner"
 cargo test --lib
+
+# Exercise the ROS action loop as well as the rclrs-free core.
+python3 "$REPO_ROOT/scripts/ros2_follow_wait_test.py"

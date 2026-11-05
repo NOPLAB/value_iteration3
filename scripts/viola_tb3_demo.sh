@@ -126,7 +126,6 @@ VI_ARGS=(
     -p scan_topic:=scan                  # 規定: scan
     -p control_frequency:=10.0           # 規定: 10.0 [Hz]
     -p local_cpu_share:=0.6              # 規定: 0.6 [core] (狭域 worker の CPU 配分)
-    -p no_action_timeout_sec:=3.0        # 規定: 3.0 [s] (方策なし連続でこの時間 → 追従失敗)
     -p follow_controller:=mppi           # 規定: greedy (本家 decision) | dwa | mppi
     -p dwa_horizon_s:=1.0                # 規定: 1.0 [s] (DWA/MPPI の前方シミュレーション)
     -p dwa_lethal_penalty:=2.0           # 規定: 2.0 [PROB_BASE 単位] (margin 帯棄却、0 で無効)
