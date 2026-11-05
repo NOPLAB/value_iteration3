@@ -823,6 +823,51 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_committed_values_cannot_guide_interpolation_or_continuous_control() {
+        use crate::planner::{CompactPolicy, PolicyView};
+        use crate::solvers::frontier2d_sparse_compact::{CompactSink, RamSink};
+
+        let mut vi = solved_vi(32, 32, empty_map(32), (1.2, 1.2, 0));
+        assert!(v_hat(&vi, 0.5, 0.5, 0.0).is_some());
+        for s in &mut vi.states {
+            if s.free && !s.final_state {
+                s.optimal_action = None;
+            }
+        }
+        let mut sink = RamSink::new(vi.states.len());
+        for (i, s) in vi.states.iter().enumerate() {
+            sink.write_column(
+                i,
+                &[s.total_cost],
+                &[s.optimal_action.map_or(-1, |a| a as i32)],
+            );
+        }
+        let compact = CompactPolicy::new(
+            &sink,
+            &vi.actions,
+            (32, 32, NT),
+            RES,
+            (0.0, 0.0),
+            (1.2, 1.2, 0),
+        );
+        let dwa = DwaConfig::from_actions(&vi.actions, 0.1);
+        let mppi = MppiConfig::from_actions(&vi.actions, 0.1);
+        for view in [&vi as &dyn PolicyView, &compact] {
+            assert_eq!(view.value_at(10, 10, 0), MAX_COST);
+            assert!(v_hat(view, 0.5, 0.5, 0.0).is_none());
+            assert!(dwa_decide(view, &vi, &dwa, 0.5, 0.5, 0.0).is_none());
+            let mut state = MppiState::new(mppi.seed);
+            assert!(mppi_decide(view, &vi, &mppi, &mut state, 0.5, 0.5, 0.0).is_none());
+            assert_eq!(view.value_at(24, 24, 0), 0, "absorbing goals remain usable");
+        }
+        let source = &vi.states[vi.to_index(10, 10, 0) as usize];
+        assert!(
+            source.total_cost > 0 && source.total_cost < MAX_COST,
+            "the old committed value is retained for display"
+        );
+    }
+
+    #[test]
     fn v_hat_matches_cell_value_at_centers() {
         let vi = solved_vi(64, 64, empty_map(64), (2.0, 2.0, 0));
         use crate::planner::PolicyView as _;

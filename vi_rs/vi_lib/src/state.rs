@@ -16,10 +16,20 @@ pub struct State {
     pub free: bool,
     pub final_state: bool,
     /// 本家 `Action *optimal_action_` → `actions` ベクタへの索引。
+    /// None with a finite free nonterminal value marks a discarded policy.
     pub optimal_action: Option<usize>,
 }
 
 impl State {
+    /// A discarded policy retains its last committed value until repair.
+    /// Goals and ordinary unreached/occupied states are not this marker.
+    pub fn policy_invalidated(&self) -> bool {
+        self.free
+            && !self.final_state
+            && self.total_cost < MAX_COST
+            && self.optimal_action.is_none()
+    }
+
     /// 本家 `State(int x, int y, int theta, const nav_msgs::OccupancyGrid &map,
     ///            int margin, double margin_penalty, int x_num)`。
     pub fn from_occupancy(
@@ -129,5 +139,4 @@ mod tests {
             "行跨ぎバグにより penalty が立つこと"
         );
     }
-
 }

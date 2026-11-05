@@ -22,7 +22,7 @@
 //! ただし sink は `(value, action)` の 12 B/state しか持たない。値を書き戻しても
 //! **その値を正当化する `local_penalty` がどこにも残らない**ので、次にその区画を
 //! 起こし直すと penalty 0 で価値反復が回り、上げた値が静かに元へ戻る。そこで
-//! 観測した penalty だけを別に覚える ([`PenaltyOverlay`], 1 B/セル)。密経路の
+//! 観測した penalty だけを別に覚える ([`PenaltyOverlay`], 8 B/セル)。密経路の
 //! `states.local_penalty` の代わりで、寿命も同じ (ゴールを解き直すと消える)。
 //!
 //! # 全域伝播はタイル修復で回す ([`Repair`])
@@ -152,21 +152,18 @@ impl Patch {
 /// たびに [`Patch::hydrate`] が窓の外の分もここから復元する。無いと、置き直した
 /// 直後の価値反復が penalty 0 で回って上げた値を戻してしまう。
 ///
-/// **1 セル 1 バイトで正確に持てる。** `set_local_cost` が書くのは
-/// `2048 << PROB_BASE_BIT` (= 2^29) か、それを 2 で割り続けた値だけなので常に
-/// 2 の冪で、指数だけ持てば足りる。しかも θ 方向に一様 (同じ (ix,iy) の全 θ へ
-/// 同じ値を書く) なので 2D でよい。この 2 つは `vi_lib::local` の
-/// `set_local_cost` の実装そのもので、崩れたらこの表は近似に落ちる。
+/// Exact fixed-point values support arbitrary integer scan strengths, quality
+/// attenuation, and beam halving. Penalties are theta-uniform, so 8 B/cell in
+/// two dimensions suffices; no full-map dense states are needed.
 pub(super) struct PenaltyOverlay {
-    /// 指数 + 1。0 = penalty 無し、`e` = 値 `1 << (e - 1)`。
-    exp: Vec<u8>,
+    values: Vec<u64>,
     nx: i32,
     ny: i32,
 }
 
 impl PenaltyOverlay {
     pub(super) fn new(nx: i32, ny: i32) -> Self {
-        Self { exp: vec![0u8; nx as usize * ny as usize], nx, ny }
+        Self { values: vec![0; nx as usize * ny as usize], nx, ny }
     }
 
     fn idx(&self, ix: i32, iy: i32) -> Option<usize> {
@@ -175,20 +172,17 @@ impl PenaltyOverlay {
     }
 
     pub(super) fn get(&self, ix: i32, iy: i32) -> u64 {
-        match self.idx(ix, iy).map(|i| self.exp[i]) {
-            Some(0) | None => 0,
-            Some(e) => 1u64 << (e - 1),
-        }
+        self.idx(ix, iy).map_or(0, |i| self.values[i])
     }
 
-    /// 2 の冪でない値が来たら**切り下げ**て記録する (上の理由で実際には来ない)。
+    /// Preserve the complete value, including non-power-of-two decay.
     pub(super) fn set(&mut self, ix: i32, iy: i32, v: u64) {
         let Some(i) = self.idx(ix, iy) else { return };
-        self.exp[i] = if v == 0 { 0 } else { (64 - v.leading_zeros()) as u8 };
+        self.values[i] = v;
     }
 
     pub(super) fn clear(&mut self) {
-        self.exp.fill(0);
+        self.values.fill(0);
     }
 }
 
@@ -333,8 +327,8 @@ pub(super) fn new_patch(build: &BuildParams) -> Result<Patch, PlanError> {
     vi.set_map_with_occupancy_grid(
         &dummy,
         build.theta_cell_num,
-        build.safety_radius,
-        build.safety_radius_penalty,
+        build.map_penalty_radius,
+        build.map_penalty,
         build.goal_margin_radius,
         build.goal_margin_theta,
     );
@@ -391,8 +385,8 @@ pub(super) fn new_repair(build: &BuildParams, reach: i32) -> Result<Repair, Plan
     vi.set_map_with_occupancy_grid(
         &dummy,
         build.theta_cell_num,
-        build.safety_radius,
-        build.safety_radius_penalty,
+        build.map_penalty_radius,
+        build.map_penalty,
         build.goal_margin_radius,
         build.goal_margin_theta,
     );
@@ -438,7 +432,7 @@ pub(super) fn hydrate_states(
     let (gnx, gny, nt) = f.cell_num;
     let res = f.resolution;
     let (sx, sy) = (base.cell_num_x, base.cell_num_y);
-    let margin = (build.safety_radius / res).ceil() as i32;
+    let margin = (build.map_penalty_radius / res).ceil() as i32;
 
     base.map_origin_x = f.origin.0 + p0.0 as f64 * res;
     base.map_origin_y = f.origin.1 + p0.1 as f64 * res;
@@ -458,7 +452,7 @@ pub(super) fn hydrate_states(
             // `State::from_occupancy` の margin ループは行跨ぎバグを持つので、
             // 切り出してから評価すると compact solve が見た値とズレる。
             let proto = if inside {
-                let pen = build.safety_radius_penalty;
+                let pen = build.map_penalty;
                 State::from_occupancy(gx, gy, 0, &build.grid, margin, pen, gnx)
             } else {
                 // 地図外。`from_occupancy` の非 free 早期リターンと同じ形。
@@ -637,8 +631,8 @@ impl PlannerCore {
             1,
             g,
             nt,
-            self.build.safety_radius,
-            self.build.safety_radius_penalty,
+            self.build.map_penalty_radius,
+            self.build.map_penalty,
             self.build.goal_margin_radius,
             self.build.goal_margin_theta,
             goal.x,

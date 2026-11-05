@@ -26,8 +26,11 @@ pub struct Params {
     // ── 共有 (価値関数の定義そのもの) ──
     pub solver: String,
     pub theta_cell_num: i64,
-    pub safety_radius: f64,
-    pub safety_radius_penalty: i64,
+    pub map_penalty_radius: f64,
+    pub map_penalty: i64,
+    /// Scan hit band radius [m], followed by its integer cost strength.
+    pub scan_penalty_radius: f64,
+    pub scan_penalty: i64,
     pub goal_margin_radius: f64,
     pub goal_margin_theta_deg: f64,
     pub map_wait_sec: i64,
@@ -78,8 +81,6 @@ pub struct Params {
     // ── 狭域 (follow_path) ──
     /// ローカルウィンドウの前後半径 [m] (本家 ValueIteratorLocal は 1.0 固定)。
     pub local_xy_range: f64,
-    /// ヒットセル周囲のペナルティ帯の半幅 [m]。0 はヒットセルのみ。
-    pub scan_penalty_radius: f64,
     /// ローカルウィンドウの横半径 [m]。0 = `local_xy_range` と同じ (等方)。
     pub local_xy_range_lat: f64,
     /// ウィンドウ形状 ("square" / "circle" / "ellipse" / "capsule")。
@@ -92,7 +93,7 @@ pub struct Params {
     pub scan_topic: String,
     pub control_frequency: f64,
     /// 狭域 worker の CPU 秒 / 実時間秒 (1 コア基準)。
-    pub local_cpu_share: CpuShare,
+    pub local_cpu_share: vi_planner::cpu::LocalCpuShare,
     pub no_action_timeout_sec: f64,
     /// follow 1 tick の判断器 ("greedy" = 本家 decision / "dwa"・"mppi" = 連続行動)。
     pub follow_controller: String,
@@ -186,8 +187,10 @@ pub fn read_params(node: &Node) -> Result<Params> {
     let mut params = Params {
         solver: p!("solver", Arc<str>, "frontier2d_sparse".into()).to_string(),
         theta_cell_num: p!("theta_cell_num", i64, 60),
-        safety_radius: p!("safety_radius", f64, 0.2),
-        safety_radius_penalty: p!("safety_radius_penalty", i64, 30),
+        map_penalty_radius: p!("map_penalty_radius", f64, 0.2),
+        map_penalty: p!("map_penalty", i64, 10_000),
+        scan_penalty_radius: p!("scan_penalty_radius", f64, 0.1),
+        scan_penalty: p!("scan_penalty", i64, 10_000),
         goal_margin_radius: p!("goal_margin_radius", f64, 0.3),
         goal_margin_theta_deg: p!("goal_margin_theta", f64, 15.0),
         map_wait_sec: p!("map_wait_sec", i64, 30),
@@ -265,7 +268,6 @@ pub fn read_params(node: &Node) -> Result<Params> {
         // 追従が見る・スキャンで補正するウィンドウの半径。広げると 1 tick の
         // refine 対象と compact パッチ (辺 ∝ 2×半径) が大きくなる。
         local_xy_range: p!("local_xy_range", f64, 1.0),
-        scan_penalty_radius: p!("scan_penalty_radius", f64, 0.1),
         // 窓の形。既定 square は本家そのもの (地図軸の矩形)。lat を別に与えれば
         // 「前後 2m × 左右 1m」のような異方の窓になる。ellipse / capsule は
         // 走行方向に応じて前後の半軸が伸縮する (面積は一定 — 前に伸びたぶん
@@ -280,8 +282,8 @@ pub fn read_params(node: &Node) -> Result<Params> {
         follow: p!("follow", bool, true),
         scan_topic: p!("scan_topic", Arc<str>, "scan".into()).to_string(),
         control_frequency: p!("control_frequency", f64, 10.0),
-        local_cpu_share: CpuShare::new(p!("local_cpu_share", f64, 0.6))
-            .ok_or_else(|| anyhow!("local_cpu_share must be finite and in (0, 1]"))?,
+        local_cpu_share: vi_planner::cpu::LocalCpuShare::new(p!("local_cpu_share", f64, 0.6))
+            .ok_or_else(|| anyhow!("local_cpu_share must be finite and > 0"))?,
         no_action_timeout_sec: p!("no_action_timeout_sec", f64, 3.0),
         // follow 1 tick の判断器。"greedy" (既定) は本家 ViNode::decision 準拠の離散
         // 6 行動。"dwa" / "mppi" は同じ価値関数を連続に読む (V̂ 補間 + 軌道サンプリング、
@@ -410,8 +412,17 @@ pub fn validate(p: &Params) -> Result<U64Solver> {
     if p.local_xy_range <= 0.0 {
         return Err(anyhow!("local_xy_range must be > 0, got {}", p.local_xy_range));
     }
+    if !p.map_penalty_radius.is_finite() || p.map_penalty_radius < 0.0 {
+        return Err(anyhow!("map_penalty_radius must be finite and >= 0"));
+    }
+    if !(0..=1_000_000_000).contains(&p.map_penalty) {
+        return Err(anyhow!("map_penalty must be an integer in [0, 1000000000]"));
+    }
     if !p.scan_penalty_radius.is_finite() || p.scan_penalty_radius < 0.0 {
         return Err(anyhow!("scan_penalty_radius must be finite and >= 0"));
+    }
+    if !(0..=1_000_000_000).contains(&p.scan_penalty) {
+        return Err(anyhow!("scan_penalty must be an integer in [0, 1000000000]"));
     }
     if p.local_xy_range_lat < 0.0 {
         return Err(anyhow!(

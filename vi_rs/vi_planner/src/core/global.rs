@@ -1,15 +1,15 @@
 //! Manager-owned scheduling and bounded worker-owned Bellman snapshots.
 use std::collections::BTreeSet;
 
-use vi_lib::state::State;
-
 use super::*;
 
+mod invalidate;
 mod job;
 mod local;
 mod ownership;
-use job::geometry;
+use invalidate::repair_values;
 pub use job::GlobalJob;
+use job::{geometry, unchanged};
 pub use local::LocalJob;
 
 #[derive(Default)]
@@ -24,27 +24,26 @@ pub(super) struct Manager {
     pub(super) local_in_flight: Option<u64>,
     local_revision: u64,
     boundary_revision: u64,
+    invalidation: invalidate::Invalidation,
 }
 
 impl Manager {
+    pub(super) fn invalidating(&self) -> bool {
+        !self.invalidation.pending.is_empty()
+    }
+
     pub(super) fn local_pending(&self) -> bool {
         !self.owned.is_empty() && !self.certified
     }
-}
-
-fn unchanged(a: &State, b: &State) -> bool {
-    a.total_cost == b.total_cost
-        && a.optimal_action == b.optimal_action
-        && a.free == b.free
-        && a.final_state == b.final_state
-        && a.penalty == b.penalty
-        && a.local_penalty == b.local_penalty
 }
 
 impl PlannerCore {
     /// Prepare one bounded batch. None may mean only locally deferred work remains.
     /// Exactly one job may be outstanding; it must be returned to commit.
     pub fn prepare_global_job(&mut self, max_states: usize) -> Option<GlobalJob> {
+        if !self.advance_invalidations(max_states.clamp(1, 5_000)) {
+            return None;
+        }
         if self.global.in_flight.is_some() || self.cached.is_none() {
             return None;
         }
@@ -160,10 +159,12 @@ impl PlannerCore {
         let id = self.global.serial;
         self.global.in_flight = Some(id);
         self.dirty = true;
+        let before = vi.states.clone();
+        repair_values(&mut vi);
         Some(GlobalJob {
             epoch: self.global.epoch,
             id,
-            before: vi.states.clone(),
+            before,
             vi,
             origin,
             cells,
@@ -176,6 +177,13 @@ impl PlannerCore {
 
     pub fn commit_global_job(&mut self, job: GlobalJob) -> (u64, bool) {
         if job.epoch != self.global.epoch || self.global.in_flight != Some(job.id) {
+            if self.global.in_flight == Some(job.id) {
+                self.global.in_flight = None;
+                for &(x, y) in &job.cells {
+                    let (gx, gy) = (x + job.origin.0, y + job.origin.1);
+                    self.enqueue_global((gx, gx, gy, gy));
+                }
+            }
             return (0, !self.is_dirty());
         }
         self.global.in_flight = None;
@@ -208,7 +216,8 @@ impl PlannerCore {
                     for t in 0..nt as usize {
                         let s = &job.vi.states[i + t];
                         let live = &mut vi.base.states[dst + t];
-                        moved |= live.total_cost != s.total_cost;
+                        moved |= live.total_cost != s.total_cost
+                            || live.optimal_action != s.optimal_action;
                         live.total_cost = s.total_cost;
                         live.optimal_action = s.optimal_action;
                     }

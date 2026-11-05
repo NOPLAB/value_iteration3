@@ -3,6 +3,15 @@ use vi_lib::state::State;
 
 use super::super::ValueIterator;
 
+pub(super) fn unchanged(a: &State, b: &State) -> bool {
+    a.total_cost == b.total_cost
+        && a.optimal_action == b.optimal_action
+        && a.free == b.free
+        && a.final_state == b.final_state
+        && a.penalty == b.penalty
+        && a.local_penalty == b.local_penalty
+}
+
 pub struct GlobalJob {
     pub(super) epoch: u64,
     pub(super) id: u64,

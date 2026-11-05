@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use vi_planner::core::{lock, PlannerCore};
-use vi_planner::cpu::{CpuPacer, CpuShare};
+use vi_planner::cpu::{CpuPacer, CpuShare, LocalCpuShare};
 
 use super::handles::Handles;
 use super::msg::ros_grid_from;
@@ -82,14 +82,15 @@ pub fn spawn(handles: Arc<Handles>, params: &Params) -> Result<()> {
     Ok(())
 }
 
-fn local_worker(handles: Arc<Handles>, share: CpuShare) -> io::Result<()> {
-    let mut pacer = CpuPacer::new(share)?;
+fn local_worker(handles: Arc<Handles>, share: LocalCpuShare) -> io::Result<()> {
+    let mut pacer = share.pacer()?;
+    let threads = share.threads();
     loop {
         let job = lock(&handles.core).prepare_local_job();
         if let Some(mut job) = job {
-            job.run();
+            let cpu = job.run_parallel(threads)?;
             let _delta = lock(&handles.core).commit_local_job(job);
-            pacer.pace()?;
+            pacer.pace_with_cpu(cpu)?;
         } else {
             std::thread::sleep(IDLE);
             pacer.reset()?;

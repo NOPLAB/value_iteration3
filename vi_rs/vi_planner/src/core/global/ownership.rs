@@ -43,6 +43,7 @@ impl PlannerCore {
         self.global.owned.clear();
         self.global.deferred.clear();
         self.global.certified = false;
+        self.global.invalidation.pending.clear();
         self.dirty = false;
         self.sweep.clear();
         if let Some(r) = self.repair.as_mut() {
@@ -179,10 +180,34 @@ impl PlannerCore {
             vi.local_iy_min + p0.1,
             vi.local_iy_max + p0.1,
         );
+        let mut old = before.into_iter();
+        let mut increased = Vec::new();
+        for y in vi.local_iy_min..=vi.local_iy_max {
+            for x in vi.local_ix_min..=vi.local_ix_max {
+                if !vi.in_local_area(x, y) {
+                    continue;
+                }
+                let Some((free, penalty, local_penalty)) = old.next() else {
+                    break;
+                };
+                let s = &vi.base.states[vi.base.to_index(x, y, 0) as usize];
+                if free
+                    && (!s.free
+                        || s.penalty.wrapping_add(s.local_penalty)
+                            > penalty.wrapping_add(local_penalty))
+                {
+                    increased.push((x + p0.0, y + p0.1));
+                }
+            }
+        }
+        self.queue_cost_increases(increased);
         self.enqueue_global(rect);
     }
 
     pub(super) fn global_queued(&self) -> bool {
+        if !self.global.invalidation.pending.is_empty() {
+            return true;
+        }
         if let Some(r) = self.repair.as_ref() {
             !r.queue.is_empty()
         } else {

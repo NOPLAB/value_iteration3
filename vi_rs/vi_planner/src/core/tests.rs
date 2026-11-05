@@ -7,6 +7,11 @@ use vi_lib::{LocalShape, LocalShapeConfig};
 use vi_lib::params::{MAX_COST, PROB_BASE_BIT};
 use vi_lib::solvers::frontier2d_sparse_compact::{CompactSink, RamSink};
 
+#[path = "tests/invalidation.rs"]
+mod invalidation;
+#[path = "tests/invalidation_lifecycle.rs"]
+mod invalidation_lifecycle;
+
 const RES: f64 = 0.05;
 
 fn actions() -> Vec<Action> {
@@ -33,8 +38,8 @@ fn build(size: i32) -> BuildParams {
         },
         actions: actions(),
         theta_cell_num: 60,
-        safety_radius: 0.1,
-        safety_radius_penalty: 30.0,
+        map_penalty_radius: 0.1,
+        map_penalty: 30.0,
         goal_margin_radius: 0.2,
         goal_margin_theta: 180,
         local_xy_range: 1.0,
@@ -47,6 +52,7 @@ fn build(size: i32) -> BuildParams {
 fn cfg() -> PlanConfig {
     PlanConfig {
         scan_penalty_radius: 0.1,
+        scan_penalty: 10_000,
         solver: U64Solver::Frontier2DSparse,
         max_solve_iter: 100_000,
         solve_chunk: 16,
@@ -205,7 +211,7 @@ fn compact_recenters_repeatedly_with_an_interior_patch() {
         Action::new("leftfw", 0.3333, 20.0, 5),
     ];
     b.goal_margin_radius = 0.5; // セルサイズに比例 (overrides と同じ)
-    b.safety_radius_penalty = 1.0;
+    b.map_penalty = 1.0;
 
     let mut core = PlannerCore::new(b, cfg_compact());
     let cancel = AtomicBool::new(false);
@@ -715,7 +721,7 @@ fn scan_penalty_raises_upstream_value() {
         let vi = core.local().unwrap();
         let (hx, hy, _) = pose_to_cell(&vi.base, 1.5, 1.0, 0.0);
         let hit = vi.base.to_index(hx, hy, 0) as usize;
-        assert_eq!(vi.base.states[hit].local_penalty, 2048u64 << PROB_BASE_BIT);
+        assert_eq!(vi.base.states[hit].local_penalty, 10_000u64 << PROB_BASE_BIT);
     }
 
     core.refine_passes(5);
@@ -784,18 +790,16 @@ fn observe_scan_gated_attenuates_injection() {
     let vi = core.local().unwrap();
     let (hx, hy, _) = pose_to_cell(&vi.base, 1.5, 1.0, 0.0);
     let hit = vi.base.to_index(hx, hy, 0) as usize;
-    assert_eq!(vi.base.states[hit].local_penalty, 256u64 << PROB_BASE_BIT);
+    assert_eq!(vi.base.states[hit].local_penalty, 1250u64 << PROB_BASE_BIT);
 }
 
-/// penalty 表が `set_local_cost` の書く値を**丸めずに**持てること
-/// (1 B/セルで足りる根拠 = 2 の冪しか来ない)。
+/// Arbitrary configured strengths and their fixed-point decay remain exact.
 #[test]
 fn penalty_overlay_is_exact_for_every_value_set_local_cost_writes() {
     let mut ov = PenaltyOverlay::new(4, 3);
     assert_eq!(ov.get(0, 0), 0, "初期値は penalty 無し");
 
-    // set_local_cost が書くのは 2048<<PROB_BASE_BIT と、その半減列だけ。
-    let mut v = 2048u64 << PROB_BASE_BIT;
+    let mut v = 10_000u64 << PROB_BASE_BIT;
     let mut seen = 0;
     while v > 0 {
         ov.set(1, 2, v);
@@ -803,7 +807,7 @@ fn penalty_overlay_is_exact_for_every_value_set_local_cost_writes() {
         v /= 2;
         seen += 1;
     }
-    assert_eq!(seen, 30, "2^29 から 1 まで 30 段");
+    assert_eq!(seen, 32);
 
     ov.set(1, 2, 0);
     assert_eq!(ov.get(1, 2), 0);
@@ -955,7 +959,7 @@ fn compact_penalty_survives_a_patch_recenter() {
     };
     assert_eq!(
         core.penalty.as_ref().unwrap().get(hgx, hgy),
-        2048u64 << PROB_BASE_BIT,
+        10_000u64 << PROB_BASE_BIT,
         "ヒット帯の penalty が表に載ること"
     );
     let raised = {
@@ -976,7 +980,7 @@ fn compact_penalty_survives_a_patch_recenter() {
     let (p0x, p0y) = p.at.unwrap();
     let idx = p.vi.base.to_index(hgx - p0x, hgy - p0y, 0) as usize;
     let s = &p.vi.base.states[idx];
-    assert_eq!(s.local_penalty, 2048u64 << PROB_BASE_BIT, "penalty が復元されること");
+    assert_eq!(s.local_penalty, 10_000u64 << PROB_BASE_BIT, "penalty が復元されること");
     assert_eq!(s.total_cost, raised, "sink から上がった値のまま起きること");
 
     // 起こし直した場でもう一度回しても値は戻らない (penalty が効いているため)。
@@ -1835,8 +1839,13 @@ fn the_core_and_the_prefetcher_cross_threads() {
 
 // manager の checkout / compute / commit を、順序を固定して交差させる。
 fn managed_field(compact: bool) -> PlannerCore {
-    let mut b = build(32);
-    b.grid.resolution = 0.1;
+    managed_field_scaled(compact, 1)
+}
+
+fn managed_field_scaled(compact: bool, scale: i32) -> PlannerCore {
+    let mut b = build(32 * scale);
+    b.grid.resolution = 0.1 / scale as f64;
+    b.grid = vi_lib::bridge::downsample_occupancy(&b.grid, scale);
     b.theta_cell_num = 8;
     b.actions = vec![
         Action::new("forward", 0.2, 0.0, 0),
@@ -2003,6 +2012,30 @@ fn local_and_global_owners_settle_to_the_shared_field() {
 }
 
 #[test]
+fn parallel_local_jobs_settle_to_the_shared_field() {
+    for compact in [false, true] {
+        let mut core = managed_field(compact);
+        let mut expected = managed_field(compact);
+        finish_in_background(&mut expected, 100_000);
+        core.claim_local();
+        for _ in 0..100_000 {
+            let mut local = core.prepare_local_job().expect("local pass");
+            local.run_parallel(4).expect("parallel pass");
+            assert!(core.commit_local_job(local).is_some());
+            if let Some(mut global) = core.prepare_global_job(128) {
+                global.run();
+                core.commit_global_job(global);
+            }
+            if !core.is_dirty() {
+                break;
+            }
+        }
+        assert!(!core.is_dirty(), "parallel passes did not converge");
+        assert_eq!(managed_values(&core), managed_values(&expected));
+    }
+}
+
+#[test]
 fn local_jobs_leave_the_core_available_for_global_work_and_scan_updates() {
     use std::sync::mpsc;
     for compact in [false, true] {
@@ -2013,7 +2046,7 @@ fn local_jobs_leave_the_core_available_for_global_work_and_scan_updates() {
         let (resume, gate) = mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
             gate.recv_timeout(Duration::from_secs(10)).expect("release local worker");
-            local.run();
+            local.run_parallel(4).expect("parallel local pass");
             local
         });
         let global = try_lock(&core).map(|mut c| {
@@ -2061,7 +2094,7 @@ fn local_jobs_reject_goal_window_scan_and_owner_changes() {
             }
             let values = managed_values(&core);
             let inputs = core.local_inputs();
-            job.run();
+            job.run_parallel(4).expect("parallel local pass");
             assert_eq!(core.commit_local_job(job), None, "change {change}, compact {compact}");
             assert_eq!(managed_values(&core), values);
             assert_eq!(core.local_inputs(), inputs);

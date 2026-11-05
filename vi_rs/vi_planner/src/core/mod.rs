@@ -119,8 +119,8 @@ pub struct BuildParams {
     pub grid: OccupancyGrid,
     pub actions: Vec<Action>,
     pub theta_cell_num: i32,
-    pub safety_radius: f64,
-    pub safety_radius_penalty: f64,
+    pub map_penalty_radius: f64,
+    pub map_penalty: f64,
     pub goal_margin_radius: f64,
     pub goal_margin_theta: i32,
     /// 追従のローカルウィンドウ半径 [m] (本家 `ValueIteratorLocal` は 1.0 固定)。
@@ -157,6 +157,7 @@ pub type SinkGen = Option<Arc<AtomicU64>>;
 pub struct PlanConfig {
     /// スキャンのヒットセル周囲に塗るペナルティ帯の半幅 [m]。
     pub scan_penalty_radius: f64,
+    pub scan_penalty: u64,
     pub solver: U64Solver,
     /// solve 総イテレーション上限 (発散ガード)。
     pub max_solve_iter: u32,
@@ -563,8 +564,8 @@ pub fn value_grid_on(p: &dyn PolicyView, threshold_steps: u64) -> OccupancyGrid 
 
 impl PlannerCore {
     pub fn new(build: BuildParams, cfg: PlanConfig) -> Self {
-        // penalty 表は compact だけ (密は states がそのまま持つ)。1 B/セルなので
-        // 津田沼の 0.25 m/cell (1177x800) でも 0.9 MB。
+        // penalty 表は compact だけ (密は states がそのまま持つ)。8 B/セルなので
+        // 津田沼の 0.25 m/cell (1177x800) で約 7.5 MB。
         let penalty = cfg
             .use_compact()
             .then(|| PenaltyOverlay::new(build.grid.width, build.grid.height));
@@ -864,8 +865,8 @@ impl PlannerCore {
         vi.set_map_with_occupancy_grid(
             &self.build.grid,
             self.build.theta_cell_num,
-            self.build.safety_radius,
-            self.build.safety_radius_penalty,
+            self.build.map_penalty_radius,
+            self.build.map_penalty,
             self.build.goal_margin_radius,
             self.build.goal_margin_theta,
         );
@@ -927,8 +928,8 @@ impl PlannerCore {
         vi.set_map_with_occupancy_grid(
             &self.build.grid,
             self.build.theta_cell_num,
-            self.build.safety_radius,
-            self.build.safety_radius_penalty,
+            self.build.map_penalty_radius,
+            self.build.map_penalty,
             self.build.goal_margin_radius,
             self.build.goal_margin_theta,
         );
@@ -1144,7 +1145,7 @@ impl PlannerCore {
         self.observe_scan_gated(scan, pose, 0);
     }
 
-    /// 品質ゲート付きの [`Self::observe_scan`]: 注入 penalty を `2048 >> shift` に
+    /// 品質ゲート付きの [`Self::observe_scan`]: 注入 penalty を `scan_penalty >> shift` に
     /// 減衰する。自己位置のフィットが怪しい tick は localizer 自身がそれを
     /// `quality()` で知っている — そのスキャンの投影は地図とずれており、満額で
     /// 塗るとゴースト壁がロボットを global 勾配との間に挟んで止める。shift は
@@ -1152,10 +1153,12 @@ impl PlannerCore {
     pub fn observe_scan_gated(&mut self, scan: &LaserScan, pose: PoseView, shift: u32) {
         let map_clear = self.cfg.map_clear_from_scan;
         let radius = self.cfg.scan_penalty_radius;
+        let penalty = self.cfg.scan_penalty;
         let before = self.local_inputs();
         if let Some(vi) = self.local_mut() {
             vi.clear_map_from_scan = map_clear;
             vi.scan_penalty_radius = radius;
+            vi.scan_penalty = penalty;
             vi.set_local_cost_attenuated(scan, pose.x, pose.y, pose.yaw_rad, shift);
         }
         self.harvest_penalties();
@@ -1189,6 +1192,11 @@ impl PlannerCore {
     /// する。戻り値は最後のパスの Δ 合計。
     pub fn refine_for(&mut self, budget: Duration) -> u64 {
         let t0 = Instant::now();
+        while !self.advance_invalidations(512) {
+            if t0.elapsed() >= budget {
+                return 0;
+            }
+        }
         loop {
             let (pass_delta, stopped) = self.refine_pass_until(|| t0.elapsed() >= budget);
             if pass_delta > 0 {
@@ -1222,6 +1230,7 @@ impl PlannerCore {
     /// ウィンドウ全体を `n` パス回す (決定的テスト用)。
     #[cfg(test)]
     pub fn refine_passes(&mut self, n: usize) {
+        while !self.advance_invalidations(512) {}
         for _ in 0..n {
             let (delta, stopped) = self.refine_pass_until(|| false);
             if delta > 0 {
@@ -1329,12 +1338,37 @@ impl PlannerCore {
     /// ウィンドウ 1 パス。`should_stop` は x 列ごとに観測し、途中打ち切り時は
     /// `(それまでの Δ 合計, true)` を返す。
     fn refine_pass_until(&mut self, should_stop: impl Fn() -> bool) -> (u64, bool) {
-        let Some(vi) = self.local_mut() else { return (0, true) };
+        let Some(vi) = self.local_mut() else {
+            return (0, true);
+        };
         let nt = vi.base.cell_num_t;
+        let reach = transition_reach(&vi.base);
+        let mut boundary = Vec::new();
+        for y in
+            (vi.local_iy_min - reach).max(0)..=(vi.local_iy_max + reach).min(vi.base.cell_num_y - 1)
+        {
+            for x in
+                (vi.local_ix_min - reach).max(0)..=(vi.local_ix_max + reach).min(vi.base.cell_num_x - 1)
+            {
+                let outside = !vi.in_local_area(x, y);
+                for t in 0..nt {
+                    let idx = vi.base.to_index(x, y, t) as usize;
+                    let s = &mut vi.base.states[idx];
+                    if s.policy_invalidated() {
+                        if outside {
+                            boundary.push((idx, s.total_cost));
+                        }
+                        s.total_cost = MAX_COST;
+                    }
+                }
+            }
+        }
         let mut delta = 0u64;
+        let mut stopped = false;
         for iix in vi.local_ix_min..=vi.local_ix_max {
             if should_stop() {
-                return (delta, true);
+                stopped = true;
+                break;
             }
             for iiy in vi.local_iy_min..=vi.local_iy_max {
                 // 窓の形は `in_local_area` 一点で決まる (スキャン注入と同じ判定)。
@@ -1347,7 +1381,12 @@ impl PlannerCore {
                 }
             }
         }
-        (delta, false)
+        // The halo participates in this calculation, but only window states are
+        // published. Far-field values are committed by the global worker.
+        for (idx, value) in boundary {
+            vi.base.states[idx].total_cost = value;
+        }
+        (delta, stopped)
     }
 
     /// 現在姿勢の判断 (読み取り専用)。実体は [`PlanConfig::follow_controller`] で
@@ -1356,6 +1395,13 @@ impl PlannerCore {
     /// compact 経路では `set_window` でパッチを起こしてから呼ぶこと。
     pub fn decide(&self, pose: PoseView) -> Decision {
         let Some(local) = self.local() else { return Decision::NoAction };
+        let (x, y, t) = pose_to_cell(&local.base, pose.x, pose.y, pose.yaw_rad);
+        if is_final(&local.base, x, y, t) {
+            return Decision::Goal;
+        }
+        if self.global.invalidating() {
+            return Decision::NoAction;
+        }
         self.follow.decide(&local.base, &self.cfg, pose)
     }
 
@@ -1370,6 +1416,9 @@ impl PlannerCore {
         match qmdp_decide(&local.base, hyps) {
             QmdpDecision::Goal => Decision::Goal,
             QmdpDecision::Action(ai) => {
+                if self.global.invalidating() {
+                    return Decision::NoAction;
+                }
                 let a = &local.base.actions[ai];
                 Decision::Action { id: Some(a.id as usize), fw: a.delta_fw, rot_deg: a.delta_rot }
             }

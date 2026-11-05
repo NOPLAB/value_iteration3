@@ -85,6 +85,8 @@ pub trait PolicyView {
     /// `(ix,iy,it)` の値 (`total_cost`)。範囲外・未到達は `MAX_COST`。solve 途中の
     /// 観測 (value_function 可視化・上界不変条件の検証) が同じビューで値も読めるように
     /// するための口。
+    /// A discarded finite nonterminal policy reads as MAX_COST until repaired;
+    /// its last committed value may still be retained by the backing storage.
     fn value_at(&self, ix: i32, iy: i32, it: i32) -> u64;
     /// 地図原点の姿勢 (可視化グリッド生成用)。既定は単位クォータニオン —
     /// 回転付き地図を扱うビューは override すること (`ValueIterator` は地図から、
@@ -143,7 +145,12 @@ impl PolicyView for ValueIterator {
         if !PolicyView::in_map_area(self, ix, iy) || it < 0 || it >= self.cell_num_t {
             return MAX_COST;
         }
-        self.states[self.to_index(ix, iy, it) as usize].total_cost
+        let s = &self.states[self.to_index(ix, iy, it) as usize];
+        if s.policy_invalidated() {
+            MAX_COST
+        } else {
+            s.total_cost
+        }
     }
     fn map_origin_quat(&self) -> crate::msg::Quaternion {
         self.map_origin_quat.clone()
@@ -255,7 +262,12 @@ impl PolicyView for CompactPolicy<'_> {
         (a.delta_fw, a.delta_rot)
     }
     fn value_at(&self, ix: i32, iy: i32, it: i32) -> u64 {
-        self.read(ix, iy, it).0
+        let (value, action) = self.read(ix, iy, it);
+        if value > 0 && value < MAX_COST && action < 0 {
+            MAX_COST
+        } else {
+            value
+        }
     }
     fn map_origin_quat(&self) -> crate::msg::Quaternion {
         self.origin_quat.clone()
@@ -493,14 +505,25 @@ pub fn qmdp_decide(vi: &ValueIterator, hyps: &[(crate::bridge::PoseView, f64)]) 
         }
         usable += w;
         for (ai, a) in vi.actions.iter().enumerate() {
-            let q = crate::value_iterator::action_cost_raw(
-                &vi.states,
-                a,
-                s,
-                vi.cell_num_x,
-                vi.cell_num_y,
-                vi.cell_num_t,
-            );
+            let unavailable = s.policy_invalidated()
+                || a.state_transitions[s.it as usize].iter().any(|t| {
+                    let (x, y) = (s.ix + t.dix, s.iy + t.diy);
+                    t.prob > 0 && vi.in_map_area(x, y)
+                        && vi.states[vi.to_index(x, y, t.dit.rem_euclid(vi.cell_num_t)) as usize]
+                            .policy_invalidated()
+                });
+            let q = if unavailable {
+                MAX_COST
+            } else {
+                crate::value_iterator::action_cost_raw(
+                    &vi.states,
+                    a,
+                    s,
+                    vi.cell_num_x,
+                    vi.cell_num_y,
+                    vi.cell_num_t,
+                )
+            };
             qb[ai] += w * q as f64;
             if q == MAX_COST {
                 veto[ai] += w;
@@ -780,6 +803,51 @@ mod tests {
 
     fn hyp(x: f64, y: f64, yaw: f64) -> PoseView {
         PoseView { x, y, yaw_rad: yaw }
+    }
+
+    #[test]
+    fn qmdp_vetoes_invalidated_sources_and_probabilistic_successors() {
+        let mut vi = solved_vi(32, 32, empty_map(32), (1.2, 1.2, 0), U64Solver::Frontier3D);
+        let p = hyp(0.5, 0.5, 0.0);
+        let (x, y, theta) = pose_to_cell(&vi, p.x, p.y, p.yaw_rad);
+        let source = vi.to_index(x, y, theta) as usize;
+        assert!(matches!(
+            qmdp_decide(&vi, &[(p, 1.0)]),
+            QmdpDecision::Action(_)
+        ));
+        let before = vi.states.clone();
+        for invalidate_source in [true, false] {
+            vi.states = before.clone();
+            if invalidate_source {
+                vi.states[source].optimal_action = None;
+            } else {
+                let targets: Vec<_> = vi
+                    .actions
+                    .iter()
+                    .flat_map(|a| {
+                        a.state_transitions[theta as usize]
+                            .iter()
+                            .filter(|t| t.prob > 0)
+                            .map(|t| vi.to_index(x + t.dix, y + t.diy, t.dit.rem_euclid(NT)) as usize)
+                    })
+                    .collect();
+                for idx in targets {
+                    if idx != source {
+                        assert!(vi.states[idx].free && !vi.states[idx].final_state);
+                        vi.states[idx].optimal_action = None;
+                    }
+                }
+                assert!(vi.states[source].optimal_action.is_some());
+            }
+            assert!(
+                matches!(qmdp_decide(&vi, &[(p, 1.0)]), QmdpDecision::NoAction),
+                "source invalidation={invalidate_source}"
+            );
+            assert!(matches!(
+                qmdp_decide(&vi, &[(hyp(1.2, 1.2, 0.0), 1.0)]),
+                QmdpDecision::Goal
+            ));
+        }
     }
 
     /// 仮説セルでの Q(s,a)。衝突チェック用 (テスト専用の薄い読み)。

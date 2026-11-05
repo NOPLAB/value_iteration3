@@ -265,6 +265,18 @@ impl ValueIterator {
         )
     }
 
+    /// Compute a Bellman update without modifying the field (for parallel Jacobi passes).
+    pub fn bellman_update(&self, idx: usize) -> Option<(u64, Option<usize>)> {
+        min_action_cost(
+            &self.states,
+            &self.actions,
+            idx,
+            self.cell_num_x,
+            self.cell_num_y,
+            self.cell_num_t,
+        )
+    }
+
     /// 本家 `valueIteration` (states[idx] を更新)。
     pub fn value_iteration_at(&mut self, idx: usize) -> u64 {
         value_iteration_raw(

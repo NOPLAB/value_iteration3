@@ -331,8 +331,8 @@ pub fn build_core(
             .map(|(i, (name, fw, rot))| Action::new(name, *fw, *rot, i as i32))
             .collect(),
         theta_cell_num: params.theta_cell_num as i32,
-        safety_radius: params.safety_radius,
-        safety_radius_penalty: params.safety_radius_penalty as f64,
+        map_penalty_radius: params.map_penalty_radius,
+        map_penalty: params.map_penalty as f64,
         goal_margin_radius: params.goal_margin_radius,
         goal_margin_theta: params.goal_margin_theta_deg as i32,
         local_xy_range: params.local_xy_range,
@@ -375,6 +375,7 @@ pub fn build_core(
     }
     let cfg = PlanConfig {
         scan_penalty_radius: params.scan_penalty_radius,
+        scan_penalty: params.scan_penalty as u64,
         solver,
         max_solve_iter: MAX_SOLVE_ITER,
         solve_chunk: SOLVE_CHUNK,

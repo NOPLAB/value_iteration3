@@ -46,7 +46,7 @@ pub struct Wiring {
     pub prefetch: Option<Prefetcher>,
     /// follow_waypoints: 1 点失敗したら残りを諦めるか。
     pub stop_on_failure: bool,
-    /// ロールアウト固着時のヒント表示用 (safety_radius_penalty [秒/セル], safety_radius [m])。
+    /// ロールアウト固着時のヒント表示用 (map_penalty [秒/セル], map_penalty_radius [m])。
     pub hint: (i64, f64),
 }
 
@@ -208,7 +208,7 @@ pub fn plan_server(
                     Ok(Err(e)) => {
                         eprintln!("ERROR: vi_planner: {e}");
                         // ロールアウトの固着は「価値関数の局所的なゆらぎ >
-                        // 1 手の進捗」で起きる。safety_radius_penalty (秒/セル)
+                        // 1 手の進捗」で起きる。map_penalty (秒/セル)
                         // が 1 手のコスト 1 秒に対して大きすぎ、かつ経路の
                         // 大半がペナルティ域に入る地図で顕在化する。
                         if matches!(
@@ -217,8 +217,8 @@ pub fn plan_server(
                         ) {
                             eprintln!(
                                 "HINT: value function converged but the greedy rollout \
-                                 oscillated. Lower safety_radius_penalty (currently {}) or \
-                                 safety_radius (currently {}) — a penalty much larger than \
+                                 oscillated. Lower map_penalty (currently {}) or \
+                                 map_penalty_radius (currently {}) — a penalty much larger than \
                                  the 1s per-step cost makes the value landscape jitter more \
                                  than one step of progress.",
                                 params_hint.0, params_hint.1

@@ -308,9 +308,9 @@ fn main() -> Result<()> {
         },
         prefetch,
         stop_on_failure: params.waypoint_stop_on_failure,
-        // ロールアウト固着時のヒント表示用 (safety_radius_penalty [秒/セル],
-        // safety_radius [m])。
-        hint: (params.safety_radius_penalty, params.safety_radius),
+        // ロールアウト固着時のヒント表示用 (map_penalty [秒/セル],
+        // map_penalty_radius [m])。
+        hint: (params.map_penalty, params.map_penalty_radius),
     };
 
     // 6e. アクションサーバ。compute_path_to_pose は常に、follow_path は

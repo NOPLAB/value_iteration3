@@ -15,6 +15,62 @@ pub struct LocalJob {
 }
 
 impl LocalJob {
+    /// A synchronous Jacobi pass: all helpers read the same immutable snapshot.
+    /// Only this job's cells are published after every helper has joined, so the
+    /// existing epoch, owner, input, and boundary checks remain authoritative.
+    /// Returns helper CPU time for the worker's aggregate CPU budget.
+    pub fn run_parallel(&mut self, threads: usize) -> std::io::Result<std::time::Duration> {
+        if self.ran {
+            return Ok(std::time::Duration::ZERO);
+        }
+        if threads <= 1 || self.cells.is_empty() {
+            self.run();
+            return Ok(std::time::Duration::ZERO);
+        }
+        let vi = &self.vi;
+        let chunk = self.cells.len().div_ceil(threads);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = self
+                .cells
+                .chunks(chunk)
+                .map(|cells| {
+                    scope.spawn(move || {
+                        let clock = cpu_time::ThreadTime::try_now()?;
+                        let mut updates = Vec::new();
+                        for &(x, y) in cells {
+                            for t in 0..vi.cell_num_t {
+                                let idx = vi.to_index(x, y, t) as usize;
+                                if let Some((cost, action)) = vi.bellman_update(idx) {
+                                    updates.push((idx, cost, action));
+                                }
+                            }
+                        }
+                        Ok::<_, std::io::Error>((updates, clock.try_elapsed()?))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| match handle.join() {
+                    Ok(result) => result,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                })
+                .collect::<std::io::Result<Vec<_>>>()
+        })?;
+        let mut cpu = std::time::Duration::ZERO;
+        for (updates, elapsed) in results {
+            cpu += elapsed;
+            for (idx, cost, action) in updates {
+                let state = &mut self.vi.states[idx];
+                self.delta = self.delta.saturating_add(state.total_cost.abs_diff(cost));
+                state.total_cost = cost;
+                state.optimal_action = action;
+            }
+        }
+        self.ran = true;
+        Ok(cpu)
+    }
+
     /// Complete the captured local mask once. The transition halo stays frozen.
     /// Pacing belongs to the worker; never restart a partial pass at column zero.
     pub fn run(&mut self) {
@@ -35,6 +91,9 @@ impl PlannerCore {
     /// Checkout one local pass while keeping live scan inputs and policy readable.
     /// Exactly one local job may be outstanding; return it even if it was not run.
     pub fn prepare_local_job(&mut self) -> Option<LocalJob> {
+        if !self.advance_invalidations(512) {
+            return None;
+        }
         let owner = self.global.owner?;
         if self.global.local_in_flight.is_some() || self.global.owned.is_empty() {
             return None;
@@ -58,6 +117,7 @@ impl PlannerCore {
                 }
             }
         }
+        repair_values(&mut vi);
         let mut cells = Vec::new();
         for x in local.local_ix_min..=local.local_ix_max {
             for y in local.local_iy_min..=local.local_iy_max {
@@ -90,6 +150,9 @@ impl PlannerCore {
             || self.global.owner != Some(job.owner)
             || self.global.local_in_flight != Some(job.id)
         {
+            if self.global.local_in_flight == Some(job.id) {
+                self.global.local_in_flight = None;
+            }
             return None;
         }
         self.global.local_in_flight = None;
