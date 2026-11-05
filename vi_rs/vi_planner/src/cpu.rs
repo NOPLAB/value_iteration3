@@ -1,11 +1,12 @@
-//! Per-worker CPU allocation, measured against one core rather than lock wait time.
+//! Per-worker CPU thread-equivalent allocation, excluding lock wait time.
 
 use std::io;
 use std::time::{Duration, Instant};
 
 use cpu_time::ThreadTime;
 
-/// CPU seconds per wall second for one worker. Independent workers may sum above 1.
+/// CPU seconds per wall second for one single-threaded worker, in (0, 1].
+/// Independent workers may sum above 1.
 #[derive(Clone, Copy, Debug)]
 pub struct CpuShare(f64);
 
@@ -19,7 +20,8 @@ impl CpuShare {
     }
 }
 
-/// Total local CPU budget. Parallelism is bounded by the host's available cores.
+/// Total local CPU thread-equivalent budget: 4.0 means four threads, 0.6 means
+/// 60% of one thread, independent of the host's available parallelism.
 #[derive(Clone, Copy, Debug)]
 pub struct LocalCpuShare(f64);
 
@@ -33,9 +35,8 @@ impl LocalCpuShare {
     }
 
     pub fn threads(self) -> usize {
-        let available = std::thread::available_parallelism().map_or(1, usize::from);
-        // Float-to-integer saturation is intentional; cap before converting.
-        self.0.ceil().min(available as f64) as usize
+        // Float-to-integer saturation is intentional for budgets beyond usize::MAX.
+        self.0.ceil() as usize
     }
 
     pub fn pacer(self) -> io::Result<CpuPacer> {
@@ -102,7 +103,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shares_reject_values_outside_one_core() {
+    fn shares_reject_values_outside_one_thread() {
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 0.0, 1.01] {
             assert!(CpuShare::new(value).is_none(), "{value}");
         }
@@ -112,12 +113,19 @@ mod tests {
     }
 
     #[test]
-    fn local_budgets_accept_multiple_cores_but_reject_nonpositive_or_nonfinite() {
-        for value in [0.6, 1.0, 1.5, 4.0] {
+    fn local_budgets_request_threads_independently_of_host_parallelism() {
+        let available = std::thread::available_parallelism().map_or(1, usize::from);
+        let above_host = available + 1;
+        for (value, threads) in [
+            (0.6, 1),
+            (1.0, 1),
+            (1.5, 2),
+            (4.0, 4),
+            (above_host as f64, above_host),
+        ] {
             let share = LocalCpuShare::new(value).unwrap();
             assert_eq!(share.get(), value);
-            let available = std::thread::available_parallelism().map_or(1, usize::from);
-            assert_eq!(share.threads(), (value.ceil() as usize).min(available));
+            assert_eq!(share.threads(), threads);
         }
         for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert!(LocalCpuShare::new(value).is_none());

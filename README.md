@@ -9,11 +9,15 @@ field. Parameters are declared in `src/node/params.rs`.
 | `map_penalty` | `10000` | Map obstacle margin cost, integer from 0 to 1000000000. |
 | `scan_penalty_radius` | `0.1` | Scan hit band radius in metres. |
 | `scan_penalty` | `10000` | Integer scan hit cost, from 0 to 1000000000 inclusive; 0 disables hit injection. |
-| `local_cpu_share` | `0.6` | Local CPU seconds per wall second; any finite positive number. |
-| `global_cpu_share` | `0.2` | Global CPU seconds per wall second, in (0, 1]. |
+| `local_cpu_share` | `0.6` | Local CPU thread-equivalent share (CPU seconds per wall second); any finite positive number. |
+| `global_cpu_share` | `0.2` | Global single-thread CPU share (CPU seconds per wall second), in (0, 1]. |
 
-For example, `local_cpu_share: 4.0` enables up to four helper threads, bounded by
-the host's available parallelism. They calculate a synchronous Jacobi pass on
+For example, `local_cpu_share: 4.0` budgets the equivalent of four CPU threads,
+and `0.6` budgets 60% of one thread. It requests `ceil(share)` helper threads
+independently of the host's available parallelism; fewer work chunks may use
+fewer helpers. The share is not a fraction of all host threads.
+The global worker remains single-threaded: `global_cpu_share: 0.2` budgets 20%
+of one thread. Local helpers calculate a synchronous Jacobi pass on
 one immutable local snapshot outside the core mutex. One checked commit publishes
 the pass; changes to the goal, owner, window, or scan inputs reject stale results.
 The default single-thread path retains its existing in-place sweep order.

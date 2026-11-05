@@ -75,7 +75,7 @@ pub fn spawn(handles: Arc<Handles>, params: &Params) -> Result<()> {
             .context("starting global worker")?;
     }
     eprintln!(
-        "vi_planner: worker CPU shares local={} global={} (one core = 1.0)",
+        "vi_planner: worker CPU shares local={} global={} (one thread-equivalent = 1.0; global single-threaded)",
         params.local_cpu_share.get(),
         params.global_cpu_share.get(),
     );

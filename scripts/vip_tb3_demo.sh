@@ -99,7 +99,7 @@ VI_ARGS=(
     -p follow:=true                      # 規定: true — false で global-only (nav2_controller と組む)
     -p scan_topic:=scan                  # 規定: scan
     -p control_frequency:=10.0           # 規定: 10.0 [Hz]
-    -p local_cpu_share:=0.6              # 規定: 0.6 [core] (狭域 worker の CPU 配分)
+    -p local_cpu_share:=0.6              # 規定: 0.6 [スレッド相当] (1 スレッドの 60%、4.0 = 4 スレッド相当)
     -p follow_controller:=mppi           # 規定: greedy (本家 decision) | dwa | mppi
     -p dwa_horizon_s:=1.0                # 規定: 1.0 [s] (DWA/MPPI の前方シミュレーション)
     -p dwa_lethal_penalty:=2.0           # 規定: 2.0 [PROB_BASE 単位] (margin 帯棄却、0 で無効)
@@ -110,7 +110,7 @@ VI_ARGS=(
     -p stop_on_failadaptive=false            # 規定: false (巡回で 1 点失敗しても次へ)
     # ── 狭域 → 広域フィードバック (全域掃き) ──
     -p global_sweep:=true                # 規定: true (local_penalty を全域へ伝播)
-    -p global_cpu_share:=0.2             # 規定: 0.2 [core] (広域 worker の CPU 配分)
+    -p global_cpu_share:=0.2             # 規定: 0.2 [スレッド相当] (広域 worker は単一スレッド、20% 配分)
     # ── ウェイポイント先読み / 早期発進 ──
     -p waypoint_prefetch:=false          # 規定: false — 次の点の価値関数を走行中に解く (メモリ 2 倍)
     -p waypoint_topic:=waypoints         # 規定: waypoints (nav_msgs/Path, transient_local)

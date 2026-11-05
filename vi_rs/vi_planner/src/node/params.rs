@@ -92,7 +92,8 @@ pub struct Params {
     pub follow: bool,
     pub scan_topic: String,
     pub control_frequency: f64,
-    /// 狭域 worker の CPU 秒 / 実時間秒 (1 コア基準)。
+    /// 狭域 worker の CPU スレッド換算配分 (CPU 秒 / 実時間秒)。
+    /// 4.0 = 4 スレッド相当、0.6 = 1 スレッドの 60%。ホストによらず ceil(share) 本を要求。
     pub local_cpu_share: vi_planner::cpu::LocalCpuShare,
     /// follow 1 tick の判断器 ("greedy" = 本家 decision / "dwa"・"mppi" = 連続行動)。
     pub follow_controller: String,
@@ -124,7 +125,7 @@ pub struct Params {
     pub waypoint_stop_on_failure: bool,
     // ── 狭域 → 広域のフィードバック (全域掃き) ──
     pub global_sweep: bool,
-    /// 広域 worker の CPU 秒 / 実時間秒 (1 コア基準)。
+    /// 広域 worker の単一スレッド CPU 配分 (CPU 秒 / 実時間秒、(0, 1])。
     pub global_cpu_share: CpuShare,
     // ── ウェイポイントの先読み ──
     pub waypoint_prefetch: bool,
