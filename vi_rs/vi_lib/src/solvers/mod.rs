@@ -371,25 +371,27 @@ pub enum U64Solver {
 }
 
 impl U64Solver {
+    /// Accepted solver names with their default parameters. Shared with conformance.
+    pub const NAMED_DEFAULTS: &[(&str, Self)] = &[
+        ("reference", Self::Reference),
+        ("frontier3d", Self::Frontier3D),
+        ("frontier2d", Self::Frontier2D),
+        ("frontier2d_par", Self::Frontier2DPar),
+        ("frontier2d_par_unsafe", Self::Frontier2DParUnsafe),
+        ("frontier2d_fused", Self::Frontier2DFused),
+        ("frontier2d_sparse", Self::Frontier2DSparse),
+        ("frontier2d_sparse_compact", Self::Frontier2DSparseCompact { band: 0 }),
+        ("frontier_stack", Self::FrontierStack),
+        ("block_refine", Self::BlockRefine),
+        ("pyramid_sweep", Self::PyramidSweep),
+        ("stream_mimic", Self::StreamMimic),
+        ("prio_ls", Self::PriorityLabelSetting),
+        ("prio_lc", Self::PriorityLabelCorrecting),
+        ("schur", Self::SchurPortal { tile: 32, portal_thetas: 8 }),
+    ];
+
     pub fn from_name(s: &str) -> Option<Self> {
-        Some(match s {
-            "reference" => U64Solver::Reference,
-            "frontier3d" => U64Solver::Frontier3D,
-            "frontier2d" => U64Solver::Frontier2D,
-            "frontier2d_par" => U64Solver::Frontier2DPar,
-            "frontier2d_par_unsafe" => U64Solver::Frontier2DParUnsafe,
-            "frontier2d_fused" => U64Solver::Frontier2DFused,
-            "frontier2d_sparse" => U64Solver::Frontier2DSparse,
-            "frontier2d_sparse_compact" => U64Solver::Frontier2DSparseCompact { band: 0 },
-            "frontier_stack" => U64Solver::FrontierStack,
-            "block_refine" => U64Solver::BlockRefine,
-            "pyramid_sweep" => U64Solver::PyramidSweep,
-            "stream_mimic" => U64Solver::StreamMimic,
-            "prio_ls" => U64Solver::PriorityLabelSetting,
-            "prio_lc" => U64Solver::PriorityLabelCorrecting,
-            "schur" => U64Solver::SchurPortal { tile: 32, portal_thetas: 8 },
-            _ => return None,
-        })
+        Self::NAMED_DEFAULTS.iter().find_map(|(name, solver)| (*name == s).then_some(*solver))
     }
 }
 
@@ -705,5 +707,13 @@ mod helper_tests {
         assert!(matches!(U64Solver::from_name("frontier3d"), Some(U64Solver::Frontier3D)));
         assert!(matches!(U64Solver::from_name("reference"), Some(U64Solver::Reference)));
         assert!(U64Solver::from_name("nope").is_none());
+        assert_eq!(
+            U64Solver::from_name("frontier2d_sparse_compact"),
+            Some(U64Solver::Frontier2DSparseCompact { band: 0 }),
+        );
+        assert_eq!(
+            U64Solver::from_name("schur"),
+            Some(U64Solver::SchurPortal { tile: 32, portal_thetas: 8 }),
+        );
     }
 }

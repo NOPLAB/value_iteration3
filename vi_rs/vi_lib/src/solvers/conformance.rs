@@ -29,24 +29,7 @@ use crate::value_iterator::ValueIterator;
 
 /// テスト対象の全変種。
 fn all_solvers() -> Vec<(&'static str, U64Solver)> {
-    use U64Solver::*;
-    vec![
-        ("reference", Reference),
-        ("frontier3d", Frontier3D),
-        ("frontier2d", Frontier2D),
-        ("frontier2d_par", Frontier2DPar),
-        ("frontier2d_par_unsafe", Frontier2DParUnsafe),
-        ("frontier2d_fused", Frontier2DFused),
-        ("frontier2d_sparse", Frontier2DSparse),
-        ("frontier2d_sparse_compact", Frontier2DSparseCompact { band: 0 }),
-        ("frontier_stack", FrontierStack),
-        ("block_refine", BlockRefine),
-        ("pyramid_sweep", PyramidSweep),
-        ("stream_mimic", StreamMimic),
-        ("prio_ls", PriorityLabelSetting),
-        ("prio_lc", PriorityLabelCorrecting),
-        ("schur", SchurPortal { tile: 32, portal_thetas: 8 }),
-    ]
+    U64Solver::NAMED_DEFAULTS.to_vec()
 }
 
 fn exact_fixed_point(w: i32, h: i32, occ: &[i8]) -> ValueIterator {
