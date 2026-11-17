@@ -37,9 +37,11 @@ use crate::msg::{LaserScan, OccupancyGrid, Quaternion};
 
 mod adaptive;
 mod grid;
+mod estimator;
 
 pub use adaptive::AdaptiveLocalizer;
 pub use grid::GridLocalizer;
+pub use estimator::Estimator;
 
 #[cfg(test)]
 mod tests;

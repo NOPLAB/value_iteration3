@@ -460,79 +460,10 @@ fn parse_kidnap(s: &str, tick_s: f64) -> Result<(String, Kidnap), String> {
     ))
 }
 
-/// 推定器の入れ物。窓つき ([`GridLocalizer`], `Localizer` トレイト) と全地図
-/// ([`Belief`]) は別の型なので、bench の中だけの都合でここに束ねる
-/// (実ノード側の同じ役の enum は `vi_planner::node::handles::Loc`)。
-enum Est {
-    /// 窓つき系 ([`GridLocalizer`] / [`AdaptiveLocalizer`]、`Localizer` トレイト)。
-    Win(Box<dyn Localizer>),
-    Whole(Box<Belief>),
-}
+#[path = "viola_bench/recovery.rs"]
+mod recovery;
 
-impl Est {
-    fn predict(&mut self, v: f64, w_deg: f64, dt: f64) {
-        match self {
-            Est::Win(l) => l.predict(v, w_deg, dt),
-            Est::Whole(b) => b.predict(v, w_deg, dt),
-        }
-    }
-    fn observe(&mut self, scan: &vi_lib::msg::LaserScan) {
-        match self {
-            Est::Win(l) => l.observe(scan),
-            Est::Whole(b) => b.observe(scan),
-        }
-    }
-    fn pose(&self) -> Option<PoseView> {
-        match self {
-            Est::Win(l) => l.pose(),
-            Est::Whole(b) => b.pose(),
-        }
-    }
-    fn quality(&self) -> f64 {
-        match self {
-            Est::Win(l) => l.quality(),
-            Est::Whole(b) => b.quality(),
-        }
-    }
-    /// belief の広がり (全地図のみ — 窓つきはトレイトが出していない)。
-    fn ess(&self) -> f64 {
-        match self {
-            Est::Win(_) => f64::NAN,
-            Est::Whole(b) => b.ess(),
-        }
-    }
-    fn top_cells(&self, k: usize) -> Vec<(PoseView, f64)> {
-        match self {
-            Est::Win(l) => l.top_cells(k),
-            Est::Whole(b) => b.top_cells(k),
-        }
-    }
-    fn reloc_targets(&self) -> Vec<(f64, f64)> {
-        match self {
-            Est::Win(l) => l.reloc_targets(),
-            Est::Whole(b) => b.reloc_targets(),
-        }
-    }
-    /// 診断: 真値仮説の周辺重み / 最大重みとその位置 (全地図のみ)。
-    fn probe_weight(&self, p: PoseView) -> (f64, f64, Option<PoseView>) {
-        match self {
-            Est::Win(_) => (f64::NAN, f64::NAN, None),
-            Est::Whole(b) => b.probe_weight(p),
-        }
-    }
-    /// 解除の probation (全地図のみ — 窓つき系は未対応で常に確定解除)。
-    fn in_probation(&self) -> bool {
-        match self {
-            Est::Win(_) => false,
-            Est::Whole(b) => b.in_probation(),
-        }
-    }
-    fn fail_probation(&mut self) {
-        if let Est::Whole(b) = self {
-            b.fail_probation();
-        }
-    }
-}
+use vi_lib::localize::Estimator as Est;
 
 #[derive(Clone)]
 struct RunResult {
@@ -660,17 +591,17 @@ fn simulate(
             // これが実構成)。窓つきの GridLocalizer は native 一本。
             let mut b = Belief::new(grid, N_THETA, native_tri, wbc);
             b.seed(seed_pose);
-            Est::Whole(Box::new(b))
+            Est::Belief(Box::new(b))
         }
         Mode::Adaptive => {
             let mut l = AdaptiveLocalizer::new(native, N_THETA, bc);
             l.set_pose(seed_pose);
-            Est::Win(Box::new(l))
+            Est::Windowed(Box::new(l))
         }
         _ => {
             let mut l = GridLocalizer::new(native, N_THETA, bc);
             l.set_pose(seed_pose);
-            Est::Win(Box::new(l))
+            Est::Windowed(Box::new(l))
         }
     });
     let mut r = RunResult {
@@ -705,27 +636,7 @@ fn simulate(
         reloc_dist_m: 0.0,
     };
     let mut starve = 0usize;
-    // 能動的再定位 (実ノードの Reloc::Idle/Driving/GaveUp に対応)。判別場は
-    // ロスト 1 回につき 1 度だけ、主フィールドを in place で張り替えて解く。
-    let mut field_is_reloc = false;
-    let mut reloc_ticks = 0u32;
-    let mut reloc_gave_up = false;
-    // --reloc-creep: ロスト 1 回ぶんの凍結判別点 (pose 復帰で捨てる)。
-    let mut reloc_frozen: Option<Vec<(f64, f64)>> = None;
-    // lost_creep の回頭コミット (前 tick の回頭成分 — 前進 / pose 復帰で 0)。
-    let mut creep_rot = 0.0f64;
-    // ロスト解除からの経過 tick (安全ゲート・飢餓棄却のスコープ)。初回 relock
-    // で切れる recovering と違い、後続の再ロスト解除にも毎回窓が開く。
-    // usize::MAX = まだ一度もロストしていない (base 走行はゲート対象外)。
-    let mut post_release = usize::MAX;
-    let mut was_none = false;
-    /// 解除後、安全ゲートと飢餓棄却が有効な窓 [tick] (60 s)。
-    const RELEASE_GUARD_TICKS: usize = 600;
-    // δ* の実行状態 (残距離 [m], ロボット系方位 [rad])。凍結時に上位モードから
-    // 1 度だけ落とし、以後は指令オドメトリで更新する — 上位モードの同一性は
-    // エイリアス間で毎 tick 入れ替わるので、モードから引き直すと方位が振動して
-    // 回頭に食われる (実測: 180 s で並進 2.5 m)。
-    let mut reloc_delta: Option<(f64, f64)> = None;
+    let mut recovery = recovery::Recovery::new();
     // QMDP 決定の内訳 (診断用: 判別場が立ったのに走らないときの切り分け)。
     let (mut qn_goal, mut qn_act, mut qn_noact) = (0u32, 0u32, 0u32);
     let reloc_ticks_limit = (args.reloc_timeout_s / args.tick_s).ceil() as u32;
@@ -764,7 +675,7 @@ fn simulate(
             r.collided = true;
             break;
         }
-        if !field_is_reloc && vi.is_final(tix, tiy, tit) {
+        if !recovery.field_is_reloc && vi.is_final(tix, tiy, tit) {
             // 判別場の final は再定位の行き先であってゴールではない。
             r.reached = true;
             break;
@@ -783,16 +694,8 @@ fn simulate(
             None => Some(PoseView { x, y, yaw_rad: yaw }),
             Some(l) => l.pose(),
         };
-        // 解除後窓の追跡 (None → Some 遷移で開く)。
         if loc.is_some() {
-            if est.is_none() {
-                was_none = true;
-            } else if was_none {
-                was_none = false;
-                post_release = 0;
-            } else if post_release != usize::MAX {
-                post_release = post_release.saturating_add(1);
-            }
+            recovery.note_pose(est.is_some());
         }
         if let (Some(e), Some(_)) = (est, &loc) {
             let d = ((e.x - x).powi(2) + (e.y - y).powi(2)).sqrt();
@@ -841,7 +744,7 @@ fn simulate(
                     }
                 }
                 let reloc_live =
-                    args.active_reloc && !reloc_gave_up && reloc_ticks < reloc_ticks_limit;
+                    recovery.is_active(args.active_reloc, reloc_ticks_limit);
                 if !reloc_live {
                     lost_run += 1;
                     if lost_run > lost_abort_ticks {
@@ -895,19 +798,15 @@ fn simulate(
         if let Some(e) = est {
             // pose が戻った — 本来のゴールを解き直して通常追従へ (本家の再ロック後
             // re-solve と Reloc::Idle 復帰)。
-            if field_is_reloc {
+            if recovery.field_is_reloc {
                 let t0 = Instant::now();
                 vi.set_goal(goal.0, goal.1, args.goal_theta_deg as i32);
                 solve(vi, solver, args.max_iters);
                 r.reloc_solve_s += t0.elapsed().as_secs_f64();
                 r.reloc_solves += 1;
-                field_is_reloc = false;
+                recovery.field_is_reloc = false;
             }
-            reloc_ticks = 0;
-            reloc_gave_up = false;
-            reloc_frozen = None;
-            reloc_delta = None;
-            creep_rot = 0.0;
+            recovery.resume();
             let (ix, iy, it) = pose_to_cell(vi, e.x, e.y, e.yaw_rad);
             if in_field(vi, ix, iy, it) {
                 match greedy_decide(vi, ix, iy, it, args.action_tolerance_cells) {
@@ -926,9 +825,11 @@ fn simulate(
             // 経路に落ち、probation なら 50 tick で失敗 → 再拡散 (K2: 誤 belief
             // の復帰走行で壁 0.15 m まで詰めて衝突、の対策)。誘拐前の base 走行
             // と検出前の盲走行には触れない — 検出のダイナミクスを変えない。
-            let verifying = loc.as_ref().map(|l| l.in_probation()).unwrap_or(false)
-                || (recovering && r.detect_tick.is_some())
-                || post_release < RELEASE_GUARD_TICKS;
+            let verifying = recovery.verifying(
+                loc.as_ref().map(|l| l.in_probation()).unwrap_or(false),
+                recovering,
+                r.detect_tick.is_some(),
+            );
             if let (Some((fw, rot)), true, Some(s)) = (cmd, verifying, scan.as_ref()) {
                 if fw > 0.0
                     && min_range_ahead(s, 30f64.to_radians(), args.scan_range) < RECOVERY_GUARD_M
@@ -942,12 +843,12 @@ fn simulate(
                     cmd = if rot != 0.0 { Some((0.0, rot)) } else { None };
                 }
             }
-        } else if args.active_reloc && !reloc_gave_up && reloc_ticks < reloc_ticks_limit {
+        } else if recovery.is_active(args.active_reloc, reloc_ticks_limit) {
             // ロスト中の能動的再定位 (本家 follow_loop のロスト分岐を写す):
             // 仮説 2 個以上 + 近接ガードのとき、初回は判別点の多目標場を解き、
             // 以後は QMDP で判別点へ走る。Goal/NoAction は止まって観測を待つ。
             if let Some(l) = &loc {
-                reloc_ticks += 1;
+                recovery.ticks += 1;
                 // QMDP へは生の top-64 でなくモード集約を渡す (vi_lib 側の
                 // (b) 修正 — 生セルはキャンパス級の多峰で veto ロックする)。
                 let hyps = vi_lib::belief::weighted_modes(&l.top_cells(QMDP_TOP_K), 1.0, 4);
@@ -956,42 +857,15 @@ fn simulate(
                     // creep 実行器: 安全判定はスキャン (真値の環境) のみ —
                     // 仮説地図の近接ガード (clr_now) は使わない。δ* があれば
                     // 上位モード系の最寄り判別点への方位をバイアスに渡す。
-                    if reloc_frozen.is_none() {
-                        let targets = l.reloc_targets();
-                        if !targets.is_empty() {
-                            // δ* を (残距離, ロボット系方位) へ 1 度だけ落とす。
-                            // 既に居る (< 1 m) 判別点は除く — 到着直後の
-                            // 引き直しが同じ点を選んで凍結スラッシュしない。
-                            if let Some(&(mp, _)) = hyps.first() {
-                                if let Some((tx, ty)) = targets
-                                    .iter()
-                                    .copied()
-                                    .filter(|&(tx, ty)| (tx - mp.x).hypot(ty - mp.y) > 1.0)
-                                    .min_by(|a, b| {
-                                        (a.0 - mp.x)
-                                            .hypot(a.1 - mp.y)
-                                            .total_cmp(&(b.0 - mp.x).hypot(b.1 - mp.y))
-                                    })
-                                {
-                                    reloc_delta = Some((
-                                        (tx - mp.x).hypot(ty - mp.y),
-                                        wrap_rad((ty - mp.y).atan2(tx - mp.x) - mp.yaw_rad),
-                                    ));
-                                }
-                            }
-                            reloc_frozen = Some(targets);
-                        }
+                    if !recovery.has_target() {
+                        recovery.freeze_target(&hyps, l.reloc_targets());
                     }
-                    let preferred = reloc_delta.map(|(_, b)| b);
-                    let (fw, rot) = match scan.as_ref() {
-                        Some(s) => vi_lib::ctrl::lost_creep(s, preferred, args.scan_range, creep_rot),
-                        None => (0.0, 0.0),
-                    };
-                    creep_rot = rot;
-                    if reloc_ticks % 25 == 1 {
+                    let preferred = recovery.preferred_heading();
+                    let (fw, rot) = recovery.creep(scan.as_ref(), args.scan_range);
+                    if recovery.ticks % 25 == 1 {
                         eprintln!(
                             "  [creep] t={t} frozen={} pref_deg={:?} cmd=({fw:.2},{rot:.0}) yaw={:.0}",
-                            reloc_frozen.is_some(),
+                            recovery.has_target(),
                             preferred.map(|b| b.to_degrees() as i32),
                             yaw.to_degrees().rem_euclid(360.0),
                         );
@@ -1009,9 +883,9 @@ fn simulate(
                         from_reloc = true;
                     }
                 } else if hyps.len() >= 2 && clr_now >= RELOC_STOP_RANGE {
-                    if !field_is_reloc {
+                    if !recovery.field_is_reloc {
                         let targets = l.reloc_targets();
-                        if reloc_ticks % 50 == 1 {
+                        if recovery.ticks % 50 == 1 {
                             // 判別場が立たない理由の診断 (モード数は top-64 の近似)。
                             eprintln!(
                                 "  [reloc] t={t} hyps={} modes={} targets={} ess={:.0}",
@@ -1029,17 +903,17 @@ fn simulate(
                             let st = solve(vi, solver, args.max_iters);
                             r.reloc_solve_s += t0.elapsed().as_secs_f64();
                             r.reloc_solves += 1;
-                            field_is_reloc = true;
+                            recovery.field_is_reloc = true;
                             if !st.converged {
                                 // 収束しない判別場では走らない — 主ゴールへ戻して諦める。
                                 vi.set_goal(goal.0, goal.1, args.goal_theta_deg as i32);
                                 solve(vi, solver, args.max_iters);
-                                field_is_reloc = false;
-                                reloc_gave_up = true;
+                                recovery.field_is_reloc = false;
+                                recovery.gave_up = true;
                             }
                         }
                     }
-                    if field_is_reloc {
+                    if recovery.field_is_reloc {
                         match qmdp_decide(vi, &hyps) {
                             QmdpDecision::Action(i) => {
                                 qn_act += 1;
@@ -1085,9 +959,11 @@ fn simulate(
                     // を完走した誤解除が安全ゲートで詰む (津田沼 K2 で実測 —
                     // エイリアスの quality はバーの上に留まり得る) のは同じく
                     // 誤姿勢の外部証拠なので、死なずに再マッチへ回す。
-                    let reject = loc.as_ref().map(|l| l.in_probation()).unwrap_or(false)
-                        || ((recovering || post_release < RELEASE_GUARD_TICKS)
-                            && matches!(loc.as_ref(), Some(Est::Whole(_))));
+                    let reject = recovery.reject_starvation(
+                        loc.as_ref().map(|l| l.in_probation()).unwrap_or(false),
+                        recovering,
+                        matches!(loc.as_ref(), Some(Est::Belief(_))),
+                    );
                     if reject {
                         if let Some(l) = &mut loc {
                             eprintln!("  [prob] t={t} 方策飢餓 → 解除を棄却して lost へ");
@@ -1104,21 +980,7 @@ fn simulate(
             None
         };
 
-        // δ* 実行状態の指令オドメトリ更新 (ロボット系の目標点を平行移動+回転)。
-        if let (Some((d, b)), Some((v, w_deg))) = (&mut reloc_delta, moved) {
-            let (bx, by) = (*d * b.cos() - v * args.tick_s, *d * b.sin());
-            *b = wrap_rad(by.atan2(bx) - (w_deg.to_radians()) * args.tick_s);
-            *d = bx.hypot(by);
-            if *d < 0.5 {
-                // 判別点に到着 — 凍結も解き、次の tick に**今の** belief から
-                // 次の判別点を引き直す。到着後に凍結を保つ旧挙動は、その lost
-                // エピソードの残りを盲目の乱歩にしていた (津田沼 K3/K4 で実測:
-                // frozen=true / pref=None のまま 180 m 這って収束せず — 1 点
-                // 見ただけでは割れない多峰は連続で見に行かないと割れない)。
-                reloc_delta = None;
-                reloc_frozen = None;
-            }
-        }
+        recovery.advance_target(moved, args.tick_s);
 
         if let Some(l) = &mut loc {
             let t0 = Instant::now();
@@ -1141,7 +1003,7 @@ fn simulate(
     }
     // 判別場のまま終わった run (LOST 等) は主ゴールへ戻す — 次の run が同じ
     // フィールドを共有するための不変条件。
-    if field_is_reloc {
+    if recovery.field_is_reloc {
         vi.set_goal(goal.0, goal.1, args.goal_theta_deg as i32);
         solve(vi, solver, args.max_iters);
     }

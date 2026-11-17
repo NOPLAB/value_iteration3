@@ -23,6 +23,9 @@
 //! 尤度・平均・ESS はすべて active だけを舐める。`weight_skip_ratio` の枝刈りが
 //! 集合を belief の広がりに比例した大きさに保つ。
 
+mod localizer;
+mod observation;
+
 use crate::bridge::PoseView;
 use crate::msg::{LaserScan, OccupancyGrid, Quaternion};
 
@@ -1533,15 +1536,8 @@ impl Belief {
     /// 一様混合リセットが張った床 (α/free 数 ≪ max·ratio) がビーム評価される
     /// 前に消え、リセットが機能しなくなるため。
     fn sum_observe(&mut self, beams: &[(f64, f64)], lut: Option<&[[f32; 256]]>) -> f64 {
-        let z_min = self.cfg.z_min;
-        let m_inv = 1.0 / beams.len() as f64;
-        // 焼きなまし強度は observe 内で一定 (global_match のロスト経路のみ有効)。
         let apow = if self.cfg.global_match { self.anneal_pow() } else { 1 };
-        // 追跡経路の未知端点クランプ / ロスト経路の証拠不足の頭打ち定数。
-        let unk_l = z_min + (1.0 - z_min) * UNKNOWN_L;
-        // ビーム角は加法定理で回す (セルごとに全ビームの sin/cos を呼ばない)。
-        let bt: Vec<(f64, f64, f64)> =
-            beams.iter().map(|&(ba, r)| (ba.cos(), ba.sin(), r)).collect();
+        let model = observation::ObservationModel::new(&self.cfg, beams, apow);
         let mut quality = 0.0f64;
         let mut active = std::mem::take(&mut self.active);
         active.retain(|&iu| {
@@ -1559,59 +1555,11 @@ impl Belief {
             let th = self.theta_center(it);
             let (ct, st) = (th.cos(), th.sin());
             let (cx, cy) = self.cell_center(ix, iy);
-            let (mut prod, mut known) = (1.0f64, 0u32);
-            for (bi, &(cb, sb, r)) in bt.iter().enumerate() {
-                let (ca, sa) = (ct * cb - st * sb, st * cb + ct * sb);
-                let (px, py) = (cx + r * ca, cy + r * sa);
-                match lut {
-                    // ロスト観測モデル: LUT は z_min ミキシング + (1/M)
-                    // テンパリング焼き込み済み。未知・地図外の端点は分母から
-                    // 除外 (E 正規化 — LOST_MIN_KNOWN の doc 参照)。
-                    Some(t) => {
-                        if let Some(d) = self.field.known_dist(px, py) {
-                            prod *= t[bi][d] as f64;
-                            known += 1;
-                        }
-                    }
-                    None => {
-                        let mut lb = z_min + (1.0 - z_min) * self.field.at(px, py);
-                        // 未知セルの端点は中立 (UNKNOWN_L) との max。
-                        if lb < unk_l && self.field.unk_at(px, py) {
-                            lb = unk_l;
-                        }
-                        prod *= lb;
-                    }
-                }
-            }
-            // 観測一致度はビームの**幾何**平均 (= prod^(1/M))。算術平均だと
-            // ミスマッチでも「たまたま障害物帯に乗った端点」の寄与で 0.3 台に
-            // 浮き、ロスト検出のしきい値と分離できない。幾何平均は外れビームに
-            // 引きずられて z_min 側へ落ちるので、整合 (~0.5+) と乖離する。
-            let (gm, bw) = if lut.is_some() {
-                let s = if known >= LOST_MIN_KNOWN {
-                    // (Π l^(1/M))^(M/E) = (Π l)^(1/E) — 既知ビームの幾何平均。
-                    prod.powf(bt.len() as f64 / known as f64)
-                } else {
-                    unk_l
-                };
-                // global_match: 淘汰の**重み**は「未知ビーム = 中立」で数え
-                // 直し、焼きなまし乗する: (Π_known l^(1/M) · unk_l^((M−E)/M))^apow。
-                // E 正規化の gm は少数ビーム候補ほど高分散で、良く合う数ビーム
-                // の縁セル (gm ~0.9) が全証拠の真値 (gm ~0.7) を恒常的に上回る
-                // (津田沼 K4 の北東フリンジで実測 — probation q=0.63 の高品質
-                // エイリアスの正体)。中立記数なら証拠が薄いほど主張も薄く、
-                // ゼロ証拠セルのタダ乗り (乗数 1) も起きない。quality (検出・
-                // probation のしきい値系) は E 正規化 gm のまま。
-                let bwv = if self.cfg.global_match {
-                    (prod * unk_l.powf((bt.len() - known as usize) as f64 * m_inv))
-                        .powf(apow as f64)
-                } else {
-                    s
-                };
-                (s, bwv)
-            } else {
-                (prod.powf(m_inv), prod)
-            };
+            let (gm, bw) = model.score(
+                &self.field,
+                observation::BeamPose { position: (cx, cy), heading: (ct, st) },
+                lut,
+            );
             quality += w as f64 * gm;
             self.b[i] = (w as f64 * bw) as f32;
             true
@@ -1968,10 +1916,10 @@ impl Belief {
     fn vit_observe(&mut self, beams: &[(f64, f64)], lut: Option<&[[f32; 256]]>) -> f64 {
         // 焼きなまし強度 (sum 側と同じ、borrow の都合で先に取る)。
         let apow = if self.cfg.global_match { self.anneal_pow() } else { 1 };
+        let model = observation::ObservationModel::new(&self.cfg, beams, apow);
         let (nx, ny, nt) = (self.nx, self.ny, self.nt);
         let n = (nx as usize) * (ny as usize) * (nt as usize);
         let (ox, oy, res, t_res) = (self.ox, self.oy, self.res, self.t_res_deg);
-        let z_min = self.cfg.z_min;
         // Bayes 側の weight_skip_ratio と同じ意味の枝刈り (δ は -ln 重み)。
         // ただしリセット床 ([`Belief::reset_floor_ln`]) は必ず内側に含める:
         // 床を切ってから観測を足すと、一様混合が張った仮説が尤度で評価される
@@ -1979,11 +1927,6 @@ impl Belief {
         // 置いているのと同じ理由)。床が張られた直後の 1 回だけ全域評価になる。
         let thr_ln =
             (-(self.cfg.weight_skip_ratio.max(1e-30)).ln()).max(self.reset_floor_ln()) as f32;
-        let m_inv = 1.0 / beams.len() as f64;
-        // sum 側と同じ: 追跡クランプ / 証拠不足の頭打ち定数。
-        let unk_l = z_min + (1.0 - z_min) * UNKNOWN_L;
-        let bt: Vec<(f64, f64, f64)> =
-            beams.iter().map(|&(ba, r)| (ba.cos(), ba.sin(), r)).collect();
         let mut quality = 0.0f64;
         let delta = &mut self.delta;
         let dmin0 = delta[..n].iter().cloned().fold(f32::INFINITY, f32::min);
@@ -2005,45 +1948,11 @@ impl Belief {
                         continue;
                     }
                     let cx = ox + (ix as f64 + 0.5) * res;
-                    let (mut prod, mut known) = (1.0f64, 0u32);
-                    for (bi, &(cb, sb, r)) in bt.iter().enumerate() {
-                        let (ca, sa) = (ct * cb - st * sb, st * cb + ct * sb);
-                        let (px, py) = (cx + r * ca, cy + r * sa);
-                        match lut {
-                            // sum 側と同じ E 正規化 (LOST_MIN_KNOWN の doc 参照)。
-                            Some(t) => {
-                                if let Some(dk) = self.field.known_dist(px, py) {
-                                    prod *= t[bi][dk] as f64;
-                                    known += 1;
-                                }
-                            }
-                            None => {
-                                let mut lb = z_min + (1.0 - z_min) * self.field.at(px, py);
-                                if lb < unk_l && self.field.unk_at(px, py) {
-                                    lb = unk_l;
-                                }
-                                prod *= lb;
-                            }
-                        }
-                    }
-                    let (gm, cost) = if lut.is_some() {
-                        let s = if known >= LOST_MIN_KNOWN {
-                            prod.powf(bt.len() as f64 / known as f64)
-                        } else {
-                            unk_l
-                        };
-                        // sum 側と同じ「未知 = 中立」記数 + 焼きなまし
-                        // (min-plus では cost に -ln が掛かる)。
-                        let cv = if self.cfg.global_match {
-                            (prod * unk_l.powf((bt.len() - known as usize) as f64 * m_inv))
-                                .powf(apow as f64)
-                        } else {
-                            s
-                        };
-                        (s, cv)
-                    } else {
-                        (prod.powf(m_inv), prod)
-                    };
+                    let (gm, cost) = model.score(
+                        &self.field,
+                        observation::BeamPose { position: (cx, cy), heading: (ct, st) },
+                        lut,
+                    );
                     quality += self.b[i] as f64 * gm;
                     delta[i] = d - cost.ln() as f32;
                 }
@@ -2455,11 +2364,12 @@ mod tests {
             init_sigma_theta_deg: 20.0,
             ..BeliefConfig::default()
         };
-        let mut loc = Belief::new(&g, 36, &g, bc);
+        let mut belief = Belief::new(&g, 36, &g, bc);
+        let loc: &mut dyn crate::localize::Localizer = &mut belief;
         assert!(loc.pose().is_none(), "シード前は None");
 
         // 真値から 0.14m / 11° ずらして手動シード。
-        loc.seed(pose(1.3, 1.4, 0.3));
+        loc.set_pose(pose(1.3, 1.4, 0.3));
         let scan = cast_scan(&g, truth, 36, 5.0);
         for _ in 0..6 {
             loc.observe(&scan);
@@ -2502,8 +2412,8 @@ mod tests {
             init_sigma_theta_deg: 5.0,
             ..BeliefConfig::default()
         };
-        let mut loc = Belief::new(&g, 36, &g, bc);
-        loc.seed(pose(1.5, 1.5, 0.0));
+        let mut loc = crate::localize::Estimator::Belief(Box::new(Belief::new(&g, 36, &g, bc)));
+        loc.set_pose(pose(1.5, 1.5, 0.0));
 
         // 前進 0.3 m/s × 1.0 s。flush 前でも pose() は解析 pend で前進を返す。
         for _ in 0..10 {

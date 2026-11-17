@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use vi_lib::bridge::PoseView;
 use vi_lib::msg::LaserScan as ViLaserScan;
 
-use vi_planner::core::{Belief, Localizer, PlannerCore};
+use vi_planner::core::PlannerCore;
 
 use rclrs::*;
 
@@ -80,98 +80,7 @@ pub struct PlanPub {
 // Localizer
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// 自己位置推定。3 系統が併存する:
-///   - `External` — pose トピックの素通し (既定)。
-///   - `Windowed` — 窓つきヒストグラム MCL ([`vi_planner::core::GridLocalizer`] /
-///     [`vi_planner::core::AdaptiveLocalizer`])。belief は機体まわりの窓だけに載り、
-///     `AdaptiveLocalizer` は観測が合わなくなると粗い広域レベルへ広げて再定位する
-///     (能動的再定位の判別点 `reloc_targets` を出せるのもこちら)。
-///   - `Belief` — 全地図 belief ([`vi_planner::core::Belief`])。窓もレベル機構も無く、
-///     プランナと同じ格子の上に belief を全域で持つ。
-///
-/// **`PlannerCore` の外に置くこと。** 30 秒級の solve は核の `Mutex` を握りっぱなし
-/// にするが、belief はその間もスキャンコールバックから更新され続けなければならない。
-/// ロック順序は常に localizer → core (入れ子は作らない)。
-pub enum Loc {
-    External(Option<PoseView>),
-    Windowed(Box<dyn Localizer>),
-    Belief(Box<Belief>),
-}
-
-impl Loc {
-    /// 外部姿勢の取り込み。External = そのまま採用、他は手動シード。
-    pub fn set_pose(&mut self, p: PoseView) {
-        match self {
-            Loc::External(o) => *o = Some(p),
-            Loc::Windowed(l) => l.set_pose(p),
-            Loc::Belief(b) => b.seed(p),
-        }
-    }
-    pub fn predict(&mut self, v: f64, w_deg: f64, dt: f64) {
-        match self {
-            Loc::External(_) => {}
-            Loc::Windowed(l) => l.predict(v, w_deg, dt),
-            Loc::Belief(b) => b.predict(v, w_deg, dt),
-        }
-    }
-    /// `map_clear` = `map_clear_from_scan`。VI 側と同じ反証を belief の free
-    /// マスクにも当ててから補正する (順序が逆だと、開いた先へ質量を動かすのは
-    /// 次の tick になる)。Windowed 側は未対応 — 必要になったら足す。
-    pub fn observe(&mut self, scan: &ViLaserScan, map_clear: bool) {
-        match self {
-            Loc::External(_) => {}
-            Loc::Windowed(l) => l.observe(scan),
-            Loc::Belief(b) => {
-                if map_clear {
-                    b.clear_free_from_scan(scan);
-                }
-                b.observe(scan);
-            }
-        }
-    }
-    pub fn pose(&self) -> Option<PoseView> {
-        match self {
-            Loc::External(o) => *o,
-            Loc::Windowed(l) => l.pose(),
-            Loc::Belief(b) => b.pose(),
-        }
-    }
-    /// 直近の補正の観測一致度 [0,1]。External は常に 1.0 (ゲートが実質無効)。
-    pub fn quality(&self) -> f64 {
-        match self {
-            Loc::External(_) => 1.0,
-            Loc::Windowed(l) => l.quality(),
-            Loc::Belief(b) => b.quality(),
-        }
-    }
-    /// QMDP 用の上位仮説。External は単一仮説なので空 = 呼び出し側は点推定へ退避。
-    pub fn top_cells(&self, k: usize) -> Vec<(PoseView, f64)> {
-        match self {
-            Loc::External(_) => Vec::new(),
-            Loc::Windowed(l) => l.top_cells(k),
-            Loc::Belief(b) => b.top_cells(k),
-        }
-    }
-    /// 能動的再定位 (`active_reloc`) の行き先候補。多峰 belief を持つ推定器
-    /// (窓つき [`vi_planner::core::AdaptiveLocalizer`] と全地図
-    /// [`vi_planner::core::Belief`]) が出す — External は空 = 提案なし。
-    pub fn reloc_targets(&self) -> Vec<(f64, f64)> {
-        match self {
-            Loc::External(_) => Vec::new(),
-            Loc::Windowed(l) => l.reloc_targets(),
-            Loc::Belief(b) => b.reloc_targets(),
-        }
-    }
-    /// 可視化用の belief グリッド。External は belief を持たないので None
-    /// (窓つきは窓ぶんだけ、全地図は VI と同じ格子)。
-    pub fn belief_grid(&self) -> Option<vi_lib::msg::OccupancyGrid> {
-        match self {
-            Loc::External(_) => None,
-            Loc::Windowed(l) => l.belief_grid(),
-            Loc::Belief(b) => b.grid(),
-        }
-    }
-}
+pub use vi_lib::localize::Estimator as Loc;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Handles
