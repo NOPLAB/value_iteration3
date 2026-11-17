@@ -460,79 +460,7 @@ fn parse_kidnap(s: &str, tick_s: f64) -> Result<(String, Kidnap), String> {
     ))
 }
 
-/// 推定器の入れ物。窓つき ([`GridLocalizer`], `Localizer` トレイト) と全地図
-/// ([`Belief`]) は別の型なので、bench の中だけの都合でここに束ねる
-/// (実ノード側の同じ役の enum は `vi_planner::node::handles::Loc`)。
-enum Est {
-    /// 窓つき系 ([`GridLocalizer`] / [`AdaptiveLocalizer`]、`Localizer` トレイト)。
-    Win(Box<dyn Localizer>),
-    Whole(Box<Belief>),
-}
-
-impl Est {
-    fn predict(&mut self, v: f64, w_deg: f64, dt: f64) {
-        match self {
-            Est::Win(l) => l.predict(v, w_deg, dt),
-            Est::Whole(b) => b.predict(v, w_deg, dt),
-        }
-    }
-    fn observe(&mut self, scan: &vi_lib::msg::LaserScan) {
-        match self {
-            Est::Win(l) => l.observe(scan),
-            Est::Whole(b) => b.observe(scan),
-        }
-    }
-    fn pose(&self) -> Option<PoseView> {
-        match self {
-            Est::Win(l) => l.pose(),
-            Est::Whole(b) => b.pose(),
-        }
-    }
-    fn quality(&self) -> f64 {
-        match self {
-            Est::Win(l) => l.quality(),
-            Est::Whole(b) => b.quality(),
-        }
-    }
-    /// belief の広がり (全地図のみ — 窓つきはトレイトが出していない)。
-    fn ess(&self) -> f64 {
-        match self {
-            Est::Win(_) => f64::NAN,
-            Est::Whole(b) => b.ess(),
-        }
-    }
-    fn top_cells(&self, k: usize) -> Vec<(PoseView, f64)> {
-        match self {
-            Est::Win(l) => l.top_cells(k),
-            Est::Whole(b) => b.top_cells(k),
-        }
-    }
-    fn reloc_targets(&self) -> Vec<(f64, f64)> {
-        match self {
-            Est::Win(l) => l.reloc_targets(),
-            Est::Whole(b) => b.reloc_targets(),
-        }
-    }
-    /// 診断: 真値仮説の周辺重み / 最大重みとその位置 (全地図のみ)。
-    fn probe_weight(&self, p: PoseView) -> (f64, f64, Option<PoseView>) {
-        match self {
-            Est::Win(_) => (f64::NAN, f64::NAN, None),
-            Est::Whole(b) => b.probe_weight(p),
-        }
-    }
-    /// 解除の probation (全地図のみ — 窓つき系は未対応で常に確定解除)。
-    fn in_probation(&self) -> bool {
-        match self {
-            Est::Win(_) => false,
-            Est::Whole(b) => b.in_probation(),
-        }
-    }
-    fn fail_probation(&mut self) {
-        if let Est::Whole(b) = self {
-            b.fail_probation();
-        }
-    }
-}
+use vi_lib::localize::Estimator as Est;
 
 #[derive(Clone)]
 struct RunResult {
@@ -660,17 +588,17 @@ fn simulate(
             // これが実構成)。窓つきの GridLocalizer は native 一本。
             let mut b = Belief::new(grid, N_THETA, native_tri, wbc);
             b.seed(seed_pose);
-            Est::Whole(Box::new(b))
+            Est::Belief(Box::new(b))
         }
         Mode::Adaptive => {
             let mut l = AdaptiveLocalizer::new(native, N_THETA, bc);
             l.set_pose(seed_pose);
-            Est::Win(Box::new(l))
+            Est::Windowed(Box::new(l))
         }
         _ => {
             let mut l = GridLocalizer::new(native, N_THETA, bc);
             l.set_pose(seed_pose);
-            Est::Win(Box::new(l))
+            Est::Windowed(Box::new(l))
         }
     });
     let mut r = RunResult {
@@ -1087,7 +1015,7 @@ fn simulate(
                     // 誤姿勢の外部証拠なので、死なずに再マッチへ回す。
                     let reject = loc.as_ref().map(|l| l.in_probation()).unwrap_or(false)
                         || ((recovering || post_release < RELEASE_GUARD_TICKS)
-                            && matches!(loc.as_ref(), Some(Est::Whole(_))));
+                            && matches!(loc.as_ref(), Some(Est::Belief(_))));
                     if reject {
                         if let Some(l) = &mut loc {
                             eprintln!("  [prob] t={t} 方策飢餓 → 解除を棄却して lost へ");

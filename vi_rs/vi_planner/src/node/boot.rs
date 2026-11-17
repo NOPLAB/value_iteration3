@@ -223,7 +223,7 @@ pub fn build_core(
             );
             Loc::Belief(Box::new(b))
         }
-        _ => Loc::External(None),
+        _ => Loc::External(Default::default()),
     };
     drop(binary_grid);
     let nstates =

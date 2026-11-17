@@ -215,7 +215,7 @@ fn main() -> Result<()> {
                 let scan = vi_scan_from(&msg);
                 let est = {
                     let mut l = lock(&h.localizer);
-                    l.observe(&scan, map_clear);
+                    l.observe_with_map_clear(&scan, map_clear);
                     let p = l.pose();
                     // 無条件代入: belief はロスト中 None を返すので、latest_pose
                     // ごと消して follow ループを「pose なし」停止経路に乗せる

@@ -23,6 +23,7 @@
 //! 尤度・平均・ESS はすべて active だけを舐める。`weight_skip_ratio` の枝刈りが
 //! 集合を belief の広がりに比例した大きさに保つ。
 
+mod localizer;
 mod observation;
 
 use crate::bridge::PoseView;
@@ -2363,11 +2364,12 @@ mod tests {
             init_sigma_theta_deg: 20.0,
             ..BeliefConfig::default()
         };
-        let mut loc = Belief::new(&g, 36, &g, bc);
+        let mut belief = Belief::new(&g, 36, &g, bc);
+        let loc: &mut dyn crate::localize::Localizer = &mut belief;
         assert!(loc.pose().is_none(), "シード前は None");
 
         // 真値から 0.14m / 11° ずらして手動シード。
-        loc.seed(pose(1.3, 1.4, 0.3));
+        loc.set_pose(pose(1.3, 1.4, 0.3));
         let scan = cast_scan(&g, truth, 36, 5.0);
         for _ in 0..6 {
             loc.observe(&scan);
@@ -2410,8 +2412,8 @@ mod tests {
             init_sigma_theta_deg: 5.0,
             ..BeliefConfig::default()
         };
-        let mut loc = Belief::new(&g, 36, &g, bc);
-        loc.seed(pose(1.5, 1.5, 0.0));
+        let mut loc = crate::localize::Estimator::Belief(Box::new(Belief::new(&g, 36, &g, bc)));
+        loc.set_pose(pose(1.5, 1.5, 0.0));
 
         // 前進 0.3 m/s × 1.0 s。flush 前でも pose() は解析 pend で前進を返す。
         for _ in 0..10 {
