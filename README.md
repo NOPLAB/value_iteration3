@@ -1,4 +1,26 @@
-# vi_planner runtime parameters
+# Development
+
+## Nix shell
+
+Run `nix-shell` from the repository root for the C compiler, Make, Cargo, Rust,
+rustfmt, Clippy, rust-analyzer, pkg-config, Git, and the Docker client. The Rust
+tools come from the same `<nixpkgs>` as the shell; no rustup setup is required.
+Tool versions follow your configured Nixpkgs channel.
+
+```sh
+nix-shell
+make test-host
+make rs-test
+```
+
+ROS2 uses the existing `make ros2-docker` and `make ros2-test` targets and requires
+a running Docker daemon that your user can access. This shell does not install
+native ROS2, MATLAB, Vivado, or Vitis.
+
+If a generated `.cargo/config.toml` from a ROS2 build is present, run host Cargo
+commands from outside the repository with `--manifest-path`, as described below.
+
+## vi_planner runtime parameters
 
 `vi_rs/vi_planner` serves the ROS2 planning and following actions from one value
 field. Parameters are declared in `src/node/params.rs`.
