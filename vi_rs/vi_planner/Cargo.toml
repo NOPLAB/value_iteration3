@@ -18,8 +18,7 @@ futures = "0.3"
 vi_lib = { path = "../vi_lib" }
 
 # ROS deps。colcon-ros-cargo の生成 config が [patch.crates-io] でローカル
-# ビルド済みクレートへ差し替える。nav2_msgs は Docker の ros2_rust
-# ワークスペースでソースビルドして Rust バインディングを得る。
+# ビルド済みクレートへ差し替える。
 rclrs         = "*"
 nav_msgs      = "*"
 geometry_msgs = "*"

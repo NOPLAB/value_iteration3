@@ -13,9 +13,12 @@ make test-host
 make rs-test
 ```
 
-ROS2 uses the existing `make ros2-docker` and `make ros2-test` targets and requires
-a running Docker daemon that your user can access. This shell does not install
-native ROS2, MATLAB, Vivado, or Vitis.
+ROS2 CI builds and tests the planner on Humble, Jazzy, and Lyrical. To run the
+same Docker targets locally, run `make ros2-docker` followed by `make ros2-test`
+(Humble by default). For Jazzy or Lyrical, pass `VI_ROS_DISTRO=jazzy` or
+`VI_ROS_DISTRO=lyrical` to both commands in a separate checkout.
+A running Docker daemon is required. This shell does not install native ROS2,
+MATLAB, Vivado, or Vitis.
 
 If a generated `.cargo/config.toml` from a ROS2 build is present, run host Cargo
 commands from outside the repository with `--manifest-path`, as described below.

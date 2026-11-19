@@ -3,10 +3,11 @@ set -euo pipefail
 
 # The ROS setup scripts reference unbound vars (e.g. AMENT_TRACE_SETUP_FILES),
 # so relax nounset while sourcing them, then restore it.
-if [ -f /opt/ros/humble/setup.sh ]; then
+ros_setup="/opt/ros/${ROS_DISTRO:-humble}/setup.sh"
+if [ -f "$ros_setup" ]; then
     # Docker (make ros2-build)
     set +u
-    . /opt/ros/humble/setup.sh
+    . "$ros_setup"
     . /ros2_rust_ws/install/local_setup.sh
     set -u
 else
@@ -34,8 +35,7 @@ ln -sfn "$REPO_ROOT/vi_rs/vi_planner" "$WS/src/vi_planner"
 #     both the real package sources and the ../vi_lib path dep.
 #
 #  2. --merge-install: rosidl_runtime_rs's build.rs adds `<prefix>/lib` to the
-#     linker search path for each prefix on AMENT_PREFIX_PATH (this is also how
-#     the Dockerfile builds rclrs / nav2_msgs in /ros2_rust_ws).
+#     linker search path for each prefix on AMENT_PREFIX_PATH.
 cd "$REPO_ROOT"
 # Build the Rust node in cargo's *release* profile. colcon-ros-cargo 0.2.0
 # builds via `cargo ament-build -- ... <cargo-args>` and does NOT inject a
