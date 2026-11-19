@@ -30,6 +30,7 @@ pub struct Params {
     pub map_penalty: i64,
     /// Scan hit band radius [m], followed by its integer cost strength.
     pub scan_penalty_radius: f64,
+    pub scan_collision_radius: f64,
     pub scan_penalty: i64,
     pub goal_margin_radius: f64,
     pub goal_margin_theta_deg: f64,
@@ -188,6 +189,7 @@ pub fn read_params(node: &Node) -> Result<Params> {
         map_penalty_radius: p!("map_penalty_radius", f64, 0.2),
         map_penalty: p!("map_penalty", i64, 10_000),
         scan_penalty_radius: p!("scan_penalty_radius", f64, 0.1),
+        scan_collision_radius: p!("scan_collision_radius", f64, 0.2),
         scan_penalty: p!("scan_penalty", i64, 10_000),
         goal_margin_radius: p!("goal_margin_radius", f64, 0.3),
         goal_margin_theta_deg: p!("goal_margin_theta", f64, 15.0),
@@ -424,6 +426,9 @@ fn parse_actions(
 /// のは、値を変えたいときの邪魔にしかならなかった)。落とすのは、後段のどこかで
 /// 実際に割り算・添字になって壊れるものだけ。
 pub fn validate(p: &Params) -> Result<U64Solver> {
+    if !p.scan_collision_radius.is_finite() || p.scan_collision_radius < 0.0 {
+        return Err(anyhow!("scan_collision_radius must be finite and nonnegative"));
+    }
     if p.map_scale < 1 {
         return Err(anyhow!("map_scale must be >= 1, got {}", p.map_scale));
     }

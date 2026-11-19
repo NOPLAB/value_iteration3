@@ -68,7 +68,7 @@ use vi_planner::core::lock;
 use rclrs::*;
 
 use node::follow_loop::{FollowTuning, RetryTuning};
-use node::handles::{Handles, PlanPub, Viz};
+use node::handles::{Handles, PlanPub, ScanObservation, Viz};
 use node::msg::{pose_view_from, vi_scan_from};
 use node::params::{read_params, validate};
 use node::servers::{self, Wiring};
@@ -223,16 +223,18 @@ fn main() -> Result<()> {
                     *lock(&h.latest_pose) = p;
                     p
                 };
+                {
+                    let mut q = lock(&h.scan_queue);
+                    // 制御ループが止まっていても際限なく溜めない (最新を優先)。
+                    if q.len() >= 10 {
+                        q.remove(0);
+                    }
+                    q.push(ScanObservation { scan, pose: est });
+                }
                 if let Some(p) = est {
                     h.publish_est(p);
                 }
                 h.publish_belief();
-                let mut q = lock(&h.scan_queue);
-                // 制御ループが止まっていても際限なく溜めない (最新を優先)。
-                if q.len() >= 10 {
-                    q.remove(0);
-                }
-                q.push(scan);
             },
         )?
     };

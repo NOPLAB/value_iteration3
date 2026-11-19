@@ -9,11 +9,12 @@ import time
 
 import rclpy
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.qos import DurabilityPolicy, QoSProfile
+from sensor_msgs.msg import LaserScan
 
 
 def main():
@@ -24,6 +25,9 @@ def main():
         QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
     )
     pose_pub = node.create_publisher(PoseWithCovarianceStamped, "mcl_pose", 10)
+    scan_pub = node.create_publisher(LaserScan, "scan", 10)
+    estimates = []
+    estimate_sub = node.create_subscription(PoseStamped, "viola_pose", estimates.append, 10)
     commands = []
     subscription = node.create_subscription(Twist, "cmd_vel", commands.append, 100)
     client = ActionClient(node, NavigateToPose, "navigate_to_pose")
@@ -95,6 +99,7 @@ def main():
             str(executable), "--ros-args",
             "-p", "standalone:=true", "-p", "goal_retry_limit:=0",
             "-p", "vi_threads:=1", "-p", "map_penalty_radius:=0.0",
+            "-p", "scan_penalty:=0",
         ], stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy())
         try:
             spin_until(lambda: client.server_is_ready())
@@ -120,12 +125,40 @@ def main():
             publish_pose(2.5)
             assert wait_future(result).status == GoalStatus.STATUS_SUCCEEDED
             print("PASS: waiting resumes on pose update and reaches the goal", flush=True)
+
+            # Queue one scan while no follow loop is running. An estimate is
+            # published for both pose updates and scan receipts.
+            spin_until(lambda: scan_pub.get_subscription_count() > 0)
+            publish_pose(1.0)
+            spin_until(lambda: estimates and estimates[-1].pose.position.x == 1.0)
+            scan = LaserScan()
+            scan.header.frame_id = "base_footprint"
+            scan.angle_increment = 0.1
+            scan.range_min = 0.01
+            scan.range_max = 10.0
+            scan.ranges = [0.41]
+            received = len(estimates)
+            scan_pub.publish(scan)
+            spin_until(lambda: len(estimates) > received)
+            publish_pose(1.05)
+            spin_until(lambda: estimates[-1].pose.position.x == 1.05)
+
+            # The hit is now 0.36 m ahead, not 0.41 m ahead. Projecting it from
+            # the new pose would admit a forward turn through its footprint.
+            commands.clear()
+            handle, result = send_goal()
+            spin_until(lambda: len(commands) >= 10)
+            assert all(cmd.linear.x <= 0.0 for cmd in commands), "forward command through queued hit"
+            assert any(cmd.linear.x < 0.0 or cmd.angular.z != 0.0 for cmd in commands)
+            cancel(handle, result)
+            print("PASS: queued scan keeps its observation pose after a pose update", flush=True)
         finally:
             process.terminate()
             process.wait(timeout=10)
             log.seek(0)
             print(log.read(), flush=True)
             client.destroy()
+            node.destroy_subscription(estimate_sub)
             node.destroy_subscription(subscription)
             node.destroy_node()
             rclpy.shutdown()

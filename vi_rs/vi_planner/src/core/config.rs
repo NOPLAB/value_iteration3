@@ -48,6 +48,8 @@ pub struct PlanConfig {
     /// スキャンのヒットセル周囲に塗るペナルティ帯の半幅 [m]。
     pub scan_penalty_radius: f64,
     pub scan_penalty: u64,
+    /// Circular footprint radius [m] for greedy scan collision checks; 0 disables them.
+    pub scan_collision_radius: f64,
     pub solver: U64Solver,
     /// solve 総イテレーション上限 (発散ガード)。
     pub max_solve_iter: u32,

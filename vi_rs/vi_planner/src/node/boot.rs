@@ -370,6 +370,7 @@ pub fn build_core(
     let cfg = PlanConfig {
         scan_penalty_radius: params.scan_penalty_radius,
         scan_penalty: params.scan_penalty as u64,
+        scan_collision_radius: params.scan_collision_radius,
         solver,
         max_solve_iter: MAX_SOLVE_ITER,
         solve_chunk: SOLVE_CHUNK,

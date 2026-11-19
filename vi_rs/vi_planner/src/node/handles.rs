@@ -82,6 +82,11 @@ pub struct PlanPub {
 
 pub use vi_lib::localize::Estimator as Loc;
 
+pub struct ScanObservation {
+    pub scan: ViLaserScan,
+    pub pose: Option<PoseView>,
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Handles
 // ──────────────────────────────────────────────────────────────────────────────
@@ -96,7 +101,7 @@ pub struct Handles {
     /// (follow ループ・plan サーバ) は従来どおり latest_pose だけを見る。
     /// **核の Mutex とは別**: solve 中も scan から更新され続ける必要がある。
     pub localizer: Mutex<Loc>,
-    pub scan_queue: Mutex<Vec<ViLaserScan>>,
+    pub scan_queue: Mutex<Vec<ScanObservation>>,
     pub cmd_pub: Publisher<geometry_msgs::msg::Twist>,
     pub viz: Option<Viz>,
     /// 表示専用の経路 (`plan`)。standalone のときだけ Some。
@@ -185,7 +190,7 @@ pub struct FollowCtx<'a> {
     pub core: &'a Mutex<PlannerCore>,
     pub latest_pose: &'a Mutex<Option<PoseView>>,
     pub localizer: &'a Mutex<Loc>,
-    pub scan_queue: &'a Mutex<Vec<ViLaserScan>>,
+    pub scan_queue: &'a Mutex<Vec<ScanObservation>>,
     pub cmd_pub: &'a Publisher<geometry_msgs::msg::Twist>,
     /// 表示専用の経路。None なら出さない (`follow_path` 構成では BT 側の
     /// `compute_path_to_pose` が出すので不要)。

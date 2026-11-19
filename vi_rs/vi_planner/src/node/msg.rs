@@ -4,6 +4,7 @@
 use vi_lib::bridge::PoseView;
 use vi_lib::msg::LaserScan as ViLaserScan;
 use vi_lib::planner::PathPose;
+use vi_planner::core::INVALID_RANGE_M;
 
 use rclrs::*;
 
@@ -39,10 +40,6 @@ pub fn poses_to_path(poses: &[PathPose], frame_id: &str, stamp: (i32, u32)) -> n
         .collect();
     path
 }
-
-/// 無効レンジ (inf / NaN / 非正) の差し替え値 [m]。ローカルウィンドウから
-/// 十分遠く、セル座標化しても i32 に収まる値であればよい。
-const INVALID_RANGE_M: f64 = 1.0e6;
 
 /// sensor_msgs/LaserScan → vi_lib::LaserScan。ビーム角と添字の対応を
 /// 保つため無効レンジは取り除かず [`INVALID_RANGE_M`] に差し替える

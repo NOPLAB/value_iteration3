@@ -255,7 +255,9 @@ pub fn run_follow(
             // (core::prepare_reloc_goal の doc)。
             // どの経路も最新スキャンしか見ないので先に 1 回だけ引く (スキャンは
             // コールバックで localizer に反映済みなので、ここで消費してよい)。
-            let last_scan = std::mem::take(&mut *scan_queue.lock().unwrap()).pop();
+            let last_scan = std::mem::take(&mut *scan_queue.lock().unwrap())
+                .pop()
+                .map(|observation| observation.scan);
             // ロスト中の走行予算は再定位 QMDP と creep で共有する。予算切れ後は
             // 停止待ちに戻り、姿勢の復帰かキャンセルを待ち続ける。
             let lost_budget = reloc_ticks < tuning.reloc_ticks_limit;
@@ -411,8 +413,8 @@ pub fn run_follow(
 
         // scan の取り込みはロックを取れた tick でだけ行う (取れなかった tick で
         // 捨てると、待っている間のスキャンが丸ごと失われる)。ビジーが続くと
-        // キューは 10 件の上限に張り付き、次に取れた tick でまとめて同一 pose の
-        // もとに注入される — スキャンコールバック側の上限はこのための蓋。
+        // キューは 10 件の上限に張り付き、次に取れた tick でまとめて注入される。
+        // 衝突判定に使うヒットは、キューに保持した各スキャンの観測姿勢で投影する。
         let scans = std::mem::take(&mut *scan_queue.lock().unwrap());
 
         let (decision, dist, window_grid) = {
@@ -424,8 +426,8 @@ pub fn run_follow(
                 return Outcome::Preempted;
             }
             core.set_window(pose);
-            for scan in &scans {
-                core.observe_scan_gated(scan, pose, scan_shift);
+            for observation in &scans {
+                core.observe_scan_gated_from(&observation.scan, pose, observation.pose, scan_shift);
             }
             // 自己位置が曖昧なほど壁際のマージンを広げる (文献 4·2·2)。注入の後に
             // 置く — 帯は地図の壁から起こすので、スキャンの塗り直しと打ち消し合わない。
@@ -541,8 +543,8 @@ pub fn run_settle(ctx: &FollowCtx, cancel: &AtomicBool, dur: Duration) -> bool {
                     quality_shift(lock(localizer).quality(), tuning.scan_quality_gate);
                 let scans = std::mem::take(&mut *scan_queue.lock().unwrap());
                 c.set_window(pose);
-                for scan in &scans {
-                    c.observe_scan_gated(scan, pose, scan_shift);
+                for observation in &scans {
+                    c.observe_scan_gated_from(&observation.scan, pose, observation.pose, scan_shift);
                 }
             }
         }

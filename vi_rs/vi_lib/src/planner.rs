@@ -505,25 +505,7 @@ pub fn qmdp_decide(vi: &ValueIterator, hyps: &[(crate::bridge::PoseView, f64)]) 
         }
         usable += w;
         for (ai, a) in vi.actions.iter().enumerate() {
-            let unavailable = s.policy_invalidated()
-                || a.state_transitions[s.it as usize].iter().any(|t| {
-                    let (x, y) = (s.ix + t.dix, s.iy + t.diy);
-                    t.prob > 0 && vi.in_map_area(x, y)
-                        && vi.states[vi.to_index(x, y, t.dit.rem_euclid(vi.cell_num_t)) as usize]
-                            .policy_invalidated()
-                });
-            let q = if unavailable {
-                MAX_COST
-            } else {
-                crate::value_iterator::action_cost_raw(
-                    &vi.states,
-                    a,
-                    s,
-                    vi.cell_num_x,
-                    vi.cell_num_y,
-                    vi.cell_num_t,
-                )
-            };
+            let q = vi.policy_action_cost(s, a);
             qb[ai] += w * q as f64;
             if q == MAX_COST {
                 veto[ai] += w;

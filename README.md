@@ -31,6 +31,7 @@ field. Parameters are declared in `src/node/params.rs`.
 | `map_penalty` | `10000` | Map obstacle margin cost, integer from 0 to 1000000000. |
 | `scan_penalty_radius` | `0.1` | Scan hit band radius in metres. |
 | `scan_penalty` | `10000` | Integer scan hit cost, from 0 to 1000000000 inclusive; 0 disables hit injection. |
+| `scan_collision_radius` | `0.2` | Circular footprint radius in metres for greedy following. Set it to match the robot; 0 disables the check. |
 | `local_cpu_share` | `0.6` | Local CPU thread-equivalent share (CPU seconds per wall second); any finite positive number. |
 | `global_cpu_share` | `0.2` | Global single-thread CPU share (CPU seconds per wall second), in (0, 1]. |
 | `action_costs_s` | `1.0` for each action | Traversal cost in seconds, parallel to `action_names`. |
@@ -83,6 +84,14 @@ rounding. Localization quality attenuates the configured strength by right shift
 with a minimum of one cost unit when enabled; beam traversal still halves existing
 fixed-point penalties. Compact planning stores exact theta-uniform penalties in
 an 8-byte-per-map-cell overlay, including decayed values after patch recentering.
+
+Greedy following checks the circular footprint along one second of the selected
+motion against the latest scan hits projected at observation time. If it would hit an obstacle between
+VI cells, the follower tries the lowest-cost unblocked action, or stops if
+none is available. If a hit is already inside the footprint, an action that
+moves away from it is still allowed. The check uses scan hits directly and is
+independent of `scan_penalty` and `scan_quality_gate`. It does not change the
+global plan, and does not apply to DWA, MPPI, or QMDP.
 
 With global repair enabled, an increased observed traversal cost first invalidates
 the stored policies that depend on it, tracing every positive-probability successor

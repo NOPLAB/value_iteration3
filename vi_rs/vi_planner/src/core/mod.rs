@@ -48,6 +48,7 @@ mod solve;
 mod follow;
 mod global;
 mod prefetch;
+mod scan_collision;
 mod value_grid;
 #[cfg(test)]
 mod tests;
@@ -87,6 +88,10 @@ use compact::{
     new_patch, new_repair, transition_reach, CompactField, Patch, PenaltyOverlay, Repair,
 };
 pub use prefetch::Prefetcher;
+use scan_collision::ScanCollision;
+
+/// Placeholder for an invalid scan range, preserving its beam index.
+pub const INVALID_RANGE_M: f64 = 1.0e6;
 
 /// 他スレッドの panic で毒された Mutex もそのまま使い続けて取る。この核の場も
 /// 先読みの state も、フィールドが独立していて panic を跨ぐ不変条件を持たない
@@ -247,6 +252,7 @@ pub struct PlannerCore {
     /// follow 1 tick の判断器 ([`PlanConfig::follow_controller`] から組む)。
     /// solve・ロールアウトには関与しない — `decide` だけがこれを通る。
     follow: Box<dyn FollowController>,
+    scan_collision: ScanCollision,
 }
 
 /// 2 つのゴール `(x, y, θ[deg])` を「同じ」とみなせるか。キャッシュの再利用判定と
@@ -369,6 +375,7 @@ impl PlannerCore {
             build,
             cfg,
             follow,
+            scan_collision: ScanCollision::default(),
             cached: None,
             patch: None,
             penalty,

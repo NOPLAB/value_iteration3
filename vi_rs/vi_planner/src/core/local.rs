@@ -75,6 +75,23 @@ impl PlannerCore {
     /// 塗るとゴースト壁がロボットを global 勾配との間に挟んで止める。shift は
     /// [`quality_shift`] で quality から量子化する。0 は `observe_scan` と同一。
     pub fn observe_scan_gated(&mut self, scan: &LaserScan, pose: PoseView, shift: u32) {
+        self.observe_scan_gated_from(scan, pose, Some(pose), shift);
+    }
+
+    /// Process a queued scan. Costs retain their follow-window projection, but
+    /// collision hits use the observation pose, not the later control pose.
+    pub fn observe_scan_gated_from(
+        &mut self,
+        scan: &LaserScan,
+        pose: PoseView,
+        observation_pose: Option<PoseView>,
+        shift: u32,
+    ) {
+        if self.cfg.follow_controller == FollowKind::Greedy && self.cfg.scan_collision_radius > 0.0 {
+            if let Some(observation_pose) = observation_pose {
+                self.scan_collision.observe(scan, observation_pose);
+            }
+        }
         let map_clear = self.cfg.map_clear_from_scan;
         let radius = self.cfg.scan_penalty_radius;
         let penalty = self.cfg.scan_penalty;
@@ -238,7 +255,38 @@ impl PlannerCore {
         if self.global.invalidating() {
             return Decision::NoAction;
         }
-        self.follow.decide(&local.base, &self.cfg, pose)
+        let vi = &local.base;
+        let decision = self.follow.decide(vi, &self.cfg, pose);
+        let Decision::Action { fw, rot_deg, .. } = decision else { return decision };
+        let radius = self.cfg.scan_collision_radius;
+        if !self.scan_collision.blocks(pose, fw, rot_deg, radius) {
+            return decision;
+        }
+        // Score safe alternatives from the real pose, even if the blocked action
+        // came from a neighboring cell. Do not replace it with another borrowed policy.
+        if !vi.in_map_area(x, y) {
+            return Decision::NoAction;
+        }
+        let state = &vi.states[vi.to_index(x, y, t) as usize];
+        if !state.free {
+            return Decision::NoAction;
+        }
+        vi.actions
+            .iter()
+            .filter_map(|action| {
+                let fw = action.delta_fw;
+                let rot_deg = action.delta_rot;
+                if self.scan_collision.blocks(pose, fw, rot_deg, radius) {
+                    return None;
+                }
+                let cost = vi.policy_action_cost(state, action);
+                (cost < MAX_COST).then_some((
+                    cost,
+                    Decision::Action { id: Some(action.id as usize), fw, rot_deg },
+                ))
+            })
+            .min_by_key(|&(cost, _)| cost)
+            .map_or(Decision::NoAction, |(_, alternative)| alternative)
     }
 
     /// belief 仮説集合での判断 (QMDP — [`qmdp_decide`])。読む場は [`Self::decide`]
