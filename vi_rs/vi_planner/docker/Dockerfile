@@ -1,8 +1,16 @@
 ARG ROS_DISTRO=humble
 FROM ros:${ROS_DISTRO}-ros-base
 
-# The ROS packages include the generated Rust bindings, including nav2_msgs.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Use the Ubuntu Azure mirror for CI runners. Leave ROS and Ubuntu Ports
+# sources in place.
+RUN set -e; \
+    for source in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
+      if [ -f "$source" ]; then \
+        sed -i -E 's@https?://(archive|security)\.ubuntu\.com/ubuntu@https://azure.archive.ubuntu.com/ubuntu@g' "$source"; \
+      fi; \
+    done; \
+    apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update; \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
       curl pkg-config libclang-dev libssl-dev python3-pip \
       "ros-${ROS_DISTRO}-nav2-msgs" \
     && rm -rf /var/lib/apt/lists/*
