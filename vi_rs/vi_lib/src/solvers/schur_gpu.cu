@@ -24,7 +24,7 @@ extern "C" __global__ void vi_init(long long total, int dom, u64* values) {
 }
 
 /* 釘付け: 問題 p のパッチ状態 pin_states[pin_off[p]..pin_off[p+1]] を 0 に。
-   タイル内で値 0 を取るのは釘だけ (1 歩 ≥ 1 s) なので、vi_pass は V==0 を
+   タイル内で値 0 を取るのは釘だけ (行動コストは正) なので、vi_pass は V==0 を
    釘として飛ばす。 */
 extern "C" __global__ void vi_pin(long long npin, int n_prob, int dom,
                                   const int* __restrict__ pin_off,
@@ -56,6 +56,7 @@ extern "C" __global__ void vi_pin(long long npin, int n_prob, int dom,
 extern "C" __global__ void vi_pass(int side, int nt, int dom, int n_actions,
                                    const int* __restrict__ trans_off,
                                    const int* __restrict__ trans_dat,
+                                   const u64* __restrict__ action_cost,
                                    const u8* __restrict__ frees,
                                    const u64* __restrict__ pens,
                                    const int* __restrict__ prob_slot,
@@ -96,7 +97,7 @@ extern "C" __global__ void vi_pass(int side, int nt, int dom, int n_actions,
             /* C の unsigned 演算はラップする = wrapping_add / wrapping_mul */
             cost += (av + pn[jy * side + jx]) * (u64)trans_dat[4 * k + 3];
         }
-        u64 c = ok ? (cost >> PROB_BASE_BIT) : MAX_COST;
+        u64 c = ok ? (cost >> PROB_BASE_BIT) + action_cost[a] - (1ULL << PROB_BASE_BIT) : MAX_COST;
         if (c < best) best = c;
     }
     V[i] = best;

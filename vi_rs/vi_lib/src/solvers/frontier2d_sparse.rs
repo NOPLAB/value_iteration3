@@ -256,7 +256,7 @@ pub fn frontier2d_sparse_solve_observed(
                     for per_theta in g_ref.precomp.iter() {
                         for itq in [0usize, 16, 32, 48] {
                             if let Some(&(off, _)) =
-                                per_theta[itq.min(nt as usize - 1)].first()
+                                per_theta[itq.min(nt as usize - 1)].buckets.first()
                             {
                                 // SAFETY: prefetch はメモリを読まないヒント命令。
                                 unsafe {

@@ -1267,7 +1267,8 @@ pub fn fix_portal_actions(vi: &mut ValueIterator, art: &SchurArtifact) -> u64 {
                 acc += (after.total_cost + after.penalty + after.local_penalty)
                     * tran.prob as u64;
             }
-            let q = acc >> crate::params::PROB_BASE_BIT;
+            let q = (acc >> crate::params::PROB_BASE_BIT)
+                .wrapping_add(a.cost.wrapping_sub(PROB_BASE));
             if best.map_or(true, |(b, _)| q < b) {
                 best = Some((q, ai));
             }

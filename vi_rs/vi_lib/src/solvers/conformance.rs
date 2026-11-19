@@ -116,6 +116,104 @@ fn conformance_converges_and_matches_caps() {
     }
 }
 
+#[test]
+fn conformance_action_costs_choose_cheaper_action_and_keep_penalties() {
+    use crate::params::PROB_BASE;
+    use crate::{Action, OccupancyGrid, StateTransition};
+
+    for (name, solver) in all_solvers() {
+        let actions = [2.0, 0.5]
+            .into_iter()
+            .map(|seconds| {
+                let mut action = Action::new("forward", 1.0, 0.0, 0)
+                    .with_cost_seconds(seconds)
+                    .unwrap();
+                action.state_transitions = vec![vec![StateTransition::new(
+                    1,
+                    0,
+                    0,
+                    i32::try_from(PROB_BASE).unwrap(),
+                )]];
+                action
+            })
+            .collect();
+        let mut vi = ValueIterator::new(actions, 1);
+        let map = OccupancyGrid {
+            width: 3,
+            height: 1,
+            resolution: 1.0,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Default::default(),
+            data: vec![0; 3],
+        };
+        vi.cell_num_x = 3;
+        vi.cell_num_y = 1;
+        vi.cell_num_t = 1;
+        vi.xy_resolution = 1.0;
+        vi.t_resolution = 360.0;
+        vi.states = (0..3)
+            .map(|x| crate::State::from_occupancy(x, 0, 0, &map, 0, 0.0, 3))
+            .collect();
+        vi.set_sweep_orders();
+        vi.states[1].penalty = 4 * PROB_BASE;
+        vi.states[1].local_penalty = 2 * PROB_BASE;
+        vi.states[2].final_state = true;
+        vi.states[2].total_cost = 0;
+
+        let stats = solve(&mut vi, solver, MAX_ITER);
+
+        assert!(stats.converged, "{name}");
+        assert_eq!(vi.states[0].total_cost, 6 * PROB_BASE, "{name}: upstream");
+        assert_eq!(vi.states[1].total_cost, PROB_BASE / 2, "{name}: goal step");
+        assert_eq!(
+            vi.states[0].optimal_action,
+            Some(1),
+            "{name}: upstream policy"
+        );
+        assert_eq!(vi.states[1].optimal_action, Some(1), "{name}: goal policy");
+        assert_eq!(vi.states[2].total_cost, 0, "{name}: pinned goal");
+    }
+}
+
+#[test]
+fn conformance_nonuniform_costs_match_reference_on_stochastic_transitions() {
+    let costs = [1.0, 2.0, 0.5, 1.5, 0.75, 3.0];
+    let configured = || {
+        let mut vi = make_vi(12, 10, vec![0; 120]);
+        vi.actions = vi
+            .actions
+            .into_iter()
+            .zip(costs)
+            .map(|(action, seconds)| action.with_cost_seconds(seconds).unwrap())
+            .collect();
+        vi
+    };
+    let mut exact = configured();
+    run_reference_to_fixed_point(&mut exact);
+    for (name, solver) in all_solvers() {
+        let mut vi = configured();
+        let stats = solve(&mut vi, solver, MAX_ITER);
+        assert!(stats.converged, "{name}");
+        for (i, (expected, actual)) in exact.states.iter().zip(&vi.states).enumerate() {
+            if expected.total_cost < REACH {
+                if solver.caps().exact {
+                    assert_eq!(
+                        actual.total_cost, expected.total_cost,
+                        "{name}: value @ {i}"
+                    );
+                    assert_eq!(
+                        actual.optimal_action, expected.optimal_action,
+                        "{name}: policy @ {i}"
+                    );
+                } else {
+                    assert!(actual.total_cost < REACH, "{name}: reachable @ {i}");
+                }
+            }
+        }
+    }
+}
+
 /// 並列ソルバは行バンド分割・work stealing が効く広いマップでも parity を確認する
 /// (旧 fused/sparse/par_unsafe の larger-map テストの置き換え)。
 #[test]

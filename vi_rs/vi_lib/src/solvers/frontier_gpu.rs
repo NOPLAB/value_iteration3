@@ -79,6 +79,7 @@ pub struct GpuSolver {
     d_pc_off: CudaSlice<i64>,
     d_pc_prob: CudaSlice<u32>,
     d_pc_start: CudaSlice<u32>,
+    d_action_cost: CudaSlice<u64>,
     d_chg_flag: CudaSlice<u32>,
     d_cand_flag: CudaSlice<u32>,
     d_chg_list: CudaSlice<u32>,
@@ -159,6 +160,8 @@ impl GpuSolver {
         let d_pc_off = stream.clone_htod(&pc_off)?;
         let d_pc_prob = stream.clone_htod(&pc_prob)?;
         let d_pc_start = stream.clone_htod(&pc_start)?;
+        let action_costs: Vec<u64> = vi.actions.iter().map(|a| a.cost).collect();
+        let d_action_cost = stream.clone_htod(&action_costs)?;
         let d_chg_flag = stream.alloc_zeros::<u32>(n_cols)?;
         let d_cand_flag = stream.alloc_zeros::<u32>(n_cols)?;
         let d_chg_list = stream.alloc_zeros::<u32>(n_cols)?;
@@ -191,6 +194,7 @@ impl GpuSolver {
             d_pc_off,
             d_pc_prob,
             d_pc_start,
+            d_action_cost,
             d_chg_flag,
             d_cand_flag,
             d_chg_list,
@@ -305,6 +309,7 @@ impl GpuSolver {
                     .arg(&self.d_pc_off)
                     .arg(&self.d_pc_prob)
                     .arg(&self.d_pc_start)
+                    .arg(&self.d_action_cost)
                     .arg(&na_i)
                     .arg(&mut self.d_cand_flag)
                     .arg(&mut self.d_chg_flag)
@@ -347,6 +352,7 @@ impl GpuSolver {
                 .arg(&self.d_pc_off)
                 .arg(&self.d_pc_prob)
                 .arg(&self.d_pc_start)
+                .arg(&self.d_action_cost)
                 .arg(&self.na)
                 .arg(&mut d_opt);
             unsafe { lb.launch(cfg) }?;

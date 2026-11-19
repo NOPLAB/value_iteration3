@@ -33,6 +33,32 @@ field. Parameters are declared in `src/node/params.rs`.
 | `scan_penalty` | `10000` | Integer scan hit cost, from 0 to 1000000000 inclusive; 0 disables hit injection. |
 | `local_cpu_share` | `0.6` | Local CPU thread-equivalent share (CPU seconds per wall second); any finite positive number. |
 | `global_cpu_share` | `0.2` | Global single-thread CPU share (CPU seconds per wall second), in (0, 1]. |
+| `action_costs_s` | `1.0` for each action | Traversal cost in seconds, parallel to `action_names`. |
+
+The complete default action table is:
+
+```yaml
+vi_planner:
+  ros__parameters:
+    action_names:        ["forward", "back", "right", "rightfw", "left", "leftfw"]
+    action_forward_m:    [0.3, -0.2, 0.0, 0.2, 0.0, 0.2]
+    action_rotation_deg: [0.0, 0.0, -20.0, -20.0, 20.0, 20.0]
+    action_costs_s:      [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+```
+
+All four arrays must have the same nonzero length. When `action_costs_s` is
+omitted, it defaults to one second for each configured action name, including
+custom action counts. Each cost must be finite, positive, at most 1,000,000
+seconds, and large enough to survive quantization. Costs round down to fixed-point
+units of `1 / PROB_BASE` seconds (`PROB_BASE = 2^18 = 262144`), so the minimum
+accepted cost is `1 / 262144` seconds, approximately 3.815 microseconds.
+The upper bound keeps an individual cost within the solvers' reachable-value
+range; accumulated path costs still have that range limit.
+
+These values describe the planning objective in seconds. They do not change
+motion duration, control frequency, forward distance, rotation, or the velocities
+derived from the motion table. The default equal costs preserve the existing
+objective of minimizing action count.
 
 For example, `local_cpu_share: 4.0` budgets the equivalent of four CPU threads,
 and `0.6` budgets 60% of one thread. It requests `ceil(share)` helper threads

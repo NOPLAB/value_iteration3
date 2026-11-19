@@ -583,7 +583,10 @@ pub(crate) fn action_cost_raw(
                 .wrapping_mul(tran.prob as u64),
         );
     }
-    cost >> PROB_BASE_BIT
+    // State.penalty already includes the original one-second action cost.
+    // Replace it after averaging; probabilities sum to PROB_BASE, so the
+    // constant shift is exact and the default preserves the original arithmetic.
+    (cost >> PROB_BASE_BIT).wrapping_add(a.cost.wrapping_sub(PROB_BASE))
 }
 
 /// 本家 `valueIteration`。free でない/final_state なら 0 を返し更新しない。

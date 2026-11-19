@@ -197,6 +197,21 @@ fn action_cost_deterministic_neighbor() {
 }
 
 #[test]
+fn action_cost_replaces_base_second_and_preserves_environment_penalties() {
+    let mut states = vec![
+        mk_state(0, 0, 0, true, MAX_COST, PROB_BASE),
+        mk_state(1, 0, 0, true, 5 * PROB_BASE, 4 * PROB_BASE),
+    ];
+    states[1].local_penalty = 2 * PROB_BASE;
+    for (seconds, expected) in [(0.5, 21 * PROB_BASE / 2), (2.0, 12 * PROB_BASE)] {
+        let a = single_action(1, 0, 0, 1)
+            .with_cost_seconds(seconds)
+            .unwrap();
+        assert_eq!(action_cost_raw(&states, &a, &states[0], 2, 1, 1), expected);
+    }
+}
+
+#[test]
 fn action_cost_out_of_map_returns_max() {
     let nt = 1usize;
     let states = vec![mk_state(0, 0, 0, true, 0, 0)];
