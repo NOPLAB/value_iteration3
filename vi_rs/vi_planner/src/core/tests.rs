@@ -116,6 +116,37 @@ fn greedy_rejects_forward_motion_through_a_near_scan_hit() {
     assert!(matches!(decision, Decision::Action { fw, .. } if fw <= 0.0), "{decision:?}");
 }
 
+#[test]
+fn greedy_ignores_the_stale_cost_of_a_blocked_fallback_policy() {
+    let mut core = PlannerCore::new(build(64), PlanConfig { scan_penalty: 0, ..cfg() });
+    let robot = pose(1.025, 1.525, 0.0);
+    core.prepare_goal(pose(2.525, 1.525, 0.0), &AtomicBool::new(false)).unwrap();
+    core.set_window(robot);
+    assert!(matches!(core.decide(robot), Decision::Action { fw, .. } if fw > 0.0));
+    let scan = LaserScan { ranges: vec![0.05], ..LaserScan::default() };
+    core.observe_scan(&scan, robot);
+    let Decision::Action { id: Some(first), fw, .. } = core.decide(robot) else {
+        panic!("expected a usable alternative");
+    };
+    assert!(fw <= 0.0);
+
+    let vi = &mut core.local_mut().unwrap().base;
+    let (x, y, t) = pose_to_cell(vi, robot.x, robot.y, robot.yaw_rad);
+    let targets: Vec<_> = vi.actions[first].state_transitions[t as usize]
+        .iter()
+        .map(|s| vi.to_index(x + s.dix, y + s.diy, s.dit.rem_euclid(vi.cell_num_t)) as usize)
+        .collect();
+    for target in targets {
+        let state = &mut vi.states[target];
+        state.optimal_action = None;
+        assert!(state.policy_invalidated());
+    }
+
+    let decision = core.decide(robot);
+    assert!(matches!(decision, Decision::Action { id: Some(id), fw, .. } if id != first && fw <= 0.0),
+        "stale alternative {first} must not win: {decision:?}");
+}
+
 /// この統合の本題: 広域 (plan) と狭域 (decide) が **1 回の solve** を
 /// 共有すること。旧構成 (vi_global_planner + vi_local_planner) では
 /// 同じゴールに対して別プロセスで 2 回解いていた。

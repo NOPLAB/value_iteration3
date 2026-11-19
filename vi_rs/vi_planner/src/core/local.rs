@@ -75,8 +75,22 @@ impl PlannerCore {
     /// 塗るとゴースト壁がロボットを global 勾配との間に挟んで止める。shift は
     /// [`quality_shift`] で quality から量子化する。0 は `observe_scan` と同一。
     pub fn observe_scan_gated(&mut self, scan: &LaserScan, pose: PoseView, shift: u32) {
+        self.observe_scan_gated_from(scan, pose, Some(pose), shift);
+    }
+
+    /// Process a queued scan. Costs retain their follow-window projection, but
+    /// collision hits use the observation pose, not the later control pose.
+    pub fn observe_scan_gated_from(
+        &mut self,
+        scan: &LaserScan,
+        pose: PoseView,
+        observation_pose: Option<PoseView>,
+        shift: u32,
+    ) {
         if self.cfg.follow_controller == FollowKind::Greedy && self.cfg.scan_collision_radius > 0.0 {
-            self.scan_collision.observe(scan, pose);
+            if let Some(observation_pose) = observation_pose {
+                self.scan_collision.observe(scan, observation_pose);
+            }
         }
         let map_clear = self.cfg.map_clear_from_scan;
         let radius = self.cfg.scan_penalty_radius;
@@ -265,7 +279,7 @@ impl PlannerCore {
                 if self.scan_collision.blocks(pose, fw, rot_deg, radius) {
                     return None;
                 }
-                let cost = vi.action_cost(state, action);
+                let cost = vi.policy_action_cost(state, action);
                 (cost < MAX_COST).then_some((
                     cost,
                     Decision::Action { id: Some(action.id as usize), fw, rot_deg },

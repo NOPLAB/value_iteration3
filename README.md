@@ -86,7 +86,7 @@ fixed-point penalties. Compact planning stores exact theta-uniform penalties in
 an 8-byte-per-map-cell overlay, including decayed values after patch recentering.
 
 Greedy following checks the circular footprint along one second of the selected
-motion against hits from the latest scan. If it would hit an obstacle between
+motion against the latest scan hits projected at observation time. If it would hit an obstacle between
 VI cells, the follower tries the lowest-cost unblocked action, or stops if
 none is available. If a hit is already inside the footprint, an action that
 moves away from it is still allowed. The check uses scan hits directly and is
