@@ -23,22 +23,22 @@ RUN prefix="/opt/ros/${ROS_DISTRO}"; \
     index="$prefix/share/ament_index/resource_index/rust_packages"; \
     mkdir -p "$index"; \
     for manifest in "$prefix"/share/*/rust/Cargo.toml; do \
+      if [ "$ROS_DISTRO" = lyrical ]; then \
+        # The packaged bindings still request 0.6. Lyrical's C primitive
+        # sequences have extra fields, which rosidl_runtime_rs 0.7 mirrors.
+        sed -i 's/^rosidl_runtime_rs = "0\.6"$/rosidl_runtime_rs = "0.7"/' "$manifest"; \
+      fi; \
       package_dir="${manifest%/rust/Cargo.toml}"; \
       touch "$index/${package_dir##*/}"; \
     done
 
 WORKDIR /ros2_rust_ws
-# Keep the existing rclrs API pin on Humble and Jazzy. Lyrical needs its own
-# RCL bindings, but still ships messages generated for rosidl_runtime_rs 0.6.
+# Keep the existing rclrs pin on Humble and Jazzy. Lyrical requires its own
+# RCL bindings and rosidl_runtime_rs 0.7.
 RUN rev=2c6b92671a65a426aec9c3468c069a551329ca1b; \
-    if [ "$ROS_DISTRO" = lyrical ]; then rev=2766eab6e1e9208a67e8570bfa5027ec38387534; fi; \
+    if [ "$ROS_DISTRO" = lyrical ]; then rev=7a097bb349a193a96f620e3e94bb2224ffd698af; fi; \
     git clone https://github.com/ros2-rust/ros2_rust.git src/ros2_rust && \
     git -C src/ros2_rust checkout "$rev" && \
-    if [ "$ROS_DISTRO" = lyrical ]; then \
-      # ros-env 0.2.1 switched to rosidl_runtime_rs 0.7. Pin the last compatible
-      # version in rclrs's manifest so both colcon and vi_planner use it.
-      sed -i 's/^ros-env = "0\.2"$/ros-env = "=0.2.0"/' src/ros2_rust/rclrs/Cargo.toml; \
-    fi && \
     . "/opt/ros/${ROS_DISTRO}/setup.sh" && \
     colcon build --merge-install --base-paths src/ros2_rust/rclrs --packages-select rclrs
 
