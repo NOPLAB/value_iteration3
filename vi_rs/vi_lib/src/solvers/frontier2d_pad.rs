@@ -14,7 +14,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::params::{MAX_COST, PROB_BASE_BIT};
+use crate::params::{MAX_COST, PROB_BASE, PROB_BASE_BIT};
 use crate::value_iterator::ValueIterator;
 
 use super::displacement;
@@ -42,13 +42,19 @@ impl HotCells for [[AtomicU64; 2]] {
     }
 }
 
+/// One action and source heading's successors and replacement for the base cost.
+pub(crate) struct ActionTransitions {
+    pub buckets: Vec<(i64, u64)>,
+    pub cost_adjustment: u64,
+}
+
 /// frontier2d 用パディング SoA モデル。`hot=[total_cost, penalty +ʷ local_penalty]`、
-/// `free`/`finals` は境界が false。`precomp[a][it]` は隣接の `(相対オフセット, prob)`。
+/// `free`/`finals` は境界が false。`precomp[a][it]` は行動コストと隣接バケット。
 pub(crate) struct Padded {
     pub hot: Vec<[u64; 2]>,
     pub free: Vec<bool>,
     pub finals: Vec<bool>,
-    pub precomp: Vec<Vec<Vec<(i64, u64)>>>,
+    pub precomp: Vec<Vec<ActionTransitions>>,
     pub nx: i32,
     pub ny: i32,
     pub nt: i32,
@@ -118,13 +124,14 @@ pub(crate) fn build_precomp(
     vi: &ValueIterator,
     nt: i32,
     row_stride: i64,
-) -> Vec<Vec<Vec<(i64, u64)>>> {
+) -> Vec<Vec<ActionTransitions>> {
     vi.actions
         .iter()
         .map(|a| {
             (0..nt as usize)
-                .map(|it| {
-                    a.state_transitions[it]
+                .map(|it| ActionTransitions {
+                    cost_adjustment: a.cost.wrapping_sub(PROB_BASE),
+                    buckets: a.state_transitions[it]
                         .iter()
                         .map(|tr| {
                             let nit = (tr.dit + nt) % nt;
@@ -132,7 +139,7 @@ pub(crate) fn build_precomp(
                                 tr.dix as i64 * nt as i64 + tr.diy as i64 * row_stride + nit as i64;
                             (off, tr.prob as u64)
                         })
-                        .collect()
+                        .collect(),
                 })
                 .collect()
         })
@@ -151,11 +158,11 @@ pub(crate) fn build_precomp(
 pub(crate) fn action_cost_pad<H: HotCells + ?Sized>(
     hot: &H,
     free: &[bool],
-    buckets: &[(i64, u64)],
+    transitions: &ActionTransitions,
     col_base: i64,
 ) -> u64 {
     let mut cost: u64 = 0;
-    for &(off, prob) in buckets {
+    for &(off, prob) in &transitions.buckets {
         let n = (col_base + off) as usize; // パディングにより常に有効域
         if !free[n] {
             return MAX_COST;
@@ -166,5 +173,5 @@ pub(crate) fn action_cost_pad<H: HotCells + ?Sized>(
         }
         cost = cost.wrapping_add(h[0].wrapping_add(h[1]).wrapping_mul(prob));
     }
-    cost >> PROB_BASE_BIT
+    (cost >> PROB_BASE_BIT).wrapping_add(transitions.cost_adjustment)
 }

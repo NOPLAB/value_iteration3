@@ -97,14 +97,14 @@ pub(crate) fn final_policy_parallel<S, C>(
     mx: i32,
     my: i32,
     row_stride: i64,
-    precomp: &[Vec<Vec<(i64, u64)>>],
+    precomp: &[Vec<frontier2d_pad::ActionTransitions>],
     nthreads: usize,
     skip: S,
     cost: C,
 ) -> Vec<Option<usize>>
 where
     S: Fn(usize) -> bool + Sync,
-    C: Fn(&[(i64, u64)], i64) -> u64 + Sync,
+    C: Fn(&frontier2d_pad::ActionTransitions, i64) -> u64 + Sync,
 {
     let n = (nx * ny * nt) as usize;
     let rows: Vec<i32> = (0..ny).collect();

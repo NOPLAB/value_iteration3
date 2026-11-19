@@ -62,7 +62,8 @@ extern "C" __global__ void vi_update(const u32* __restrict__ cand_list, u32 cc, 
                                      const u8* __restrict__ free_, const u8* __restrict__ fin,
                                      const long long* __restrict__ pc_off,
                                      const u32* __restrict__ pc_prob,
-                                     const u32* __restrict__ pc_start, int n_act,
+                                     const u32* __restrict__ pc_start,
+                                     const u64* __restrict__ action_cost, int n_act,
                                      u32* cand_flag, u32* chg_flag,
                                      u32* chg_list, u32* chg_cnt, u64* updates) {
     /* 更新数はブロック内で集約して 1 回だけ atomicAdd (1 アドレスへの百万回
@@ -98,6 +99,7 @@ extern "C" __global__ void vi_update(const u32* __restrict__ cand_list, u32 cc, 
                 }
                 if (!bad) {
                     cost >>= PROB_BASE_BIT;
+                    cost += action_cost[a] - (1ULL << PROB_BASE_BIT);
                     if (cost < min_cost) min_cost = cost;
                 }
             }
@@ -123,7 +125,8 @@ extern "C" __global__ void vi_policy(long long n_pad, int nt, long long plane,
                                      const u8* __restrict__ free_, const u8* __restrict__ fin,
                                      const long long* __restrict__ pc_off,
                                      const u32* __restrict__ pc_prob,
-                                     const u32* __restrict__ pc_start, int n_act,
+                                     const u32* __restrict__ pc_start,
+                                     const u64* __restrict__ action_cost, int n_act,
                                      signed char* opt) {
     long long p = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n_pad) return;
@@ -147,6 +150,7 @@ extern "C" __global__ void vi_policy(long long n_pad, int nt, long long plane,
         }
         if (!bad) {
             cost >>= PROB_BASE_BIT;
+            cost += action_cost[a] - (1ULL << PROB_BASE_BIT);
             if (cost < min_cost) { min_cost = cost; best = a; }
         }
     }

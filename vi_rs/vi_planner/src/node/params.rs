@@ -15,7 +15,7 @@ use anyhow::{anyhow, Result};
 use std::sync::Arc;
 
 use vi_lib::solvers::U64Solver;
-use vi_lib::LocalShape;
+use vi_lib::{Action, LocalShape};
 
 use vi_planner::core::FollowKind;
 use vi_planner::cpu::CpuShare;
@@ -34,7 +34,7 @@ pub struct Params {
     pub goal_margin_radius: f64,
     pub goal_margin_theta_deg: f64,
     pub map_wait_sec: i64,
-    pub action_list: Vec<(String, f64, f64)>,
+    pub action_list: Vec<Action>,
     pub unknown_as_obstacle: bool,
     /// プランナ内部で地図を何倍に粗くするか (1 = /map のまま)。
     pub map_scale: i64,
@@ -173,16 +173,14 @@ pub fn read_params(node: &Node) -> Result<Params> {
         .map_err(|e| anyhow!("declare action_rotation_deg: {e}"))?
         .get()
         .to_vec();
-
-    if names.len() != fws.len() || fws.len() != rots.len() {
-        return Err(anyhow!(
-            "action_names/action_forward_m/action_rotation_deg length mismatch: \
-             names={}, fws={}, rots={}",
-            names.len(),
-            fws.len(),
-            rots.len()
-        ));
-    }
+    let costs: Vec<f64> = node
+        .declare_parameter::<Arc<[f64]>>("action_costs_s")
+        .default_from_iter(vec![1.0; names.len()])
+        .mandatory()
+        .map_err(|e| anyhow!("declare action_costs_s: {e}"))?
+        .get()
+        .to_vec();
+    let action_list = parse_actions(names, fws, rots, costs)?;
 
     let mut params = Params {
         solver: p!("solver", Arc<str>, "frontier2d_sparse".into()).to_string(),
@@ -194,7 +192,7 @@ pub fn read_params(node: &Node) -> Result<Params> {
         goal_margin_radius: p!("goal_margin_radius", f64, 0.3),
         goal_margin_theta_deg: p!("goal_margin_theta", f64, 15.0),
         map_wait_sec: p!("map_wait_sec", i64, 30),
-        action_list: names.into_iter().zip(fws).zip(rots).map(|((n, f), r)| (n, f, r)).collect(),
+        action_list,
         unknown_as_obstacle: p!("unknown_as_obstacle", bool, true),
         map_scale: p!("map_scale", i64, 1),
         // "conservative" = 本家 downsample_occupancy (障害物優先)。"optimistic" = ブロック内に free が
@@ -383,6 +381,42 @@ pub fn read_params(node: &Node) -> Result<Params> {
     Ok(params)
 }
 
+fn parse_actions(
+    names: Vec<String>,
+    fws: Vec<f64>,
+    rots: Vec<f64>,
+    costs: Vec<f64>,
+) -> Result<Vec<Action>> {
+    if names.len() != fws.len() || names.len() != rots.len() || names.len() != costs.len() {
+        return Err(anyhow!(
+            "action_names/action_forward_m/action_rotation_deg/action_costs_s length mismatch: \
+             names={}, fws={}, rots={}, costs={}",
+            names.len(),
+            fws.len(),
+            rots.len(),
+            costs.len()
+        ));
+    }
+    if names.is_empty() {
+        return Err(anyhow!(
+            "action_names/action_forward_m/action_rotation_deg/action_costs_s are empty"
+        ));
+    }
+    names
+        .into_iter()
+        .zip(fws)
+        .zip(rots)
+        .zip(costs)
+        .enumerate()
+        .map(|(i, (((name, fw), rot), seconds))| {
+            let id = i32::try_from(i).map_err(|_| anyhow!("too many action_names"))?;
+            Action::new(name, fw, rot, id)
+                .with_cost_seconds(seconds)
+                .map_err(|e| anyhow!("action_costs_s[{i}] for action id {id} ({seconds} s): {e}"))
+        })
+        .collect()
+}
+
 /// パラメータの自己整合検査 (vi_node / vi_global_planner と同じ fail-fast)。
 ///
 /// 行動集合も θ 数も `ValueIterator` は実行時に受け取るので、値そのものは launch
@@ -403,7 +437,9 @@ pub fn validate(p: &Params) -> Result<U64Solver> {
         ));
     }
     if p.action_list.is_empty() {
-        return Err(anyhow!("action_names/action_forward_m/action_rotation_deg are empty"));
+        return Err(anyhow!(
+            "action_names/action_forward_m/action_rotation_deg/action_costs_s are empty"
+        ));
     }
     if p.control_frequency <= 0.0 {
         return Err(anyhow!("control_frequency must be > 0, got {}", p.control_frequency));
@@ -493,4 +529,53 @@ pub fn validate(p: &Params) -> Result<U64Solver> {
         ));
     }
     Ok(solver)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vi_lib::params::PROB_BASE;
+
+    #[test]
+    fn parses_custom_action_count_and_costs() {
+        let actions = parse_actions(
+            vec!["forward".into(), "turn".into()],
+            vec![0.3, 0.0],
+            vec![0.0, 20.0],
+            vec![1.0, 0.5],
+        )
+        .unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].name, "forward");
+        assert_eq!(actions[0].id, 0);
+        assert_eq!(actions[0].cost, PROB_BASE);
+        assert_eq!(actions[1].id, 1);
+        assert_eq!(actions[1].cost, PROB_BASE / 2);
+        assert_eq!(actions[1].delta_rot, 20.0);
+    }
+
+    #[test]
+    fn rejects_empty_actions_and_mismatched_rows() {
+        let error = parse_actions(vec![], vec![], vec![], vec![]).unwrap_err();
+        assert!(error.to_string().contains("are empty"));
+        for (fws, rots, costs) in [
+            (vec![], vec![0.0], vec![1.0]),
+            (vec![0.3], vec![], vec![1.0]),
+            (vec![0.3], vec![0.0], vec![]),
+        ] {
+            let error = parse_actions(vec!["forward".into()], fws, rots, costs).unwrap_err();
+            assert!(error.to_string().contains("length mismatch"));
+            assert!(error.to_string().contains("action_costs_s"));
+        }
+    }
+
+    #[test]
+    fn reports_invalid_action_cost_row() {
+        for seconds in [f64::NAN, 0.0, -1.0, 0.000_001, 1_000_001.0] {
+            let error = parse_actions(vec!["forward".into()], vec![0.3], vec![0.0], vec![seconds])
+                .unwrap_err();
+            assert!(error.to_string().contains("action_costs_s[0]"));
+            assert!(error.to_string().contains("finite, positive"));
+        }
+    }
 }

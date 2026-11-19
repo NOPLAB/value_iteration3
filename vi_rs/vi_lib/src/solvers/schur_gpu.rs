@@ -138,6 +138,8 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
 
     let d_toff = stream.clone_htod(&t_off)?;
     let d_tdat = stream.clone_htod(&t_dat)?;
+    let action_costs: Vec<u64> = src.actions.iter().map(|a| a.cost).collect();
+    let d_action_cost = stream.clone_htod(&action_costs)?;
     let cells = (side * side) as usize;
     let (nx, ny) = (src.cell_num_x, src.cell_num_y);
 
@@ -283,6 +285,7 @@ pub fn build_gpu(src: &ValueIterator, cfg: &SchurConfig) -> Result<SchurArtifact
                 .arg(&na_i)
                 .arg(&d_toff)
                 .arg(&d_tdat)
+                .arg(&d_action_cost)
                 .arg(&d_frees)
                 .arg(&d_pens)
                 .arg(&d_pslot)

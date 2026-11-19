@@ -16,7 +16,7 @@ use vi_lib::bridge::{
     OccupancyGridView,
 };
 use vi_lib::solvers::U64Solver;
-use vi_lib::{Action, LocalShape, LocalShapeConfig};
+use vi_lib::{LocalShape, LocalShapeConfig};
 
 use vi_planner::core::{
     AdaptiveLocalizer, Belief, BeliefConfig, BuildParams, FollowKind, GridLocalizer, PlanConfig,
@@ -323,12 +323,7 @@ pub fn build_core(
 
     let build = BuildParams {
         grid: vi_grid,
-        actions: params
-            .action_list
-            .iter()
-            .enumerate()
-            .map(|(i, (name, fw, rot))| Action::new(name, *fw, *rot, i as i32))
-            .collect(),
+        actions: params.action_list.clone(),
         theta_cell_num: params.theta_cell_num as i32,
         map_penalty_radius: params.map_penalty_radius,
         map_penalty: params.map_penalty as f64,
@@ -349,7 +344,7 @@ pub fn build_core(
             fw_ref_m: params
                 .action_list
                 .iter()
-                .map(|(_, fw, _)| fw.abs())
+                .map(|action| action.delta_fw.abs())
                 .fold(0.0f64, f64::max)
                 / params.control_frequency,
         },

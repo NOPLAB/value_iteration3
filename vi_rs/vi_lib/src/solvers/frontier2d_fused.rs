@@ -31,7 +31,7 @@ use crate::solvers::observe::{
 };
 use crate::value_iterator::ValueIterator;
 
-use super::frontier2d_pad::build_precomp;
+use super::frontier2d_pad::{build_precomp, ActionTransitions};
 use super::frontier2d_par::n_threads;
 use super::{async_gs_engine, displacement, seed_frontier_2d};
 
@@ -65,24 +65,24 @@ impl CpCells for [AtomicU64] {
 #[inline]
 pub(crate) fn action_cost_fused<C: CpCells + ?Sized>(
     cp: &C,
-    buckets: &[(i64, u64)],
+    transitions: &ActionTransitions,
     col_base: i64,
 ) -> u64 {
     let mut cost: u64 = 0;
-    for &(off, prob) in buckets {
+    for &(off, prob) in &transitions.buckets {
         let v = cp.get((col_base + off) as usize); // パディングにより常に有効域
         if v == UNREACHED {
             return MAX_COST; // !free / 未確定の統合クランプ
         }
         cost = cost.wrapping_add(v.wrapping_mul(prob));
     }
-    cost >> PROB_BASE_BIT
+    (cost >> PROB_BASE_BIT).wrapping_add(transitions.cost_adjustment)
 }
 
 /// パディング座標系の幾何 + 遷移オフセットだけの軽量モデル (`Padded` から hot/free/finals を
 /// 除いたもの)。fused/sparse 系は states→cp 直接構築なので中間配列を持たない。
 pub(crate) struct Geom {
-    pub(crate) precomp: Vec<Vec<Vec<(i64, u64)>>>,
+    pub(crate) precomp: Vec<Vec<ActionTransitions>>,
     pub(crate) nx: i32,
     pub(crate) ny: i32,
     pub(crate) nt: i32,

@@ -595,7 +595,16 @@ impl CpCells for AtomicCpView {
 /// 値バンド幅 `Δ_band`。`COUPLE_SAFETY · max(mx,my) · max_pen`。
 fn couple_margin(g: &Geom, max_pen: u64) -> u64 {
     let r = (g.mx.max(g.my)).max(1) as u64;
-    COUPLE_SAFETY.saturating_mul(r).saturating_mul(max_pen.max(1))
+    let max_step = g
+        .precomp
+        .iter()
+        .flatten()
+        .map(|a| max_pen.wrapping_add(a.cost_adjustment))
+        .max()
+        .unwrap_or(max_pen);
+    COUPLE_SAFETY
+        .saturating_mul(r)
+        .saturating_mul(max_step.max(1))
 }
 
 /// 列 (ix,iy) の窓（±my 行）に重なる行ブロックを全て確保する。relax/finalize で近傍 gather する前に
