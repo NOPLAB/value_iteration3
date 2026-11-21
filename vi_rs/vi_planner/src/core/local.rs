@@ -270,8 +270,19 @@ impl PlannerCore {
             let Some(action) = state.optimal_action.and_then(|i| vi.actions.get(i)) else {
                 return Decision::NoAction;
             };
+            // The weighted sum can wrap MAX_COST into a finite score. Check
+            // reachability before comparing costs, rather than trusting that sum.
+            let has_unreached_successor = action.state_transitions[t as usize].iter().any(|tr| {
+                let (nx, ny) = (x + tr.dix, y + tr.diy);
+                tr.prob > 0
+                    && (!vi.in_map_area(nx, ny)
+                        || vi.states[vi.to_index(nx, ny, tr.dit.rem_euclid(vi.cell_num_t)) as usize]
+                            .total_cost
+                            >= MAX_COST)
+            });
             if !state.free
                 || state.total_cost >= MAX_COST
+                || has_unreached_successor
                 || vi.policy_action_cost(state, action) != state.total_cost
                 || self.scan_collision.blocks(pose, action.delta_fw, action.delta_rot, radius)
             {
