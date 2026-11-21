@@ -133,14 +133,13 @@ pub fn plan_server(
                 let start = if goal_msg.use_start {
                     Some(pose_view_from(&goal_msg.start.pose))
                 } else {
-                    *lock(&h.latest_pose)
+                    h.latest_pose.get()
                 };
                 let executing = accepted.execute();
 
                 let Some(start) = start else {
                     eprintln!(
-                        "ERROR: vi_planner: no robot pose available (use_start=false and \
-                         nothing received on the pose topic yet)"
+                        "ERROR: vi_planner: no current robot pose available (use_start=false)"
                     );
                     return executing
                         .aborted_with(nav2_msgs::action::ComputePathToPose_Result::default());

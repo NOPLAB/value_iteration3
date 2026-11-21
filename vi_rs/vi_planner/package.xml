@@ -24,6 +24,7 @@
 
   <export>
     <build_type>ament_cargo</build_type>
+    <stamped_external_pose/>
     <install>launch</install>
   </export>
 </package>

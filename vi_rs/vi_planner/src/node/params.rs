@@ -47,6 +47,8 @@ pub struct Params {
     pub compact_ram_limit_mb: i64,
     pub vi_threads: i64,
     pub pose_topic: String,
+    /// 外部姿勢の時刻・無更新の上限 [s]。0 は従来の無期限な姿勢入力。
+    pub external_pose_max_age_sec: f64,
     pub global_frame: String,
     /// map→odom TF を配信するか (AMCL の契約の置き換え)。外部 localizer が
     /// map→odom を出す構成 (emcl2/AMCL) では off のまま — 出すのは常に 1 人。
@@ -211,6 +213,7 @@ pub fn read_params(node: &Node) -> Result<Params> {
         compact_ram_limit_mb: p!("compact_ram_limit_mb", i64, 0),
         vi_threads: p!("vi_threads", i64, 0),
         pose_topic: p!("pose_topic", Arc<str>, "mcl_pose".into()).to_string(),
+        external_pose_max_age_sec: p!("external_pose_max_age_sec", f64, 0.0),
         global_frame: p!("global_frame", Arc<str>, "map".into()).to_string(),
         publish_tf: p!("publish_tf", bool, false),
         transform_tolerance: p!("transform_tolerance", f64, 0.5),
@@ -498,6 +501,14 @@ pub fn validate(p: &Params) -> Result<U64Solver> {
             "unknown localizer: {} (expected \"external\", \"grid\", \"adaptive\", \"belief\" \
              or \"viterbi\")",
             p.localizer
+        ));
+    }
+    if std::time::Duration::try_from_secs_f64(p.external_pose_max_age_sec).is_err()
+        || (p.external_pose_max_age_sec > 0.0 && (p.localizer != "external" || p.publish_tf))
+    {
+        return Err(anyhow!(
+            "external_pose_max_age_sec must be finite and nonnegative, and a positive \
+             value requires localizer=external and publish_tf=false"
         ));
     }
     let solver = U64Solver::from_name(&p.solver)

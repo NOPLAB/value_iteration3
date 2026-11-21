@@ -15,6 +15,7 @@ use rclrs::*;
 
 use super::follow_loop::FollowTuning;
 use super::msg::ros_grid_from;
+use super::pose::PoseSlot;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Value function visualization
@@ -96,7 +97,7 @@ pub struct ScanObservation {
 /// closure 用と内側 async 用に二重 clone していた)。
 pub struct Handles {
     pub core: Mutex<PlannerCore>,
-    pub latest_pose: Mutex<Option<PoseView>>,
+    pub latest_pose: PoseSlot,
     /// 自己位置推定 ([`Loc`])。`latest_pose` はこれの出力キャッシュ — 読む側
     /// (follow ループ・plan サーバ) は従来どおり latest_pose だけを見る。
     /// **核の Mutex とは別**: solve 中も scan から更新され続ける必要がある。
@@ -188,7 +189,7 @@ impl Handles {
 #[derive(Clone, Copy)]
 pub struct FollowCtx<'a> {
     pub core: &'a Mutex<PlannerCore>,
-    pub latest_pose: &'a Mutex<Option<PoseView>>,
+    pub latest_pose: &'a PoseSlot,
     pub localizer: &'a Mutex<Loc>,
     pub scan_queue: &'a Mutex<Vec<ScanObservation>>,
     pub cmd_pub: &'a Publisher<geometry_msgs::msg::Twist>,

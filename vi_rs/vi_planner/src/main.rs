@@ -71,6 +71,7 @@ use node::follow_loop::{FollowTuning, RetryTuning};
 use node::handles::{Handles, PlanPub, ScanObservation, Viz};
 use node::msg::{pose_view_from, vi_scan_from};
 use node::params::{read_params, validate};
+use node::pose::PoseSlot;
 use node::servers::{self, Wiring};
 
 fn main() -> Result<()> {
@@ -110,7 +111,11 @@ fn main() -> Result<()> {
     //    成功が出すトピックなので立てない)。
     let handles = Arc::new(Handles {
         core: Mutex::new(core),
-        latest_pose: Mutex::new(None),
+        latest_pose: PoseSlot::new(
+            node.get_clock(),
+            (params.external_pose_max_age_sec > 0.0)
+                .then(|| Duration::from_secs_f64(params.external_pose_max_age_sec)),
+        ),
         localizer: Mutex::new(localizer),
         scan_queue: Mutex::new(Vec::new()),
         cmd_pub: node.create_publisher::<geometry_msgs::msg::Twist>("cmd_vel".keep_last(1))?,
@@ -167,11 +172,24 @@ fn main() -> Result<()> {
         node.create_subscription::<geometry_msgs::msg::PoseWithCovarianceStamped, _>(
             params.pose_topic.as_str().keep_last(1),
             move |msg: geometry_msgs::msg::PoseWithCovarianceStamped| {
+                let pose = pose_view_from(&msg.pose.pose);
+                if h.latest_pose.requires_fresh_stamp() {
+                    if msg.header.frame_id.as_str() == h.est_frame
+                        && h.latest_pose.set_stamped(
+                            pose,
+                            msg.header.stamp.sec,
+                            msg.header.stamp.nanosec,
+                        )
+                    {
+                        h.publish_est(pose);
+                    }
+                    return;
+                }
                 let p = {
                     let mut l = lock(&h.localizer);
-                    l.set_pose(pose_view_from(&msg.pose.pose));
+                    l.set_pose(pose);
                     let p = l.pose();
-                    *lock(&h.latest_pose) = p;
+                    h.latest_pose.set(p);
                     p
                 };
                 if let Some(p) = p {
@@ -192,7 +210,7 @@ fn main() -> Result<()> {
         Some(node.create_subscription::<nav_msgs::msg::Odometry, _>(
             params.odom_topic.as_str().keep_last(1),
             move |msg: nav_msgs::msg::Odometry| {
-                let est = match *lock(&h.latest_pose) {
+                let est = match h.latest_pose.get() {
                     Some(p) => p,
                     None => return, // シード前は map→odom を定義できない
                 };
@@ -213,14 +231,16 @@ fn main() -> Result<()> {
             params.scan_topic.as_str().best_effort().keep_last(5),
             move |msg: sensor_msgs::msg::LaserScan| {
                 let scan = vi_scan_from(&msg);
-                let est = {
+                let est = if h.latest_pose.requires_fresh_stamp() {
+                    h.latest_pose.get()
+                } else {
                     let mut l = lock(&h.localizer);
                     l.observe_with_map_clear(&scan, map_clear);
                     let p = l.pose();
                     // 無条件代入: belief はロスト中 None を返すので、latest_pose
                     // ごと消して follow ループを「pose なし」停止経路に乗せる
                     // (external は observe が no-op で Some のまま = 従来どおり)。
-                    *lock(&h.latest_pose) = p;
+                    h.latest_pose.set(p);
                     p
                 };
                 {
