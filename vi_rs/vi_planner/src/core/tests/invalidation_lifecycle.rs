@@ -3,6 +3,76 @@ use super::invalidation::{drain, policies};
 use super::*;
 
 #[test]
+fn a_scan_off_the_route_does_not_pause_a_locally_consistent_action() {
+    for compact in [false, true] {
+        let mut b = build(80);
+        b.actions[0] = Action::new("forward", 0.5, 0.0, 0);
+        let mut core = PlannerCore::new(b, if compact { cfg_compact() } else { cfg() });
+        let robot = pose(1.025, 2.025, 0.0);
+        core.prepare_goal(pose(3.525, 2.025, 0.0), &AtomicBool::new(false)).expect("solve");
+        core.set_window(robot);
+        let forward = core.decide(robot);
+        assert_eq!(forward, Decision::Action { id: Some(0), fw: 0.5, rot_deg: 0.0 });
+
+        core.observe_scan(
+            &LaserScan {
+                angle_min: std::f64::consts::FRAC_PI_2,
+                ranges: vec![0.7],
+                ..LaserScan::default()
+            },
+            robot,
+        );
+        assert!(!core.advance_invalidations(1), "the scan must leave a pending closure");
+        assert_eq!(
+            core.decide(robot),
+            forward,
+            "off-route scan invalidation should not stop forward motion (compact={compact})"
+        );
+
+        // A hit outside the starting footprint can still block the swept
+        // path. Turn off soft injection to exercise the hard check by itself.
+        core.cfg.scan_penalty = 0;
+        core.observe_scan(&LaserScan { ranges: vec![0.55], ..LaserScan::default() }, robot);
+        assert_eq!(
+            core.decide(robot),
+            Decision::NoAction,
+            "a hit on the swept path must still stop the robot (compact={compact})"
+        );
+    }
+}
+
+#[test]
+fn pending_repair_stops_when_a_worker_scores_unreached_successors() {
+    let mut b = build(32);
+    b.map_penalty_radius = 0.0;
+    b.actions = vec![Action::new("forward", 0.5, 0.0, 0)];
+    let mut core = PlannerCore::new(b, cfg());
+    let robot = pose(0.875, 0.825, 0.0);
+    core.prepare_goal(pose(0.275, 0.225, 0.0), &AtomicBool::new(false)).expect("solve");
+    core.set_window(robot);
+    let _owner = core.claim_local();
+    let mut job = core.prepare_local_job().expect("local snapshot");
+    job.run_parallel(2).expect("run local pass");
+    assert!(core.commit_local_job(job).is_some());
+    assert!(matches!(core.decide(robot), Decision::Action { fw: 0.5, .. }));
+
+    core.observe_scan(
+        &LaserScan {
+            angle_min: std::f64::consts::FRAC_PI_2,
+            ranges: vec![0.6],
+            ..LaserScan::default()
+        },
+        robot,
+    );
+    assert!(!core.advance_invalidations(1), "the scan must leave a pending closure");
+    assert_eq!(
+        core.decide(robot),
+        Decision::NoAction,
+        "a matching score does not make an unreached successor executable"
+    );
+}
+
+#[test]
 fn pending_invalidation_pauses_guidance_but_preserves_terminal_decisions() {
     for compact in [false, true] {
         let mut core = managed_field(compact);

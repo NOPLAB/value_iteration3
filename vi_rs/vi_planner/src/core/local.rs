@@ -252,13 +252,50 @@ impl PlannerCore {
         if is_final(&local.base, x, y, t) {
             return Decision::Goal;
         }
-        if self.global.invalidating() {
-            return Decision::NoAction;
-        }
         let vi = &local.base;
+        let radius = self.cfg.scan_collision_radius;
+        if self.global.invalidating() {
+            // A queued repair does not necessarily affect this step. Keep only
+            // the policy at the actual pose, with a live Bellman check and a
+            // clear footprint from start to finish. Do not borrow a policy or
+            // choose a new one while the dependency traversal is incomplete.
+            if self.cfg.follow_controller != FollowKind::Greedy
+                || radius <= 0.0
+                || !vi.in_map_area(x, y)
+                || self.scan_collision.overlaps(pose, radius)
+            {
+                return Decision::NoAction;
+            }
+            let state = &vi.states[vi.to_index(x, y, t) as usize];
+            let Some(action) = state.optimal_action.and_then(|i| vi.actions.get(i)) else {
+                return Decision::NoAction;
+            };
+            // The weighted sum can wrap MAX_COST into a finite score. Check
+            // reachability before comparing costs, rather than trusting that sum.
+            let has_unreached_successor = action.state_transitions[t as usize].iter().any(|tr| {
+                let (nx, ny) = (x + tr.dix, y + tr.diy);
+                tr.prob > 0
+                    && (!vi.in_map_area(nx, ny)
+                        || vi.states[vi.to_index(nx, ny, tr.dit.rem_euclid(vi.cell_num_t)) as usize]
+                            .total_cost
+                            >= MAX_COST)
+            });
+            if !state.free
+                || state.total_cost >= MAX_COST
+                || has_unreached_successor
+                || vi.policy_action_cost(state, action) != state.total_cost
+                || self.scan_collision.blocks(pose, action.delta_fw, action.delta_rot, radius)
+            {
+                return Decision::NoAction;
+            }
+            return Decision::Action {
+                id: Some(action.id as usize),
+                fw: action.delta_fw,
+                rot_deg: action.delta_rot,
+            };
+        }
         let decision = self.follow.decide(vi, &self.cfg, pose);
         let Decision::Action { fw, rot_deg, .. } = decision else { return decision };
-        let radius = self.cfg.scan_collision_radius;
         if !self.scan_collision.blocks(pose, fw, rot_deg, radius) {
             return decision;
         }
