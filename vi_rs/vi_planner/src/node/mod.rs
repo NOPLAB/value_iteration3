@@ -16,5 +16,6 @@ pub mod follow_loop;
 pub mod handles;
 pub mod msg;
 pub mod params;
+pub mod pose;
 pub mod servers;
 pub mod sweep;

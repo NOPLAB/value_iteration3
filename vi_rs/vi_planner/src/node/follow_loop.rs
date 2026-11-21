@@ -135,7 +135,7 @@ pub fn run_follow(
         // 早期走り出し (early_start) の起点。solve のあいだ機体は止まっているので、
         // ここで読んだ姿勢は走り出すときの姿勢そのもの。まだ pose が来ていなければ
         // 打ち切らずに最後まで解く (下の制御ループはどのみち pose を待つ)。
-        let from = *latest_pose.lock().unwrap();
+        let from = latest_pose.get();
         let prepared = core.prepare_goal_with_progress(goal, from, cancel, &mut |vi| {
             let Some(v) = viz else { return };
             if !v.due(&mut last_viz) {
@@ -185,7 +185,7 @@ pub fn run_follow(
         // なので、経路が引けなくても走れる。BT 構成ではこの失敗が
         // `ComputePathToPose` の失敗 = ゴールの失敗だった。
         if let Some(pp) = plan_pub {
-            let from = *latest_pose.lock().unwrap();
+            let from = latest_pose.get();
             if let Some(from) = from {
                 match core.plan(from, goal, cancel) {
                     Ok((poses, _)) => {
@@ -218,7 +218,7 @@ pub fn run_follow(
             return Outcome::Preempted;
         }
 
-        let pose = *latest_pose.lock().unwrap();
+        let pose = latest_pose.get();
         // 能動的再定位から復帰した直後: キャッシュには再定位場が載っている。
         // 下の「goal replaced」プリエンプトと誤認する前に本来のゴールを解き直す
         // (再定位中に本当に別の追従ゴールが来る形は cancel 経由で上で抜けている)。
@@ -325,7 +325,7 @@ pub fn run_follow(
                             let _ = cmd_pub.publish(tw);
                             let mut l = lock(localizer);
                             l.predict(fw, rot_deg, tuning.period.as_secs_f64());
-                            *lock(latest_pose) = l.pose();
+                            latest_pose.set(l.pose());
                             true
                         }
                         // Goal = 判別点に到着 / NoAction — 止まって観測を待つ。
@@ -336,7 +336,7 @@ pub fn run_follow(
                     }
                 };
             }
-            if !acted && tuning.lost_creep && lost_budget {
+            if !acted && tuning.lost_creep && lost_budget && !latest_pose.requires_fresh_stamp() {
                 // スキャン反射の creep (`ctrl::lost_creep`) — 判別場が立たない間
                 // (単峰・targets なし・compact の GaveUp) も動き続ける。安全判定は
                 // 仮説地図でなくスキャンそのもの。相関観測ゲートは静止スキャンを
@@ -353,7 +353,7 @@ pub fn run_follow(
                         let _ = cmd_pub.publish(tw);
                         let mut l = lock(localizer);
                         l.predict(fw, rot_deg, tuning.period.as_secs_f64());
-                        *lock(latest_pose) = l.pose();
+                        latest_pose.set(l.pose());
                         acted = true;
                     }
                 }
@@ -481,6 +481,10 @@ pub fn run_follow(
                 return Outcome::Reached;
             }
             Decision::Action { fw, rot_deg, .. } => {
+                if latest_pose.requires_fresh_stamp() && latest_pose.get().is_none() {
+                    stop_cmd(cmd_pub);
+                    continue;
+                }
                 // 本家 ViNode::decision: delta をそのまま速度指令に。
                 let mut tw = geometry_msgs::msg::Twist::default();
                 tw.linear.x = fw;
@@ -494,7 +498,7 @@ pub fn run_follow(
                 {
                     let mut l = lock(localizer);
                     l.predict(fw, rot_deg, tuning.period.as_secs_f64());
-                    *lock(latest_pose) = l.pose();
+                    latest_pose.set(l.pose());
                 }
                 speed = fw as f32;
             }
@@ -536,7 +540,7 @@ pub fn run_settle(ctx: &FollowCtx, cancel: &AtomicBool, dur: Duration) -> bool {
         }
         stop_cmd(cmd_pub);
 
-        let pose = *latest_pose.lock().unwrap();
+        let pose = latest_pose.get();
         if let Some(pose) = pose {
             if let Some(mut c) = try_lock(core) {
                 let scan_shift =
