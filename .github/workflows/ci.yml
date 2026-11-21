@@ -32,9 +32,15 @@ jobs:
       - run: make rs-test
 
   ros2:
-    name: ROS2 planner
+    name: ROS2 planner (${{ matrix.ros_distro }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        ros_distro: [humble, jazzy, lyrical]
+    env:
+      VI_ROS_DISTRO: ${{ matrix.ros_distro }}
     steps:
       - uses: actions/checkout@v6
       - run: make ros2-docker

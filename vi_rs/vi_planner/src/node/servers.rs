@@ -398,12 +398,12 @@ pub fn follow_waypoints_server(
 
                 let feedback = executing.feedback_publisher();
                 let (done_tx, done_rx) =
-                    futures::channel::oneshot::channel::<(TourOutcome, Vec<i32>)>();
+                    futures::channel::oneshot::channel::<(TourOutcome, Vec<usize>)>();
                 let cancel_t = Arc::clone(&my_cancel);
                 std::thread::spawn(move || {
                     let ctx = h.follow_ctx(tuning, true);
                     let retries = AtomicU64::new(0);
-                    let mut missed: Vec<i32> = Vec::new();
+                    let mut missed = Vec::new();
                     let mut outcome = TourOutcome::Done;
                     for (i, goal) in goals.iter().enumerate() {
                         let publish_current = || {
@@ -436,7 +436,7 @@ pub fn follow_waypoints_server(
                                     "ERROR: vi_planner: waypoint {} failed: {reason}",
                                     i + 1
                                 );
-                                missed.push(i as i32);
+                                missed.push(i);
                                 if stop_on_failure {
                                     outcome = TourOutcome::Aborted(
                                         "ERROR: vi_planner: tour stopped at the first \
@@ -455,7 +455,33 @@ pub fn follow_waypoints_server(
                 match executing.until_cancel_requested(&mut done_rx).await {
                     Ok(Ok((outcome, missed))) => {
                         let mut result = nav2_msgs::action::FollowWaypoints_Result::default();
-                        result.missed_waypoints = missed;
+                        result.missed_waypoints = missed
+                            .into_iter()
+                            .map(|i| {
+                                #[cfg(ros_distro = "jazzy")]
+                                {
+                                    nav2_msgs::msg::MissedWaypoint {
+                                        index: u32::try_from(i).unwrap_or(u32::MAX),
+                                        goal: executing.goal().poses[i].clone(),
+                                        error_code: nav2_msgs::action::FollowWaypoints_Result::UNKNOWN,
+                                    }
+                                }
+                                #[cfg(ros_distro = "lyrical")]
+                                {
+                                    nav2_msgs::msg::WaypointStatus {
+                                        waypoint_index: u32::try_from(i).unwrap_or(u32::MAX),
+                                        waypoint_pose: executing.goal().poses[i].clone(),
+                                        waypoint_status: nav2_msgs::msg::WaypointStatus::FAILED,
+                                        error_code: nav2_msgs::action::FollowWaypoints_Result::UNKNOWN,
+                                        error_msg: Default::default(),
+                                    }
+                                }
+                                #[cfg(not(any(ros_distro = "jazzy", ros_distro = "lyrical")))]
+                                {
+                                    i32::try_from(i).unwrap_or(i32::MAX)
+                                }
+                            })
+                            .collect();
                         match outcome {
                             TourOutcome::Done => {
                                 eprintln!(
@@ -531,10 +557,14 @@ pub fn follow_path_server(
                     // BT 構成では投げ直しは BT (RecoveryNode) の仕事なので、
                     // ここは 1 回きり (run_goal を通さない)。
                     let outcome = run_follow(&ctx, goal, &cancel_t, &|p| {
-                        let _ = feedback.publish(nav2_msgs::action::FollowPath_Feedback {
-                            distance_to_goal: p.distance_remaining.unwrap_or(f64::NAN) as f32,
-                            speed: p.speed,
-                        });
+                        let mut message = nav2_msgs::action::FollowPath_Feedback::default();
+                        #[cfg(ros_distro = "lyrical")]
+                        let fields = &mut message.tracking_feedback;
+                        #[cfg(not(ros_distro = "lyrical"))]
+                        let fields = &mut message;
+                        fields.distance_to_goal = p.distance_remaining.unwrap_or(f64::NAN) as f32;
+                        fields.speed = p.speed;
+                        let _ = feedback.publish(message);
                     });
                     let _ = done_tx.send(outcome);
                 });
