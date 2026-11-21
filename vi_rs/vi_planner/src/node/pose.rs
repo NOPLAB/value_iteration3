@@ -59,9 +59,16 @@ impl PoseSlot {
             return false;
         }
         let mut current = lock(&self.pose);
-        // Repeating the same transform must not keep the robot moving if /clock pauses.
-        if current.is_some_and(|(_, old)| old.is_some_and(|old| old.nanos == stamp.nanos)) {
-            return false;
+        // A pose can change via odometry without a new map correction. Accept the
+        // coordinates without renewing their freshness, including when /clock pauses.
+        if let Some((_, Some(old))) = *current {
+            if old.nanos == stamp.nanos {
+                if !self.is_fresh(old, max_age) {
+                    return false;
+                }
+                *current = Some((pose, Some(old)));
+                return true;
+            }
         }
         *current = Some((pose, Some(stamp)));
         true
