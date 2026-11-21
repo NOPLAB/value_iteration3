@@ -25,6 +25,10 @@ impl ScanCollision {
         }
     }
 
+    pub(super) fn overlaps(&self, pose: PoseView, radius: f64) -> bool {
+        self.hits.iter().any(|&(x, y)| (x - pose.x).hypot(y - pose.y) <= radius)
+    }
+
     pub(super) fn blocks(&self, pose: PoseView, fw: f64, rot_deg: f64, radius: f64) -> bool {
         if fw == 0.0 || radius <= 0.0 || self.hits.is_empty() {
             return false;
