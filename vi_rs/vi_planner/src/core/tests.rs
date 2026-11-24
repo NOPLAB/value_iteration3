@@ -92,6 +92,21 @@ fn pose(x: f64, y: f64, yaw: f64) -> PoseView {
 }
 
 #[test]
+fn try_lock_until_waits_out_a_short_hold_but_not_past_the_deadline() {
+    let m = Arc::new(Mutex::new(0));
+    let held = lock(&m);
+    assert!(try_lock_until(&m, Instant::now()).is_none());
+    let waiter = {
+        let m = Arc::clone(&m);
+        std::thread::spawn(move || {
+            try_lock_until(&m, Instant::now() + Duration::from_secs(10)).is_some()
+        })
+    };
+    drop(held);
+    assert!(waiter.join().unwrap(), "a released lock is taken before the deadline");
+}
+
+#[test]
 fn greedy_rejects_forward_motion_through_a_near_scan_hit() {
     let mut build = build(80);
     build.actions = vec![
