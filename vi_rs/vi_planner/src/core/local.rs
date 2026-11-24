@@ -1,5 +1,6 @@
 //! Local field access, scan updates, refinement, and control decisions.
 use super::*;
+use vi_lib::State;
 
 impl PlannerCore {
     // ──────────────────────────────────────────────────────────────────────
@@ -286,33 +287,13 @@ impl PlannerCore {
             .iter()
             .enumerate()
             .filter_map(|(index, action)| {
-                let fw = action.delta_fw;
-                let rot_deg = action.delta_rot;
-                if self.scan_collision.blocks(pose, fw, rot_deg, radius) {
-                    return None;
-                }
-                // Neither discard a candidate because the current policy was
-                // cleared nor let an unreached successor wrap into a finite cost.
-                if action.state_transitions[t as usize].iter().any(|tr| {
-                    if tr.prob == 0 {
-                        return false;
-                    }
-                    let (nx, ny) = (x + tr.dix, y + tr.diy);
-                    if !vi.in_map_area(nx, ny) {
-                        return true;
-                    }
-                    let next =
-                        &vi.states[vi.to_index(nx, ny, tr.dit.rem_euclid(vi.cell_num_t)) as usize];
-                    !next.free || next.total_cost >= MAX_COST || next.policy_invalidated()
-                }) {
-                    return None;
-                }
-                let cost = vi.action_cost(state, action);
+                let (fw, rot_deg) = (action.delta_fw, action.delta_rot);
+                let cost = self.safe_cost(vi, state, (x, y, t), pose, action)?;
                 // Keep a still-consistent policy instead of switching turns
                 // solely because other values are still being repaired. Of
                 // substitute steps, use retreat only if no other step is safe.
                 let keep = state.optimal_action == Some(index) && cost == state.total_cost;
-                (cost < MAX_COST).then_some((
+                Some((
                     (!keep, repairing && fw < 0.0, cost),
                     Decision::Action {
                         id: Some(action.id as usize),
@@ -323,6 +304,85 @@ impl PlannerCore {
             })
             .min_by_key(|&(rank, _)| rank)
             .map_or(Decision::NoAction, |(_, alternative)| alternative)
+    }
+
+    /// 制御ループの 1 tick 分の判断。[`Self::decide`] に加え、greedy の行動を
+    /// モデルどおり 1 秒 (`1 / dwa_tick_s` tick) 続ける。1 tick に 1 回だけ呼ぶこと。
+    pub fn decide_tick(&self, pose: PoseView) -> Decision {
+        let decision = self.decide(pose);
+        if self.cfg.follow_controller != FollowKind::Greedy {
+            return decision;
+        }
+        // Each action models one second of motion, but the loop decides every
+        // tick. Re-deciding mid-action lets two neighboring cells undo each
+        // other's choice, so finish the action unless it stops being safe.
+        let ticks = (1.0 / self.cfg.dwa_tick_s).round() as u32;
+        let mut running = lock(&self.running_action);
+        if let (Decision::Action { id: Some(next), .. }, Some((prev, done))) = (decision, *running)
+        {
+            if next != prev && done < ticks {
+                if let Some(kept) = self.continue_action(pose, prev) {
+                    *running = Some((prev, done + 1));
+                    return kept;
+                }
+            }
+        }
+        *running = match (decision, *running) {
+            (Decision::Action { id: Some(id), .. }, Some((prev, done))) if prev == id => {
+                Some((id, done + 1))
+            }
+            (Decision::Action { id: Some(id), .. }, _) => Some((id, 1)),
+            _ => None,
+        };
+        decision
+    }
+
+    /// The running action, if it is still collision-free from the actual cell.
+    fn continue_action(&self, pose: PoseView, id: usize) -> Option<Decision> {
+        let vi = &self.local()?.base;
+        let (x, y, t) = pose_to_cell(vi, pose.x, pose.y, pose.yaw_rad);
+        if !vi.in_map_area(x, y) || is_final(vi, x, y, t) {
+            return None;
+        }
+        let state = &vi.states[vi.to_index(x, y, t) as usize];
+        let action = vi.actions.iter().find(|a| a.id as usize == id)?;
+        if !state.free {
+            return None;
+        }
+        self.safe_cost(vi, state, (x, y, t), pose, action)?;
+        Some(Decision::Action { id: Some(id), fw: action.delta_fw, rot_deg: action.delta_rot })
+    }
+
+    /// Cost of a collision-free action whose successors all have usable values.
+    fn safe_cost(
+        &self,
+        vi: &ValueIterator,
+        state: &State,
+        (x, y, t): (i32, i32, i32),
+        pose: PoseView,
+        action: &Action,
+    ) -> Option<u64> {
+        let radius = self.cfg.scan_collision_radius;
+        if self.scan_collision.blocks(pose, action.delta_fw, action.delta_rot, radius) {
+            return None;
+        }
+        // Neither discard a candidate because the current policy was
+        // cleared nor let an unreached successor wrap into a finite cost.
+        if action.state_transitions[t as usize].iter().any(|tr| {
+            if tr.prob == 0 {
+                return false;
+            }
+            let (nx, ny) = (x + tr.dix, y + tr.diy);
+            if !vi.in_map_area(nx, ny) {
+                return true;
+            }
+            let next = &vi.states[vi.to_index(nx, ny, tr.dit.rem_euclid(vi.cell_num_t)) as usize];
+            !next.free || next.total_cost >= MAX_COST || next.policy_invalidated()
+        }) {
+            return None;
+        }
+        let cost = vi.action_cost(state, action);
+        (cost < MAX_COST).then_some(cost)
     }
 
     /// belief 仮説集合での判断 (QMDP — [`qmdp_decide`])。読む場は [`Self::decide`]

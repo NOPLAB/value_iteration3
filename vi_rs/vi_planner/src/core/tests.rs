@@ -107,6 +107,36 @@ fn try_lock_until_waits_out_a_short_hold_but_not_past_the_deadline() {
 }
 
 #[test]
+fn greedy_finishes_a_one_second_action_unless_it_becomes_unsafe() {
+    let goal = pose(3.525, 2.025, 0.0);
+    let start = pose(1.025, 2.025, 0.0);
+    let away = pose(1.025, 2.025, std::f64::consts::PI);
+    let solved = || {
+        let mut core = PlannerCore::new(build(80), cfg());
+        core.prepare_goal(goal, &AtomicBool::new(false)).expect("solve");
+        core.set_window(start);
+        core
+    };
+    let turn = solved().decide(away);
+    let core = solved();
+    let forward = core.decide_tick(start);
+    assert!(matches!(forward, Decision::Action { fw, .. } if fw > 0.0));
+    assert_ne!(turn, forward, "the fixture needs a different policy after turning");
+    // Ten ticks of 0.1 s make up the one second the action models.
+    for _ in 1..10 {
+        assert_eq!(core.decide_tick(away), forward, "a running action is finished");
+    }
+    assert_eq!(core.decide_tick(away), turn, "the next action starts after one second");
+
+    let mut core = solved();
+    assert_eq!(core.decide_tick(start), forward);
+    core.cfg.scan_penalty = 0;
+    // Inside the 0.3 m step plus the 0.2 m collision radius.
+    core.observe_scan(&LaserScan { ranges: vec![0.45], ..LaserScan::default() }, start);
+    assert_ne!(core.decide_tick(start), forward, "a blocked action is abandoned at once");
+}
+
+#[test]
 fn greedy_rejects_forward_motion_through_a_near_scan_hit() {
     let mut build = build(80);
     build.actions = vec![
@@ -1219,6 +1249,7 @@ fn decide_borrows_action_from_neighbors() {
         follow: strict_follow,
         global: global::Manager::default(),
         scan_collision: ScanCollision::default(),
+        running_action: Mutex::new(None),
     };
     assert_eq!(strict_core.decide(on_obstacle), Decision::NoAction);
     // tolerance 4 (0.2m) なら近傍の行動を借りられる。
@@ -1237,6 +1268,7 @@ fn decide_borrows_action_from_neighbors() {
         follow: relaxed_follow,
         global: global::Manager::default(),
         scan_collision: ScanCollision::default(),
+        running_action: Mutex::new(None),
     };
     assert!(matches!(relaxed_core.decide(on_obstacle), Decision::Action { .. }));
 }

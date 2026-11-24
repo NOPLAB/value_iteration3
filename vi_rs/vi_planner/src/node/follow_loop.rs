@@ -454,7 +454,7 @@ pub fn run_follow(
                 // 生のセル集合でなく峰へ集約して渡す (weighted_modes の doc)。
                 core.decide_qmdp(&weighted_modes(&hyps, QMDP_MODE_SEP_M, QMDP_MODES))
             } else {
-                core.decide(pose)
+                core.decide_tick(pose)
             };
             (decision, core.goal_distance(pose.x, pose.y), window_grid)
         };

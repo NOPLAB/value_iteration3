@@ -267,6 +267,8 @@ pub struct PlannerCore {
     /// solve・ロールアウトには関与しない — `decide` だけがこれを通る。
     follow: Box<dyn FollowController>,
     scan_collision: ScanCollision,
+    /// greedy が実行中の行動 id と、続けた tick 数 ([`Self::decide`])。
+    running_action: Mutex<Option<(usize, u32)>>,
 }
 
 /// 2 つのゴール `(x, y, θ[deg])` を「同じ」とみなせるか。キャッシュの再利用判定と
@@ -390,6 +392,7 @@ impl PlannerCore {
             cfg,
             follow,
             scan_collision: ScanCollision::default(),
+            running_action: Mutex::new(None),
             cached: None,
             patch: None,
             penalty,
