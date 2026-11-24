@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use vi_lib::bridge::PoseView;
 
 use vi_planner::core::{
-    lock, mode_count, quality_shift, spread_m, try_lock, value_grid_on, weighted_modes, Decision,
-    PlanError,
+    lock, mode_count, quality_shift, spread_m, try_lock, try_lock_until, value_grid_on,
+    weighted_modes, Decision, PlanError,
 };
 
 use super::handles::FollowCtx;
@@ -394,7 +394,9 @@ pub fn run_follow(
         // 計画要求を受けると、その solve は数秒〜数十秒ロックを握り続ける。
         // ここでブロックすると、その間ずっと直前の速度指令が出たままロボットが
         // 走り続けることになる (velocity_smoother のタイムアウト任せにしない)。
-        let Some(mut core) = try_lock(core) else {
+        // worker は短い保持を繰り返すので、1 回の try_lock では数 tick 続けて外れ
+        // 停止指令が挟まる。周期の半分までは取り直す。
+        let Some(mut core) = try_lock_until(core, tick_start + tuning.period / 2) else {
             // 1〜2 tick 取れないのは同一ゴールのロールアウト待ち (BT の 1Hz
             // リプランはキャッシュヒットでも rollout + densify をロック内で回す)。
             // ここで毎回止めると、取り除いたはずの「1 秒ごとに 0 速度が挟まる」

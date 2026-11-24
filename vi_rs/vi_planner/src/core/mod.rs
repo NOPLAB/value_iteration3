@@ -109,6 +109,20 @@ pub fn try_lock<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
     }
 }
 
+/// [`try_lock`] を `deadline` まで取り直す。worker の短い保持をまたいで待つが、
+/// 長い solve の間はブロックしない。
+pub fn try_lock_until<T>(m: &Mutex<T>, deadline: Instant) -> Option<MutexGuard<'_, T>> {
+    loop {
+        if let Some(g) = try_lock(m) {
+            return Some(g);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// 観測一致度 → スキャン注入の減衰段数 ([`PlannerCore::observe_scan_gated`] の
 /// `shift`)。`gate` 以上は 0 (満額 2048)、下回ると注入 ∝ quality/gate の 2 冪
 /// 量子化 (PenaltyOverlay が指数しか持てないため冪に丸める)。上限 11
