@@ -254,53 +254,27 @@ impl PlannerCore {
         }
         let vi = &local.base;
         let radius = self.cfg.scan_collision_radius;
-        if self.global.invalidating() {
-            // A queued repair does not necessarily affect this step. Keep only
-            // the policy at the actual pose, with a live Bellman check and a
-            // clear footprint from start to finish. Do not borrow a policy or
-            // choose a new one while the dependency traversal is incomplete.
-            if self.cfg.follow_controller != FollowKind::Greedy
-                || radius <= 0.0
-                || !vi.in_map_area(x, y)
-                || self.scan_collision.overlaps(pose, radius)
-            {
+        let greedy = self.cfg.follow_controller == FollowKind::Greedy && radius > 0.0;
+        let repairing = self.global.invalidating();
+        if repairing {
+            // During repair, score from the actual cell instead of borrowing
+            // a policy that may be affected by the pending scan.
+            if !greedy || self.scan_collision.overlaps(pose, radius) {
                 return Decision::NoAction;
             }
-            let state = &vi.states[vi.to_index(x, y, t) as usize];
-            let Some(action) = state.optimal_action.and_then(|i| vi.actions.get(i)) else {
-                return Decision::NoAction;
-            };
-            // The weighted sum can wrap MAX_COST into a finite score. Check
-            // reachability before comparing costs, rather than trusting that sum.
-            let has_unreached_successor = action.state_transitions[t as usize].iter().any(|tr| {
-                let (nx, ny) = (x + tr.dix, y + tr.diy);
-                tr.prob > 0
-                    && (!vi.in_map_area(nx, ny)
-                        || vi.states[vi.to_index(nx, ny, tr.dit.rem_euclid(vi.cell_num_t)) as usize]
-                            .total_cost
-                            >= MAX_COST)
-            });
-            if !state.free
-                || state.total_cost >= MAX_COST
-                || has_unreached_successor
-                || vi.policy_action_cost(state, action) != state.total_cost
-                || self.scan_collision.blocks(pose, action.delta_fw, action.delta_rot, radius)
-            {
-                return Decision::NoAction;
+        } else {
+            let decision = self.follow.decide(vi, &self.cfg, pose);
+            match decision {
+                Decision::Goal => return decision,
+                Decision::Action { fw, rot_deg, .. }
+                    if !self.scan_collision.blocks(pose, fw, rot_deg, radius) =>
+                {
+                    return decision;
+                }
+                Decision::NoAction if !greedy => return decision,
+                Decision::NoAction | Decision::Action { .. } => {}
             }
-            return Decision::Action {
-                id: Some(action.id as usize),
-                fw: action.delta_fw,
-                rot_deg: action.delta_rot,
-            };
         }
-        let decision = self.follow.decide(vi, &self.cfg, pose);
-        let Decision::Action { fw, rot_deg, .. } = decision else { return decision };
-        if !self.scan_collision.blocks(pose, fw, rot_deg, radius) {
-            return decision;
-        }
-        // Score safe alternatives from the real pose, even if the blocked action
-        // came from a neighboring cell. Do not replace it with another borrowed policy.
         if !vi.in_map_area(x, y) {
             return Decision::NoAction;
         }
@@ -310,19 +284,44 @@ impl PlannerCore {
         }
         vi.actions
             .iter()
-            .filter_map(|action| {
+            .enumerate()
+            .filter_map(|(index, action)| {
                 let fw = action.delta_fw;
                 let rot_deg = action.delta_rot;
                 if self.scan_collision.blocks(pose, fw, rot_deg, radius) {
                     return None;
                 }
-                let cost = vi.policy_action_cost(state, action);
+                // Neither discard a candidate because the current policy was
+                // cleared nor let an unreached successor wrap into a finite cost.
+                if action.state_transitions[t as usize].iter().any(|tr| {
+                    if tr.prob == 0 {
+                        return false;
+                    }
+                    let (nx, ny) = (x + tr.dix, y + tr.diy);
+                    if !vi.in_map_area(nx, ny) {
+                        return true;
+                    }
+                    let next =
+                        &vi.states[vi.to_index(nx, ny, tr.dit.rem_euclid(vi.cell_num_t)) as usize];
+                    !next.free || next.total_cost >= MAX_COST || next.policy_invalidated()
+                }) {
+                    return None;
+                }
+                let cost = vi.action_cost(state, action);
+                // Keep a still-consistent policy instead of switching turns
+                // solely because other values are still being repaired. Of
+                // substitute steps, use retreat only if no other step is safe.
+                let keep = state.optimal_action == Some(index) && cost == state.total_cost;
                 (cost < MAX_COST).then_some((
-                    cost,
-                    Decision::Action { id: Some(action.id as usize), fw, rot_deg },
+                    (!keep, repairing && fw < 0.0, cost),
+                    Decision::Action {
+                        id: Some(action.id as usize),
+                        fw,
+                        rot_deg,
+                    },
                 ))
             })
-            .min_by_key(|&(cost, _)| cost)
+            .min_by_key(|&(rank, _)| rank)
             .map_or(Decision::NoAction, |(_, alternative)| alternative)
     }
 

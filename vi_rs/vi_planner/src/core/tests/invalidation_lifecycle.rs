@@ -3,10 +3,52 @@ use super::invalidation::{drain, policies};
 use super::*;
 
 #[test]
-fn a_scan_off_the_route_does_not_pause_a_locally_consistent_action() {
+fn repeated_scan_changes_keep_a_safe_detour_available() {
     for compact in [false, true] {
         let mut b = build(80);
         b.actions[0] = Action::new("forward", 0.5, 0.0, 0);
+        let mut core = PlannerCore::new(b, if compact { cfg_compact() } else { cfg() });
+        let robot = pose(1.025, 2.025, 0.0);
+        core.prepare_goal(pose(3.525, 2.025, 0.0), &AtomicBool::new(false))
+            .expect("solve");
+        core.set_window(robot);
+        assert_eq!(
+            core.decide(robot),
+            Decision::Action {
+                id: Some(0),
+                fw: 0.5,
+                rot_deg: 0.0,
+            }
+        );
+
+        for range in [0.55, 0.60, 0.55, 0.60] {
+            core.observe_scan(
+                &LaserScan {
+                    ranges: vec![range],
+                    ..LaserScan::default()
+                },
+                robot,
+            );
+            assert!(
+                !core.advance_invalidations(1),
+                "fixture must still be repairing"
+            );
+            assert!(
+                matches!(core.decide(robot), Decision::Action { rot_deg, .. } if rot_deg != 0.0),
+                "the front hit needs a collision-free turn, not a stop (compact={compact})"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_scan_off_the_route_does_not_pause_a_locally_consistent_action() {
+    for compact in [false, true] {
+        let mut b = build(80);
+        // With no alternative, a hit on the only swept path must stop guidance.
+        b.actions = vec![Action::new("forward", 0.5, 0.0, 0)];
+        // A forward-only policy cannot correct lateral transition uncertainty.
+        b.goal_margin_radius = 0.65;
         let mut core = PlannerCore::new(b, if compact { cfg_compact() } else { cfg() });
         let robot = pose(1.025, 2.025, 0.0);
         core.prepare_goal(pose(3.525, 2.025, 0.0), &AtomicBool::new(false)).expect("solve");
