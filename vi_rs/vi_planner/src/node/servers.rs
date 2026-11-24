@@ -269,6 +269,7 @@ pub fn nav_to_pose_server(
                 let feedback = executing.feedback_publisher();
                 let (done_tx, done_rx) = futures::channel::oneshot::channel::<Outcome>();
                 let cancel_t = Arc::clone(&my_cancel);
+                let h_cancel = Arc::clone(&h);
                 std::thread::spawn(move || {
                     let ctx = h.follow_ctx(tuning, true);
                     let retries = AtomicU64::new(0);
@@ -308,6 +309,7 @@ pub fn nav_to_pose_server(
                         my_cancel.store(true, Ordering::SeqCst);
                         let cancelling = executing.begin_cancelling();
                         let _ = rest.await;
+                        stop_cmd(&h_cancel.cmd_pub);
                         eprintln!("vi_planner: cancelled by client");
                         cancelling
                             .cancelled_with(nav2_msgs::action::NavigateToPose_Result::default())
@@ -400,6 +402,7 @@ pub fn follow_waypoints_server(
                 let (done_tx, done_rx) =
                     futures::channel::oneshot::channel::<(TourOutcome, Vec<usize>)>();
                 let cancel_t = Arc::clone(&my_cancel);
+                let h_cancel = Arc::clone(&h);
                 std::thread::spawn(move || {
                     let ctx = h.follow_ctx(tuning, true);
                     let retries = AtomicU64::new(0);
@@ -502,6 +505,7 @@ pub fn follow_waypoints_server(
                         my_cancel.store(true, Ordering::SeqCst);
                         let cancelling = executing.begin_cancelling();
                         let _ = rest.await;
+                        stop_cmd(&h_cancel.cmd_pub);
                         eprintln!("vi_planner: tour cancelled by client");
                         cancelling
                             .cancelled_with(nav2_msgs::action::FollowWaypoints_Result::default())
@@ -551,6 +555,7 @@ pub fn follow_path_server(
                 let feedback = executing.feedback_publisher();
                 let (done_tx, done_rx) = futures::channel::oneshot::channel::<Outcome>();
                 let cancel_t = Arc::clone(&my_cancel);
+                let h_cancel = Arc::clone(&h);
                 std::thread::spawn(move || {
                     // Nav2 構成で `plan` を出すのは compute_path_to_pose の側。
                     let ctx = h.follow_ctx(tuning, false);
@@ -592,6 +597,7 @@ pub fn follow_path_server(
                         my_cancel.store(true, Ordering::SeqCst);
                         let cancelling = executing.begin_cancelling();
                         let _ = rest.await;
+                        stop_cmd(&h_cancel.cmd_pub);
                         eprintln!("vi_planner: cancelled by client");
                         cancelling.cancelled_with(nav2_msgs::action::FollowPath_Result::default())
                     }

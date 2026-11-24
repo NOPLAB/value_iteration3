@@ -152,6 +152,22 @@ def main():
             assert any(cmd.linear.x < 0.0 or cmd.angular.z != 0.0 for cmd in commands)
             cancel(handle, result)
             print("PASS: queued scan keeps its observation pose after a pose update", flush=True)
+
+            # Nav2's BT resends the goal whenever the path changes. Taking over
+            # must not insert a stop, but a client cancel must still stop.
+            def moving(cmd):
+                return cmd.linear.x != 0.0 or cmd.angular.z != 0.0
+
+            handle, result = send_goal()
+            spin_until(lambda: any(moving(cmd) for cmd in commands))
+            commands.clear()
+            resent, resent_result = send_goal()
+            spin_until(result.done)
+            spin_until(lambda: len(commands) >= 10)
+            assert all(moving(cmd) for cmd in commands), "resending the goal published a stop"
+            cancel(resent, resent_result)
+            spin_until(lambda: commands and not moving(commands[-1]))
+            print("PASS: a resent goal keeps driving and a client cancel stops", flush=True)
         finally:
             process.terminate()
             process.wait(timeout=10)
