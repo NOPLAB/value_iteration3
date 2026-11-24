@@ -86,7 +86,8 @@ pub struct PlanConfig {
     /// 開いた分は `global_sweep` 経由で広域の場にも伝わる (寿命は local_penalty と
     /// 同じ = そのゴールの間だけ)。
     pub map_clear_from_scan: bool,
-    /// DWA/MPPI: 制御周期 [s] (= 1/control_frequency)。候補評価の時間刻みの上限。
+    /// 制御周期 [s] (= 1/control_frequency)。DWA/MPPI は候補評価の時間刻みの上限、
+    /// greedy は 1 秒の行動を何 tick 続けるかに使う。
     pub dwa_tick_s: f64,
     /// DWA/MPPI: 前方シミュレーション時間 [s]。
     pub dwa_horizon_s: f64,
