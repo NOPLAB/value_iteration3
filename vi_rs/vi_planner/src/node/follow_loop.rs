@@ -213,8 +213,10 @@ pub fn run_follow(
     let mut creep_rot = 0.0f64;
     loop {
         let tick_start = Instant::now();
+        // cancel では止めない。BT は経路が更新されるたびに follow_path を送り直す
+        // ので、ここで 0 速度を出すとリプランのたびに停止が挟まる。後続の追従が
+        // そのまま指令を引き継ぎ、クライアントの cancel はサーバ側で止める。
         if cancel.load(Ordering::Relaxed) {
-            stop_cmd(cmd_pub);
             return Outcome::Preempted;
         }
 
@@ -472,7 +474,6 @@ pub fn run_follow(
         // ロックを握っていたので起こらなかった)。古いループの指令が新しい
         // ループの指令を上書きしないよう、publish の直前でもう一度観測する。
         if cancel.load(Ordering::Relaxed) {
-            stop_cmd(cmd_pub);
             return Outcome::Preempted;
         }
 
