@@ -38,7 +38,7 @@ use crate::value_iterator::ValueIterator;
 
 use super::frontier2d_pad::{action_cost_pad, Padded};
 use super::frontier2d_par::{final_policy, final_policy_hot, n_threads};
-use super::{async_gs_engine, seed_frontier_2d};
+use super::{async_gs_engine, dilate_2d_once, seed_frontier_2d};
 
 // AtomicU64 は u64 と同一のメモリ表現を持つ (std ドキュメント保証) — `Vec<[u64; 2]>` を
 // `&[[AtomicU64; 2]]` として再解釈する前提をコンパイル時に固定する。
@@ -70,7 +70,7 @@ pub fn frontier2d_par_unsafe_solve_observed(
     let hot_atomic: &[[AtomicU64; 2]] =
         unsafe { std::slice::from_raw_parts(hot.as_mut_ptr().cast::<[AtomicU64; 2]>(), n_pad) };
 
-    let cand_list: Vec<(u32, u32)> = seed_frontier_2d(vi).dilate(dx, dy).enumerate().collect();
+    let cand_list = dilate_2d_once(nx as u32, ny as u32, &seed_frontier_2d(vi), dx, dy);
     let interval = obs.interval();
     let m_ref = &m;
 

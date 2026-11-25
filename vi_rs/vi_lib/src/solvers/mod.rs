@@ -9,9 +9,8 @@ use std::sync::Barrier;
 use crate::params::MAX_COST;
 use crate::value_iterator::ValueIterator;
 
-// フロンティアには実績ある word 並列 Bitboard を再利用する（u16 frontier の高速化の源）。
-// Bitboard は値の型に非依存なので u64 モデルでもそのまま使える。dilate は theta periodic。
-pub(crate) use crate::bitboard::{Bitboard2D, Bitboard3D};
+// フロンティア膨張には行スパン付き 2 パス分離膨張 (Frontier2D) を使う。
+pub(crate) use crate::frontier::{dilate_2d_once, Frontier2D};
 
 pub mod block;
 #[cfg(test)]
@@ -60,25 +59,28 @@ pub(crate) fn displacement(vi: &ValueIterator) -> (i32, i32, i32) {
 }
 
 /// 初期フロンティア種: `total_cost < MAX_COST` のセル（`set_goal` 後の `final_state` セル）。
-pub(crate) fn seed_frontier(vi: &ValueIterator) -> Bitboard3D {
-    let mut bb = Bitboard3D::new(vi.cell_num_x as u32, vi.cell_num_y as u32, vi.cell_num_t as u32);
+pub(crate) fn seed_frontier(vi: &ValueIterator) -> Vec<(u32, u32, u32)> {
+    let mut out = Vec::new();
     for s in &vi.states {
         if s.total_cost < MAX_COST {
-            bb.set(s.ix as u32, s.iy as u32, s.it as u32);
+            out.push((s.ix as u32, s.iy as u32, s.it as u32));
         }
     }
-    bb
+    out
 }
 
-/// 初期フロンティア種 (2D): いずれかの θ で `total_cost < MAX_COST` の (ix,iy)。
-pub(crate) fn seed_frontier_2d(vi: &ValueIterator) -> Bitboard2D {
-    let mut bb = Bitboard2D::new(vi.cell_num_x as u32, vi.cell_num_y as u32);
+/// 初期フロンティア種 (2D): いずれかの θ で `total_cost < MAX_COST` の `(ix, iy)`（重複なし）。
+pub(crate) fn seed_frontier_2d(vi: &ValueIterator) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
     for s in &vi.states {
         if s.total_cost < MAX_COST {
-            bb.set(s.ix as u32, s.iy as u32);
+            let xy = (s.ix as u32, s.iy as u32);
+            if out.last() != Some(&xy) {
+                out.push(xy);
+            }
         }
     }
-    bb
+    out
 }
 
 /// 収束後の最終 argmin パス（並列・読み取り専用）の共通実装。frontier2d_par /
@@ -281,6 +283,8 @@ where
         let interval = obs_interval.max(1) as u64;
         let mut next_boundary: u64 = interval;
         let mut iter_count: u32 = 0;
+        let mut dilator = Frontier2D::new(nx as u32, ny as u32);
+        let mut touched: Vec<(u32, u32)> = Vec::new();
         let mut outcome: Option<SolveOutcome> = None;
         loop {
             // SAFETY: compute 相 (B2 後〜B1 前)。
@@ -294,18 +298,13 @@ where
             // ここでは全ワーカーが B2 で待機している (compute 書き込みは静止) ので、
             // boundary の具現化 (write_back / argmin) は共有配列を安全に読める。
             iter_count += 1;
-            let mut any = false;
-            let mut nf = Bitboard2D::new(nx as u32, ny as u32);
+            touched.clear();
             for i in 0..nthreads {
                 // SAFETY: B1 後、各 changed[i] への書きは完了し可視。
                 let cl = unsafe { &*shared.changed.add(i) };
-                if !cl.is_empty() {
-                    any = true;
-                }
-                for &(ixu, iyu) in cl {
-                    nf.set(ixu, iyu);
-                }
+                touched.extend_from_slice(cl);
             }
+            let any = !touched.is_empty();
             let updates_now = updates_total.load(Ordering::Relaxed);
             let mut flow = SolveFlow::Continue;
             if any && iter_count < max_iter && iter_count as u64 >= next_boundary {
@@ -313,7 +312,7 @@ where
                 flow = boundary(iter_count, updates_now);
             }
             if any && iter_count < max_iter && flow == SolveFlow::Continue {
-                let mut next: Vec<(u32, u32)> = nf.dilate(dx, dy).enumerate().collect();
+                let mut next = dilator.dilate(&touched, dx, dy);
                 // 対称 Gauss-Seidel 風: 走査方向をラウンドごとに反転。
                 if iter_count % 2 == 1 {
                     next.reverse();
@@ -685,7 +684,7 @@ mod helper_tests {
         let seed = seed_frontier(&vi);
         let n_final = vi.states.iter().filter(|s| s.total_cost < crate::params::MAX_COST).count();
         assert!(n_final > 0, "goal セルが存在するはず");
-        assert_eq!(seed.popcount(), n_final as u64);
+        assert_eq!(seed.len(), n_final);
     }
 
     #[test]

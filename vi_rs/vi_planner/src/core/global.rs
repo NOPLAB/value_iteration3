@@ -78,15 +78,11 @@ impl PlannerCore {
             let sw = &mut self.sweep;
             let reach = *sw.reach.get_or_insert_with(|| {
                 let r = transition_reach(base);
-                assert!((1..64).contains(&r));
+                assert!(r >= 1);
                 r as u32
             });
             if sw.pos >= sw.cands.len() {
-                sw.cands.clear();
-                sw.pos = 0;
-                if let Some(seed) = sw.pending.take() {
-                    sw.cands.extend(seed.dilate(reach, reach).enumerate());
-                }
+                sw.refill_cands(base.cell_num_x, base.cell_num_y, reach);
             }
             if sw.cands.is_empty() {
                 self.settle_global();
