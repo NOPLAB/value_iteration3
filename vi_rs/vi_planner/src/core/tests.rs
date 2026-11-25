@@ -1249,6 +1249,7 @@ fn decide_borrows_action_from_neighbors() {
         follow: strict_follow,
         global: global::Manager::default(),
         scan_collision: ScanCollision::default(),
+        scan_hold: HashMap::new(),
         running_action: Mutex::new(None),
     };
     assert_eq!(strict_core.decide(on_obstacle), Decision::NoAction);
@@ -1268,6 +1269,7 @@ fn decide_borrows_action_from_neighbors() {
         follow: relaxed_follow,
         global: global::Manager::default(),
         scan_collision: ScanCollision::default(),
+        scan_hold: HashMap::new(),
         running_action: Mutex::new(None),
     };
     assert!(matches!(relaxed_core.decide(on_obstacle), Decision::Action { .. }));
@@ -1431,6 +1433,34 @@ fn sweeping_stops_once_the_field_settles() {
     assert!(!core.is_dirty(), "同じ入力の再注入で伝播を再開しないこと");
     core.observe_scan_gated(&scan, robot, 1);
     assert!(core.is_dirty(), "値を反復する前でも入力コストの変更は伝播させること");
+}
+
+/// 静止した機体でも、LiDAR のノイズで当たり位置は 1 セルほど前後する。ずれた 2 枚の
+/// スキャンを交互に入れても、両方を一度見たあとは入力の増加と判定しないこと。
+/// 増加と判定されると、そのたびに方策の閉包が遠方まで無効化される
+/// (19F 実機で、静止中に /value_function が明滅し続けた原因)。
+#[test]
+fn alternating_noisy_scans_stop_invalidating_once_both_were_seen() {
+    let mut core = PlannerCore::new(corridor(64, 20, 30), cfg());
+    let cancel = AtomicBool::new(false);
+    core.prepare_goal(pose(2.8, 1.25, 0.0), &cancel).expect("solve");
+    let robot = pose(1.5, 1.25, 0.0);
+    core.set_window(robot);
+
+    let mut invalidated = Vec::new();
+    for k in 0..20 {
+        let range = if k % 2 == 0 { 0.55 } else { 0.62 };
+        let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![range] };
+        core.observe_scan(&scan, robot);
+        invalidated.push(core.global.invalidating());
+        while !core.advance_invalidations(512) {}
+    }
+    assert!(invalidated[0], "fixture: the first hit must invalidate");
+    assert_eq!(
+        invalidated[2..],
+        [false; 18],
+        "re-hitting cells that the previous scan only decayed must not invalidate"
+    );
 }
 
 /// 通路を塞いだ場を、窓ごと動かしてから伝播させる。テストごとに同じ状況を作る。

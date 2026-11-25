@@ -85,8 +85,12 @@ localization uncertainty inflation. It does not specify a collision footprint.
 Scan cost is represented exactly as `scan_penalty * 2^18`, with no power-of-two
 rounding. Localization quality attenuates the configured strength by right shifts,
 with a minimum of one cost unit when enabled; beam traversal still halves existing
-fixed-point penalties. Compact planning stores exact theta-uniform penalties in
-an 8-byte-per-map-cell overlay, including decayed values after patch recentering.
+fixed-point penalties, except in cells hit within the last 10 scans. Scan noise
+moves a hit by about one cell even when the robot stands still, so without that
+hold a cell would be halved and re-raised every other scan, and each re-raise
+invalidates every policy that depends on it. Compact planning stores exact
+theta-uniform penalties in an 8-byte-per-map-cell overlay, including decayed values
+after patch recentering.
 
 Greedy following checks the circular footprint along one second of the selected
 motion against the latest scan hits projected at observation time. If it would hit an obstacle between

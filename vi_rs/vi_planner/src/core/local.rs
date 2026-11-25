@@ -97,14 +97,64 @@ impl PlannerCore {
         let radius = self.cfg.scan_penalty_radius;
         let penalty = self.cfg.scan_penalty;
         let before = self.local_inputs();
+        let mut inject = 0;
         if let Some(vi) = self.local_mut() {
             vi.clear_map_from_scan = map_clear;
             vi.scan_penalty_radius = radius;
             vi.scan_penalty = penalty;
+            inject = vi.scan_injection(shift);
             vi.set_local_cost_attenuated(scan, pose.x, pose.y, pose.yaw_rad, shift);
         }
+        self.hold_scan_hits(&before, inject);
         self.harvest_penalties();
         self.invalidate_local_inputs(before);
+    }
+
+    /// 直近 [`SCAN_HIT_HOLD`] 枚のうちに当たったセルへ、このスキャンが掛けた半減を
+    /// 戻す。`before` は注入前の [`Self::local_inputs`] (同じ窓・同じ走査順)。
+    /// 当たりは、このスキャンの注入値ちょうどになったセルとして数える。弱い注入
+    /// (品質ゲートや `scan_penalty: 0`) で値が下がるのは当たりなので、そのまま通す。
+    fn hold_scan_hits(&mut self, before: &[(bool, u64, u64)], inject: u64) {
+        let p0 = if self.cfg.use_compact() {
+            self.patch.as_ref().and_then(|p| p.at).unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
+        let held = std::mem::take(&mut self.scan_hold);
+        let mut hold = HashMap::new();
+        if let Some(vi) = self.local_mut() {
+            let nt = vi.base.cell_num_t as usize;
+            let mut old = before.iter();
+            'rows: for y in vi.local_iy_min..=vi.local_iy_max {
+                for x in vi.local_ix_min..=vi.local_ix_max {
+                    if !vi.in_local_area(x, y) {
+                        continue;
+                    }
+                    let Some(&(_, _, prev)) = old.next() else {
+                        break 'rows;
+                    };
+                    let key = (x + p0.0, y + p0.1);
+                    let base = vi.base.to_index(x, y, 0) as usize;
+                    let now = vi.base.states[base].local_penalty;
+                    if now == inject {
+                        // 当たり。罰則が無効 (注入 0) なら消すのも当たりで、保留しない。
+                        if inject > 0 {
+                            hold.insert(key, SCAN_HIT_HOLD);
+                        }
+                    } else if let Some(&left) = held.get(&key) {
+                        if now < prev {
+                            for s in &mut vi.base.states[base..base + nt] {
+                                s.local_penalty = prev;
+                            }
+                        }
+                        if left > 1 {
+                            hold.insert(key, left - 1);
+                        }
+                    }
+                }
+            }
+        }
+        self.scan_hold = hold;
     }
 
     /// 自己位置の広がり `sigma_m` [m] に応じて壁際のマージンを広げる
