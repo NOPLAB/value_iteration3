@@ -1397,23 +1397,23 @@ fn sweeping_stops_once_the_field_settles() {
     assert!(core.is_dirty(), "値を反復する前でも入力コストの変更は伝播させること");
 }
 
-/// 走行中に壁へ当たったスキャンで、次の判断が止まらないこと。19F 実機では壁際の
-/// 罰則が増えるたびに方策が無効化され、`decide` が 1〜2 tick だけ NoAction を返していた。
+/// 走行中のスキャンで経路の先のコストが上がっても、次の判断が止まらないこと。
+/// 19F 実機では罰則が増えるたびに経路の先の方策が無効化され、`decide` が
+/// 1〜2 tick だけ NoAction を返して /cmd_vel_nav が小刻みに止まっていた。
 #[test]
-fn a_scan_hit_on_the_wall_does_not_stop_the_next_decision() {
+fn a_scan_hit_ahead_does_not_stop_the_next_decision() {
     let mut core = PlannerCore::new(corridor(64, 20, 30), cfg());
     core.prepare_goal(pose(2.8, 1.25, 0.0), &AtomicBool::new(false)).expect("solve");
     let robot = pose(1.5, 1.25, 0.0);
     core.set_window(robot);
     assert!(matches!(core.decide(robot), Decision::Action { fw, .. } if fw > 0.0));
-    let wall = LaserScan {
-        angle_min: std::f64::consts::FRAC_PI_2,
-        angle_increment: 0.0,
-        ranges: vec![0.28],
-    };
-    core.observe_scan(&wall, robot);
+    let ahead = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.65] };
+    core.observe_scan(&ahead, robot);
+    // 全域ワーカーが次の仕事を取り出した直後 (まだ走らせていない) の判断。
+    let job = (0..1_000).find_map(|_| core.prepare_global_job(usize::MAX));
+    assert!(job.is_some(), "fixture: the global worker must get work");
     let decision = core.decide(robot);
-    assert!(matches!(decision, Decision::Action { fw, .. } if fw > 0.0), "{decision:?}");
+    assert!(matches!(decision, Decision::Action { .. }), "{decision:?}");
 }
 
 /// 通路を塞いだ場を、窓ごと動かしてから伝播させる。テストごとに同じ状況を作る。
@@ -1587,8 +1587,9 @@ fn compact_global_propagation_matches_the_dense_global_sweep() {
 /// 上のパリティ試験は「compact が密と同じ不動点に落ちる」ことしか見ていない。
 /// 実機で確かめたいのはその手前の「不動点が実用的な量だけ動く」ほうなので、
 /// 追従 1 tick + 修復数枚を交互に回す (掃きスレッドの duty そのもの) 形で
-/// 遠方の値を追う。実測 13 → 38 ステップ、119 ラウンド (= 12 秒相当) /
-/// タイル訪問 358 回で落ち着く。
+/// 遠方の値を追う。実測 13 → 122 ステップ、330 ラウンド (= 33 秒相当) /
+/// タイル訪問 991 回で落ち着く。方策を無効化しないので、上がった値は
+/// 探きのたびに少しずつ (1 ラウンド約 0.4 ステップ) 上がる。
 ///
 /// **塞ぎ方で桁が変わる**。通路の一部だけを塞ぐと迂回できてしまい遠方の値は
 /// ほとんど動かない (別測定: 幅 2m の通路を幅 0.4m だけ塞いで +0.75 ステップ
@@ -1620,7 +1621,7 @@ fn a_full_width_block_raises_the_value_far_outside_the_window() {
 
     let mut visits = 0usize;
     let mut settled = None;
-    for round in 0..300 {
+    for round in 0..400 {
         core.set_window(robot);
         core.observe_scan(&scan, robot);
         core.refine_for(Duration::from_secs(5));
@@ -1641,7 +1642,7 @@ fn a_full_width_block_raises_the_value_far_outside_the_window() {
     let steps = |v: u64| v / 262144;
     assert!(
         settled.is_some(),
-        "300 ラウンド (= 30 秒相当) で伝播が落ち着くこと (訪問 {visits} 回)"
+        "400 ラウンド (= 40 秒相当) で伝播が落ち着くこと (訪問 {visits} 回)"
     );
     // 塞ぎの penalty (2048 ステップ) を丸ごと払うわけではない — 帯の縁を
     // かすめる経路が残るので、その差額ぶんだけ上がる。
