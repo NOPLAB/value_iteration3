@@ -17,7 +17,7 @@ use crate::solvers::observe::{
 use crate::value_iterator::ValueIterator;
 
 use super::frontier2d_pad::{action_cost_pad, HotCells, Padded};
-use super::{seed_frontier_2d, Bitboard2D};
+use super::{seed_frontier_2d, Frontier2D};
 
 pub(crate) fn n_threads() -> usize {
     // ベンチ用スレッド数オーバーライド (Fig.21/22 のスレッド掃引)。既定は論理コア数。
@@ -96,28 +96,32 @@ pub fn frontier2d_par_solve_observed(
 
     let (dx, dy) = (m.mx as u32, m.my as u32);
     let mut pacer = BoundaryPacer::new(obs);
+    let mut dilator = Frontier2D::new(nx as u32, ny as u32);
     let mut frontier = seed_frontier_2d(vi);
+    let mut candidates = Vec::new();
     let mut updates: u64 = 0;
     let mut iters: u32 = 0;
     let mut flow = SolveFlow::Continue;
 
-    while frontier.popcount() > 0 && iters < max_iter {
+    while !frontier.is_empty() && iters < max_iter {
         iters += 1;
-        let candidates: Vec<(u32, u32)> = frontier.dilate(dx, dy).enumerate().collect();
+        dilator.dilate_into(&frontier, dx, dy, &mut candidates);
         let results = compute_round(&m, &candidates, nthreads);
 
         // ── apply (直列): hot 書き戻し + new_frontier 構築。──
-        let mut new_frontier = Bitboard2D::new(nx as u32, ny as u32);
+        frontier.clear();
         for ups in &results {
             for &(pad_idx, min_cost, ixu, iyu) in ups {
                 m.hot[pad_idx][0] = min_cost;
                 updates += 1;
-                new_frontier.set(ixu, iyu);
+                let xy = (ixu, iyu);
+                if frontier.last() != Some(&xy) {
+                    frontier.push(xy);
+                }
             }
         }
-        frontier = new_frontier;
 
-        if frontier.popcount() > 0 && pacer.due(iters as u64) {
+        if !frontier.is_empty() && pacer.due(iters as u64) {
             // ラウンド間なので m は静止している。具現化 (write_back + argmin) は
             // 観測されたときだけ走る。
             let mut mat = |vi: &mut ValueIterator| {
@@ -132,7 +136,7 @@ pub fn frontier2d_par_solve_observed(
             }
         }
     }
-    let converged = flow == SolveFlow::Continue && frontier.popcount() == 0;
+    let converged = flow == SolveFlow::Continue && frontier.is_empty();
 
     if flow == SolveFlow::Cancel {
         // 中断: 場は保証しない契約なので書き戻しをスキップして即戻る。

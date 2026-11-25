@@ -46,6 +46,5 @@ pub use localize::{BeliefConfig, ExternalLocalizer, GridLocalizer, Localizer};
 
 pub mod belief;
 
-// 旧 vi_algorithm から取り込んだ word 並列 bitboard プリミティブ。solvers のフロンティアが
-// 使い、vi_bench の bitboard マイクロベンチが `vi_lib::bitboard` として参照する。
-pub mod bitboard;
+// 2D 活性セル集合の膨張器 (行スパン付き 2 パス分離膨張)。solvers と vi_planner が共有する。
+pub mod frontier;

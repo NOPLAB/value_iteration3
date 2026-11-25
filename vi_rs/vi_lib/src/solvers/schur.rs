@@ -56,7 +56,7 @@ use std::path::Path;
 
 use crate::params::{MAX_COST, PROB_BASE};
 use crate::solvers::observe::{BoundaryPacer, InPlaceProbe, SolveFlow, SolveObserver, SolveOutcome};
-use crate::solvers::{displacement, frontier2d::frontier2d_solve_observed, Bitboard2D, REACH_THRESH};
+use crate::solvers::{displacement, frontier2d::frontier2d_solve_observed, Frontier2D, REACH_THRESH};
 use crate::state::State;
 use crate::value_iterator::{min_action_cost, to_index_raw, value_iteration_raw, ValueIterator};
 
@@ -1308,17 +1308,22 @@ fn exactify(
 ) -> SolveOutcome {
     let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
     let (mx, my, _) = displacement(vi);
-    let mut frontier = Bitboard2D::new(nx as u32, ny as u32);
+    let mut dilator = Frontier2D::new(nx as u32, ny as u32);
+    let mut frontier: Vec<(u32, u32)> = Vec::new();
     for s in &vi.states {
         if s.total_cost < MAX_COST {
-            frontier.set(s.ix as u32, s.iy as u32);
+            let xy = (s.ix as u32, s.iy as u32);
+            if frontier.last() != Some(&xy) {
+                frontier.push(xy);
+            }
         }
     }
-    while frontier.popcount() > 0 && iters < max_iter {
+    let mut candidates = Vec::new();
+    while !frontier.is_empty() && iters < max_iter {
         iters += 1;
-        let candidates = frontier.dilate(mx as u32, my as u32);
-        let mut next = Bitboard2D::new(nx as u32, ny as u32);
-        for (ix, iy) in candidates.enumerate() {
+        dilator.dilate_into(&frontier, mx as u32, my as u32, &mut candidates);
+        frontier.clear();
+        for &(ix, iy) in &candidates {
             let mut u = 0u64;
             for it in 0..nt {
                 let idx = to_index_raw(ix as i32, iy as i32, it, nx, nt) as usize;
@@ -1328,11 +1333,10 @@ fn exactify(
             }
             if u > 0 {
                 updates += u;
-                next.set(ix, iy);
+                frontier.push((ix, iy));
             }
         }
-        frontier = next;
-        if frontier.popcount() > 0 && pacer.due(iters as u64) {
+        if !frontier.is_empty() && pacer.due(iters as u64) {
             let mut probe = InPlaceProbe { vi, iters, updates };
             match obs.boundary(&mut probe) {
                 SolveFlow::Continue => {}
@@ -1341,7 +1345,7 @@ fn exactify(
             }
         }
     }
-    SolveOutcome::running(iters, updates, frontier.popcount() == 0)
+    SolveOutcome::running(iters, updates, frontier.is_empty())
 }
 
 /// 場が処女 (非 final は全部 MAX_COST、local_penalty なし) か。

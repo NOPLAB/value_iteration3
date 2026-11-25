@@ -28,7 +28,7 @@ use crate::value_iterator::ValueIterator;
 use super::frontier2d_fused::{action_cost_fused, CpCells, Geom, UNREACHED};
 use super::frontier2d_par::n_threads;
 use super::frontier2d_sparse::rot_dilate;
-use super::{displacement, Bitboard2D};
+use super::{displacement, Frontier2D};
 use crate::planner::{CompactPolicy, PolicyView};
 use crate::solvers::observe::{NullObserver, SolveFlow, SolveObserver, SolveProbe};
 
@@ -907,12 +907,12 @@ fn converge_band_async(
     src: &dyn StateSource,
     nthreads: usize,
     nx: i32,
-    ny: i32,
     dx: u32,
     dy: u32,
     t: u64,
     max_iter: u32,
     cancel: &AtomicBool,
+    dilator: &mut Frontier2D,
     frontier: &mut Vec<(u32, u32)>,
     col_min: &mut [u64],
     col_max: &mut [u64],
@@ -997,7 +997,6 @@ fn converge_band_async(
             mask[midx(x as i32, y as i32)] = 0;
         }
         prev_cells.clear();
-        let mut changed = Bitboard2D::new(nx as u32, ny as u32);
         let mut any = false;
         for part in &results {
             for &(i, mn, mx_, ups, cmask) in part {
@@ -1015,7 +1014,6 @@ fn converge_band_async(
                     let iy = (i / nx as usize) as i32;
                     mask[midx(ix, iy)] = cmask;
                     prev_cells.push((ix as u32, iy as u32));
-                    changed.set(ix as u32, iy as u32);
                 }
             }
         }
@@ -1027,9 +1025,9 @@ fn converge_band_async(
         if !any {
             break true;
         }
-        *frontier = changed
-            .dilate(dx, dy)
-            .enumerate()
+        *frontier = dilator
+            .dilate(&prev_cells, dx, dy)
+            .into_iter()
             .filter(|&(ixu, iyu)| !col_final[cidx(ixu as i32, iyu as i32)])
             .collect();
     };
@@ -1349,9 +1347,10 @@ fn solve_compact_core(
     let mut freed_blocks = 0u64;
 
     // 初期フロンティア（ゴール列を依存窓で膨張）。seed は src.for_each_seed（ゴール局所）から作る。
-    let mut seed_bb = Bitboard2D::new(nx as u32, ny as u32);
-    src.for_each_seed(&mut |ix, iy, _it| seed_bb.set(ix as u32, iy as u32));
-    let mut frontier: Vec<(u32, u32)> = seed_bb.dilate(dx, dy).enumerate().collect();
+    let mut dilator = Frontier2D::new(nx as u32, ny as u32);
+    let mut seed_cells: Vec<(u32, u32)> = Vec::new();
+    src.for_each_seed(&mut |ix, iy, _it| seed_cells.push((ix as u32, iy as u32)));
+    let mut frontier = dilator.dilate(&seed_cells, dx, dy);
 
     let mut store = BlockStore::new(g, src);
     let band = band_override.unwrap_or_else(|| couple_margin(g, store.max_pen));
@@ -1382,9 +1381,9 @@ fn solve_compact_core(
         //    async G-S × θマスク疎評価（nthreads==1 は単一ワーカー）。max_iter 到達なら
         //    'outer を false で抜ける。 ──
         let band_ok = converge_band_async(
-            &mut store, g, src, nthreads, nx, ny, dx, dy, t, max_iter, cancel, &mut frontier,
-            &mut col_min, &mut col_max, &col_final, &mut reached, &mut live, &mut iters,
-            &mut total_updates, &mut mask, mw, mt, full_mask,
+            &mut store, g, src, nthreads, nx, dx, dy, t, max_iter, cancel, &mut dilator,
+            &mut frontier, &mut col_min, &mut col_max, &col_final, &mut reached, &mut live,
+            &mut iters, &mut total_updates, &mut mask, mw, mt, full_mask,
         );
         if !band_ok {
             break 'outer false;
@@ -1455,17 +1454,17 @@ fn solve_compact_core(
 
         // T を次バンドへ進め、deferred（live かつ col_min < 新 T）を膨張して再活性。
         t = t.saturating_add(band);
-        let mut react = Bitboard2D::new(nx as u32, ny as u32);
+        let mut react: Vec<(u32, u32)> = Vec::new();
         for &i in &live {
             if col_min[i] < t {
                 let ix = (i % nx as usize) as u32;
                 let iy = (i / nx as usize) as u32;
-                react.set(ix, iy);
+                react.push((ix, iy));
             }
         }
-        frontier = react
-            .dilate(dx, dy)
-            .enumerate()
+        frontier = dilator
+            .dilate(&react, dx, dy)
+            .into_iter()
             .filter(|&(ixu, iyu)| !col_final[cidx(ixu as i32, iyu as i32)])
             .collect();
     };

@@ -186,12 +186,7 @@ impl PlannerCore {
         if let Some(r) = self.repair.as_ref() {
             !r.queue.is_empty()
         } else {
-            self.sweep.pos < self.sweep.cands.len()
-                || self
-                    .sweep
-                    .pending
-                    .as_ref()
-                    .is_some_and(|p| p.popcount() > 0)
+            self.sweep.pos < self.sweep.cands.len() || self.sweep.pending_len() > 0
         }
     }
 

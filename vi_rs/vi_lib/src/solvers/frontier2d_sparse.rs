@@ -35,7 +35,7 @@ use crate::solvers::observe::{
     MaterializeProbe, SolveFlow, SolveObserver, SolveOutcome,
 };
 use super::frontier2d_par::n_threads;
-use super::{displacement, seed_frontier_2d, Bitboard2D};
+use super::{displacement, seed_frontier_2d, Frontier2D};
 
 /// θ マスクを円環 (周期 `nt`) で ±k 膨張する。回転アクションは dix=diy=0 で自セルも
 /// 窓に含むため、変化 θ から `circ(θ′−θ) ≤ mt` の θ を再評価対象に広げる
@@ -192,8 +192,8 @@ pub fn frontier2d_sparse_solve_observed(
         .collect();
     let midx = |ix: i32, iy: i32| -> usize { (ix + mx) as usize + (iy + my) as usize * mw };
 
-    let mut cand_list: Vec<(u32, u32)> =
-        seed_frontier_2d(vi).dilate(dx, dy).enumerate().collect();
+    let mut dilator = Frontier2D::new(nx as u32, ny as u32);
+    let mut cand_list = dilator.dilate(&seed_frontier_2d(vi), dx, dy);
 
     // 低メモリ動画モードの states 解放はここ (種付け後)。seed_frontier_2d は vi.states を
     // 走査して初期フロンティア (goal セル) を作るので、その前に解放すると種が空になり
@@ -364,21 +364,16 @@ pub fn frontier2d_sparse_solve_observed(
             }
             prev_cells.clear();
 
-            let mut any = false;
-            let mut nf = Bitboard2D::new(nx as u32, ny as u32);
             for i in 0..nthreads {
                 // SAFETY: B1 後、各 changed[i] への書きは完了し可視。
                 let cl = unsafe { &*shared.changed.add(i) };
-                if !cl.is_empty() {
-                    any = true;
-                }
                 for &(x, y, cm) in cl {
                     // セルの書き手は 1 スレッド = リストにも一意に現れる → store で足りる。
                     mask_ref[midx(x as i32, y as i32)].store(cm, Ordering::Relaxed);
-                    nf.set(x, y);
                     prev_cells.push((x, y));
                 }
             }
+            let any = !prev_cells.is_empty();
             let updates_now = updates_total.load(Ordering::Relaxed);
             let mut flow = SolveFlow::Continue;
             // 全ワーカーは B2 で待機中 (cp への書き込みは静止) — 具現化はここで安全。
@@ -399,7 +394,7 @@ pub fn frontier2d_sparse_solve_observed(
                 flow = obs.boundary(&mut probe);
             }
             if any && iter_count < max_iter && flow == SolveFlow::Continue {
-                let mut next: Vec<(u32, u32)> = nf.dilate(dx, dy).enumerate().collect();
+                let mut next = dilator.dilate(&prev_cells, dx, dy);
                 // 対称 G-S 風: 走査方向をラウンドごとに反転。
                 if iter_count % 2 == 1 {
                     next.reverse();

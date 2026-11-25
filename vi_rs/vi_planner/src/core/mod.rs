@@ -82,7 +82,7 @@ use vi_lib::solvers::{solve_observed, SolveFlow, SolveObserver, SolveProbe, U64S
 use vi_lib::value_iterator::ValueIterator;
 use vi_lib::{Action, LocalShapeConfig, ValueIteratorLocal};
 
-use vi_lib::bitboard::Bitboard2D;
+use vi_lib::frontier::Frontier2D;
 
 use compact::{
     new_patch, new_repair, transition_reach, CompactField, Patch, PenaltyOverlay, Repair,
@@ -195,9 +195,14 @@ impl CachedGoal {
 /// ラウンドを bounded なジョブへ切り出すため、その続きだけを核に保持する。
 #[derive(Default)]
 struct DenseSweep {
+    nx: usize,
+    /// `pending` に積み済みのセル印 (`iy * nx + ix`)。
+    pending_mark: Vec<u8>,
     /// **次の**ラウンドの種。前のラウンドで値が動いたセルと、狭域が外から
     /// 積んだ矩形が入る (2D。θ 層は候補セルごとにまとめて評価するので持たない)。
-    pending: Option<Bitboard2D>,
+    pending: Vec<(u32, u32)>,
+    /// 再利用する 2D フロンティア膨張器。
+    dilator: Option<Frontier2D>,
     /// いま処理中のラウンドの候補セル (種を `reach` だけ膨張させて列挙したもの)。
     cands: Vec<(u32, u32)>,
     /// `cands` の次に見る位置。
@@ -213,12 +218,47 @@ struct DenseSweep {
 impl DenseSweep {
     /// グローバルセル矩形 `(x0, x1, y0, y1)` (両端含む) を次ラウンドの種に加える。
     fn seed_rect(&mut self, nx: i32, ny: i32, (x0, x1, y0, y1): (i32, i32, i32, i32)) {
-        let bb = self.pending.get_or_insert_with(|| Bitboard2D::new(nx as u32, ny as u32));
+        let (nxu, nyu) = (nx.max(0) as usize, ny.max(0) as usize);
+        let total = nxu * nyu;
+        if self.nx != nxu || self.pending_mark.len() != total {
+            self.nx = nxu;
+            self.pending_mark.clear();
+            self.pending_mark.resize(total, 0);
+            self.pending.clear();
+            self.dilator = None;
+        }
         for iy in y0.max(0)..=y1.min(ny - 1) {
+            let row = iy as usize * nxu;
             for ix in x0.max(0)..=x1.min(nx - 1) {
-                bb.set(ix as u32, iy as u32);
+                let idx = row + ix as usize;
+                if self.pending_mark[idx] == 0 {
+                    self.pending_mark[idx] = 1;
+                    self.pending.push((ix as u32, iy as u32));
+                }
             }
         }
+    }
+
+    fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// 溜まった種を `reach` だけ膨張して `cands` に詰め、`pending` を空にする。
+    fn refill_cands(&mut self, nx: i32, ny: i32, reach: u32) {
+        self.cands.clear();
+        self.pos = 0;
+        if self.pending.is_empty() {
+            return;
+        }
+        let nxu = nx as usize;
+        for &(ix, iy) in &self.pending {
+            self.pending_mark[iy as usize * nxu + ix as usize] = 0;
+        }
+        let dil = self
+            .dilator
+            .get_or_insert_with(|| Frontier2D::new(nx as u32, ny as u32));
+        dil.dilate_into(&self.pending, reach, reach, &mut self.cands);
+        self.pending.clear();
     }
 
     /// 伝播 1 回ぶんの終わり。評価数はログ用に写してから畳む。
@@ -229,7 +269,10 @@ impl DenseSweep {
 
     /// 掃く仕事を捨てる (ゴールを解き直したとき)。`reach` は幾何なので残す。
     fn clear(&mut self) {
-        self.pending = None;
+        for &(ix, iy) in &self.pending {
+            self.pending_mark[iy as usize * self.nx + ix as usize] = 0;
+        }
+        self.pending.clear();
         self.cands.clear();
         self.pos = 0;
         self.settle();

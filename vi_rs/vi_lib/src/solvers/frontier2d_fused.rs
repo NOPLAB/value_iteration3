@@ -33,7 +33,7 @@ use crate::value_iterator::ValueIterator;
 
 use super::frontier2d_pad::{build_precomp, ActionTransitions};
 use super::frontier2d_par::n_threads;
-use super::{async_gs_engine, displacement, seed_frontier_2d};
+use super::{async_gs_engine, dilate_2d_once, displacement, seed_frontier_2d};
 
 /// 未確定/非 free の番兵。実 cp (< MAX_COST + pen 上限) と衝突しない。
 pub(crate) const UNREACHED: u64 = u64::MAX;
@@ -284,7 +284,7 @@ pub fn frontier2d_fused_solve_observed(
     let eval_ref: &[bool] = &f.eval_ok;
     let g_ref = &g;
 
-    let cand_list: Vec<(u32, u32)> = seed_frontier_2d(vi).dilate(dx, dy).enumerate().collect();
+    let cand_list = dilate_2d_once(nx as u32, ny as u32, &seed_frontier_2d(vi), dx, dy);
     let interval = obs.interval();
 
     // per-cell 評価 (cp 融合モデル): 自セルは単一書き手なので最新値。before = cp − pen で復元。

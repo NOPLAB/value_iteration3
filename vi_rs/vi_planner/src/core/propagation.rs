@@ -39,8 +39,7 @@ impl PlannerCore {
             return (queued > 0).then_some((r.visits, queued));
         }
         let sw = &self.sweep;
-        let queued = sw.cands.len() - sw.pos
-            + sw.pending.as_ref().map_or(0, |b| b.popcount() as usize) + outstanding;
+        let queued = sw.cands.len() - sw.pos + sw.pending_len() + outstanding;
         (queued > 0).then_some((sw.visits, queued))
     }
 

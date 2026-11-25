@@ -22,7 +22,7 @@
 use crate::solvers::observe::{
     BoundaryPacer, InPlaceProbe, SolveFlow, SolveObserver, SolveOutcome,
 };
-use crate::solvers::{displacement, seed_frontier_2d, Bitboard2D};
+use crate::solvers::{displacement, seed_frontier_2d, Frontier2D};
 use crate::value_iterator::{value_iteration_raw, ValueIterator};
 
 /// セット済み `ValueIterator` を Frontier2D で収束まで解く。
@@ -39,14 +39,16 @@ pub fn frontier2d_solve_observed(
     let (mx, my, _mt) = displacement(vi);
     let (dx, dy) = (mx as u32, my as u32);
     let mut pacer = BoundaryPacer::new(obs);
+    let mut dilator = Frontier2D::new(nx as u32, ny as u32);
     let mut frontier = seed_frontier_2d(vi);
+    let mut candidates = Vec::new();
     let mut updates: u64 = 0;
     let mut iters: u32 = 0;
-    while frontier.popcount() > 0 && iters < max_iter {
+    while !frontier.is_empty() && iters < max_iter {
         iters += 1;
-        let candidates = frontier.dilate(dx, dy);
-        let mut new_frontier = Bitboard2D::new(nx as u32, ny as u32);
-        for (ix, iy) in candidates.enumerate() {
+        dilator.dilate_into(&frontier, dx, dy, &mut candidates);
+        frontier.clear();
+        for &(ix, iy) in &candidates {
             let mut u = 0u64;
             for it in 0..nt {
                 let idx = vi.to_index(ix as i32, iy as i32, it) as usize;
@@ -59,11 +61,10 @@ pub fn frontier2d_solve_observed(
             }
             if u > 0 {
                 updates += u;
-                new_frontier.set(ix, iy);
+                frontier.push((ix, iy));
             }
         }
-        frontier = new_frontier;
-        if frontier.popcount() > 0 && pacer.due(iters as u64) {
+        if !frontier.is_empty() && pacer.due(iters as u64) {
             let mut probe = InPlaceProbe { vi, iters, updates };
             match obs.boundary(&mut probe) {
                 SolveFlow::Continue => {}
@@ -72,5 +73,5 @@ pub fn frontier2d_solve_observed(
             }
         }
     }
-    SolveOutcome::running(iters, updates, frontier.popcount() == 0)
+    SolveOutcome::running(iters, updates, frontier.is_empty())
 }
