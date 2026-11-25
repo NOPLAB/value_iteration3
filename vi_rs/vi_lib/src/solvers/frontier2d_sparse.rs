@@ -243,33 +243,8 @@ pub fn frontier2d_sparse_solve_observed(
                 break;
             }
             let e = (s + BLOCK).min(n);
-            for j in s..e {
-                let (ixu, iyu) = cand[j];
+            for &(ixu, iyu) in &cand[s..e] {
                 let (ix, iy) = (ixu as i32, iyu as i32);
-
-                // 次セルのアクション先カラムを先読み (ヒントのみ、意味論不変)。
-                #[cfg(target_arch = "x86_64")]
-                if j + 1 < e {
-                    let (nix, niy) = cand[j + 1];
-                    let ncol = g_ref.pad_col(nix as i32, niy as i32);
-                    let base = cp_atomic.as_ptr();
-                    for per_theta in g_ref.precomp.iter() {
-                        for itq in [0usize, 16, 32, 48] {
-                            if let Some(&(off, _)) =
-                                per_theta[itq.min(nt as usize - 1)].buckets.first()
-                            {
-                                // SAFETY: prefetch はメモリを読まないヒント命令。
-                                unsafe {
-                                    std::arch::x86_64::_mm_prefetch::<
-                                        { std::arch::x86_64::_MM_HINT_T1 },
-                                    >(
-                                        base.add((ncol + off) as usize) as *const i8,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
 
                 // ── θ マスク gather: 窓内の前ラウンド変化マスクを OR ──
                 let eval_mask = if first {
