@@ -25,6 +25,9 @@ pub(super) struct Manager {
     local_revision: u64,
     boundary_revision: u64,
     invalidation: invalidate::Invalidation,
+    /// Cells whose input cost increased after the outstanding global job was
+    /// checked out. Its snapshot still holds their old penalties.
+    raised: Vec<(i32, i32)>,
 }
 
 impl Manager {
@@ -158,6 +161,7 @@ impl PlannerCore {
         self.global.serial += 1;
         let id = self.global.serial;
         self.global.in_flight = Some(id);
+        self.global.raised.clear();
         self.dirty = true;
         let before = vi.states.clone();
         repair_values(&mut vi);
@@ -187,6 +191,13 @@ impl PlannerCore {
             return (0, !self.is_dirty());
         }
         self.global.in_flight = None;
+        if self.snapshot_outdated(&job) {
+            for &(x, y) in &job.cells {
+                let (gx, gy) = (x + job.origin.0, y + job.origin.1);
+                self.enqueue_global((gx, gx, gy, gy));
+            }
+            return (0, !self.is_dirty());
+        }
         let nt = job.vi.cell_num_t;
         let mut changed = Vec::new();
         let mut retry = Vec::new();
@@ -262,5 +273,51 @@ impl PlannerCore {
             self.refresh_local_boundary();
         }
         (job.delta, self.settle_global())
+    }
+
+    /// A cost increase after checkout outdates a job only where it touches the
+    /// job's snapshot: an increased input inside it, a pending invalidation that
+    /// may still reach it, or a snapshot policy that has since been invalidated
+    /// (cleared, or repaired to a higher value). Elsewhere the job stays valid,
+    /// so a scan near the robot no longer discards far-field work.
+    fn snapshot_outdated(&self, job: &GlobalJob) -> bool {
+        if self.global.invalidating() {
+            return true;
+        }
+        let (nx, ny, nt) = (job.vi.cell_num_x, job.vi.cell_num_y, job.vi.cell_num_t);
+        let (ox, oy) = job.origin;
+        if self
+            .global
+            .raised
+            .iter()
+            .any(|&(x, y)| (ox..ox + nx).contains(&x) && (oy..oy + ny).contains(&y))
+        {
+            return true;
+        }
+        let Some(cached) = self.cached.as_ref() else {
+            return true;
+        };
+        job.before.iter().enumerate().any(|(i, old)| {
+            if old.optimal_action.is_none() {
+                return false;
+            }
+            let (t, x, y) = (i as i32 % nt, i as i32 / nt % nx + ox, i as i32 / (nt * nx) + oy);
+            let (value, action) = match &cached.field {
+                Field::Dense(vi) => {
+                    if !vi.base.in_map_area(x, y) {
+                        return false;
+                    }
+                    let s = &vi.base.states[vi.base.to_index(x, y, t) as usize];
+                    (s.total_cost, s.optimal_action.map_or(-1, |a| a as i32))
+                }
+                Field::Compact(f) => {
+                    if x < 0 || y < 0 || x >= f.cell_num.0 || y >= f.cell_num.1 {
+                        return false;
+                    }
+                    f.sink.read(f.orig(x, y, t))
+                }
+            };
+            action < 0 || value > old.total_cost
+        })
     }
 }

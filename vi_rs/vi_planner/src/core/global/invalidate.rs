@@ -55,14 +55,17 @@ impl PlannerCore {
             self.global.invalidation.reverse = reverse;
         }
         let nt = self.global.invalidation.reverse.len() as i32;
-        for (x, y) in cells {
+        for &(x, y) in &cells {
             for theta in 0..nt {
                 self.global.invalidation.pending.push_back((x, y, theta));
             }
         }
-        // Keep outstanding IDs until their commits return them. Their old
-        // epoch rejects stale halos; global commits requeue the checked-out work.
-        self.global.epoch += 1;
+        // The goal epoch stays: a global job outstanding now is rejected at commit
+        // only if this increase or its invalidation touches its snapshot. A local
+        // job is rejected by the local revision that every window input change bumps.
+        if self.global.in_flight.is_some() {
+            self.global.raised.extend(cells);
+        }
         self.global.boundary_revision += 1;
         self.global.certified = false;
     }

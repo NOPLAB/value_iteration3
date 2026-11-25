@@ -44,6 +44,7 @@ impl PlannerCore {
         self.global.deferred.clear();
         self.global.certified = false;
         self.global.invalidation.pending.clear();
+        self.global.raised.clear();
         self.dirty = false;
         self.sweep.clear();
         if let Some(r) = self.repair.as_mut() {

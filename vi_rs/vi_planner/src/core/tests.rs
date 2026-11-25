@@ -2092,6 +2092,45 @@ fn invalidations_received_during_global_work_are_not_lost() {
     }
 }
 
+/// 窓の中のコスト増加は、その無効化に触れない遠くの全域ジョブを捨てさせない。
+/// 以前はゴールの epoch を上げて、取り出し済みの仕事をすべて捨てていた。
+/// スキャンのたびにそうなるので、実機では遠方の場がいつまでも埋まらなかった。
+#[test]
+fn a_cost_increase_keeps_global_work_outside_its_invalidation() {
+    let mut core = PlannerCore::new(build(96), cfg());
+    core.prepare_goal(pose(2.4, 2.4, 0.0), &AtomicBool::new(false)).expect("solve");
+    assert!(!core.is_dirty(), "fixture: the solved field has no work");
+
+    // ゴールの向こう (東) の 1 セルを持ち上げ、下げ戻す仕事を作って取り出す。
+    // 方策はゴールで止まるので、ロボットの後ろの無効化はここまで届かない。
+    let far = (80, 48);
+    let raised = {
+        let vi = core.local_mut().expect("dense field");
+        let i = vi.base.to_index(far.0, far.1, 0) as usize;
+        vi.base.states[i].total_cost += 1 << PROB_BASE_BIT;
+        vi.base.states[i].total_cost
+    };
+    let (w, h) = (core.build.grid.width, core.build.grid.height);
+    core.sweep.seed_rect(w, h, (far.0, far.0, far.1, far.1));
+    core.dirty = true;
+    let mut job = core.prepare_global_job(usize::MAX).expect("far job");
+    job.run();
+
+    // 取り出し中に、ロボットの後ろ (西) でコストが上がる。
+    let robot = pose(1.2, 2.4, 0.0);
+    core.set_window(robot);
+    let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![0.55] };
+    core.observe_scan(&scan, pose(robot.x, robot.y, std::f64::consts::PI));
+    assert!(core.global.invalidating(), "fixture: the scan must raise a cost");
+    while !core.advance_invalidations(512) {}
+
+    let (delta, _) = core.commit_global_job(job);
+    assert!(delta > 0, "a job outside the invalidated policies was discarded");
+    let vi = core.local().expect("dense field");
+    let now = vi.base.states[vi.base.to_index(far.0, far.1, 0) as usize].total_cost;
+    assert!(now < raised, "the far job's result was not committed");
+}
+
 #[test]
 fn local_and_global_owners_settle_to_the_shared_field() {
     for compact in [false, true] {
