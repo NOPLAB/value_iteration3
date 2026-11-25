@@ -3,11 +3,9 @@ use std::collections::BTreeSet;
 
 use super::*;
 
-mod invalidate;
 mod job;
 mod local;
 mod ownership;
-use invalidate::repair_values;
 pub use job::GlobalJob;
 use job::{geometry, unchanged};
 pub use local::LocalJob;
@@ -24,14 +22,9 @@ pub(super) struct Manager {
     pub(super) local_in_flight: Option<u64>,
     local_revision: u64,
     boundary_revision: u64,
-    invalidation: invalidate::Invalidation,
 }
 
 impl Manager {
-    pub(super) fn invalidating(&self) -> bool {
-        !self.invalidation.pending.is_empty()
-    }
-
     pub(super) fn local_pending(&self) -> bool {
         !self.owned.is_empty() && !self.certified
     }
@@ -41,9 +34,6 @@ impl PlannerCore {
     /// Prepare one bounded batch. None may mean only locally deferred work remains.
     /// Exactly one job may be outstanding; it must be returned to commit.
     pub fn prepare_global_job(&mut self, max_states: usize) -> Option<GlobalJob> {
-        if !self.advance_invalidations(max_states.clamp(1, 5_000)) {
-            return None;
-        }
         if self.global.in_flight.is_some() || self.cached.is_none() {
             return None;
         }
@@ -160,7 +150,6 @@ impl PlannerCore {
         self.global.in_flight = Some(id);
         self.dirty = true;
         let before = vi.states.clone();
-        repair_values(&mut vi);
         Some(GlobalJob {
             epoch: self.global.epoch,
             id,
