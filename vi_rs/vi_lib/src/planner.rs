@@ -145,12 +145,7 @@ impl PolicyView for ValueIterator {
         if !PolicyView::in_map_area(self, ix, iy) || it < 0 || it >= self.cell_num_t {
             return MAX_COST;
         }
-        let s = &self.states[self.to_index(ix, iy, it) as usize];
-        if s.policy_invalidated() {
-            MAX_COST
-        } else {
-            s.total_cost
-        }
+        self.states[self.to_index(ix, iy, it) as usize].total_cost
     }
     fn map_origin_quat(&self) -> crate::msg::Quaternion {
         self.map_origin_quat.clone()
@@ -505,7 +500,7 @@ pub fn qmdp_decide(vi: &ValueIterator, hyps: &[(crate::bridge::PoseView, f64)]) 
         }
         usable += w;
         for (ai, a) in vi.actions.iter().enumerate() {
-            let q = vi.policy_action_cost(s, a);
+            let q = vi.action_cost(s, a);
             qb[ai] += w * q as f64;
             if q == MAX_COST {
                 veto[ai] += w;
@@ -785,51 +780,6 @@ mod tests {
 
     fn hyp(x: f64, y: f64, yaw: f64) -> PoseView {
         PoseView { x, y, yaw_rad: yaw }
-    }
-
-    #[test]
-    fn qmdp_vetoes_invalidated_sources_and_probabilistic_successors() {
-        let mut vi = solved_vi(32, 32, empty_map(32), (1.2, 1.2, 0), U64Solver::Frontier3D);
-        let p = hyp(0.5, 0.5, 0.0);
-        let (x, y, theta) = pose_to_cell(&vi, p.x, p.y, p.yaw_rad);
-        let source = vi.to_index(x, y, theta) as usize;
-        assert!(matches!(
-            qmdp_decide(&vi, &[(p, 1.0)]),
-            QmdpDecision::Action(_)
-        ));
-        let before = vi.states.clone();
-        for invalidate_source in [true, false] {
-            vi.states = before.clone();
-            if invalidate_source {
-                vi.states[source].optimal_action = None;
-            } else {
-                let targets: Vec<_> = vi
-                    .actions
-                    .iter()
-                    .flat_map(|a| {
-                        a.state_transitions[theta as usize]
-                            .iter()
-                            .filter(|t| t.prob > 0)
-                            .map(|t| vi.to_index(x + t.dix, y + t.diy, t.dit.rem_euclid(NT)) as usize)
-                    })
-                    .collect();
-                for idx in targets {
-                    if idx != source {
-                        assert!(vi.states[idx].free && !vi.states[idx].final_state);
-                        vi.states[idx].optimal_action = None;
-                    }
-                }
-                assert!(vi.states[source].optimal_action.is_some());
-            }
-            assert!(
-                matches!(qmdp_decide(&vi, &[(p, 1.0)]), QmdpDecision::NoAction),
-                "source invalidation={invalidate_source}"
-            );
-            assert!(matches!(
-                qmdp_decide(&vi, &[(hyp(1.2, 1.2, 0.0), 1.0)]),
-                QmdpDecision::Goal
-            ));
-        }
     }
 
     /// 仮説セルでの Q(s,a)。衝突チェック用 (テスト専用の薄い読み)。

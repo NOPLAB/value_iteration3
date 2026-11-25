@@ -7,11 +7,6 @@ use vi_lib::{LocalShape, LocalShapeConfig};
 use vi_lib::params::{MAX_COST, PROB_BASE_BIT};
 use vi_lib::solvers::frontier2d_sparse_compact::{CompactSink, RamSink};
 
-#[path = "tests/invalidation.rs"]
-mod invalidation;
-#[path = "tests/invalidation_lifecycle.rs"]
-mod invalidation_lifecycle;
-
 const RES: f64 = 0.05;
 
 fn actions() -> Vec<Action> {
@@ -159,37 +154,6 @@ fn greedy_rejects_forward_motion_through_a_near_scan_hit() {
 
     let decision = core.decide(robot);
     assert!(matches!(decision, Decision::Action { fw, .. } if fw <= 0.0), "{decision:?}");
-}
-
-#[test]
-fn greedy_ignores_the_stale_cost_of_a_blocked_fallback_policy() {
-    let mut core = PlannerCore::new(build(64), PlanConfig { scan_penalty: 0, ..cfg() });
-    let robot = pose(1.025, 1.525, 0.0);
-    core.prepare_goal(pose(2.525, 1.525, 0.0), &AtomicBool::new(false)).unwrap();
-    core.set_window(robot);
-    assert!(matches!(core.decide(robot), Decision::Action { fw, .. } if fw > 0.0));
-    let scan = LaserScan { ranges: vec![0.05], ..LaserScan::default() };
-    core.observe_scan(&scan, robot);
-    let Decision::Action { id: Some(first), fw, .. } = core.decide(robot) else {
-        panic!("expected a usable alternative");
-    };
-    assert!(fw <= 0.0);
-
-    let vi = &mut core.local_mut().unwrap().base;
-    let (x, y, t) = pose_to_cell(vi, robot.x, robot.y, robot.yaw_rad);
-    let targets: Vec<_> = vi.actions[first].state_transitions[t as usize]
-        .iter()
-        .map(|s| vi.to_index(x + s.dix, y + s.diy, s.dit.rem_euclid(vi.cell_num_t)) as usize)
-        .collect();
-    for target in targets {
-        let state = &mut vi.states[target];
-        state.optimal_action = None;
-        assert!(state.policy_invalidated());
-    }
-
-    let decision = core.decide(robot);
-    assert!(matches!(decision, Decision::Action { id: Some(id), fw, .. } if id != first && fw <= 0.0),
-        "stale alternative {first} must not win: {decision:?}");
 }
 
 /// この統合の本題: 広域 (plan) と狭域 (decide) が **1 回の solve** を
@@ -1249,7 +1213,6 @@ fn decide_borrows_action_from_neighbors() {
         follow: strict_follow,
         global: global::Manager::default(),
         scan_collision: ScanCollision::default(),
-        scan_hold: HashMap::new(),
         running_action: Mutex::new(None),
     };
     assert_eq!(strict_core.decide(on_obstacle), Decision::NoAction);
@@ -1269,7 +1232,6 @@ fn decide_borrows_action_from_neighbors() {
         follow: relaxed_follow,
         global: global::Manager::default(),
         scan_collision: ScanCollision::default(),
-        scan_hold: HashMap::new(),
         running_action: Mutex::new(None),
     };
     assert!(matches!(relaxed_core.decide(on_obstacle), Decision::Action { .. }));
@@ -1435,32 +1397,23 @@ fn sweeping_stops_once_the_field_settles() {
     assert!(core.is_dirty(), "値を反復する前でも入力コストの変更は伝播させること");
 }
 
-/// 静止した機体でも、LiDAR のノイズで当たり位置は 1 セルほど前後する。ずれた 2 枚の
-/// スキャンを交互に入れても、両方を一度見たあとは入力の増加と判定しないこと。
-/// 増加と判定されると、そのたびに方策の閉包が遠方まで無効化される
-/// (19F 実機で、静止中に /value_function が明滅し続けた原因)。
+/// 走行中に壁へ当たったスキャンで、次の判断が止まらないこと。19F 実機では壁際の
+/// 罰則が増えるたびに方策が無効化され、`decide` が 1〜2 tick だけ NoAction を返していた。
 #[test]
-fn alternating_noisy_scans_stop_invalidating_once_both_were_seen() {
+fn a_scan_hit_on_the_wall_does_not_stop_the_next_decision() {
     let mut core = PlannerCore::new(corridor(64, 20, 30), cfg());
-    let cancel = AtomicBool::new(false);
-    core.prepare_goal(pose(2.8, 1.25, 0.0), &cancel).expect("solve");
+    core.prepare_goal(pose(2.8, 1.25, 0.0), &AtomicBool::new(false)).expect("solve");
     let robot = pose(1.5, 1.25, 0.0);
     core.set_window(robot);
-
-    let mut invalidated = Vec::new();
-    for k in 0..20 {
-        let range = if k % 2 == 0 { 0.55 } else { 0.62 };
-        let scan = LaserScan { angle_min: 0.0, angle_increment: 0.0, ranges: vec![range] };
-        core.observe_scan(&scan, robot);
-        invalidated.push(core.global.invalidating());
-        while !core.advance_invalidations(512) {}
-    }
-    assert!(invalidated[0], "fixture: the first hit must invalidate");
-    assert_eq!(
-        invalidated[2..],
-        [false; 18],
-        "re-hitting cells that the previous scan only decayed must not invalidate"
-    );
+    assert!(matches!(core.decide(robot), Decision::Action { fw, .. } if fw > 0.0));
+    let wall = LaserScan {
+        angle_min: std::f64::consts::FRAC_PI_2,
+        angle_increment: 0.0,
+        ranges: vec![0.28],
+    };
+    core.observe_scan(&wall, robot);
+    let decision = core.decide(robot);
+    assert!(matches!(decision, Decision::Action { fw, .. } if fw > 0.0), "{decision:?}");
 }
 
 /// 通路を塞いだ場を、窓ごと動かしてから伝播させる。テストごとに同じ状況を作る。

@@ -265,20 +265,6 @@ impl ValueIterator {
         )
     }
 
-    /// Score a control candidate without reading last-committed values from
-    /// invalidated states. Those values remain in the field until repair.
-    pub fn policy_action_cost(&self, s: &State, a: &Action) -> u64 {
-        let unavailable = s.policy_invalidated()
-            || a.state_transitions[s.it as usize].iter().any(|t| {
-                let (x, y) = (s.ix + t.dix, s.iy + t.diy);
-                t.prob > 0
-                    && self.in_map_area(x, y)
-                    && self.states[self.to_index(x, y, t.dit.rem_euclid(self.cell_num_t)) as usize]
-                        .policy_invalidated()
-            });
-        if unavailable { MAX_COST } else { self.action_cost(s, a) }
-    }
-
     /// Compute a Bellman update without modifying the field (for parallel Jacobi passes).
     pub fn bellman_update(&self, idx: usize) -> Option<(u64, Option<usize>)> {
         min_action_cost(

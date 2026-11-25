@@ -67,7 +67,6 @@ pub use vi_lib::localize::{
     AdaptiveLocalizer, BeliefConfig, ExternalLocalizer, GridLocalizer, Localizer,
 };
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
@@ -268,19 +267,9 @@ pub struct PlannerCore {
     /// solve・ロールアウトには関与しない — `decide` だけがこれを通る。
     follow: Box<dyn FollowController>,
     scan_collision: ScanCollision,
-    /// 窓内セル (全域座標) ごとに、ビームの通過による半減をあと何枚のスキャンの間
-    /// 保留するか ([`SCAN_HIT_HOLD`])。当たるたびに数え直す。
-    scan_hold: HashMap<(i32, i32), u8>,
     /// greedy が実行中の行動 id と、続けた tick 数 ([`Self::decide`])。
     running_action: Mutex<Option<(usize, u32)>>,
 }
-
-/// スキャンが当たったセルは、この枚数のスキャンが続けて外れるまでビームの通過で
-/// 半減しない。静止していても当たり位置はノイズで 1 セル前後し、半減と満額の
-/// 再注入が交互に起きる。再注入は入力コストの増加なので、そのたびに方策の閉包
-/// が遠方まで無効化される。障害物が本当に消えたときの解除は、この枚数ぶん
-/// (10 Hz の LiDAR で約 1 秒) 遅れる。
-pub(super) const SCAN_HIT_HOLD: u8 = 10;
 
 /// 2 つのゴール `(x, y, θ[deg])` を「同じ」とみなせるか。キャッシュの再利用判定と
 /// 先読み ([`Prefetcher`]) の照合が同じ規則を使うためにここに 1 つだけ置く
@@ -403,7 +392,6 @@ impl PlannerCore {
             cfg,
             follow,
             scan_collision: ScanCollision::default(),
-            scan_hold: HashMap::new(),
             running_action: Mutex::new(None),
             cached: None,
             patch: None,

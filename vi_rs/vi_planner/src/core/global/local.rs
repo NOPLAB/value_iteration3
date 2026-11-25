@@ -91,9 +91,6 @@ impl PlannerCore {
     /// Checkout one local pass while keeping live scan inputs and policy readable.
     /// Exactly one local job may be outstanding; return it even if it was not run.
     pub fn prepare_local_job(&mut self) -> Option<LocalJob> {
-        if !self.advance_invalidations(512) {
-            return None;
-        }
         let owner = self.global.owner?;
         if self.global.local_in_flight.is_some() || self.global.owned.is_empty() {
             return None;
@@ -117,7 +114,6 @@ impl PlannerCore {
                 }
             }
         }
-        repair_values(&mut vi);
         let mut cells = Vec::new();
         for x in local.local_ix_min..=local.local_ix_max {
             for y in local.local_iy_min..=local.local_iy_max {

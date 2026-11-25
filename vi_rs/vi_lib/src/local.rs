@@ -374,17 +374,6 @@ impl ValueIteratorLocal {
         self.set_local_cost_attenuated(msg, x, y, t, 0);
     }
 
-    /// The `local_penalty` that [`Self::set_local_cost_attenuated`] writes into a
-    /// hit square for this quality shift (0 when scan penalties are disabled).
-    pub fn scan_injection(&self, shift: u32) -> u64 {
-        let strength = if self.scan_penalty == 0 {
-            0
-        } else {
-            (self.scan_penalty >> shift.min(63)).max(1)
-        };
-        strength << PROB_BASE_BIT
-    }
-
     /// Attenuate the configured hit strength by the quality shift, retaining at
     /// least one cost unit when enabled. Existing beam penalties still halve.
     pub fn set_local_cost_attenuated(
@@ -395,7 +384,12 @@ impl ValueIteratorLocal {
         t: f64,
         shift: u32,
     ) {
-        let inject = self.scan_injection(shift);
+        let strength = if self.scan_penalty == 0 {
+            0
+        } else {
+            (self.scan_penalty >> shift.min(63)).max(1)
+        };
+        let inject = strength << PROB_BASE_BIT;
         let start_angle = msg.angle_min;
         let nt = self.base.cell_num_t;
         let (ox, oy, res) = (self.base.map_origin_x, self.base.map_origin_y, self.base.xy_resolution);

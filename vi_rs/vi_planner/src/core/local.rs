@@ -97,64 +97,14 @@ impl PlannerCore {
         let radius = self.cfg.scan_penalty_radius;
         let penalty = self.cfg.scan_penalty;
         let before = self.local_inputs();
-        let mut inject = 0;
         if let Some(vi) = self.local_mut() {
             vi.clear_map_from_scan = map_clear;
             vi.scan_penalty_radius = radius;
             vi.scan_penalty = penalty;
-            inject = vi.scan_injection(shift);
             vi.set_local_cost_attenuated(scan, pose.x, pose.y, pose.yaw_rad, shift);
         }
-        self.hold_scan_hits(&before, inject);
         self.harvest_penalties();
         self.invalidate_local_inputs(before);
-    }
-
-    /// 直近 [`SCAN_HIT_HOLD`] 枚のうちに当たったセルへ、このスキャンが掛けた半減を
-    /// 戻す。`before` は注入前の [`Self::local_inputs`] (同じ窓・同じ走査順)。
-    /// 当たりは、このスキャンの注入値ちょうどになったセルとして数える。弱い注入
-    /// (品質ゲートや `scan_penalty: 0`) で値が下がるのは当たりなので、そのまま通す。
-    fn hold_scan_hits(&mut self, before: &[(bool, u64, u64)], inject: u64) {
-        let p0 = if self.cfg.use_compact() {
-            self.patch.as_ref().and_then(|p| p.at).unwrap_or((0, 0))
-        } else {
-            (0, 0)
-        };
-        let held = std::mem::take(&mut self.scan_hold);
-        let mut hold = HashMap::new();
-        if let Some(vi) = self.local_mut() {
-            let nt = vi.base.cell_num_t as usize;
-            let mut old = before.iter();
-            'rows: for y in vi.local_iy_min..=vi.local_iy_max {
-                for x in vi.local_ix_min..=vi.local_ix_max {
-                    if !vi.in_local_area(x, y) {
-                        continue;
-                    }
-                    let Some(&(_, _, prev)) = old.next() else {
-                        break 'rows;
-                    };
-                    let key = (x + p0.0, y + p0.1);
-                    let base = vi.base.to_index(x, y, 0) as usize;
-                    let now = vi.base.states[base].local_penalty;
-                    if now == inject {
-                        // 当たり。罰則が無効 (注入 0) なら消すのも当たりで、保留しない。
-                        if inject > 0 {
-                            hold.insert(key, SCAN_HIT_HOLD);
-                        }
-                    } else if let Some(&left) = held.get(&key) {
-                        if now < prev {
-                            for s in &mut vi.base.states[base..base + nt] {
-                                s.local_penalty = prev;
-                            }
-                        }
-                        if left > 1 {
-                            hold.insert(key, left - 1);
-                        }
-                    }
-                }
-            }
-        }
-        self.scan_hold = hold;
     }
 
     /// 自己位置の広がり `sigma_m` [m] に応じて壁際のマージンを広げる
@@ -184,11 +134,6 @@ impl PlannerCore {
     /// する。戻り値は最後のパスの Δ 合計。
     pub fn refine_for(&mut self, budget: Duration) -> u64 {
         let t0 = Instant::now();
-        while !self.advance_invalidations(512) {
-            if t0.elapsed() >= budget {
-                return 0;
-            }
-        }
         loop {
             let (pass_delta, stopped) = self.refine_pass_until(|| t0.elapsed() >= budget);
             if pass_delta > 0 {
@@ -222,7 +167,6 @@ impl PlannerCore {
     /// ウィンドウ全体を `n` パス回す (決定的テスト用)。
     #[cfg(test)]
     pub fn refine_passes(&mut self, n: usize) {
-        while !self.advance_invalidations(512) {}
         for _ in 0..n {
             let (delta, stopped) = self.refine_pass_until(|| false);
             if delta > 0 {
@@ -246,27 +190,6 @@ impl PlannerCore {
             return (0, true);
         };
         let nt = vi.base.cell_num_t;
-        let reach = transition_reach(&vi.base);
-        let mut boundary = Vec::new();
-        for y in
-            (vi.local_iy_min - reach).max(0)..=(vi.local_iy_max + reach).min(vi.base.cell_num_y - 1)
-        {
-            for x in
-                (vi.local_ix_min - reach).max(0)..=(vi.local_ix_max + reach).min(vi.base.cell_num_x - 1)
-            {
-                let outside = !vi.in_local_area(x, y);
-                for t in 0..nt {
-                    let idx = vi.base.to_index(x, y, t) as usize;
-                    let s = &mut vi.base.states[idx];
-                    if s.policy_invalidated() {
-                        if outside {
-                            boundary.push((idx, s.total_cost));
-                        }
-                        s.total_cost = MAX_COST;
-                    }
-                }
-            }
-        }
         let mut delta = 0u64;
         let mut stopped = false;
         for iix in vi.local_ix_min..=vi.local_ix_max {
@@ -285,11 +208,6 @@ impl PlannerCore {
                 }
             }
         }
-        // The halo participates in this calculation, but only window states are
-        // published. Far-field values are committed by the global worker.
-        for (idx, value) in boundary {
-            vi.base.states[idx].total_cost = value;
-        }
         (delta, stopped)
     }
 
@@ -306,25 +224,16 @@ impl PlannerCore {
         let vi = &local.base;
         let radius = self.cfg.scan_collision_radius;
         let greedy = self.cfg.follow_controller == FollowKind::Greedy && radius > 0.0;
-        let repairing = self.global.invalidating();
-        if repairing {
-            // During repair, score from the actual cell instead of borrowing
-            // a policy that may be affected by the pending scan.
-            if !greedy || self.scan_collision.overlaps(pose, radius) {
-                return Decision::NoAction;
+        let decision = self.follow.decide(vi, &self.cfg, pose);
+        match decision {
+            Decision::Goal => return decision,
+            Decision::Action { fw, rot_deg, .. }
+                if !self.scan_collision.blocks(pose, fw, rot_deg, radius) =>
+            {
+                return decision;
             }
-        } else {
-            let decision = self.follow.decide(vi, &self.cfg, pose);
-            match decision {
-                Decision::Goal => return decision,
-                Decision::Action { fw, rot_deg, .. }
-                    if !self.scan_collision.blocks(pose, fw, rot_deg, radius) =>
-                {
-                    return decision;
-                }
-                Decision::NoAction if !greedy => return decision,
-                Decision::NoAction | Decision::Action { .. } => {}
-            }
+            Decision::NoAction if !greedy => return decision,
+            Decision::NoAction | Decision::Action { .. } => {}
         }
         if !vi.in_map_area(x, y) {
             return Decision::NoAction;
@@ -335,16 +244,11 @@ impl PlannerCore {
         }
         vi.actions
             .iter()
-            .enumerate()
-            .filter_map(|(index, action)| {
+            .filter_map(|action| {
                 let (fw, rot_deg) = (action.delta_fw, action.delta_rot);
                 let cost = self.safe_cost(vi, state, (x, y, t), pose, action)?;
-                // Keep a still-consistent policy instead of switching turns
-                // solely because other values are still being repaired. Of
-                // substitute steps, use retreat only if no other step is safe.
-                let keep = state.optimal_action == Some(index) && cost == state.total_cost;
                 Some((
-                    (!keep, repairing && fw < 0.0, cost),
+                    cost,
                     Decision::Action {
                         id: Some(action.id as usize),
                         fw,
@@ -427,7 +331,7 @@ impl PlannerCore {
                 return true;
             }
             let next = &vi.states[vi.to_index(nx, ny, tr.dit.rem_euclid(vi.cell_num_t)) as usize];
-            !next.free || next.total_cost >= MAX_COST || next.policy_invalidated()
+            !next.free || next.total_cost >= MAX_COST
         }) {
             return None;
         }
@@ -446,9 +350,6 @@ impl PlannerCore {
         match qmdp_decide(&local.base, hyps) {
             QmdpDecision::Goal => Decision::Goal,
             QmdpDecision::Action(ai) => {
-                if self.global.invalidating() {
-                    return Decision::NoAction;
-                }
                 let a = &local.base.actions[ai];
                 Decision::Action { id: Some(a.id as usize), fw: a.delta_fw, rot_deg: a.delta_rot }
             }

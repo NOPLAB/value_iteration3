@@ -85,12 +85,8 @@ localization uncertainty inflation. It does not specify a collision footprint.
 Scan cost is represented exactly as `scan_penalty * 2^18`, with no power-of-two
 rounding. Localization quality attenuates the configured strength by right shifts,
 with a minimum of one cost unit when enabled; beam traversal still halves existing
-fixed-point penalties, except in cells hit within the last 10 scans. Scan noise
-moves a hit by about one cell even when the robot stands still, so without that
-hold a cell would be halved and re-raised every other scan, and each re-raise
-invalidates every policy that depends on it. Compact planning stores exact
-theta-uniform penalties in an 8-byte-per-map-cell overlay, including decayed values
-after patch recentering.
+fixed-point penalties. Compact planning stores exact theta-uniform penalties in
+an 8-byte-per-map-cell overlay, including decayed values after patch recentering.
 
 Greedy following checks the circular footprint along one second of the selected
 motion against the latest scan hits projected at observation time. If it would hit an obstacle between
@@ -100,17 +96,10 @@ moves away from it is still allowed. The check uses scan hits directly and is
 independent of `scan_penalty` and `scan_quality_gate`. It does not change the
 global plan, and does not apply to DWA, MPPI, or QMDP.
 
-With global repair enabled, an increased observed traversal cost first invalidates
-the stored policies that depend on it, tracing every positive-probability successor
-across positions and headings. Affected actions become unavailable; calculation
-and controller reads treat their values as `MAX_COST`, while the last committed
-values remain in storage until repair publishes a result. Observations, goals, and unrelated
-policies remain intact.
-Bounded batches complete that dependency closure before local or global Bellman
-work resumes, and older snapshots cannot publish across the input revision.
-Decreased costs use ordinary repair. With `global_sweep: false`, local refinement
-retains the existing frozen global field instead of discarding policies that no
-global worker could restore.
+A changed observed traversal cost, raised or lowered, is repaired by the same
+Bellman sweeps as any other change: local refinement first, then the global worker.
+Policies are never discarded, so the controller keeps following the current field
+while it is repaired; the scan collision check above guards the motion meanwhile.
 
 Run `scripts/ros2_test.sh` in the existing ROS2 environment to build the release
 planner through colcon and run its core tests. Run vi_lib tests from outside the
