@@ -23,7 +23,7 @@ use crate::action::Action;
 use crate::msg::OccupancyGrid;
 use crate::params::MAX_COST;
 use crate::state::State;
-use crate::value_iterator::ValueIterator;
+use crate::value_iterator::{final_t, final_xy, ValueIterator};
 
 use super::frontier2d_fused::{action_cost_fused, CpCells, Geom, UNREACHED};
 use super::frontier2d_par::n_threads;
@@ -277,22 +277,11 @@ fn compute_finals(vi: &ValueIterator, free_at: impl Fn(i32, i32) -> bool) -> Has
             }
             let x0 = ix as f64 * xy_res + ox;
             let y0 = iy as f64 * xy_res + oy;
-            let r0 = (x0 - gx) * (x0 - gx) + (y0 - gy) * (y0 - gy);
-            let x1 = x0 + xy_res;
-            let y1 = y0 + xy_res;
-            let r1 = (x1 - gx) * (x1 - gx) + (y1 - gy) * (y1 - gy);
-            if !(r0 < r2 && r1 < r2) {
-                continue; // final_xy 不成立。
+            if !final_xy(x0, y0, xy_res, gx, gy, r2) {
+                continue;
             }
-            for it in 0..nt {
-                let t0 = (it as f64 * t_res) as i32;
-                let t1 = ((it + 1) as f64 * t_res) as i32;
-                let goal_t_2 = if gt > 180 { gt - 360 } else { gt + 360 };
-                let ok = (gt - gm <= t0 && t1 <= gt + gm)
-                    || (goal_t_2 - gm <= t0 && t1 <= goal_t_2 + gm);
-                if ok {
-                    set.insert(orig_index(ix, iy, it, nx, nt) as i64);
-                }
+            for it in (0..nt).filter(|&it| final_t(it, t_res, gt, gm)) {
+                set.insert(orig_index(ix, iy, it, nx, nt) as i64);
             }
         }
     }

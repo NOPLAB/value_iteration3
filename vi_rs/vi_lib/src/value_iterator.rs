@@ -309,21 +309,11 @@ impl ValueIterator {
         let t_res = self.t_resolution;
 
         for s in self.states.iter_mut() {
-            // 距離判定
             let x0 = s.ix as f64 * xy_res + ox;
             let y0 = s.iy as f64 * xy_res + oy;
-            let r0 = (x0 - gx) * (x0 - gx) + (y0 - gy) * (y0 - gy);
-            let x1 = x0 + xy_res;
-            let y1 = y0 + xy_res;
-            let r1 = (x1 - gx) * (x1 - gx) + (y1 - gy) * (y1 - gy);
-            s.final_state = r0 < r2 && r1 < r2 && s.free;
-
-            // 向き判定 (t0/t1 は f64→i32 切り捨て)
-            let t0 = (s.it as f64 * t_res) as i32;
-            let t1 = ((s.it + 1) as f64 * t_res) as i32;
-            let goal_t_2 = if gt > 180 { gt - 360 } else { gt + 360 };
-            let ok = (gt - gm <= t0 && t1 <= gt + gm) || (goal_t_2 - gm <= t0 && t1 <= goal_t_2 + gm);
-            s.final_state = s.final_state && ok;
+            s.final_state = s.free
+                && final_xy(x0, y0, xy_res, gx, gy, r2)
+                && final_t(s.it, t_res, gt, gm);
         }
 
         for s in self.states.iter_mut() {
@@ -548,6 +538,113 @@ pub(crate) fn compute_theta_transitions(
         oy += xy_step;
     }
     out
+}
+
+/// 本家 `setStateValues` の距離判定。セルの左下角 `(x0, y0)` と右上角がともにゴールから
+/// 半径内 (`r2` は半径の 2 乗)。
+pub(crate) fn final_xy(x0: f64, y0: f64, xy_res: f64, gx: f64, gy: f64, r2: f64) -> bool {
+    let r0 = (x0 - gx) * (x0 - gx) + (y0 - gy) * (y0 - gy);
+    let x1 = x0 + xy_res;
+    let y1 = y0 + xy_res;
+    let r1 = (x1 - gx) * (x1 - gx) + (y1 - gy) * (y1 - gy);
+    r0 < r2 && r1 < r2
+}
+
+/// 本家 `setStateValues` の向き判定 (t0/t1 は f64→i32 切り捨て)。`gt` は [0,360)。
+pub(crate) fn final_t(it: i32, t_res: f64, gt: i32, gm: i32) -> bool {
+    let t0 = (it as f64 * t_res) as i32;
+    let t1 = ((it + 1) as f64 * t_res) as i32;
+    let goal_t_2 = if gt > 180 { gt - 360 } else { gt + 360 };
+    (gt - gm <= t0 && t1 <= gt + gm) || (goal_t_2 - gm <= t0 && t1 <= goal_t_2 + gm)
+}
+
+/// ゴール圏から値が外へ広がる設定か。
+///
+/// 1 手の値は行き先 (サブセルで数セルに散る) の確率加重和なので、行き先が 1 つでも
+/// 未到達 (`MAX_COST`) なら値は付かない ([`action_cost_raw`])。値がゴール圏の外へ出るには、
+/// どれかの行動の行き先がまるごとゴール圏に収まらなければならない。ゴール圏が 1 手の
+/// 散らばりより小さいと、solve は値の場をほぼ空のまま「収束」し、機体はどこからも動けない
+/// (津田沼: 0.2 m/セル・前進 0.4/0.8 m で半径 0.25 m)。
+///
+/// 障害物の無い平面にゴールを置き、セル内の位置 4 通りと向き 15° おきのどれでも、値が
+/// ゴール圏から 2 手ぶん外まで届くかを見る。値そのものは要らないので、「行き先が全部
+/// 到達済みの行動を持つ状態は到達済み」の最小不動点を求める (Bellman で有限になる
+/// 状態の集合と同じ)。各遷移は行き先が到達済みになったときに逆引きで 1 回だけ数える。
+pub fn goal_region_spreads(
+    actions: &[Action],
+    xy_resolution: f64,
+    theta_cell_num: i32,
+    goal_margin_radius: f64,
+    goal_margin_theta: i32,
+) -> bool {
+    let mut vi = ValueIterator::new(actions.to_vec(), 1);
+    vi.cell_num_t = theta_cell_num;
+    vi.xy_resolution = xy_resolution;
+    vi.t_resolution = (360 / theta_cell_num) as f64;
+    vi.set_state_transition();
+
+    let (nt, na) = (theta_cell_num, vi.actions.len());
+    // 行き先の θ ごとの逆引き (行動, 元の θ, dix, diy) と、(元の θ, 行動) ごとの行き先の数。
+    let mut rev = vec![Vec::new(); nt as usize];
+    let mut need = vec![0u32; nt as usize * na];
+    for (a, act) in vi.actions.iter().enumerate() {
+        for it in 0..nt {
+            for t in act.state_transitions[it as usize].iter().filter(|t| t.prob > 0) {
+                rev[((t.dit + nt) % nt) as usize].push((a, it, t.dix, t.diy));
+                need[it as usize * na + a] += 1;
+            }
+        }
+    }
+    let reach = vi.actions.iter().flat_map(|a| a.state_transitions.iter().flatten());
+    let reach = reach.map(|t| t.dix.abs().max(t.diy.abs())).max().unwrap_or(0).max(1);
+    let far = (goal_margin_radius / xy_resolution).ceil() as i32 + 2 * reach;
+    let half = far + reach + 1; // 境界の外へ出る行き先が far までを塞がない幅
+    let n = 2 * half + 1;
+    let idx = |ix: i32, iy: i32, it: i32| ((iy * n + ix) * nt + it) as usize;
+    let r2 = goal_margin_radius * goal_margin_radius;
+
+    let spreads_from = |gx: f64, gy: f64, gt: i32| {
+        let mut reached = vec![false; (n * n * nt) as usize];
+        let mut left: Vec<u32> = (0..n * n).flat_map(|_| need.iter().copied()).collect();
+        let mut queue = Vec::new();
+        for iy in 0..n {
+            for ix in 0..n {
+                let (x0, y0) = (ix as f64 * xy_resolution, iy as f64 * xy_resolution);
+                if !final_xy(x0, y0, xy_resolution, gx, gy, r2) {
+                    continue;
+                }
+                for it in (0..nt).filter(|&it| final_t(it, vi.t_resolution, gt, goal_margin_theta)) {
+                    reached[idx(ix, iy, it)] = true;
+                    queue.push((ix, iy, it));
+                }
+            }
+        }
+        while let Some((ix, iy, it)) = queue.pop() {
+            for &(a, pt, dix, diy) in &rev[it as usize] {
+                let (px, py) = (ix - dix, iy - diy);
+                if px < 0 || py < 0 || px >= n || py >= n || reached[idx(px, py, pt)] {
+                    continue;
+                }
+                let l = &mut left[idx(px, py, pt) * na + a];
+                *l -= 1;
+                if *l == 0 {
+                    if (px - half).abs().max((py - half).abs()) >= far {
+                        return true;
+                    }
+                    reached[idx(px, py, pt)] = true;
+                    queue.push((px, py, pt));
+                }
+            }
+        }
+        false
+    };
+
+    let cell = |f: f64| (half as f64 + f) * xy_resolution;
+    (0..360).step_by(15).all(|gt| {
+        [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)]
+            .iter()
+            .all(|&(fx, fy)| spreads_from(cell(fx), cell(fy), gt))
+    })
 }
 
 /// 本家 `actionCost`。★u64 オーバーフロー折り返しを `wrapping_*` で再現。

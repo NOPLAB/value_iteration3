@@ -16,6 +16,7 @@ use vi_lib::bridge::{
     OccupancyGridView,
 };
 use vi_lib::solvers::U64Solver;
+use vi_lib::value_iterator::goal_region_spreads;
 use vi_lib::{LocalShape, LocalShapeConfig};
 
 use vi_planner::core::{
@@ -135,6 +136,34 @@ pub fn build_core(
             ))
         }
     };
+    // ゴール圏が 1 手の行き先の散らばりより小さいと、値がゴールから広がらず、solve は
+    // 空の場で「収束」して機体はどこからも動けない。作業解像度と行動が決まったここで
+    // 確かめ、黙って止まる代わりに理由と必要な半径を出して起動を止める。
+    let goal_theta = params.goal_margin_theta_deg as i32;
+    let spreads = |radius: f64| {
+        goal_region_spreads(
+            &params.action_list,
+            vi_grid.resolution,
+            params.theta_cell_num as i32,
+            radius,
+            goal_theta,
+        )
+    };
+    if !spreads(params.goal_margin_radius) {
+        let step = vi_grid.resolution / 4.0;
+        let enough = (1..=16)
+            .map(|k| params.goal_margin_radius + k as f64 * step)
+            .find(|&radius| spreads(radius))
+            .map_or("a much larger value".to_string(), |radius| format!("{radius:.2} m"));
+        return Err(anyhow!(
+            "goal_margin_radius {:.2} m (goal_margin_theta {goal_theta} deg) is too small for the \
+             actions at {:.2} m/cell: no action's outcomes fit inside the goal region, so the \
+             value function never spreads from the goal and the robot cannot move. Raise \
+             goal_margin_radius to at least {enough}, or use a finer map_scale.",
+            params.goal_margin_radius,
+            vi_grid.resolution,
+        ));
+    }
     // 自己位置推定。窓つき (grid / adaptive / adaptive_viterbi) は native 解像度の
     // 占有格子から belief も尤度場も起こす。全地図 (belief / viterbi) は
     // **幾何と free マスクはプランナと同じ vi_grid** (map_scale 適用後) から、

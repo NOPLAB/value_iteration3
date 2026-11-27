@@ -372,3 +372,46 @@ fn value_function_writer_truncates_substep() {
     // layer[theta=0] の (iy=0,ix=0) = floor(1.5) = 1.0 (浮動小数除算なら 1.5 になる)。
     assert_eq!(gl.layers[0][0], 1.0);
 }
+
+/// 津田沼の行動集合 (前進 0.4/0.8 m、据え切り 45°)。0.2 m/セルで 1 手が 2〜4 セル飛ぶ。
+fn tsudanuma_actions() -> Vec<Action> {
+    let fw = [0.8, -0.4, 0.0, 0.4, 0.8, 0.0, 0.4, 0.8];
+    let rot = [0.0, 0.0, -45.0, -45.0, -20.0, 45.0, 45.0, 20.0];
+    (0..8).map(|i| Action::new(&format!("a{i}"), fw[i], rot[i], i as i32)).collect()
+}
+
+/// 半径 0.25 m (≈1 セル) のゴール圏にはどの行動の行き先も収まらず、値が外へ広がらない。
+/// 1.0 m なら広がる。2026-11-25 の津田沼で初回ソルブが空の場のまま止まった設定。
+#[test]
+fn a_goal_region_smaller_than_one_step_does_not_spread() {
+    assert!(!goal_region_spreads(&tsudanuma_actions(), 0.2, 60, 0.25, 20));
+    assert!(goal_region_spreads(&tsudanuma_actions(), 0.2, 60, 1.0, 20));
+}
+
+/// 判定は本物の solve と同じ答えを出すこと: 小さいゴール圏では値がゴールの近くで止まり、
+/// 大きいゴール圏では遠くまで付く。
+#[test]
+fn the_spread_check_agrees_with_a_solve() {
+    use crate::solvers::{solve, U64Solver};
+    let n = 41;
+    let grid = OccupancyGrid {
+        width: n,
+        height: n,
+        resolution: 0.2,
+        origin_x: 0.0,
+        origin_y: 0.0,
+        origin_quat: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+        data: vec![0; (n * n) as usize],
+    };
+    for radius in [0.25, 1.0] {
+        let mut vi = ValueIterator::new(tsudanuma_actions(), 1);
+        vi.set_map_with_occupancy_grid(&grid, 60, 0.0, 0.0, radius, 20);
+        vi.set_goal(4.15, 4.15, 0); // セル (20, 20) の中
+        solve(&mut vi, U64Solver::Frontier2DSparse, 100_000);
+        let far = vi
+            .states
+            .iter()
+            .any(|s| s.total_cost < MAX_COST && (s.ix - 20).abs().max((s.iy - 20).abs()) >= 12);
+        assert_eq!(far, goal_region_spreads(&tsudanuma_actions(), 0.2, 60, radius, 20), "{radius}");
+    }
+}
